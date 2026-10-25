@@ -64,6 +64,103 @@ jobs:
           path: coverage.xml
           if-no-files-found: warn
 
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        env:
+          MINIO_ROOT_USER: longhaul
+          MINIO_ROOT_PASSWORD: longhaul-secret
+          MINIO_DEFAULT_BUCKETS: longhaul
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LONGHAUL_DATABASE_URL: postgresql://longhaul:longhaul@localhost:5432/longhaul
+      LONGHAUL_TEMPORAL_ADDRESS: localhost:7233
+      LONGHAUL_BLOB_ENDPOINT: http://localhost:9000
+      LONGHAUL_BLOB_BUCKET: longhaul
+      LONGHAUL_BLOB_ACCESS_KEY: longhaul
+      LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Install Temporal CLI
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+      - name: Start Temporal dev server
+        run: |
+          nohup "$HOME/.temporalio/bin/temporal" server start-dev --headless \
+            > temporal.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/7233) 2>/dev/null; then
+              echo "temporal is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not start within 60s" >&2
+          cat temporal.log >&2
+          exit 1
+      - name: Ensure the blob bucket exists
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+
+          import boto3
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=os.environ["LONGHAUL_BLOB_ENDPOINT"],
+              aws_access_key_id=os.environ["LONGHAUL_BLOB_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["LONGHAUL_BLOB_SECRET_KEY"],
+              region_name="us-east-1",
+          )
+          bucket = os.environ["LONGHAUL_BLOB_BUCKET"]
+          for _ in range(30):
+              try:
+                  names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+                  if bucket not in names:
+                      s3.create_bucket(Bucket=bucket)
+                  print("bucket ready")
+                  break
+              except (BotoCoreError, ClientError) as exc:
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("minio bucket was not ready in time")
+          PY
+      - run: uv run pytest -m integration -q
+      - name: Show Temporal log on failure
+        if: failure()
+        run: cat temporal.log || true
+
   compose:
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -1,0 +1,218 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main, "feat/**", "fix/**", "spike/**", "chore/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  LONGHAUL_PROVIDER: scripted
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  types:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run mypy src
+
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: >
+          uv run pytest tests/unit -q
+          --cov=longhaul --cov-report=term-missing --cov-report=xml
+          --cov-fail-under=80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        env:
+          MINIO_ROOT_USER: longhaul
+          MINIO_ROOT_PASSWORD: longhaul-secret
+          MINIO_DEFAULT_BUCKETS: longhaul
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LONGHAUL_DATABASE_URL: postgresql://longhaul:longhaul@localhost:5432/longhaul
+      LONGHAUL_TEMPORAL_ADDRESS: localhost:7233
+      LONGHAUL_BLOB_ENDPOINT: http://localhost:9000
+      LONGHAUL_BLOB_BUCKET: longhaul
+      LONGHAUL_BLOB_ACCESS_KEY: longhaul
+      LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Install Temporal CLI
+        run: |
+          curl -sSf https://temporal.download/cli.sh | sh
+          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+      - name: Start Temporal dev server
+        run: |
+          nohup "$HOME/.temporalio/bin/temporal" server start-dev --headless \
+            > temporal.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if (echo > /dev/tcp/127.0.0.1/7233) 2>/dev/null; then
+              echo "temporal is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not start within 60s" >&2
+          cat temporal.log >&2
+          exit 1
+      - name: Ensure the blob bucket exists
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+
+          import boto3
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=os.environ["LONGHAUL_BLOB_ENDPOINT"],
+              aws_access_key_id=os.environ["LONGHAUL_BLOB_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["LONGHAUL_BLOB_SECRET_KEY"],
+              region_name="us-east-1",
+          )
+          bucket = os.environ["LONGHAUL_BLOB_BUCKET"]
+          for _ in range(30):
+              try:
+                  names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+                  if bucket not in names:
+                      s3.create_bucket(Bucket=bucket)
+                  print("bucket ready")
+                  break
+              except (BotoCoreError, ClientError) as exc:
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("minio bucket was not ready in time")
+          PY
+      - run: uv run pytest -m integration -q
+      - name: Show Temporal log on failure
+        if: failure()
+        run: cat temporal.log || true
+
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: docker compose config -q
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GITLEAKS_VERSION: "8.28.0"
+      GITLEAKS_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf gitleaks.tar.gz -C "$RUNNER_TEMP/gitleaks" gitleaks
+          echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
+      - name: Scan git history for secrets
+        run: gitleaks detect --source . --redact --verbose
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Audit locked dependencies
+        run: |
+          uv export --locked --format requirements-txt --no-hashes --no-emit-project \
+            > requirements-audit.txt
+          uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps --timeout 60
+
+  ci:
+    if: always()
+    needs: [lint, types, unit, integration, security, compose]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: $RESULTS"
+          for r in $RESULTS; do
+            if [ "$r" != "success" ]; then
+              echo "at least one required job did not succeed" >&2
+              exit 1
+            fi
+          done

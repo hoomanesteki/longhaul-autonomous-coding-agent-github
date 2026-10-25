@@ -6,7 +6,11 @@ authors = [
     { name = "Hooman Esteki", email = "esteki.net@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.1",
+    "pyyaml>=6.0.3",
+]
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
@@ -23,6 +27,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "ruff>=0.17.2",
     "temporalio>=1.34.0",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 
 [tool.ruff]

@@ -9,7 +9,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-002 | Local stack with docker compose | 3 | Todo | | |
 | LH-003 | CI pipeline and branch protection | 3 | Todo | | |
 | LH-004 | CLAUDE.md, ADRs and contribution docs | 3 | Todo | | |
-| LH-005 | Settings and config loading | 2 | Todo | | |
+| LH-005 | Settings and config loading | 2 | In progress | | |
 | LH-006 | Backlog import into GitHub issues | 3 | Todo | | |
 | LH-007 | Toy repo fixtures | 2 | Todo | | |
 | LH-008 | Database baseline and migrations | 2 | Todo | | |

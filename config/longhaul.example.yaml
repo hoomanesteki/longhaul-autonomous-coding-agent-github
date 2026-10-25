@@ -1,0 +1,37 @@
+poller:
+  interval_seconds: 60
+  label: longhaul
+repos:
+  - repo: hoomanesteki/lh-demo-calc
+    allowlisted: true
+    plan_approval_required: true
+    setup_command: "pip install -e '.[dev]'"
+    test_command: "pytest -q"
+    budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
+models:                 # set to current model ids at project start
+  planner: "<sonnet-class model id>"
+  coder: "<sonnet-class model id>"
+  verifier: "<sonnet-class model id>"
+  compactor: "<haiku-class model id>"
+sandbox:
+  image: "longhaul-sandbox:py312"
+  limits: { cpus: 2, memory_mb: 4096, pids: 512 }
+  command_timeout_s: 600
+context:
+  window_tokens: 200000
+  compact_at: 0.60
+  hard_limit: 0.85
+  keep_recent_turns: 6
+  elide_tool_outputs_after_turns: 4
+  tool_output_max_tokens: 4000
+loop:
+  max_verify_rounds: 3
+  continue_as_new_every_turns: 40
+  max_tokens_per_turn: 8192
+stuck:
+  no_progress_turns: 15
+  repeated_failure_count: 3
+  churn_edits: 4
+  consecutive_tool_errors: 5
+  hint_wait_hours: 24
+pricing_file: config/pricing.yaml   # fill from the provider's pricing page; never hardcode in code

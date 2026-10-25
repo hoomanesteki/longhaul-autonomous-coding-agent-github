@@ -1,0 +1,12 @@
+models:
+  # fill from provider pricing page
+  "<sonnet-class model id>":
+    input_per_mtok: null
+    output_per_mtok: null
+    cache_write_per_mtok: null
+    cache_read_per_mtok: null
+  "<haiku-class model id>":
+    input_per_mtok: null
+    output_per_mtok: null
+    cache_write_per_mtok: null
+    cache_read_per_mtok: null

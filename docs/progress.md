@@ -5,14 +5,14 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 0: Foundation and backlog import (tag v0.0.1)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-001 | Repo scaffold and tooling | 3 | Todo | | |
-| LH-002 | Local stack with docker compose | 3 | Todo | | |
-| LH-003 | CI pipeline and branch protection | 3 | Todo | | |
-| LH-004 | CLAUDE.md, ADRs and contribution docs | 3 | Todo | | |
-| LH-005 | Settings and config loading | 2 | In progress | | |
+| LH-001 | Repo scaffold and tooling | 3 | Done | merge | 2026-10-25 |
+| LH-002 | Local stack with docker compose | 3 | Done | merge | 2026-10-25 |
+| LH-003 | CI pipeline and branch protection | 3 | In progress | merge | |
+| LH-004 | CLAUDE.md, ADRs and contribution docs | 3 | Done | merge | 2026-10-25 |
+| LH-005 | Settings and config loading | 2 | Done | merge | 2026-10-25 |
 | LH-006 | Backlog import into GitHub issues | 3 | Todo | | |
-| LH-007 | Toy repo fixtures | 2 | Todo | | |
-| LH-008 | Database baseline and migrations | 2 | Todo | | |
+| LH-007 | Toy repo fixtures | 2 | Done | merge | 2026-10-25 |
+| LH-008 | Database baseline and migrations | 2 | Done | merge | 2026-10-25 |
 
 ## Phase 1: Agent core without durability (tag v0.1.0)
 | ID | Title | Pts | Status | PR | Merged |

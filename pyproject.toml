@@ -7,9 +7,13 @@ authors = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "pgvector>=0.5.1",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.1",
     "pyyaml>=6.0.3",
+    "sqlalchemy[asyncio]>=2.1.6",
 ]
 
 [build-system]
@@ -53,6 +57,11 @@ module = [
     "longhaul.cost.*",
 ]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["longhaul.db.migrations.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -197,7 +197,7 @@ jobs:
         run: |
           uv export --locked --format requirements-txt --no-hashes --no-emit-project \
             > requirements-audit.txt
-          uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps
+          uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps --timeout 60
 
   ci:
     if: always()

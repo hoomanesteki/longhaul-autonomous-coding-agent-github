@@ -10,7 +10,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-003 | CI pipeline and branch protection | 3 | In progress | merge | |
 | LH-004 | CLAUDE.md, ADRs and contribution docs | 3 | Done | merge | 2026-10-25 |
 | LH-005 | Settings and config loading | 2 | Done | merge | 2026-10-25 |
-| LH-006 | Backlog import into GitHub issues | 3 | Todo | | |
+| LH-006 | Backlog import into GitHub issues | 3 | In progress | merge | |
 | LH-007 | Toy repo fixtures | 2 | Done | merge | 2026-10-25 |
 | LH-008 | Database baseline and migrations | 2 | Done | merge | 2026-10-25 |
 

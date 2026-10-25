@@ -49,6 +49,7 @@ strict = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "--strict-markers"
 markers = [
     "unit: pure logic, no Docker, network or DB",

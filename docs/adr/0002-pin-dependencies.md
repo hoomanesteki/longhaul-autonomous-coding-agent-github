@@ -19,9 +19,10 @@ Key runtime packages:
 | anthropic | not yet added; pinned when first added |
 | docker | not yet added; pinned when first added |
 | fastapi | not yet added; pinned when first added |
-| sqlalchemy | not yet added; pinned when first added |
-| alembic | not yet added; pinned when first added |
-| pgvector | not yet added; pinned when first added |
+| sqlalchemy | 2.1.6 |
+| alembic | 1.20.1 |
+| asyncpg | 0.32.0 |
+| pgvector | 0.5.1 |
 | opentelemetry-sdk | not yet added; pinned when first added |
 | boto3 | not yet added; pinned when first added |
 

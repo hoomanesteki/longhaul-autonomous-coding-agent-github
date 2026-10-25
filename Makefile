@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e up down gate
+.PHONY: setup check ci-local itest e2e up down migrate gate
 
 PHASE ?= 0
 
@@ -30,6 +30,9 @@ up:
 
 down:
 	docker compose down -v
+
+migrate:
+	uv run alembic upgrade head
 
 gate: check
 	uv run pytest -m "$$(uv run python scripts/markers.py $(PHASE))"

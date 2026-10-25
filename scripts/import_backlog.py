@@ -329,12 +329,17 @@ def import_backlog(
             continue
         number, body = existing
         numbers[story.id] = number
-        if update and body != story.body:
+        if update and _normalize(body) != _normalize(story.body):
             gh.run(["issue", "edit", str(number), "--repo", target, "--body", story.body])
             print(f"updated {story.id} (#{number})")
         else:
             print(f"skipped {story.id} (#{number})")
     return numbers
+
+
+def _normalize(body: str) -> str:
+    # GitHub stores issue bodies with CRLF line endings; compare content, not newlines.
+    return body.replace("\r\n", "\n").strip()
 
 
 def _cells(line: str) -> list[str]:

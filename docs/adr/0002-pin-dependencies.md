@@ -33,6 +33,21 @@ Development tools, as locked in `uv.lock` on the date above:
 | pytest | 9.1.1 |
 | ruff | 0.17.2 |
 
+### Container images (docker-compose.yml)
+
+| Service | Image |
+|---|---|
+| postgres | pgvector/pgvector:0.8.0-pg17 |
+| temporal | temporalio/temporal:1.5.1 (`server start-dev`, SQLite file on a named volume) |
+| minio | bitnamilegacy/minio:2025.7.23-debian-12-r3 |
+| minio-init | bitnamilegacy/minio-client:2025.7.21-debian-12-r2 |
+| jaeger | jaegertracing/all-in-one:1.69.0 |
+| otel-collector | otel/opentelemetry-collector-contrib:0.123.0 |
+| prometheus | prom/prometheus:v3.3.0 |
+| grafana | grafana/grafana:11.6.0 |
+
+MinIO no longer publishes `minio/minio` or `minio/mc` images, so we use the `bitnamilegacy` builds. That build has no web console, so only the S3 port (9000) is exposed. The Temporal dev server runs as root inside its container because the named volume is root-owned; this is a local dev service only.
+
 ## Consequences
 
 Any checkout builds the same environment with `uv sync`. Pinned versions can fall behind security fixes, so upgrades need their own reviewed PR rather than riding along with feature work. This table must be updated when a package is first added.

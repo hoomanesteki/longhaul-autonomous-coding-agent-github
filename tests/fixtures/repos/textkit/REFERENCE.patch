@@ -1,0 +1,37 @@
+--- a/src/textkit/slug.py
++++ b/src/textkit/slug.py
+@@ -1,8 +1,11 @@
+ import re
+
++from textkit.text import strip_accents
++
+ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+
+ def slugify(text: str) -> str:
+     """Turn text into a lowercase, dash-separated slug."""
+-    return _NON_ALNUM.sub("-", text.lower()).strip("-")
++    folded = strip_accents(text).lower()
++    return _NON_ALNUM.sub("-", folded).strip("-")
+--- /dev/null
++++ b/src/textkit/text.py
+@@ -0,0 +1,7 @@
++import unicodedata
++
++
++def strip_accents(text: str) -> str:
++    """Drop combining marks so that "é" becomes "e"."""
++    decomposed = unicodedata.normalize("NFKD", text)
++    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+--- /dev/null
++++ b/tests/test_text.py
+@@ -0,0 +1,9 @@
++from textkit.text import strip_accents
++
++
++def test_strip_accents_keeps_ascii() -> None:
++    assert strip_accents("abc XYZ") == "abc XYZ"
++
++
++def test_strip_accents_removes_combining_marks() -> None:
++    assert strip_accents("Crème Brûlée") == "Creme Brulee"

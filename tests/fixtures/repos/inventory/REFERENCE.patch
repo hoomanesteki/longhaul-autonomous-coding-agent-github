@@ -1,0 +1,60 @@
+--- /dev/null
++++ b/src/inventory/errors.py
+@@ -0,0 +1,2 @@
++class InventoryError(ValueError):
++    """Raised when an inventory operation would break a stock rule."""
+--- a/src/inventory/__init__.py
++++ b/src/inventory/__init__.py
+@@ -1,5 +1,6 @@
+ """In-memory stock levels per SKU."""
+
++from inventory.errors import InventoryError
+ from inventory.store import Inventory
+
+-__all__ = ["Inventory"]
++__all__ = ["Inventory", "InventoryError"]
+--- a/src/inventory/store.py
++++ b/src/inventory/store.py
+@@ -1,21 +1,27 @@
++from inventory.errors import InventoryError
++
++
+ class Inventory:
+     """Tracks the on-hand quantity of each SKU."""
+
+     def __init__(self) -> None:
+         self._stock: dict[str, int] = {}
+
+     def add(self, sku: str, quantity: int) -> None:
+         """Increase the stock of sku by quantity."""
+         if quantity <= 0:
+             raise ValueError("quantity must be positive")
+         self._stock[sku] = self.quantity(sku) + quantity
+
+     def remove(self, sku: str, quantity: int) -> None:
+         """Decrease the stock of sku by quantity."""
+         if quantity <= 0:
+             raise ValueError("quantity must be positive")
+-        self._stock[sku] = self.quantity(sku) - quantity
++        current = self.quantity(sku)
++        if quantity > current:
++            raise InventoryError(f"{sku}: cannot remove {quantity}, only {current} in stock")
++        self._stock[sku] = current - quantity
+
+     def quantity(self, sku: str) -> int:
+         """Return the on-hand quantity of sku, or 0 if it is unknown."""
+         return self._stock.get(sku, 0)
+--- /dev/null
++++ b/tests/test_errors.py
+@@ -0,0 +1,11 @@
++import pytest
++
++from inventory import Inventory, InventoryError
++
++
++def test_remove_too_much_raises_inventory_error_and_keeps_stock() -> None:
++    inv = Inventory()
++    inv.add("widget", 1)
++    with pytest.raises(InventoryError):
++        inv.remove("widget", 2)
++    assert inv.quantity("widget") == 1

@@ -10,7 +10,7 @@ check:
 	uv run ruff check .
 	uv run ruff format --check .
 	uv run mypy src
-	uv run pytest tests/unit -q
+	uv run pytest tests/unit -q --cov=longhaul --cov-fail-under=80
 
 ci-local:
 	uv sync --locked

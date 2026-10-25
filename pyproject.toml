@@ -1,0 +1,71 @@
+[project]
+name = "longhaul"
+version = "0.1.0"
+description = "Autonomous background coding agent for GitHub issues."
+authors = [
+    { name = "Hooman Esteki", email = "esteki.net@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.17.2",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+packages = ["longhaul"]
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = [
+    "longhaul.contracts",
+    "longhaul.durable.*",
+    "longhaul.context.*",
+    "longhaul.cost.*",
+]
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "unit: pure logic, no Docker, network or DB",
+    "integration: needs the local docker compose stack",
+    "e2e: full stack end-to-end",
+    "chaos: kill-and-recover runs",
+    "chaos_lite: short chaos runs for CI",
+    "live: calls real model providers (paid)",
+    "slow: long-running tests",
+    "phase0: introduced in phase 0",
+    "phase1: introduced in phase 1",
+    "phase2: introduced in phase 2",
+    "phase3: introduced in phase 3",
+    "phase4: introduced in phase 4",
+    "phase5: introduced in phase 5",
+    "phase6: introduced in phase 6",
+    "phase7: introduced in phase 7",
+    "phase8: introduced in phase 8",
+    "phase9: introduced in phase 9",
+]

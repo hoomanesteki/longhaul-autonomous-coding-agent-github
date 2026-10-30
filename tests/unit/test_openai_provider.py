@@ -4,7 +4,9 @@ The openai 3.x SDK sends requests through httpx2, so the mock transport comes
 from httpx2 too. No network is used.
 """
 
+import email.utils
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -709,6 +711,86 @@ async def test_should_retry_header_is_honoured(handler: Handler, kind: ProviderE
     with pytest.raises(ProviderError) as info:
         await _ask(_provider(handler))
     assert info.value.kind == kind
+
+
+async def _error(handler: Handler) -> ProviderError:
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(handler))
+    return info.value
+
+
+_OVERLOADED_BODY = {"error": {"message": "Service overloaded"}}
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "headers", "retry_after_s"),
+    [
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "7"}, 7.0, id="seconds"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "0.5"}, 0.5, id="fractional-seconds"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after-ms": "1500"}, 1.5, id="milliseconds"),
+        pytest.param(
+            429,
+            _RATE_LIMIT_BODY,
+            {"retry-after-ms": "2500", "retry-after": "9"},
+            2.5,
+            id="milliseconds-first",
+        ),
+        # Any transient status can carry the hint, not only 429.
+        pytest.param(503, _OVERLOADED_BODY, {"retry-after": "30"}, 30.0, id="503-overloaded"),
+        pytest.param(529, _OVERLOADED_BODY, {"retry-after": "30"}, 30.0, id="529"),
+        pytest.param(500, {"error": {"message": "x"}}, {"retry-after": "5"}, 5.0, id="500"),
+        pytest.param(408, {"error": {"message": "x"}}, {"retry-after": "3"}, 3.0, id="408"),
+        # Values the durable layer cannot use leave it to its own backoff. A nan
+        # or inf breaks timedelta(seconds=...), and a negative value gives a past retry.
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "nan"}, None, id="nan"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "inf"}, None, id="inf"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "1e999"}, None, id="overflow"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "-5"}, None, id="negative"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "0"}, None, id="zero"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "soon"}, None, id="not-a-number"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "1e300"}, None, id="absurdly-long"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "86400"}, 86400.0, id="one-day"),
+        pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "86401"}, None, id="over-a-day"),
+        # A bad first form falls through to the next one.
+        pytest.param(
+            429,
+            _RATE_LIMIT_BODY,
+            {"retry-after-ms": "nan", "retry-after": "9"},
+            9.0,
+            id="bad-milliseconds-then-seconds",
+        ),
+        pytest.param(
+            429,
+            _RATE_LIMIT_BODY,
+            {"retry-after-ms": "-100", "retry-after": "9"},
+            9.0,
+            id="negative-milliseconds-then-seconds",
+        ),
+        # A delay is only a hint for errors that will be retried.
+        pytest.param(401, {"error": {"message": "x"}}, {"retry-after": "5"}, None, id="401"),
+        pytest.param(400, {"error": {"message": "x"}}, {"retry-after": "5"}, None, id="400"),
+        pytest.param(429, _QUOTA_BODY, {"retry-after": "5"}, None, id="429-insufficient-quota"),
+    ],
+)
+async def test_retry_after_forms(
+    status: int, body: dict[str, Any], headers: dict[str, str], retry_after_s: float | None
+) -> None:
+    error = await _error(_status(status, body, headers))
+    assert error.retry_after_s == retry_after_s
+
+
+async def test_retry_after_http_date() -> None:
+    when = email.utils.formatdate(time.time() + 30, usegmt=True)
+    error = await _error(_status(429, _RATE_LIMIT_BODY, {"retry-after": when}))
+    # The date has whole-second resolution, so allow for rounding and a slow runner.
+    assert error.retry_after_s is not None
+    assert 20 < error.retry_after_s <= 30
+
+
+async def test_retry_after_http_date_in_the_past_is_ignored() -> None:
+    when = email.utils.formatdate(time.time() - 60, usegmt=True)
+    error = await _error(_status(429, _RATE_LIMIT_BODY, {"retry-after": when}))
+    assert error.retry_after_s is None
 
 
 async def test_prebuilt_client_gets_no_sdk_retries() -> None:

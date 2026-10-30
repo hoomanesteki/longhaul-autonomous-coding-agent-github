@@ -18,7 +18,9 @@ and cache_ratio (LH-405) add the buckets up and would count cached tokens twice
 otherwise.
 """
 
+import email.utils
 import json
+import math
 import time
 from typing import Any, Literal
 
@@ -77,6 +79,9 @@ _CONTEXT_MARKERS = (
     "input is too long",
 )
 _REQUEST_TOO_LARGE = "request too large"
+# Longest Retry-After the provider passes on. A longer one is more likely a fault
+# than a real wait, and a huge float would overflow timedelta in the retry policy.
+_MAX_RETRY_AFTER_S = 24 * 60 * 60
 _OVERLOADED_STATUS = 529
 _OVERLOADED_503_TEXT = "overloaded"
 _CHARS_PER_TOKEN = 4
@@ -277,9 +282,11 @@ def _map_error(exc: openai.APIError) -> ProviderError:
         # Connection failures and malformed bodies: treat as a server-side problem.
         return ProviderError(ProviderErrorKind.SERVER, message)
 
-    kind = _honour_should_retry(exc, _status_kind(exc))
-    retry_after = _retry_after(exc) if kind == ProviderErrorKind.RATE_LIMIT else None
-    return ProviderError(kind, message, retry_after)
+    error = ProviderError(_honour_should_retry(exc, _status_kind(exc)), message)
+    if error.retryable:
+        # Any transient status can carry the hint, a 503 or 529 as well as a 429.
+        error.retry_after_s = _retry_after(exc)
+    return error
 
 
 def _status_kind(exc: openai.APIStatusError) -> ProviderErrorKind:
@@ -337,13 +344,37 @@ def _error_text(exc: openai.APIStatusError) -> str:
 
 
 def _retry_after(exc: openai.APIStatusError) -> float | None:
-    raw = exc.response.headers.get("retry-after")
+    # Same order as the SDK: milliseconds, seconds, then an HTTP date. A form that
+    # gives nothing usable falls through to the next one. None sends the durable
+    # layer back to its own backoff.
+    headers = exc.response.headers
+    seconds = headers.get("retry-after")
+    for delay in (
+        _parse_seconds(headers.get("retry-after-ms"), divisor=1000),
+        _parse_seconds(seconds),
+        _parse_http_date(seconds),
+    ):
+        if delay is not None and math.isfinite(delay) and 0 < delay <= _MAX_RETRY_AFTER_S:
+            return delay
+    return None
+
+
+def _parse_seconds(raw: str | None, divisor: float = 1) -> float | None:
     if raw is None:
         return None
     try:
-        return float(raw)
+        return float(raw) / divisor
     except ValueError:
-        # The HTTP-date form is not parsed. The durable layer falls back to its own backoff.
+        return None
+
+
+def _parse_http_date(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    try:
+        parsed = email.utils.parsedate_tz(raw)
+        return None if parsed is None else email.utils.mktime_tz(parsed) - time.time()
+    except (TypeError, ValueError, OverflowError, OSError):
         return None
 
 

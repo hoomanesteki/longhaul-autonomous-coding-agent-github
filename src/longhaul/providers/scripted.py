@@ -5,7 +5,7 @@ Script format::
     steps:
       - match:                       # optional
           role: coder                # system prompt's first line is "Role: coder"
-          turn_index: 2              # assistant messages already in the transcript
+          turn_index: 2              # assistant turns done, counting turns folded into notes
           last_tool_result_contains: "FAILED"
         respond:
           text: "optional text"
@@ -22,8 +22,26 @@ steps that have no ``match`` (the first bare step is turn 0, the next is turn 1)
 
 The role is read from the first line of the system prompt (``Role: coder``).
 The prompt builder (LH-110) must put that line first.
+
+Turns. ``turn_index`` is the number of assistant turns completed in the
+transcript, counting turns that a compaction folded into notes. A compacted
+transcript says how many it folded in a line of its own in the first user message,
+for example ``[longhaul:turn_offset=6]``. Write it with
+``longhaul.providers.base.format_turn_offset(n)``, where n is the number of
+assistant turns removed from the front of the transcript so far, summed over all
+compactions. The provider adds n to the assistant messages that are left, so a
+step keyed on turn 5 matches the same turn before and after a compaction. Without
+the line the offset is 0.
+
+Tool ids. Each id is ``toolu_<hash>_<n>``, where the hash covers the whole
+request and n is the position of the call in the reply. A retried identical
+request gets the same ids. Any other request gets different ones, so ids stay
+unique inside a transcript, even one that was compacted, and across the
+transcripts of different roles and tasks.
 """
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,10 +61,12 @@ from longhaul.contracts import (
     ToolUseBlock,
     Usage,
 )
+from longhaul.providers.base import turn_index
 
 _ROLE_PREFIX = "Role: "
 _TAIL_CHARS = 500
 _OUTPUT_TOKENS_PER_CALL = 50
+_ID_HASH_CHARS = 16
 
 
 class _Strict(BaseModel):
@@ -121,8 +141,23 @@ def _estimate(system: str, messages: list[Message]) -> int:
     return total // 4
 
 
-def _turn_index(messages: list[Message]) -> int:
-    return sum(1 for m in messages if m.role == "assistant")
+def _fingerprint(model: str, system: str, messages: list[Message], tools: list[ToolSpec]) -> str:
+    """Hash of everything the model is asked, in a canonical form.
+
+    Blocks are dumped one by one so a block type added to the contracts later
+    needs no change here.
+    """
+    request = {
+        "model": model,
+        "system": system,
+        "messages": [
+            {"role": m.role, "content": [b.model_dump(mode="json") for b in m.content]}
+            for m in messages
+        ],
+        "tools": [t.model_dump(mode="json") for t in tools],
+    }
+    canonical = json.dumps(request, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 class ScriptedProvider:
@@ -148,7 +183,7 @@ class ScriptedProvider:
         return True
 
     def _select(self, system: str, messages: list[Message]) -> _Step:
-        role, turn, last = _role_of(system), _turn_index(messages), _last_tool_result(messages)
+        role, turn, last = _role_of(system), turn_index(messages), _last_tool_result(messages)
         for step in self._steps:
             if self._matches(step, role, turn, last):
                 return step
@@ -175,9 +210,9 @@ class ScriptedProvider:
             raise ProviderError(
                 resp.raise_, f"scripted {resp.raise_.value} error", resp.retry_after_s
             )
-        turn = _turn_index(messages)
+        digest = _fingerprint(model, system, messages, tools)[:_ID_HASH_CHARS]
         calls = [
-            ToolCall(id=f"toolu_{turn:03d}_{n}", name=c.name, input=c.input)
+            ToolCall(id=f"toolu_{digest}_{n}", name=c.name, input=c.input)
             for n, c in enumerate(resp.tool_calls)
         ]
         content: list[Block] = []

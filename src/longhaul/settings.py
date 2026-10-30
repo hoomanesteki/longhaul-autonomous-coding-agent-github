@@ -13,6 +13,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from longhaul.contracts import Budgets, RepoSettings, SandboxLimits
+
 # Matched against whole words of a key name, so "max_tokens_per_turn" passes
 # while "github_token" and "api_key" fail. A plain substring match would reject
 # legitimate keys such as max_tokens_per_turn and tool_output_max_tokens.
@@ -48,24 +50,14 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-# TODO(LH-101): move to contracts
-class Budgets(StrictModel):
-    task_usd: float = 5.0
-    task_turns: int = 150
-    task_wall_minutes: int = 240
-    daily_repo_usd: float = 25.0
-
-
-# TODO(LH-101): move to contracts
-class RepoSettings(StrictModel):
-    repo: str  # "owner/name" or "local:/abs/path"
-    plan_approval_required: bool = False
-    setup_command: str | None = None  # runs with network, before the agent phase
-    test_command: str | None = None  # e.g. "pytest -q"
-    budgets: Budgets = Field(default_factory=Budgets)
+class BudgetsEntry(Budgets):
+    model_config = ConfigDict(extra="forbid")
 
 
 class RepoEntry(RepoSettings):
+    model_config = ConfigDict(extra="forbid")
+
+    budgets: BudgetsEntry = Field(default_factory=BudgetsEntry)
     allowlisted: bool = False
 
 
@@ -81,15 +73,13 @@ class ModelIds(StrictModel):
     compactor: str
 
 
-class SandboxLimits(StrictModel):
-    cpus: float
-    memory_mb: int
-    pids: int
+class SandboxLimitsEntry(SandboxLimits):
+    model_config = ConfigDict(extra="forbid")
 
 
 class Sandbox(StrictModel):
     image: str
-    limits: SandboxLimits
+    limits: SandboxLimitsEntry
     command_timeout_s: int
 
 

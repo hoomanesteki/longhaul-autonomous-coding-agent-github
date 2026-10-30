@@ -23,11 +23,18 @@ OUTPUT_CAP = 1_000_000
 CONTAINER_PREFIX = "lh-sbx-"
 TASK_LABEL = "longhaul.task_id"
 
+# The root filesystem is read-only, so packages for the repo's tests go into a
+# virtualenv inside the workspace volume. Its bin directory leads PATH so pytest
+# and friends are found without activating the venv. When the venv does not
+# exist the entry is simply skipped.
+VENV_BIN = f"{WORKDIR}/.venv/bin"
+# The image's own PATH.
+IMAGE_PATH = "/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 # The only variables a sandbox ever sees (invariant I3). Values are fixed here
 # and never read from os.environ, so worker secrets cannot leak in by accident.
-# PATH matches the image's own PATH.
 ENV_ALLOWLIST: dict[str, str] = {
-    "PATH": "/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "PATH": f"{VENV_BIN}:{IMAGE_PATH}",
     "HOME": "/home/agent",
     "LANG": "C.UTF-8",
     "PYTHONUNBUFFERED": "1",
@@ -116,7 +123,10 @@ class DockerSandbox:
     ) -> ExecResult:
         # `timeout --signal=KILL` kills bash and its children when time is up.
         # Plain `bash -c` is used: `-l` would source /etc/profile, which resets PATH.
-        argv = ["timeout", "--signal=KILL", str(timeout_s), "bash", "-c", cmd]
+        # Both programs are called by absolute path. The agent can write to the
+        # venv directory that leads PATH, and a file named `timeout` or `bash`
+        # there must not be able to switch the time limit off.
+        argv = ["/usr/bin/timeout", "--signal=KILL", str(timeout_s), "/bin/bash", "-c", cmd]
 
         def run() -> tuple[int, Any]:
             res = self._container().exec_run(

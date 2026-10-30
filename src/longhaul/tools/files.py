@@ -7,7 +7,8 @@ import shlex
 from typing import Any
 
 from longhaul.contracts import Sandbox, ToolContext, ToolResult, ToolSpec
-from longhaul.tools.paths import PathError, safe_path
+from longhaul.tools import ToolError
+from longhaul.tools.paths import Resolved, resolve
 
 MAX_READ_LINES = 800
 MAX_LIST_ENTRIES = 400
@@ -72,6 +73,17 @@ def _path_prop(desc: str) -> dict[str, Any]:
     return {"type": "string", "description": desc}
 
 
+async def load_text(sandbox: Sandbox, raw: str) -> tuple[Resolved, str]:
+    """Resolve `raw`, check that it is a regular file and return its path and text."""
+    found = await resolve(sandbox, raw)
+    found.require_file()
+    data = await sandbox.read_file(found.rel)
+    try:
+        return found, data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ToolError(f"not a UTF-8 text file: {found.requested}") from None
+
+
 class ListDir:
     spec = ToolSpec(
         name="list_dir",
@@ -89,25 +101,24 @@ class ListDir:
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            rel = await safe_path(sandbox, args.get("path", "."), must_exist=True)
-        except (PathError, FileNotFoundError) as exc:
+            found = await resolve(sandbox, args.get("path", "."))
+            found.require_dir()
+        except (ToolError, FileNotFoundError) as exc:
             return fail(str(exc))
         depth = int(args.get("depth", 2))
         prune = " -o ".join(f"-name {shlex.quote(n)}" for n in IGNORED_DIRS)
+        # find reads a first argument that starts with a dash as an option, and it has no
+        # `--` to stop that. So go into the directory and always search ".".
         cmd = (
-            f"find {shlex.quote(rel)} -mindepth 1 -maxdepth {depth} "
+            f"cd -- {shlex.quote(found.rel)} && "
+            f"find . -mindepth 1 -maxdepth {depth} "
             f"\\( {prune} \\) -prune -o "
             "\\( -type d -exec printf '%s/\\n' {} + -o -print \\)"
         )
         res = await sandbox.exec(cmd, timeout_s=30)
         if res.exit_code != 0:
             return fail(f"list_dir failed: {res.stderr.strip()}")
-        prefix = "" if rel == "." else rel + "/"
-        paths = sorted(
-            (ln.removeprefix(prefix) if prefix else ln.removeprefix("./"))
-            for ln in res.stdout.splitlines()
-            if ln
-        )
+        paths = sorted(ln.removeprefix("./") for ln in res.stdout.split("\n") if ln)
         return ok(render_tree(paths))
 
 
@@ -130,14 +141,9 @@ class ReadFile:
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            rel = await safe_path(sandbox, args["path"], must_exist=True)
-            data = await sandbox.read_file(rel)
-        except (PathError, FileNotFoundError, IsADirectoryError) as exc:
+            _, text = await load_text(sandbox, args["path"])
+        except (ToolError, FileNotFoundError) as exc:
             return fail(str(exc))
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            return fail(f"not a UTF-8 text file: {rel}")
         return ok(number_lines(text, int(args.get("start_line", 1)), args.get("end_line")))
 
 
@@ -163,19 +169,18 @@ class EditFile:
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            rel = await safe_path(sandbox, args["path"], must_exist=True)
-            old = (await sandbox.read_file(rel)).decode("utf-8")
-        except (PathError, FileNotFoundError, IsADirectoryError) as exc:
+            found, old = await load_text(sandbox, args["path"])
+        except (ToolError, FileNotFoundError) as exc:
             return fail(str(exc))
-        except UnicodeDecodeError:
-            return fail(f"not a UTF-8 text file: {args['path']}")
         count = old.count(args["old_str"])
         if count != 1:
             hint = "add more context" if count else "check the exact text with read_file"
-            return fail(f"found {count} matches for old_str in {rel}; need exactly 1 ({hint})")
+            return fail(
+                f"found {count} matches for old_str in {found.requested}; need exactly 1 ({hint})"
+            )
         new = old.replace(args["old_str"], args["new_str"], 1)
-        await sandbox.write_file(rel, new.encode("utf-8"))
-        return ok(format_diff(rel, old, new))
+        await sandbox.write_file(found.rel, new.encode("utf-8"))
+        return ok(format_diff(found.rel, old, new))
 
 
 class WriteFile:
@@ -196,9 +201,10 @@ class WriteFile:
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            rel = await safe_path(sandbox, args["path"])
-        except PathError as exc:
+            found = await resolve(sandbox, args["path"])
+            found.require_writable()
+        except ToolError as exc:
             return fail(str(exc))
         data = args["content"].encode("utf-8")
-        await sandbox.write_file(rel, data)
-        return ok(f"wrote {len(data)} bytes to {rel}")
+        await sandbox.write_file(found.rel, data)
+        return ok(f"wrote {len(data)} bytes to {found.rel}")

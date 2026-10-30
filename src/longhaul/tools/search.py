@@ -7,7 +7,8 @@ import shlex
 from typing import Any
 
 from longhaul.contracts import Sandbox, ToolContext, ToolResult, ToolSpec
-from longhaul.tools.paths import PathError, safe_path
+from longhaul.tools import ToolError
+from longhaul.tools.paths import resolve
 
 MAX_LINE_CHARS = 300
 
@@ -56,13 +57,14 @@ class Search:
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         try:
-            rel = await safe_path(sandbox, args.get("path", "."), must_exist=True)
-        except (PathError, FileNotFoundError) as exc:
+            found = await resolve(sandbox, args.get("path", "."))
+            found.require_exists()
+        except (ToolError, FileNotFoundError) as exc:
             return ToolResult(call_id="", ok=False, output=str(exc))
         cmd = ["rg", "--json", "-e", args["pattern"]]
         if args.get("glob"):
             cmd += ["-g", args["glob"]]
-        cmd += ["--", rel]
+        cmd += ["--", found.rel]
         res = await sandbox.exec(" ".join(shlex.quote(c) for c in cmd), timeout_s=60)
         if res.exit_code == 1:
             return ToolResult(call_id="", ok=True, output="no matches")

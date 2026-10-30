@@ -39,6 +39,13 @@ async def call(reg: ToolRegistry, sbx: Sandbox, name: str, **kw: object) -> Tool
     return await reg.run(ToolCall(id="c", name=name, input=dict(kw)), sbx, CTX)
 
 
+async def sh(sbx: Sandbox, cmd: str) -> str:
+    """Run a setup command and fail the test if it does not work."""
+    done = await sbx.exec(cmd, timeout_s=30)
+    assert done.exit_code == 0, f"{cmd}: {done.stderr}"
+    return done.stdout
+
+
 async def test_edit_exactly_once(reg: ToolRegistry, sbx: Sandbox) -> None:
     r = await call(
         reg, sbx, "edit_file", path=MODULE, old_str="    return a - b", new_str="    return a + b"
@@ -61,11 +68,97 @@ async def test_path_escape_rejected(reg: ToolRegistry, sbx: Sandbox) -> None:
     for p in ("../../etc/passwd", "/etc/passwd"):
         r = await call(reg, sbx, "read_file", path=p)
         assert not r.ok, p
-    await sbx.exec("ln -s /etc /workspace/link", timeout_s=10)
+    await sh(sbx, "ln -s /etc /workspace/link")
     r = await call(reg, sbx, "read_file", path="link/passwd")
     assert not r.ok and "outside" in r.output
     w = await call(reg, sbx, "write_file", path="link/evil", content="x")
     assert not w.ok
+
+
+ESCAPES = [
+    "../../etc/passwd",
+    "/etc/passwd",
+    "link",
+    "link/passwd",
+    "link/new/file.txt",
+    "filelink",
+    "dangling_out",
+]
+FILLERS = {"pattern": "root", "old_str": "root", "new_str": "toor", "content": "pwned\n"}
+
+
+async def test_path_escape_rejected_for_every_tool_with_a_path(
+    reg: ToolRegistry, sbx: Sandbox
+) -> None:
+    await sh(
+        sbx,
+        "ln -s /etc link && ln -s /etc/passwd filelink && ln -s /etc/not-there dangling_out",
+    )
+    names = [s.name for s in reg.specs() if "path" in s.input_schema.get("properties", {})]
+    assert {"list_dir", "read_file", "edit_file", "write_file", "search"} <= set(names)
+    for name in names:
+        tool = reg.get(name)
+        assert tool is not None
+        required = [k for k in tool.spec.input_schema.get("required", []) if k != "path"]
+        for path in ESCAPES:
+            args = {"path": path, **{key: FILLERS[key] for key in required}}
+            r = await call(reg, sbx, name, **args)
+            assert not r.ok, (name, path, r.output)
+            assert "outside" in r.output, (name, path, r.output)
+
+
+async def test_dash_leading_directory_cannot_inject_a_find_option(
+    reg: ToolRegistry, sbx: Sandbox
+) -> None:
+    # list_dir used to run `find -L ...` for ./-L. GNU find read the dash as an option,
+    # walked "." and followed the link, so the listing showed the sandbox's /etc.
+    await sh(sbx, "ln -s /etc outlink && mkdir -p -- ./-L/inner && touch ./-L/inner/f")
+    r = await call(reg, sbx, "list_dir", path="./-L")
+    assert r.ok, r.output
+    assert r.output == "inner/\n  f", r.output
+
+
+async def test_links_inside_the_workspace_reach_the_real_file(
+    reg: ToolRegistry, sbx: Sandbox
+) -> None:
+    # get_archive does not follow a link in the last path part and put_archive replaces a
+    # linked directory, so the tools have to hand the sandbox the resolved path.
+    await sh(sbx, "ln -s src/calc/__init__.py alias.py && ln -s src srclink")
+    read = await call(reg, sbx, "read_file", path="alias.py")
+    assert read.ok, read.output
+    assert "return a - b" in read.output
+    listing = await call(reg, sbx, "list_dir", path="srclink")
+    assert listing.ok and "calc/" in listing.output, listing.output
+    edit = await call(
+        reg,
+        sbx,
+        "edit_file",
+        path="srclink/calc/__init__.py",
+        old_str="    return a - b",
+        new_str="    return a + b",
+    )
+    assert edit.ok, edit.output
+    made = await call(reg, sbx, "write_file", path="srclink/calc/extra.py", content="X = 1\n")
+    assert made.ok, made.output
+    assert b"return a + b" in await sbx.read_file(f"/workspace/{MODULE}")
+    assert await sbx.read_file("/workspace/src/calc/extra.py") == b"X = 1\n"
+    await sh(sbx, "test -L alias.py && test -L srclink")
+
+
+async def test_wrong_kind_of_path_is_explained(reg: ToolRegistry, sbx: Sandbox) -> None:
+    for name, extra in (
+        ("read_file", {}),
+        ("edit_file", {"old_str": "a", "new_str": "b"}),
+        ("write_file", {"content": "x"}),
+    ):
+        r = await call(reg, sbx, name, path="src", **extra)
+        assert not r.ok and "src is a directory" in r.output, (name, r.output)
+    assert "list_dir" in (await call(reg, sbx, "read_file", path="src")).output
+    listing = await call(reg, sbx, "list_dir", path=MODULE)
+    assert not listing.ok
+    assert f"{MODULE} is a file" in listing.output and "read_file" in listing.output
+    # Writing onto the directory must not have replaced it.
+    await sh(sbx, f"test -d src && test -f {MODULE}")
 
 
 async def test_read_line_range(reg: ToolRegistry, sbx: Sandbox) -> None:

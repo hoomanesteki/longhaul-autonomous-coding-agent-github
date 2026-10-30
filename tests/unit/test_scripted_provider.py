@@ -1,3 +1,4 @@
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from longhaul.contracts import (
     Role,
     TextBlock,
     ToolResultBlock,
+    ToolSpec,
     ToolUseBlock,
 )
 from longhaul.providers.base import (
@@ -31,8 +33,33 @@ SCRIPT = Path(__file__).parent.parent / "fixtures" / "scripts" / "calc_fix.yaml"
 SYSTEM = "Role: coder\nFix the bug."
 
 
-async def _call(p: ScriptedProvider, messages: list[Message], system: str = SYSTEM) -> LLMResponse:
-    return await p.complete(model="m", system=system, messages=messages, tools=[], max_tokens=100)
+def _tool(name: str) -> ToolSpec:
+    return ToolSpec(
+        name=name,
+        description=f"The {name} tool.",
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+    )
+
+
+def _spec_chars(spec: ToolSpec) -> int:
+    return len(spec.name) + len(spec.description) + len(json.dumps(spec.input_schema))
+
+
+# Every tool the scripts in this file call, so a request offers them unless a test says otherwise.
+TOOL_NAMES = ("list_dir", "read_file", "edit_file", "run_tests", "run_command", "finish")
+TOOLS = [_tool(n) for n in (*TOOL_NAMES, "record_notes", "x")]
+
+
+async def _call(
+    p: ScriptedProvider,
+    messages: list[Message],
+    system: str = SYSTEM,
+    tools: list[ToolSpec] | None = None,
+) -> LLMResponse:
+    offered = TOOLS if tools is None else tools
+    return await p.complete(
+        model="m", system=system, messages=messages, tools=offered, max_tokens=100
+    )
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -160,8 +187,8 @@ async def test_unmatched_steps_use_their_position(tmp_path: Path) -> None:
         """
 steps:
   - respond: {text: "zero"}
-  - match: {role: verifier}
-    respond: {text: "verifier"}
+  - match: {last_tool_result_contains: "boom"}
+    respond: {text: "boom"}
   - respond: {text: "one", stop_reason: max_tokens}
 """,
     )
@@ -170,17 +197,20 @@ steps:
     last = await _call(p, _turn(1))
     assert last.content[0] == TextBlock(text="one")
     assert last.stop_reason == "max_tokens"
+    # The step in the middle has a match, so it does not take a position among the bare steps.
+    assert (await _call(p, _turn(1, "boom"))).content[0] == TextBlock(text="boom")
 
 
 async def test_usage_is_deterministic() -> None:
     p = ScriptedProvider(SCRIPT)
-    resp = await _call(p, _turn(0))
-    again = await _call(p, _turn(0))
+    tools = [_tool("list_dir")]
+    resp = await _call(p, _turn(0), tools=tools)
+    again = await _call(p, _turn(0), tools=tools)
     assert resp.usage == again.usage
     assert resp.usage.output_tokens == 50 + len("Looking at the repo layout.") // 4
-    expected = await p.count_tokens(model="m", system=SYSTEM, messages=_turn(0), tools=[])
+    expected = await p.count_tokens(model="m", system=SYSTEM, messages=_turn(0), tools=tools)
     assert resp.usage.input_tokens == expected
-    assert expected == (len(SYSTEM) + len("go")) // 4
+    assert expected == (len(SYSTEM) + len("go") + _spec_chars(tools[0])) // 4
 
 
 async def test_no_match_raises() -> None:
@@ -572,3 +602,136 @@ async def test_overflow_raises_once_then_the_compacted_retry_succeeds(tmp_path: 
     assert retry.tool_calls[0].input == {"command": "after compaction"}
     # The raise was one-shot: sending the first request again no longer fails.
     assert (await _call(p, big)).tool_calls[0].input == {"command": "normal"}
+
+
+# ---------- offered tools and token counts ----------
+async def test_call_to_a_tool_that_was_not_offered_is_rejected() -> None:
+    p = ScriptedProvider(SCRIPT)
+    with pytest.raises(ProviderError) as exc:
+        await _call(p, _turn(0), tools=[])
+    assert exc.value.kind is ProviderErrorKind.INVALID_REQUEST
+    assert not exc.value.retryable
+    assert "'list_dir'" in exc.value.message
+    assert "not offered" in exc.value.message
+    # The wrong subset is caught too, and the message lists what was offered.
+    with pytest.raises(ProviderError, match=r"offered tools: \['read_file'\]"):
+        await _call(p, _turn(0), tools=[_tool("read_file")])
+    assert (await _call(p, _turn(0), tools=[_tool("list_dir")])).tool_calls[0].name == "list_dir"
+
+
+async def test_every_call_in_a_reply_must_be_offered(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "steps:\n  - respond: {tool_calls: [{name: read_file, input: {}}, {name: edit_file}]}\n",
+    )
+    p = ScriptedProvider(path)
+    with pytest.raises(ProviderError, match="'edit_file'"):
+        await _call(p, _turn(0), tools=[_tool("read_file")])
+    assert len((await _call(p, _turn(0))).tool_calls) == 2
+
+
+async def test_replies_without_tool_calls_need_no_tools(tmp_path: Path) -> None:
+    text = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {text: hello}\n"))
+    assert (await _call(text, _turn(0), tools=[])).content == [TextBlock(text="hello")]
+    raising = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {raise: overloaded}\n"))
+    with pytest.raises(ProviderError) as exc:
+        await _call(raising, _turn(0), tools=[])
+    assert exc.value.kind is ProviderErrorKind.OVERLOADED
+
+
+async def test_tool_specs_count_towards_input_tokens() -> None:
+    p = ScriptedProvider(SCRIPT)
+    specs = [_tool("list_dir"), _tool("read_file"), _tool("finish")]
+    chars = len(SYSTEM) + len("go")
+
+    async def counted(tools: list[ToolSpec]) -> int:
+        resp = await _call(p, _turn(0), tools=tools)
+        by_count = await p.count_tokens(model="m", system=SYSTEM, messages=_turn(0), tools=tools)
+        assert resp.usage.input_tokens == by_count
+        return by_count
+
+    without = await p.count_tokens(model="m", system=SYSTEM, messages=_turn(0), tools=[])
+    assert without == chars // 4
+    assert await counted(specs[:1]) == (chars + _spec_chars(specs[0])) // 4
+    assert await counted(specs) == (chars + sum(map(_spec_chars, specs))) // 4
+    assert without < await counted(specs[:1]) < await counted(specs)
+
+
+# ---------- roles ----------
+ROLE_SCRIPT = """
+steps:
+  - match: {role: planner}
+    respond: {tool_calls: [{name: list_dir, input: {}}]}
+  - match: {role: verifier}
+    respond: {tool_calls: [{name: run_tests, input: {}}]}
+  - match: {role: coder}
+    respond: {tool_calls: [{name: read_file, input: {path: a.py}}]}
+"""
+
+
+@pytest.mark.parametrize("role", ["verfier", "Coder", "CODER", "reviewer", "''"])
+def test_unknown_role_is_rejected_when_the_script_loads(tmp_path: Path, role: str) -> None:
+    body = f"steps:\n  - match: {{role: {role}}}\n    respond: {{text: hi}}\n"
+    with pytest.raises(ValueError, match="'planner', 'coder', 'verifier' or 'compactor'"):
+        ScriptedProvider(_write(tmp_path, body))
+
+
+def test_every_role_value_loads(tmp_path: Path) -> None:
+    for role in Role:
+        body = f"steps:\n  - match: {{role: {role.value}}}\n    respond: {{text: hi}}\n"
+        ScriptedProvider(_write(tmp_path, body))
+
+
+async def test_each_role_gets_its_own_steps(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, ROLE_SCRIPT))
+    for role, tool in (
+        (Role.PLANNER, "list_dir"),
+        (Role.VERIFIER, "run_tests"),
+        (Role.CODER, "read_file"),
+    ):
+        resp = await _call(p, _turn(0), system=f"{format_role_line(role)}\nWork.")
+        assert resp.tool_calls[0].name == tool
+    # A role the script has no step for gets the no-match error, not another role's answer.
+    with pytest.raises(ProviderError, match="no scripted step matches.*role=compactor"):
+        await _call(p, _turn(0), system=format_role_line(Role.COMPACTOR))
+
+
+async def test_role_keyed_steps_need_a_role_line_in_the_prompt(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, ROLE_SCRIPT))
+    # The role line only counts on the first line.
+    system = "You are a careful assistant.\nRole: coder"
+    with pytest.raises(ProviderError) as exc:
+        await _call(p, _turn(0), system=system)
+    assert exc.value.kind is ProviderErrorKind.INVALID_REQUEST
+    message = exc.value.message
+    assert format_role_line(Role.CODER) in message
+    assert "You are a careful assistant." in message
+    assert "no scripted step matches" not in message
+
+
+async def test_a_script_without_role_keys_does_not_need_a_role_line() -> None:
+    p = ScriptedProvider(SCRIPT)
+    resp = await _call(p, _turn(0), system="plain prompt")
+    assert resp.tool_calls[0].name == "list_dir"
+
+
+def test_bare_steps_are_rejected_next_to_role_keyed_steps(tmp_path: Path) -> None:
+    body = """
+steps:
+  - match: {role: verifier}
+    respond: {text: "verdict"}
+  - respond: {text: "meant for the coder"}
+"""
+    with pytest.raises(ValueError, match=r"steps \[1\] have no match"):
+        ScriptedProvider(_write(tmp_path, body))
+
+
+def test_steps_with_a_match_may_leave_out_the_role(tmp_path: Path) -> None:
+    body = """
+steps:
+  - match: {role: verifier}
+    respond: {text: "verdict"}
+  - match: {last_tool_result_contains: "FAILED"}
+    respond: {text: "any role"}
+"""
+    ScriptedProvider(_write(tmp_path, body))

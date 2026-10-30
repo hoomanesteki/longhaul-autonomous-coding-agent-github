@@ -24,7 +24,12 @@ is shorthand for ``match: {turn_index: N}``, where N is its position among the
 steps that have no ``match`` (the first bare step is turn 0, the next is turn 1).
 
 The role is read from the first line of the system prompt (``Role: coder``).
-The prompt builder (LH-110) must put that line first.
+The format is ``longhaul.providers.base.ROLE_LINE_FORMAT``, and prompt builders
+must start with it. ``match.role`` must be a ``Role`` value, which is checked when
+the script loads. If any step names a role, a prompt without a role line fails with
+INVALID_REQUEST instead of falling through to a step for another role. For the same
+reason, a script with role-keyed steps cannot hold bare steps: a bare step answers
+every role, so give such a step an explicit ``match: {role: ...}``.
 
 Text matchers. ``last_tool_result_contains`` looks at the last tool_result block
 of the final message. ``user_text_contains`` looks at the text blocks of the last
@@ -40,6 +45,12 @@ step answers. A different request has its own count. Counts live in the
 provider instance, so a new instance starts again. Give a raise step with
 ``times`` an explicit ``match``: the next bare step belongs to the next turn, so
 it would not answer the request that the spent raise stopped matching.
+
+Tools. A reply may only call tools that the request offered, because a model
+cannot call any others. A scripted call to a tool that was not offered fails
+with INVALID_REQUEST. The tool definitions count as input tokens, like they do
+for a real provider: the usage rule is the characters of the system prompt, the
+blocks and each tool's name, description and JSON schema, divided by 4.
 
 Turns. ``turn_index`` is the number of assistant turns completed in the
 transcript, counting turns that a compaction folded into notes. A compacted
@@ -62,10 +73,10 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from longhaul.contracts import (
     Block,
@@ -73,6 +84,7 @@ from longhaul.contracts import (
     Message,
     ProviderError,
     ProviderErrorKind,
+    Role,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -80,9 +92,13 @@ from longhaul.contracts import (
     ToolUseBlock,
     Usage,
 )
-from longhaul.providers.base import turn_index
+from longhaul.providers.base import (
+    ROLE_LINE_FORMAT,
+    format_role_line,
+    parse_role_line,
+    turn_index,
+)
 
-_ROLE_PREFIX = "Role: "
 _TAIL_CHARS = 500
 _USER_TEXT_TAIL_CHARS = 200
 _OUTPUT_TOKENS_PER_CALL = 50
@@ -94,7 +110,7 @@ class _Strict(BaseModel):
 
 
 class _Match(_Strict):
-    role: str | None = None
+    role: Role | None = None
     turn_index: int | None = None
     last_tool_result_contains: str | None = Field(default=None, min_length=1)
     user_text_contains: str | None = Field(default=None, min_length=1)
@@ -130,6 +146,19 @@ class _Step(_Strict):
 class _Script(_Strict):
     steps: list[_Step]
 
+    @model_validator(mode="after")
+    def _role_keyed_scripts_have_no_bare_steps(self) -> Self:
+        # A bare step answers every role, so next to role-keyed steps it would
+        # answer silently for a role it was not written for.
+        keyed = any(s.match is not None and s.match.role is not None for s in self.steps)
+        bare = [i for i, s in enumerate(self.steps) if s.match is None]
+        if keyed and bare:
+            raise ValueError(
+                f"steps {bare} have no match, so they would answer every role, but other "
+                "steps are keyed by role; add match: {role: ...} to them"
+            )
+        return self
+
 
 def _load(path: Path) -> list[_Step]:
     raw = yaml.safe_load(path.read_text())
@@ -137,11 +166,6 @@ def _load(path: Path) -> list[_Step]:
         return _Script.model_validate(raw).steps
     except ValidationError as exc:
         raise ValueError(f"invalid script {path}: {exc}") from exc
-
-
-def _role_of(system: str) -> str | None:
-    first = system.split("\n", 1)[0]
-    return first[len(_ROLE_PREFIX) :].strip() if first.startswith(_ROLE_PREFIX) else None
 
 
 def _last_tool_result(messages: list[Message]) -> str | None:
@@ -178,9 +202,14 @@ def _block_chars(block: Block) -> int:
     return len(str(block.input))
 
 
-def _estimate(system: str, messages: list[Message]) -> int:
+def _spec_chars(spec: ToolSpec) -> int:
+    return len(spec.name) + len(spec.description) + len(json.dumps(spec.input_schema, default=str))
+
+
+def _estimate(system: str, messages: list[Message], tools: list[ToolSpec]) -> int:
+    # Real providers count the tool definitions as input, so the synthetic count does too.
     total = len(system) + sum(_block_chars(b) for m in messages for b in m.content)
-    return total // 4
+    return (total + sum(_spec_chars(t) for t in tools)) // 4
 
 
 def _fingerprint(model: str, system: str, messages: list[Message], tools: list[ToolSpec]) -> str:
@@ -228,6 +257,9 @@ class ScriptedProvider:
         # Bare steps get an implicit turn_index equal to their rank among bare steps.
         bare = [i for i, step in enumerate(self._steps) if step.match is None]
         self._implicit = {index: rank for rank, index in enumerate(bare)}
+        self._role_keyed = any(
+            s.match is not None and s.match.role is not None for s in self._steps
+        )
         # How often each (step, request) pair has raised, for steps that set times.
         self._raised: dict[tuple[int, str], int] = {}
 
@@ -235,7 +267,7 @@ class ScriptedProvider:
         self, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
     ) -> _Request:
         return _Request(
-            role=_role_of(system),
+            role=parse_role_line(system),
             role_line=system.split("\n", 1)[0][:80],
             turn=turn_index(messages),
             last_result=_last_tool_result(messages),
@@ -243,6 +275,16 @@ class ScriptedProvider:
             request_text=_request_text(messages),
             fingerprint=_fingerprint(model, system, messages, tools),
         )
+
+    def _require_role_line(self, req: _Request) -> None:
+        """Role-keyed steps cannot match a prompt with no role line, so say that, not 'no match'."""
+        if self._role_keyed and req.role is None:
+            raise ProviderError(
+                ProviderErrorKind.INVALID_REQUEST,
+                "the script keys steps by role, so the system prompt must start with a role "
+                f"line, {ROLE_LINE_FORMAT!r}, such as {format_role_line(Role.CODER)!r}; "
+                f"its first line is {req.role_line!r}",
+            )
 
     def _matches(self, index: int, step: _Step, req: _Request) -> bool:
         m = step.match
@@ -283,6 +325,18 @@ class ScriptedProvider:
             message += f"; raise steps {spent} already raised as often as times allows"
         return ProviderError(ProviderErrorKind.INVALID_REQUEST, message)
 
+    @staticmethod
+    def _check_offered(index: int, resp: _Respond, tools: list[ToolSpec]) -> None:
+        """A model can only call the tools in the request, so a script may not either."""
+        offered = sorted(t.name for t in tools)
+        for call in resp.tool_calls:
+            if call.name not in offered:
+                raise ProviderError(
+                    ProviderErrorKind.INVALID_REQUEST,
+                    f"scripted step {index} calls {call.name!r}, which was not offered; "
+                    f"offered tools: {offered}",
+                )
+
     async def complete(
         self,
         *,
@@ -294,6 +348,7 @@ class ScriptedProvider:
         cache_system: bool = True,
     ) -> LLMResponse:
         req = self._request(model, system, messages, tools)
+        self._require_role_line(req)
         index, step = self._select(req)
         resp = step.respond
         if resp.raise_ is not None:
@@ -303,6 +358,7 @@ class ScriptedProvider:
             raise ProviderError(
                 resp.raise_, f"scripted {resp.raise_.value} error", resp.retry_after_s
             )
+        self._check_offered(index, resp, tools)
         digest = req.fingerprint[:_ID_HASH_CHARS]
         calls = [
             ToolCall(id=f"toolu_{digest}_{n}", name=c.name, input=c.input)
@@ -313,7 +369,7 @@ class ScriptedProvider:
             content.append(TextBlock(text=resp.text))
         content.extend(ToolUseBlock(id=c.id, name=c.name, input=c.input) for c in calls)
         usage = Usage(
-            input_tokens=_estimate(system, messages),
+            input_tokens=_estimate(system, messages, tools),
             output_tokens=_OUTPUT_TOKENS_PER_CALL * len(calls) + len(resp.text or "") // 4,
         )
         return LLMResponse(
@@ -328,4 +384,4 @@ class ScriptedProvider:
     async def count_tokens(
         self, *, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
     ) -> int:
-        return _estimate(system, messages)
+        return _estimate(system, messages, tools)

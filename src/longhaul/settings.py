@@ -22,7 +22,17 @@ _SECRET_WORDS = frozenset({"token", "key", "secret"})
 
 
 class EnvSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="LONGHAUL_", extra="ignore")
+    # .env is read from the working directory; real environment variables win over it.
+    # env_ignore_empty makes a blank assignment (a copied .env.example is full of them)
+    # mean "unset". Without it a blank admin token becomes SecretStr(""), a blank base URL
+    # becomes "", and a blank app id fails to parse.
+    model_config = SettingsConfigDict(
+        env_prefix="LONGHAUL_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
     database_url: SecretStr | None = None
     temporal_address: str = "localhost:7233"
@@ -41,6 +51,8 @@ class EnvSettings(BaseSettings):
     github_app_key_path: Path | None = None
     admin_token: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
+    # Script file for the scripted provider; the provider factory reads it (LH-197).
+    script: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )

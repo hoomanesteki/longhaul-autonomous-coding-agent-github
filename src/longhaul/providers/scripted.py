@@ -317,6 +317,7 @@ class ScriptedProvider:
     name = "scripted"
 
     def __init__(self, script_path: Path) -> None:
+        self.script_path = script_path
         self._steps = _load(script_path)
         # Bare steps get an implicit turn_index equal to their rank among bare steps.
         bare = [i for i, step in enumerate(self._steps) if step.match is None]

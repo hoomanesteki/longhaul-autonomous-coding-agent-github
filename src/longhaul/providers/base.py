@@ -101,11 +101,14 @@ def turn_index(messages: list[Message]) -> int:
 
 def get_provider(settings: EnvSettings, *, script_path: Path | None = None) -> LLMProvider:
     if settings.provider == "scripted":
-        if script_path is None:
-            raise ValueError("the scripted provider needs script_path")
+        path = script_path or settings.script
+        if path is None:
+            raise ValueError(
+                "the scripted provider needs a script: pass script_path or set LONGHAUL_SCRIPT"
+            )
         from longhaul.providers.scripted import ScriptedProvider
 
-        return ScriptedProvider(script_path)
+        return ScriptedProvider(path)
     if settings.provider == "openai":
         if settings.openai_api_key is None:
             raise ValueError("provider 'openai' needs OPENAI_API_KEY in the environment")

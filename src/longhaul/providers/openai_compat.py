@@ -62,11 +62,26 @@ _STOP_REASONS: dict[str, _StopReason] = {
     "tool_calls": "tool_use",
     "length": "max_tokens",
 }
-_CONTEXT_CODE = "context_length_exceeded"
-_CONTEXT_MESSAGE = "maximum context length"
+# Lowercase fragments of the codes, types and messages that servers use when the
+# input does not fit. OpenAI sends the code. llama.cpp sends the type. vLLM,
+# TGI, Gemini and others only write a sentence, in their own words.
+_CONTEXT_MARKERS = (
+    "context_length_exceeded",
+    "exceed_context_size_error",
+    "context length",
+    "context window",
+    "context size",
+    "exceeds the maximum number of tokens",
+    "`inputs` tokens + `max_new_tokens`",
+    "prompt is too long",
+    "input is too long",
+)
+_REQUEST_TOO_LARGE = "request too large"
 _OVERLOADED_STATUS = 529
 _OVERLOADED_503_TEXT = "overloaded"
 _CHARS_PER_TOKEN = 4
+# The kinds the contract calls retryable, read from it so the two cannot drift.
+_TRANSIENT_KINDS = frozenset(k for k in ProviderErrorKind if ProviderError(k, "").retryable)
 
 
 class OpenAICompatProvider:
@@ -262,19 +277,63 @@ def _map_error(exc: openai.APIError) -> ProviderError:
         # Connection failures and malformed bodies: treat as a server-side problem.
         return ProviderError(ProviderErrorKind.SERVER, message)
 
+    kind = _honour_should_retry(exc, _status_kind(exc))
+    retry_after = _retry_after(exc) if kind == ProviderErrorKind.RATE_LIMIT else None
+    return ProviderError(kind, message, retry_after)
+
+
+def _status_kind(exc: openai.APIStatusError) -> ProviderErrorKind:
+    # With SDK retries off, this is the only place that decides what is transient.
+    # It has to cover the statuses the SDK itself would have retried: 408, 409,
+    # 429 and 5xx.
     status = exc.status_code
-    lowered = message.lower()
-    if isinstance(exc, openai.RateLimitError) or status == 429:
-        return ProviderError(ProviderErrorKind.RATE_LIMIT, message, _retry_after(exc))
-    if isinstance(exc, (openai.AuthenticationError, openai.PermissionDeniedError)):
-        return ProviderError(ProviderErrorKind.AUTH, message)
-    if status == _OVERLOADED_STATUS or (status == 503 and _OVERLOADED_503_TEXT in lowered):
-        return ProviderError(ProviderErrorKind.OVERLOADED, message)
-    if status >= 500:
-        return ProviderError(ProviderErrorKind.SERVER, message)
-    if _is_context_error(exc):
-        return ProviderError(ProviderErrorKind.CONTEXT_TOO_LONG, message)
-    return ProviderError(ProviderErrorKind.INVALID_REQUEST, message)
+    text = _error_text(exc)
+    if status == 429:
+        return _rate_limit_kind(exc, text)
+    if status in (401, 403):
+        return ProviderErrorKind.AUTH
+    if status == 413:
+        return ProviderErrorKind.CONTEXT_TOO_LONG
+    if status == 408:
+        return ProviderErrorKind.TIMEOUT
+    if status == _OVERLOADED_STATUS or (status == 503 and _OVERLOADED_503_TEXT in text):
+        return ProviderErrorKind.OVERLOADED
+    if status >= 500 or status == 409:
+        return ProviderErrorKind.SERVER
+    # Checked for client errors only. A 5xx stays retryable whatever its text says.
+    if _is_context_error(text):
+        return ProviderErrorKind.CONTEXT_TOO_LONG
+    return ProviderErrorKind.INVALID_REQUEST
+
+
+def _rate_limit_kind(exc: openai.APIStatusError, text: str) -> ProviderErrorKind:
+    # OpenAI uses 429 for two cases that no retry can clear.
+    if "insufficient_quota" in (exc.code, exc.type):
+        # Out of credit or at the monthly cap: a billing problem, not a rate limit.
+        return ProviderErrorKind.AUTH
+    if _REQUEST_TOO_LARGE in text:
+        # One request is bigger than the tokens-per-minute limit. Only a smaller
+        # transcript helps, which is what forced compaction produces.
+        return ProviderErrorKind.CONTEXT_TOO_LONG
+    return ProviderErrorKind.RATE_LIMIT
+
+
+def _honour_should_retry(exc: openai.APIStatusError, kind: ProviderErrorKind) -> ProviderErrorKind:
+    # The SDK obeys this header over the status code, so keep doing that. It moves
+    # only the generic outcomes. AUTH and CONTEXT_TOO_LONG tell the caller something
+    # specific, and a retry hint does not change that.
+    hint = exc.response.headers.get("x-should-retry", "").strip().lower()
+    if hint == "true" and kind == ProviderErrorKind.INVALID_REQUEST:
+        return ProviderErrorKind.SERVER
+    if hint == "false" and kind in _TRANSIENT_KINDS:
+        return ProviderErrorKind.INVALID_REQUEST
+    return kind
+
+
+def _error_text(exc: openai.APIStatusError) -> str:
+    # exc.message holds error.message and nothing for a non-JSON body or another
+    # JSON shape, so add the body the SDK kept: a string, a dict or a list.
+    return f"{exc.message} {exc.body}".lower()
 
 
 def _retry_after(exc: openai.APIStatusError) -> float | None:
@@ -288,8 +347,8 @@ def _retry_after(exc: openai.APIStatusError) -> float | None:
         return None
 
 
-def _is_context_error(exc: openai.APIStatusError) -> bool:
-    return (exc.code or "") == _CONTEXT_CODE or _CONTEXT_MESSAGE in exc.message.lower()
+def _is_context_error(text: str) -> bool:
+    return any(marker in text for marker in _CONTEXT_MARKERS)
 
 
 # ---------- token estimate ----------

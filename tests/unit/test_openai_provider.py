@@ -360,11 +360,50 @@ _CONTEXT_BODY = {
         "code": "context_length_exceeded",
     }
 }
+# OpenAI answers 429 for three different things. Only the first is worth retrying.
+_TPM_BODY = {
+    "error": {
+        "message": (
+            "Rate limit reached for gpt-4o in organization org-x on tokens per min (TPM): "
+            "Limit 30000, Used 29000, Requested 2000. Please try again in 2s."
+        ),
+        "type": "tokens",
+        "param": None,
+        "code": "rate_limit_exceeded",
+    }
+}
+_QUOTA_BODY = {
+    "error": {
+        "message": "You exceeded your current quota, please check your plan and billing details.",
+        "type": "insufficient_quota",
+        "param": None,
+        "code": "insufficient_quota",
+    }
+}
+_TOO_LARGE_BODY = {
+    "error": {
+        "message": (
+            "Request too large for gpt-4o in organization org-x on tokens per min (TPM): "
+            "Limit 30000, Requested 36000. The input or output tokens must be reduced in "
+            "order to run successfully."
+        ),
+        "type": "tokens",
+        "param": None,
+        "code": "rate_limit_exceeded",
+    }
+}
 
 
-def _status(status: int, body: dict[str, Any], headers: dict[str, str] | None = None) -> Handler:
+def _status(status: int, body: Any, headers: dict[str, str] | None = None) -> Handler:
     def handler(request: httpx2.Request) -> httpx2.Response:
         return httpx2.Response(status, json=body, headers=headers)
+
+    return handler
+
+
+def _raw(status: int, content: bytes, headers: dict[str, str] | None = None) -> Handler:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status, content=content, headers=headers)
 
     return handler
 
@@ -425,6 +464,45 @@ def _connect_error(request: httpx2.Request) -> httpx2.Response:
         pytest.param(_timeout, ProviderErrorKind.TIMEOUT, None, id="timeout"),
         # The commonest transient failure. It must stay retryable.
         pytest.param(_connect_error, ProviderErrorKind.SERVER, None, id="connect-error"),
+        # The SDK retries 408 and 409 itself when its retries are on. With them
+        # off, this mapping is the only place that keeps them transient.
+        pytest.param(
+            _status(408, {"error": {"message": "Request timed out"}}),
+            ProviderErrorKind.TIMEOUT,
+            None,
+            id="408",
+        ),
+        pytest.param(
+            _status(409, {"error": {"message": "lock timeout"}}),
+            ProviderErrorKind.SERVER,
+            None,
+            id="409",
+        ),
+        pytest.param(
+            _status(403, {"error": {"message": "forbidden"}}),
+            ProviderErrorKind.AUTH,
+            None,
+            id="403",
+        ),
+        pytest.param(
+            _status(404, {"error": {"message": "no such model", "code": "model_not_found"}}),
+            ProviderErrorKind.INVALID_REQUEST,
+            None,
+            id="404",
+        ),
+        # A plain tokens-per-minute 429 clears with time. These two never will.
+        pytest.param(
+            _status(429, _TPM_BODY), ProviderErrorKind.RATE_LIMIT, None, id="429-tpm-limit"
+        ),
+        pytest.param(
+            _status(429, _QUOTA_BODY), ProviderErrorKind.AUTH, None, id="429-insufficient-quota"
+        ),
+        pytest.param(
+            _status(429, _TOO_LARGE_BODY),
+            ProviderErrorKind.CONTEXT_TOO_LONG,
+            None,
+            id="429-request-too-large",
+        ),
     ],
 )
 async def test_error_mapping(
@@ -448,6 +526,189 @@ async def test_error_mapping(
             ProviderErrorKind.TIMEOUT,
         }
     )
+
+
+_VLLM_BODY = {
+    "object": "error",
+    "message": (
+        "This model's maximum context length is 4096 tokens. However, you requested 5000 "
+        "tokens (4500 in the messages, 500 in the completion)."
+    ),
+    "type": "BadRequestError",
+    "param": None,
+    "code": 400,
+}
+_LLAMA_CPP_BODY = {
+    "error": {
+        "code": 400,
+        "message": "the request exceeds the available context size, try increasing it",
+        "type": "exceed_context_size_error",
+        "n_prompt_tokens": 9000,
+        "n_ctx": 4096,
+    }
+}
+_TGI_BODY = {
+    "error": (
+        "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 8192. "
+        "Given: 9000 `inputs` tokens and 512 `max_new_tokens`"
+    ),
+    "error_type": "validation",
+}
+_GEMINI_BODY = [
+    {
+        "error": {
+            "code": 400,
+            "message": (
+                "The input token count (1200000) exceeds the maximum number of tokens "
+                "allowed (1048576)."
+            ),
+            "status": "INVALID_ARGUMENT",
+        }
+    }
+]
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(
+            _status(400, {"error": {"message": "bad", "code": "context_length_exceeded"}}),
+            id="openai-code-only",
+        ),
+        pytest.param(
+            _status(
+                400,
+                {"error": {"message": "Your input exceeds the context window of this model."}},
+            ),
+            id="openai-window-wording",
+        ),
+        pytest.param(
+            _status(400, {"error": {"message": "This model's maximum context length is 8192."}}),
+            id="openai-length-wording",
+        ),
+        pytest.param(_status(400, _LLAMA_CPP_BODY), id="llama-cpp"),
+        pytest.param(
+            _status(400, {"error": {"message": "too big", "type": "exceed_context_size_error"}}),
+            id="llama-cpp-type-only",
+        ),
+        pytest.param(_status(400, _VLLM_BODY), id="vllm-flat-body"),
+        pytest.param(_status(422, _TGI_BODY), id="tgi-error-is-a-string"),
+        pytest.param(_status(400, _GEMINI_BODY), id="gemini-list-body"),
+        pytest.param(
+            _raw(400, b"prompt is too long: 250000 tokens > 200000 maximum"),
+            id="plain-text-body",
+        ),
+        pytest.param(
+            _raw(
+                413,
+                b"<html><body><h1>413 Request Entity Too Large</h1></body></html>",
+                {"content-type": "text/html"},
+            ),
+            id="413-html",
+        ),
+        pytest.param(_status(413, {"error": {"message": "payload too large"}}), id="413-json"),
+    ],
+)
+async def test_context_overflow_wordings(handler: Handler) -> None:
+    # Servers word this differently, and the SDK copies only error.message into
+    # exc.message. F6 compaction runs only when the kind says the input is too long.
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(handler))
+    assert info.value.kind == ProviderErrorKind.CONTEXT_TOO_LONG
+    assert not info.value.retryable
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(
+            _status(400, {"error": {"message": "Invalid value for 'context': expected an object"}}),
+            id="context-field",
+        ),
+        pytest.param(
+            _status(
+                400,
+                {
+                    "error": {
+                        "message": "Unsupported parameter: 'max_tokens' is not supported with this "
+                        "model. Use 'max_completion_tokens' instead.",
+                        "type": "invalid_request_error",
+                        "param": "max_tokens",
+                        "code": "unsupported_parameter",
+                    }
+                },
+            ),
+            id="unsupported-max-tokens",
+        ),
+        pytest.param(
+            _raw(400, b"<html>bad request</html>", {"content-type": "text/html"}),
+            id="html-body",
+        ),
+    ],
+)
+async def test_other_client_errors_stay_invalid_request(handler: Handler) -> None:
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(handler))
+    assert info.value.kind == ProviderErrorKind.INVALID_REQUEST
+    assert not info.value.retryable
+
+
+@pytest.mark.parametrize(
+    ("handler", "kind"),
+    [
+        pytest.param(
+            _status(400, {"error": {"message": "try again"}}, {"x-should-retry": "true"}),
+            ProviderErrorKind.SERVER,
+            id="true-on-400",
+        ),
+        pytest.param(
+            _status(500, {"error": {"message": "broken"}}, {"x-should-retry": "true"}),
+            ProviderErrorKind.SERVER,
+            id="true-on-500",
+        ),
+        pytest.param(
+            _status(500, {"error": {"message": "broken"}}, {"x-should-retry": "false"}),
+            ProviderErrorKind.INVALID_REQUEST,
+            id="false-on-500",
+        ),
+        pytest.param(
+            _status(429, _RATE_LIMIT_BODY, {"x-should-retry": "false"}),
+            ProviderErrorKind.INVALID_REQUEST,
+            id="false-on-429",
+        ),
+        pytest.param(
+            _status(529, {"error": {"message": "overloaded"}}, {"x-should-retry": "false"}),
+            ProviderErrorKind.INVALID_REQUEST,
+            id="false-on-529",
+        ),
+        pytest.param(
+            _status(408, {"error": {"message": "slow"}}, {"x-should-retry": "false"}),
+            ProviderErrorKind.INVALID_REQUEST,
+            id="false-on-408",
+        ),
+        # The hint only moves generic outcomes. A bad key or an oversized prompt
+        # does not become retryable because a gateway says so.
+        pytest.param(
+            _status(401, {"error": {"message": "bad key"}}, {"x-should-retry": "true"}),
+            ProviderErrorKind.AUTH,
+            id="true-keeps-auth",
+        ),
+        pytest.param(
+            _status(400, _CONTEXT_BODY, {"x-should-retry": "true"}),
+            ProviderErrorKind.CONTEXT_TOO_LONG,
+            id="true-keeps-context",
+        ),
+        pytest.param(
+            _status(400, {"error": {"message": "bad"}}, {"x-should-retry": "maybe"}),
+            ProviderErrorKind.INVALID_REQUEST,
+            id="unknown-value-ignored",
+        ),
+    ],
+)
+async def test_should_retry_header_is_honoured(handler: Handler, kind: ProviderErrorKind) -> None:
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(handler))
+    assert info.value.kind == kind
 
 
 async def test_prebuilt_client_gets_no_sdk_retries() -> None:

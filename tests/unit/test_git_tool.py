@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from longhaul.contracts import ToolCall, ToolContext
+from longhaul.contracts import ExecResult, ToolCall, ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.exec import HEAD_CHARS, TAIL_CHARS
 from longhaul.tools.git import BASE_REF, NO_CHANGES, GitDiff
@@ -15,6 +15,40 @@ IDENTITY = "-c user.name=test -c user.email=test@example.com -c commit.gpgsign=f
 MODULE = "src/calc.py"
 BEFORE = b"def add(a, b):\n    return a - b\n"
 AFTER = b"def add(a, b):\n    return a + b\n"
+
+
+class ScriptedSandbox:
+    """Answers each exec with the next canned result, for failures git will not produce on cue."""
+
+    id = "scripted"
+    workdir = "/workspace"
+
+    def __init__(self, *results: ExecResult) -> None:
+        self.results = list(results)
+        self.commands: list[str] = []
+
+    async def exec(
+        self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        self.commands.append(cmd)
+        return self.results.pop(0)
+
+    async def read_file(self, path: str) -> bytes:
+        raise AssertionError("unexpected read_file")
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        raise AssertionError("unexpected write_file")
+
+    async def destroy(self) -> None:
+        return None
+
+
+def canned(
+    stdout: str = "", stderr: str = "", code: int = 0, timed_out: bool = False
+) -> ExecResult:
+    return ExecResult(
+        exit_code=code, stdout=stdout, stderr=stderr, timed_out=timed_out, duration_ms=1
+    )
 
 
 @pytest.fixture
@@ -158,3 +192,40 @@ async def test_git_diff_is_registered_and_read_only(repo: FakeSandbox) -> None:
     # The call must not have staged or committed anything.
     status = await repo.exec("git diff --cached --quiet && echo clean", timeout_s=30)
     assert status.stdout.strip() == "clean"
+
+
+async def test_a_diff_that_times_out_is_an_error() -> None:
+    sbx = ScriptedSandbox(canned(code=137, timed_out=True))
+    r = await GitDiff().run(sbx, {}, CTX)
+    assert not r.ok
+    assert "git diff failed: timed out after 60 s" in r.output
+
+
+async def test_an_error_without_stderr_still_says_something() -> None:
+    sbx = ScriptedSandbox(canned(code=2))
+    r = await GitDiff().run(sbx, {}, CTX)
+    assert not r.ok and "git diff failed: exit code 2" in r.output
+
+
+async def test_a_failed_listing_of_new_files_is_reported_not_hidden() -> None:
+    tracked = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n"
+    sbx = ScriptedSandbox(canned(stdout=tracked), canned(stderr="fatal: boom\n", code=128))
+    r = await GitDiff().run(sbx, {}, CTX)
+    assert r.ok
+    assert "diff --git a/x b/x" in r.output
+    assert "(could not list new files: fatal: boom)" in r.output
+    assert len(sbx.commands) == 2
+
+
+async def test_the_staged_view_runs_one_command_and_asks_for_the_index() -> None:
+    sbx = ScriptedSandbox(canned())
+    r = await GitDiff().run(sbx, {"staged": True}, CTX)
+    assert r.ok and r.output == NO_CHANGES
+    assert sbx.commands == [f"git diff --no-color --staged {BASE_REF} --"]
+
+
+async def test_the_default_view_reads_the_working_tree_against_base() -> None:
+    sbx = ScriptedSandbox(canned(), canned())
+    await GitDiff().run(sbx, {}, CTX)
+    assert sbx.commands[0] == f"git diff --no-color {BASE_REF} --"
+    assert sbx.commands[1].startswith("git ls-files --others --exclude-standard -z -- . ")

@@ -182,7 +182,7 @@ async def test_git_diff_after_edit(reg: ToolRegistry, box: Sandbox) -> None:
 
     # Nothing is staged yet. Once it is, the staged view shows the same change.
     assert (await call(reg, box, "git_diff", staged=True)).output == NO_CHANGES
-    await box.exec("git add -A", timeout_s=30)
+    await box.exec(f"git add {MODULE}", timeout_s=30)
     staged = await call(reg, box, "git_diff", staged=True)
     assert "+    return a + b" in staged.output
 

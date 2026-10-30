@@ -78,6 +78,10 @@ MINI_PLAN = """\
 #### LH-109 · Extras (Could)
 - **Epic:** E1 · **Points:** 5 · **Branch:** `feat/lh-109-extras` · **Depends on:** LH-102
 - **Story:** As a developer, I want extras.
+
+### Integration checkpoint 1
+
+- **Cumulative tests:** `make gate PHASE=1`.
 """
 MINI_PROGRESS = """\
 # Progress
@@ -496,6 +500,44 @@ def test_a_broken_plan_fails_before_any_gh_call(
         assert gh.calls == []
 
 
+@pytest.mark.parametrize(
+    ("text", "anchor", "message"),
+    [
+        pytest.param(
+            MINI_PLAN.replace("- **Epic:** E0 · **Points:** 3 · **Branch:** `feat/lh-001", "- x"),
+            "#### LH-001",
+            "line {line}: LH-001 has no Epic line after its heading",
+            id="no-epic-line",
+        ),
+        pytest.param(
+            MINI_PLAN.replace("**Epic:** E1 · **Points:** 2", "**Epic:** E9 · **Points:** 2"),
+            "#### LH-102",
+            "line {line}: LH-102 uses E9, which is not in section 6.2",
+            id="unknown-epic",
+        ),
+        pytest.param(
+            MINI_PLAN.replace("**Points:** 5 · ", ""),
+            "#### LH-109",
+            "line {line}: LH-109 is missing a field matching",
+            id="no-points",
+        ),
+        pytest.param(
+            MINI_PLAN.replace("## Phase 0: Foundation (tag v0.0.1)\n", ""),
+            "#### LH-001",
+            "line {line}: LH-001 comes before any phase",
+            id="story-before-any-phase",
+        ),
+    ],
+)
+def test_a_story_block_that_cannot_be_read_is_an_error(
+    text: str, anchor: str, message: str
+) -> None:
+    expected = message.format(line=_line_of(text, anchor))
+
+    with pytest.raises(ValueError, match=re.escape(expected)):
+        backlog.parse_plan(text)
+
+
 def test_a_story_id_used_twice_is_an_error() -> None:
     text = MINI_PLAN.replace("#### LH-002 ·", "#### LH-001 ·")
     first = _line_of(text, "#### LH-001 · Repo scaffold")
@@ -657,6 +699,8 @@ def test_issue_body_is_the_story_block(tmp_path: Path) -> None:
     first = gh.issue("LH-001")["body"]
     assert first.startswith("#### LH-001 · Repo scaffold\n- **Epic:** E0")
     assert first.endswith("```bash\n#### LH-050 · A heading inside a fence is not a story\n```")
+    # The text under a later heading is not part of the story above it.
+    assert gh.issue("LH-109")["body"].endswith("- **Story:** As a developer, I want extras.")
 
 
 def test_import_into_a_repo_without_labels(tmp_path: Path) -> None:
@@ -1150,6 +1194,7 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Workspace:
 def test_main_imports_and_writes_issue_numbers_into_progress(workspace: Workspace) -> None:
     assert backlog.main([str(workspace.plan), "--repo", "o/r"]) == 0
 
+    assert not any(call[:2] == ["repo", "view"] for call in workspace.gh.calls)
     text = workspace.progress.read_text(encoding="utf-8")
     assert "| ID | Title | Pts | Status | PR | Merged | Issue |" in text
     assert "| LH-001 | Repo scaffold | 3 | Todo | | | #1 |" in text

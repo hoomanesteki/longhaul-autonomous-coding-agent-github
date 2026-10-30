@@ -66,7 +66,7 @@ def _completion(
     *,
     content: str | None = None,
     tool_calls: list[dict[str, Any]] | None = None,
-    finish_reason: str = "stop",
+    finish_reason: str | None = "stop",
     usage: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content}
@@ -333,6 +333,9 @@ async def test_max_tokens_parameter_name(
     [
         ("http://localhost:8000/v1", "max_tokens"),
         ("https://api.openai.com/v1", "max_completion_tokens"),
+        # Data residency endpoints are OpenAI's too. A look-alike host is not.
+        ("https://eu.api.openai.com/v1", "max_completion_tokens"),
+        ("https://api.openai.com.example.test/v1", "max_tokens"),
     ],
 )
 async def test_max_tokens_parameter_follows_a_prebuilt_client(base_url: str, name: str) -> None:
@@ -751,6 +754,21 @@ _OVERLOADED_BODY = {"error": {"message": "Service overloaded"}}
         pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "1e300"}, None, id="absurdly-long"),
         pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "86400"}, 86400.0, id="one-day"),
         pytest.param(429, _RATE_LIMIT_BODY, {"retry-after": "86401"}, None, id="over-a-day"),
+        # Dates the parser cannot turn into a time must not raise.
+        pytest.param(
+            429,
+            _RATE_LIMIT_BODY,
+            {"retry-after": "Wed, 21 Oct 99999999999 07:28:00 GMT"},
+            None,
+            id="date-overflows",
+        ),
+        pytest.param(
+            429,
+            _RATE_LIMIT_BODY,
+            {"retry-after": "Wed, 21 Oct 9999999 07:28:00 GMT"},
+            None,
+            id="date-year-out-of-range",
+        ),
         # A bad first form falls through to the next one.
         pytest.param(
             429,
@@ -832,6 +850,172 @@ async def test_malformed_arguments() -> None:
         ToolCall(id="call_bad", name="read_file", input={"_raw": "{not json"})
     ]
     assert resp.stop_reason == "tool_use"
+
+
+def _call(arguments: Any, *, name: str = "list_dir", call_id: str = "call_1") -> dict[str, Any]:
+    return {"id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+async def _tool_calls(arguments: Any) -> list[ToolCall]:
+    body = _completion(tool_calls=[_call(arguments)], finish_reason="tool_calls")
+    return (await _ask(_provider(_status(200, body)), tools=[READ_FILE])).tool_calls
+
+
+@pytest.mark.parametrize("arguments", ["", "  ", "\n", None, "{}"])
+async def test_no_arguments_become_an_empty_dict(arguments: str | None) -> None:
+    # Some servers send "" for a call that takes nothing. The tool schemas forbid
+    # extra keys, so a "_raw" entry would make the registry reject a valid call.
+    assert await _tool_calls(arguments) == [ToolCall(id="call_1", name="list_dir", input={})]
+
+
+@pytest.mark.parametrize("arguments", ["{not json", '{"path": "a.p', "[1, 2]", '"text"', "7"])
+async def test_arguments_that_are_not_an_object_are_kept_raw(arguments: str) -> None:
+    # The tool registry reads this "_raw" key to tell the model its JSON was bad.
+    assert await _tool_calls(arguments) == [
+        ToolCall(id="call_1", name="list_dir", input={"_raw": arguments})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "stop_reason"),
+    [
+        pytest.param("tool_calls", "tool_use", id="tool_calls"),
+        # Some servers, and OpenAI when tool_choice forces a function, say "stop"
+        # with the calls in place. ScriptedProvider reports tool_use for those.
+        pytest.param("stop", "tool_use", id="stop"),
+        pytest.param(None, "tool_use", id="no-finish-reason"),
+        # A reply cut off by the token cap may hold half a call. Say so.
+        pytest.param("length", "max_tokens", id="length"),
+    ],
+)
+async def test_stop_reason_with_tool_calls(finish_reason: str | None, stop_reason: str) -> None:
+    body = _completion(tool_calls=[_call('{"path": "a.py"}')], finish_reason=finish_reason)
+    resp = await _ask(_provider(_status(200, body)), tools=[READ_FILE])
+    assert resp.stop_reason == stop_reason
+    assert [c.id for c in resp.tool_calls] == ["call_1"]
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "stop_reason"),
+    [
+        pytest.param("stop", "end_turn", id="stop"),
+        pytest.param("length", "max_tokens", id="length"),
+        pytest.param("content_filter", "other", id="content_filter"),
+        pytest.param(None, "other", id="no-finish-reason"),
+    ],
+)
+async def test_stop_reason_without_tool_calls(finish_reason: str | None, stop_reason: str) -> None:
+    body = _completion(content="done", finish_reason=finish_reason)
+    resp = await _ask(_provider(_status(200, body)))
+    assert resp.stop_reason == stop_reason
+    assert resp.tool_calls == []
+
+
+async def test_refusal_is_surfaced_as_text() -> None:
+    body = _completion(content=None)
+    body["choices"][0]["message"]["refusal"] = "I can't help with that."
+
+    resp = await _ask(_provider(_status(200, body)))
+
+    assert resp.content == [TextBlock(text="I can't help with that.")]
+    assert resp.stop_reason == "other"
+    assert resp.tool_calls == []
+
+
+def _with_choices(choices: Any) -> dict[str, Any]:
+    body = _completion(content="x")
+    body["choices"] = choices
+    return body
+
+
+def _with_message(message: Any) -> dict[str, Any]:
+    return _with_choices([{"index": 0, "message": message, "finish_reason": "stop"}])
+
+
+def _with_tool_call(call: dict[str, Any]) -> dict[str, Any]:
+    message = {"role": "assistant", "content": None, "tool_calls": [call]}
+    return _with_choices([{"index": 0, "message": message, "finish_reason": "tool_calls"}])
+
+
+_JSON = {"content-type": "application/json"}
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        # A gateway answers 200 with a page. The SDK hands back the raw text.
+        pytest.param(
+            _raw(200, b"<html>gateway error</html>", {"content-type": "text/html"}), id="html-page"
+        ),
+        pytest.param(_raw(200, b"null", _JSON), id="json-null"),
+        pytest.param(_raw(200, b"[]", _JSON), id="json-list"),
+        pytest.param(_raw(200, b'"hello"', _JSON), id="json-string"),
+        pytest.param(_raw(200, b"{oops", _JSON), id="invalid-json"),
+        pytest.param(_raw(200, b"", _JSON), id="empty-body"),
+        pytest.param(_status(200, {"error": {"message": "upstream failed"}}), id="error-object"),
+        pytest.param(_status(200, _with_choices([])), id="no-choices"),
+        pytest.param(_status(200, _with_choices("oops")), id="choices-not-a-list"),
+        pytest.param(_status(200, _with_choices([{"index": 0}])), id="choice-without-message"),
+        pytest.param(_status(200, _with_message("hi")), id="message-not-an-object"),
+        pytest.param(_status(200, _with_tool_call(_call("{}", call_id=""))), id="empty-call-id"),
+        pytest.param(
+            _status(200, _with_tool_call({"type": "function", "function": {"name": "f"}})),
+            id="call-without-id",
+        ),
+        pytest.param(
+            _status(200, _with_tool_call({"id": "call_1", "type": "function"})),
+            id="call-without-function",
+        ),
+        pytest.param(
+            _status(200, _with_tool_call(_call("{}", name=""))),
+            id="call-without-name",
+        ),
+        pytest.param(
+            _status(200, _with_tool_call(_call({"path": "a.py"}))), id="arguments-are-an-object"
+        ),
+    ],
+)
+async def test_unexpected_response_shapes_raise_provider_error(handler: Handler) -> None:
+    # LH-204 retries by ProviderError kind. Any other exception would get
+    # Temporal's default retries, and a gateway page would never count as SERVER.
+    error = await _error(handler)
+    assert error.kind == ProviderErrorKind.SERVER
+    assert error.retryable
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        pytest.param({"completion_tokens": 3}, Usage(output_tokens=3), id="no-prompt-tokens"),
+        pytest.param({"prompt_tokens": None, "completion_tokens": None}, Usage(), id="nulls"),
+        pytest.param({}, Usage(), id="empty-object"),
+        pytest.param(
+            {"prompt_tokens": 9, "completion_tokens": 3, "prompt_tokens_details": {}},
+            Usage(input_tokens=9, output_tokens=3),
+            id="empty-details",
+        ),
+    ],
+)
+async def test_missing_usage_counters_are_zero(usage: dict[str, Any], expected: Usage) -> None:
+    # A billed call that arrives without counters is still a usable turn.
+    body = _completion(content="ok")
+    body["usage"] = usage
+    assert (await _ask(_provider(_status(200, body)))).usage == expected
+
+
+async def test_tool_use_block_in_a_user_message_is_invalid_request() -> None:
+    # A transcript bug is deterministic, so it must not be retried or sent.
+    transcript = [
+        Message(role="user", content=[ToolUseBlock(id="call_1", name="read_file", input={})])
+    ]
+    seen = Recorder(_ok)
+
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(seen), messages=transcript)
+
+    assert info.value.kind == ProviderErrorKind.INVALID_REQUEST
+    assert not info.value.retryable
+    assert seen.requests == []
 
 
 def test_get_provider_openai(monkeypatch: pytest.MonkeyPatch) -> None:

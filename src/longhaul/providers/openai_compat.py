@@ -2,7 +2,12 @@
 
 The openai SDK does the HTTP. This module converts between contracts and the
 chat completions shape, and maps SDK errors to ProviderErrorKind. Retries are
-off (max_retries=0) because the durable layer owns them.
+off (max_retries=0) because the durable layer owns them. That makes the error
+mapping the only place that knows what is transient, so it carries over what the
+SDK would have retried: 408, 409, 429, 5xx and the x-should-retry header.
+
+Whatever a server sends back, complete() returns a response or raises
+ProviderError. LH-204 retries by kind and treats any other exception as a bug.
 
 cache_system is accepted for protocol compatibility and ignored. Chat
 completions has no cache_control marker; caching, when the endpoint does it,
@@ -16,6 +21,9 @@ leaves out cache_read_tokens. Chat completions reports prompt_tokens with the
 cached tokens inside it, so the cached part is taken out here. Cost (LH-701)
 and cache_ratio (LH-405) add the buckets up and would count cached tokens twice
 otherwise.
+
+Tool arguments that are not a JSON object come back as {"_raw": text}, for the
+tool registry to report. An empty argument string means no arguments: {}.
 """
 
 import email.utils
@@ -84,6 +92,7 @@ _REQUEST_TOO_LARGE = "request too large"
 _MAX_RETRY_AFTER_S = 24 * 60 * 60
 _OVERLOADED_STATUS = 529
 _OVERLOADED_503_TEXT = "overloaded"
+_SNIPPET_CHARS = 200
 _CHARS_PER_TOKEN = 4
 # The kinds the contract calls retryable, read from it so the two cannot drift.
 _TRANSIENT_KINDS = frozenset(k for k in ProviderErrorKind if ProviderError(k, "").retryable)
@@ -132,11 +141,12 @@ class OpenAICompatProvider:
         chat_tools: list[ChatCompletionToolUnionParam] | Omit = (
             [_tool_param(t) for t in tools] if tools else omit
         )
+        chat_messages = _chat_messages(system, messages)
         started = time.monotonic()
         try:
             completion = await self._client.chat.completions.create(
                 model=model,
-                messages=_chat_messages(system, messages),
+                messages=chat_messages,
                 tools=chat_tools,
                 max_tokens=max_tokens if self._max_tokens_param == "max_tokens" else omit,
                 max_completion_tokens=(
@@ -145,6 +155,11 @@ class OpenAICompatProvider:
             )
         except openai.APIError as exc:
             raise _map_error(exc) from exc
+        except json.JSONDecodeError as exc:
+            # A 200 that claims to be JSON and is not, from a gateway or a broken server.
+            raise ProviderError(
+                ProviderErrorKind.SERVER, f"response body was not valid JSON: {exc}"
+            ) from exc
         latency_ms = int((time.monotonic() - started) * 1000)
         return _to_response(completion, model=model, latency_ms=latency_ms)
 
@@ -215,7 +230,10 @@ def _user_messages(message: Message) -> list[ChatCompletionMessageParam]:
         elif isinstance(block, TextBlock):
             texts.append(block.text)
         else:
-            raise ValueError("tool_use blocks belong to assistant messages")
+            # A transcript bug is the same on every attempt, so it is not retryable.
+            raise ProviderError(
+                ProviderErrorKind.INVALID_REQUEST, "tool_use blocks belong to assistant messages"
+            )
     if texts:
         out.append({"role": "user", "content": "\n".join(texts)})
     return out
@@ -226,34 +244,90 @@ def _result_text(block: ToolResultBlock) -> str:
 
 
 # ---------- chat completions -> contracts ----------
-def _to_response(completion: ChatCompletion, *, model: str, latency_ms: int) -> LLMResponse:
+def _to_response(completion: object, *, model: str, latency_ms: int) -> LLMResponse:
+    # Whatever the server sends back, the caller sees a ProviderError or a response.
+    # LH-204 retries by ProviderError kind and would treat any other exception as
+    # a bug in the activity.
+    if not isinstance(completion, ChatCompletion):
+        # A gateway answered 200 with a page or an error object. The SDK hands back
+        # the raw body when it is not a chat completion.
+        raise ProviderError(
+            ProviderErrorKind.SERVER, f"response was not a chat completion: {_snippet(completion)}"
+        )
+    try:
+        return _convert(completion, model=model, latency_ms=latency_ms)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        # The SDK builds models without checking them, so a field that a server
+        # left out or mistyped fails here, not in the SDK.
+        raise ProviderError(ProviderErrorKind.SERVER, f"unexpected response shape: {exc}") from exc
+
+
+def _convert(completion: ChatCompletion, *, model: str, latency_ms: int) -> LLMResponse:
     if not completion.choices:
         raise ProviderError(ProviderErrorKind.SERVER, "response contained no choices")
     choice = completion.choices[0]
+    message = choice.message
+    if message is None:
+        raise ProviderError(ProviderErrorKind.SERVER, "response choice had no message")
     content: list[Block] = []
     tool_calls: list[ToolCall] = []
-    if choice.message.content:
-        content.append(TextBlock(text=choice.message.content))
-    for raw in choice.message.tool_calls or []:
+    if message.content:
+        content.append(TextBlock(text=message.content))
+    if message.refusal:
+        # The model declined. Keep the reason where the transcript and report show it.
+        content.append(TextBlock(text=message.refusal))
+    for raw in message.tool_calls or []:
         # Custom (non-function) tool calls are not part of the contract.
         if not isinstance(raw, ChatCompletionMessageFunctionToolCall):
             continue
-        args = _parse_arguments(raw.function.arguments)
-        tool_calls.append(ToolCall(id=raw.id, name=raw.function.name, input=args))
-        content.append(ToolUseBlock(id=raw.id, name=raw.function.name, input=args))
+        call = _tool_call(raw)
+        tool_calls.append(call)
+        content.append(ToolUseBlock(id=call.id, name=call.name, input=call.input))
     return LLMResponse(
         content=content,
         tool_calls=tool_calls,
-        stop_reason=_STOP_REASONS.get(choice.finish_reason or "", "other"),
+        stop_reason=_stop_reason(
+            choice.finish_reason, has_calls=bool(tool_calls), refused=bool(message.refusal)
+        ),
         usage=_usage(completion.usage),
         model=model,
         latency_ms=latency_ms,
     )
 
 
-def _parse_arguments(raw: str) -> dict[str, Any]:
-    # Models sometimes emit invalid JSON. Keep the raw text so the transcript
-    # still shows what was sent, instead of failing the whole turn.
+def _snippet(body: object) -> str:
+    text = body if isinstance(body, str) else repr(body)
+    return f"{type(body).__name__}: {text[:_SNIPPET_CHARS]}"
+
+
+def _stop_reason(finish_reason: str | None, *, has_calls: bool, refused: bool) -> _StopReason:
+    if refused:
+        return "other"
+    mapped = _STOP_REASONS.get(finish_reason or "", "other")
+    # Some servers send finish_reason "stop" with tool calls in place, and OpenAI
+    # does when tool_choice forces a function. ScriptedProvider reports tool_use
+    # whenever calls are present, so the loop sees one rule. A reply cut off by the
+    # token cap stays max_tokens, because its last call may be half written.
+    if has_calls and mapped != "max_tokens":
+        return "tool_use"
+    return mapped
+
+
+def _tool_call(raw: ChatCompletionMessageFunctionToolCall) -> ToolCall:
+    function = raw.function
+    if not raw.id or function is None or not function.name:
+        raise ProviderError(ProviderErrorKind.SERVER, "tool call is missing its id or name")
+    return ToolCall(id=raw.id, name=function.name, input=_parse_arguments(function.arguments))
+
+
+def _parse_arguments(raw: str | None) -> dict[str, Any]:
+    # A call that takes no arguments may arrive as "", blank or null. Parsing that
+    # as JSON would fail, and the "_raw" entry would then break the strict tool schemas.
+    if raw is None or not raw.strip():
+        return {}
+    # Models also emit invalid JSON, for example cut off at the token cap. Keep the
+    # text under "_raw" so the transcript still shows what was sent and the turn
+    # does not fail. The tool registry reports the key back to the model.
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -265,12 +339,17 @@ def _usage(raw: CompletionUsage | None) -> Usage:
     if raw is None:
         return Usage()
     details = raw.prompt_tokens_details
-    cached = (details.cached_tokens if details is not None else None) or 0
+    cached = _count(details.cached_tokens if details is not None else None)
     return Usage(
-        input_tokens=max(raw.prompt_tokens - cached, 0),
-        output_tokens=raw.completion_tokens,
+        input_tokens=max(_count(raw.prompt_tokens) - cached, 0),
+        output_tokens=_count(raw.completion_tokens),
         cache_read_tokens=cached,
     )
+
+
+def _count(value: Any) -> int:
+    # Some servers leave a counter out or send null. Zero keeps a billed turn usable.
+    return int(value or 0)
 
 
 # ---------- errors ----------

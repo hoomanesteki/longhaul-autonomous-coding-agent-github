@@ -5,6 +5,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, TypeAdapter
+
+from longhaul import contracts
 from longhaul.contracts import (
     BlobRef,
     Message,
@@ -16,9 +19,6 @@ from longhaul.contracts import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from pydantic import BaseModel, TypeAdapter
-
-from longhaul import contracts
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase1]
 

@@ -124,6 +124,10 @@ class ProviderError(Exception):
         self.message = message
         self.retry_after_s = retry_after_s
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Exception pickling replays only self.args, which would drop kind and retry_after_s.
+        return (type(self), (self.kind, self.message, self.retry_after_s))
+
     @property
     def retryable(self) -> bool:
         return self.kind in _RETRYABLE

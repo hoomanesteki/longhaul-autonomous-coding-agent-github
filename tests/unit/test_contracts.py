@@ -1,5 +1,6 @@
 import ast
 import inspect
+import pickle
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -177,6 +178,12 @@ def test_provider_error_retryable(kind: ProviderErrorKind, retryable: bool) -> N
     assert err.retryable is retryable
     assert (err.kind, err.message, err.retry_after_s) == (kind, "boom", 2.5)
     assert str(err) == "boom"
+
+
+def test_provider_error_pickles() -> None:
+    err = ProviderError(ProviderErrorKind.RATE_LIMIT, "slow down", retry_after_s=3.0)
+    copy = pickle.loads(pickle.dumps(err))
+    assert (copy.kind, copy.message, copy.retry_after_s) == (err.kind, "slow down", 3.0)
 
 
 def test_defaults_are_not_shared() -> None:

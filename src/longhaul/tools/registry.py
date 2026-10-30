@@ -54,11 +54,33 @@ def _fail(message: str) -> ToolResult:
     return ToolResult(call_id="", ok=False, output=message)
 
 
-def default_registry() -> ToolRegistry:
+def default_registry(
+    *, test_command: str | None = None, max_timeout_s: int | None = None
+) -> ToolRegistry:
+    """The tools every role starts from.
+
+    `test_command` is RepoSettings.test_command. Without it run_tests answers
+    that no test command is set. `max_timeout_s` is sandbox.command_timeout_s
+    and falls back to 600 seconds. Callers that pass no arguments keep working.
+    """
+    from longhaul.tools.control import Finish
+    from longhaul.tools.exec import DEFAULT_MAX_TIMEOUT_S, RunCommand, RunTests
     from longhaul.tools.files import EditFile, ListDir, ReadFile, WriteFile
+    from longhaul.tools.git import GitDiff
     from longhaul.tools.search import Search
 
+    limit = DEFAULT_MAX_TIMEOUT_S if max_timeout_s is None else max_timeout_s
     reg = ToolRegistry()
-    for tool in (ListDir(), ReadFile(), EditFile(), WriteFile(), Search()):
+    for tool in (
+        ListDir(),
+        ReadFile(),
+        EditFile(),
+        WriteFile(),
+        Search(),
+        RunCommand(limit),
+        RunTests(test_command, limit),
+        GitDiff(),
+        Finish(),
+    ):
         reg.register(tool)
     return reg

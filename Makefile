@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e up down migrate gate
+.PHONY: setup check ci-local itest e2e up down migrate sandbox-image gate
 
 PHASE ?= 0
 
@@ -33,6 +33,9 @@ down:
 
 migrate:
 	uv run alembic upgrade head
+
+sandbox-image:
+	docker build -t longhaul-sandbox:py312 docker/sandbox
 
 gate: check
 	uv run pytest -m "$$(uv run python scripts/markers.py $(PHASE))"

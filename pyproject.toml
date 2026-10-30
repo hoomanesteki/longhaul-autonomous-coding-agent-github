@@ -53,7 +53,12 @@ python_version = "3.12"
 mypy_path = "src"
 packages = ["longhaul"]
 warn_unused_configs = true
+# Part of --strict, but mypy accepts it only as a global setting, never in an override.
+warn_redundant_casts = true
 
+# `strict = true` is a global switch even inside an override, so it would make every module
+# strict. These are the flags it stands for, so only the four packages named in the plan
+# are strict.
 [[tool.mypy.overrides]]
 module = [
     "longhaul.contracts",
@@ -61,7 +66,18 @@ module = [
     "longhaul.context.*",
     "longhaul.cost.*",
 ]
-strict = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_unused_ignores = true
+warn_return_any = true
+implicit_reexport = false
+strict_equality = true
+extra_checks = true
 
 [[tool.mypy.overrides]]
 module = ["longhaul.db.migrations.*"]

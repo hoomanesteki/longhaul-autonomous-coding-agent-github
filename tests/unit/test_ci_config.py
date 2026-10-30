@@ -1,4 +1,8 @@
 import re
+import shutil
+import subprocess
+import sys
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -66,3 +70,67 @@ def test_protect_script_targets_main_and_dev() -> None:
     assert '"strict": true' in text
     assert '"allow_force_pushes": false' in text
     assert '"allow_deletions": false' in text
+
+
+# --- mypy: strict only for the four packages the plan names -------------------------------
+
+STRICT_MODULES = {
+    "contracts.py",
+    "durable/sloppy.py",
+    "durable/workflows/sloppy.py",
+    "context/sloppy.py",
+    "cost/sloppy.py",
+}
+LOOSE_MODULES = {"sandbox/sloppy.py", "providers/sloppy.py", "tools/sloppy.py"}
+SLOPPY_SOURCE = """\
+import json
+
+
+def untyped(x):
+    return x
+
+
+def returns_any(raw: str) -> int:
+    return json.loads(raw)
+
+
+def bare_generic(items: list) -> None:
+    del items
+"""
+# What `strict` reports for SLOPPY_SOURCE: an untyped def, a returned Any, a bare generic.
+STRICT_ERROR_CODES = {"no-untyped-def", "no-any-return", "type-arg"}
+
+
+def test_mypy_overrides_do_not_use_the_global_strict_switch() -> None:
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    for override in config["tool"]["mypy"]["overrides"]:
+        assert "strict" not in override, f"strict is global in mypy: {override['module']}"
+
+
+def test_mypy_is_strict_only_for_the_four_packages(tmp_path: Path) -> None:
+    src = tmp_path / "src" / "longhaul"
+    for rel in [*STRICT_MODULES, *LOOSE_MODULES]:
+        target = src / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(SLOPPY_SOURCE, encoding="utf-8")
+    # Every directory is a package, so mypy resolves the dotted names the overrides use.
+    for directory in {p.parent for p in src.rglob("*.py")} | {src}:
+        (directory / "__init__.py").touch()
+    shutil.copy(ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--cache-dir", str(tmp_path / ".cache")],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    codes: dict[str, set[str]] = {}
+    for line in result.stdout.splitlines():
+        found = re.match(r"src/longhaul/(\S+\.py):\d+: error: .*\[([\w-]+)\]$", line)
+        if found:
+            codes.setdefault(found.group(1), set()).add(found.group(2))
+    assert set(codes) == STRICT_MODULES, result.stdout
+    for module, seen in codes.items():
+        assert seen >= STRICT_ERROR_CODES, f"{module} was not checked strictly: {seen}"

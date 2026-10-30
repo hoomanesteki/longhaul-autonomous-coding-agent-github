@@ -428,6 +428,85 @@ def test_malformed_heading_raises() -> None:
     assert stories == []
 
 
+def _line_of(text: str, needle: str) -> int:
+    return next(n for n, line in enumerate(text.splitlines(), start=1) if needle in line)
+
+
+# Plans a person could break by hand just before the one-shot import.
+BROKEN_PLANS = [
+    pytest.param(
+        MINI_PLAN.replace("(tag v0.1.0)", "(tag 0.1.0)"),
+        "(tag 0.1.0)",
+        "line {line}: malformed phase heading",
+        id="mistyped-phase-heading",
+    ),
+    pytest.param(
+        MINI_PLAN.replace("## Phase 1:", "## Phase 2:"),
+        "## Phase 2:",
+        "line {line}: found Phase 2 where Phase 1 should come next",
+        id="phase-number-skipped",
+    ),
+    pytest.param(
+        MINI_PLAN.replace("## Phase 1:", "## Phase 0:"),
+        "## Phase 0: Agent core",
+        "line {line}: found Phase 0 where Phase 1 should come next",
+        id="phase-number-repeated",
+    ),
+    pytest.param(
+        MINI_PLAN.replace("#### LH-109 ·", "#### LH-209 ·"),
+        "#### LH-209",
+        "line {line}: LH-209 sits under Phase 1, but its id says phase 2",
+        id="story-under-the-wrong-phase",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "anchor", "message"), BROKEN_PLANS)
+def test_a_broken_plan_fails_before_any_gh_call(
+    tmp_path: Path, text: str, anchor: str, message: str
+) -> None:
+    plan = _write(tmp_path, text)
+    expected = message.format(line=_line_of(text, anchor))
+
+    for dry_run in (True, False):
+        gh = FakeGh()
+        with pytest.raises(ValueError, match=re.escape(expected)):
+            backlog.import_backlog(plan, "o/r", gh, dry_run=dry_run)
+        assert gh.calls == []
+
+
+def test_a_story_id_used_twice_is_an_error() -> None:
+    text = MINI_PLAN.replace("#### LH-002 ·", "#### LH-001 ·")
+    first = _line_of(text, "#### LH-001 · Repo scaffold")
+    second = _line_of(text, "#### LH-001 · Local stack")
+
+    with pytest.raises(
+        ValueError, match=f"line {second}: LH-001 is already defined on line {first}"
+    ):
+        backlog.parse_plan(text)
+
+
+def test_a_mistyped_phase_heading_in_the_real_plan_stops_the_import(tmp_path: Path) -> None:
+    text = PLAN.read_text(encoding="utf-8")
+    heading = next(line for line in text.splitlines() if line.startswith("## Phase 4: "))
+    plan = _write(tmp_path, text.replace(heading, heading.replace("(tag v", "(tag "), 1))
+    gh = FakeGh()
+
+    with pytest.raises(ValueError, match="malformed phase heading"):
+        backlog.import_backlog(plan, "o/r", gh)
+
+    assert gh.calls == []
+
+
+def test_a_phase_heading_inside_a_code_block_is_not_a_phase() -> None:
+    text = MINI_PLAN.replace("```bash\n", "```markdown\n## Phase 9: Not a phase (draft)\n")
+
+    phases, stories = backlog.parse_plan(text)
+
+    assert [phase.number for phase in phases] == [0, 1]
+    assert len(stories) == 4
+
+
 def test_fake_gh_rejects_an_unknown_label() -> None:
     gh = FakeGh()
     create = ["issue", "create", "--repo", "o/r", "--title", "t", "--body", "b"]

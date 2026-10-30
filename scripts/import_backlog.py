@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROGRESS = ROOT / "docs" / "progress.md"
 
 PHASE_RE = re.compile(r"^## Phase (\d): (.+) \(tag (v[\d.]+)\)$")
+PHASE_START_RE = re.compile(r"^## Phase \d")
 STORY_PREFIX = "#### LH"
 STORY_RE = re.compile(r"^#### (LH-\d{3}) · (.+)$")
 HEADING_RE = re.compile(r"^#{1,6} ")
@@ -153,12 +154,48 @@ def _build_story(block: _Block, themes: dict[str, str]) -> Story:
     )
 
 
+def _start_phase(phases: list[Phase], line: str, number: int) -> None:
+    match = PHASE_RE.match(line)
+    if match is None:
+        raise ValueError(f"line {number}: malformed phase heading: {line!r}")
+    found = int(match.group(1))
+    if found != len(phases):
+        raise ValueError(
+            f"line {number}: found Phase {found} where Phase {len(phases)} should come next,"
+            " because phases must run 0..N in order"
+        )
+    phases.append(Phase(found, match.group(2), match.group(3)))
+
+
+def _start_story(phases: list[Phase], blocks: list[_Block], line: str, number: int) -> _Block:
+    match = STORY_RE.match(line)
+    if match is None:
+        raise ValueError(f"line {number}: malformed story heading: {line!r}")
+    story_id = match.group(1)
+    if not phases:
+        raise ValueError(f"line {number}: {story_id} comes before any phase")
+    # The first digit of a story id is its phase, so a mismatch means a heading above is wrong.
+    phase = phases[-1].number
+    id_phase = int(story_id[3])
+    if id_phase != phase:
+        raise ValueError(
+            f"line {number}: {story_id} sits under Phase {phase}, but its id says phase {id_phase}"
+        )
+    earlier = next((block for block in blocks if block.id == story_id), None)
+    if earlier is not None:
+        raise ValueError(f"line {number}: {story_id} is already defined on line {earlier.line}")
+    block = _Block(number, line, story_id, match.group(2), phase, [])
+    blocks.append(block)
+    return block
+
+
 def parse_plan(text: str) -> tuple[list[Phase], list[Story]]:
     """Return the phases and stories of the build plan.
 
-    Headings inside fenced code blocks are ignored. A `#### LH` heading that
-    does not match the story pattern is an error, because it would otherwise
-    be dropped without a trace.
+    Headings inside fenced code blocks are ignored. A `## Phase` or `#### LH` heading
+    that does not match its pattern is an error, because it would otherwise be dropped
+    without a trace and its stories would land in the wrong milestone. Phases must run
+    0..N in order and a story id must start with the number of the phase it sits in.
     """
     phases: list[Phase] = []
     blocks: list[_Block] = []
@@ -170,19 +207,12 @@ def parse_plan(text: str) -> tuple[list[Phase], list[Story]]:
             if current is not None:
                 current.lines.append(line)
             continue
-        phase = PHASE_RE.match(line)
-        if phase:
+        if PHASE_START_RE.match(line):
             current = None
-            phases.append(Phase(int(phase.group(1)), phase.group(2), phase.group(3)))
+            _start_phase(phases, line, number)
             continue
         if line.startswith(STORY_PREFIX):
-            story = STORY_RE.match(line)
-            if story is None:
-                raise ValueError(f"line {number}: malformed story heading: {line!r}")
-            if not phases:
-                raise ValueError(f"line {number}: {story.group(1)} comes before any phase")
-            current = _Block(number, line, story.group(1), story.group(2), phases[-1].number, [])
-            blocks.append(current)
+            current = _start_story(phases, blocks, line, number)
             continue
         if HEADING_RE.match(line):
             current = None
@@ -275,10 +305,10 @@ def import_backlog(
     and return an empty mapping.
     """
     phases, stories = parse_plan(plan_path.read_text(encoding="utf-8"))
-    milestones = [phase_milestone(phase) for phase in phases]
+    milestones = {phase.number: phase_milestone(phase) for phase in phases}
 
     if dry_run:
-        for name in milestones:
+        for name in milestones.values():
             print(f"milestone  {name}")
         for story in stories:
             print(f"story      {story.id}: {story.title}  [{', '.join(story_labels(story))}]")
@@ -289,7 +319,7 @@ def import_backlog(
     target = repo if repo is not None else _default_repo(gh)
     remote = _load_remote(gh, target)
 
-    for name in milestones:
+    for name in milestones.values():
         if name in remote.milestones:
             continue
         gh.run(["api", "-X", "POST", f"repos/{target}/milestones", "-f", f"title={name}"])

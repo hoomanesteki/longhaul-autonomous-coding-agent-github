@@ -31,6 +31,11 @@ INVALID_REQUEST instead of falling through to a step for another role. For the s
 reason, a script with role-keyed steps cannot hold bare steps: a bare step answers
 every role, so give such a step an explicit ``match: {role: ...}``.
 
+A script is checked when it loads, and a bad one raises ValueError with the file
+path. A key may not appear twice in one mapping. A reply needs text or tool calls.
+A raise cannot come with a reply, and retry_after_s and times only go with a raise.
+stop_reason has to fit the calls: tool_use needs one, end_turn allows none.
+
 Text matchers. ``last_tool_result_contains`` looks at the last tool_result block
 of the final message. ``user_text_contains`` looks at the text blocks of the last
 user message, which is how a compactor round or a hint from a human is told
@@ -69,8 +74,10 @@ unique inside a transcript, even one that was compacted, and across the
 transcripts of different roles and tasks.
 """
 
+import copy
 import hashlib
 import json
+from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -103,6 +110,7 @@ _TAIL_CHARS = 500
 _USER_TEXT_TAIL_CHARS = 200
 _OUTPUT_TOKENS_PER_CALL = 50
 _ID_HASH_CHARS = 16
+_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
 class _Strict(BaseModel):
@@ -111,14 +119,14 @@ class _Strict(BaseModel):
 
 class _Match(_Strict):
     role: Role | None = None
-    turn_index: int | None = None
+    turn_index: int | None = Field(default=None, ge=0)
     last_tool_result_contains: str | None = Field(default=None, min_length=1)
     user_text_contains: str | None = Field(default=None, min_length=1)
     request_contains: str | None = Field(default=None, min_length=1)
 
 
 class _CallSpec(_Strict):
-    name: str
+    name: str = Field(min_length=1)
     input: dict[str, Any] = {}
 
 
@@ -128,14 +136,41 @@ class _Respond(_Strict):
     stop_reason: Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "other"] | None = (
         None
     )
-    raise_: ProviderErrorKind | None = None
-    retry_after_s: float | None = None
+    raise_: ProviderErrorKind | None = Field(default=None, alias="raise")
+    retry_after_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     times: int | None = Field(default=None, ge=1)
 
-    def __init__(self, **data: Any) -> None:
-        if "raise" in data:
-            data["raise_"] = data.pop("raise")
-        super().__init__(**data)
+    @model_validator(mode="after")
+    def _only_responses_a_provider_can_give(self) -> Self:
+        if self.raise_ is not None:
+            self._check_raise_step()
+        else:
+            self._check_reply()
+        return self
+
+    def _check_raise_step(self) -> None:
+        set_too = [
+            name
+            for name, present in (
+                ("text", self.text is not None),
+                ("tool_calls", bool(self.tool_calls)),
+                ("stop_reason", self.stop_reason is not None),
+            )
+            if present
+        ]
+        if set_too:
+            raise ValueError(f"raise replaces the reply, so it cannot come with {set_too}")
+
+    def _check_reply(self) -> None:
+        for name in ("retry_after_s", "times"):
+            if getattr(self, name) is not None:
+                raise ValueError(f"{name} only applies to a raise step")
+        if self.text is None and not self.tool_calls:
+            raise ValueError("respond is empty: give text, tool_calls or raise")
+        if self.stop_reason == "tool_use" and not self.tool_calls:
+            raise ValueError("stop_reason tool_use needs a tool call")
+        if self.stop_reason == "end_turn" and self.tool_calls:
+            raise ValueError("stop_reason end_turn cannot come with tool calls")
 
 
 class _Step(_Strict):
@@ -160,11 +195,37 @@ class _Script(_Strict):
         return self
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a key written twice in one mapping.
+
+    PyYAML keeps the last value without a word, so a second ``respond:`` in a
+    step would replace the first and the script would not say what it looks like.
+    """
+
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Hashable, Any]:
+        seen: set[Hashable] = set()
+        for key_node, _ in node.value:
+            if key_node.tag == _MERGE_TAG:
+                continue
+            key = self.construct_object(key_node, deep=True)
+            if not isinstance(key, Hashable):
+                continue  # the base class reports it
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+
 def _load(path: Path) -> list[_Step]:
-    raw = yaml.safe_load(path.read_text())
     try:
+        raw = yaml.load(path.read_text(), Loader=_UniqueKeyLoader)
         return _Script.model_validate(raw).steps
-    except ValidationError as exc:
+    except (yaml.YAMLError, ValidationError) as exc:
         raise ValueError(f"invalid script {path}: {exc}") from exc
 
 
@@ -315,7 +376,7 @@ class ScriptedProvider:
 
     def _no_match(self, req: _Request, spent: list[int]) -> ProviderError:
         last = req.last_result
-        tail = last[:_TAIL_CHARS] if last is not None else None
+        tail = last[-_TAIL_CHARS:] if last is not None else None
         user = req.user_text[-_USER_TEXT_TAIL_CHARS:] if req.user_text else None
         message = (
             f"no scripted step matches: turn_index={req.turn} role={req.role} "
@@ -360,14 +421,18 @@ class ScriptedProvider:
             )
         self._check_offered(index, resp, tools)
         digest = req.fingerprint[:_ID_HASH_CHARS]
+        # Pydantic copies only the top level of an input. Nested values are copied here so a
+        # consumer that edits its arguments in place cannot change the script.
         calls = [
-            ToolCall(id=f"toolu_{digest}_{n}", name=c.name, input=c.input)
+            ToolCall(id=f"toolu_{digest}_{n}", name=c.name, input=copy.deepcopy(c.input))
             for n, c in enumerate(resp.tool_calls)
         ]
         content: list[Block] = []
         if resp.text is not None:
             content.append(TextBlock(text=resp.text))
-        content.extend(ToolUseBlock(id=c.id, name=c.name, input=c.input) for c in calls)
+        content.extend(
+            ToolUseBlock(id=c.id, name=c.name, input=copy.deepcopy(c.input)) for c in calls
+        )
         usage = Usage(
             input_tokens=_estimate(system, messages, tools),
             output_tokens=_OUTPUT_TOKENS_PER_CALL * len(calls) + len(resp.text or "") // 4,

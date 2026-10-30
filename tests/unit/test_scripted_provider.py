@@ -216,12 +216,14 @@ async def test_usage_is_deterministic() -> None:
 async def test_no_match_raises() -> None:
     p = ScriptedProvider(SCRIPT)
     with pytest.raises(ProviderError) as exc:
-        await _call(p, _turn(9, "the last result " + "z" * 600))
+        await _call(p, _turn(9, "the first line " + "z" * 600 + " 1 failed, 2 passed"))
     assert exc.value.kind is ProviderErrorKind.INVALID_REQUEST
     msg = exc.value.message
     assert "turn_index=9" in msg
     assert "Role: coder" in msg
-    assert "the last result" in msg
+    # The failures and the summary are at the end of an output, so the end is what is shown.
+    assert "1 failed, 2 passed" in msg
+    assert "the first line" not in msg
     assert "z" * 500 not in msg
 
 
@@ -735,3 +737,154 @@ steps:
     respond: {text: "any role"}
 """
     ScriptedProvider(_write(tmp_path, body))
+
+
+# ---------- the no-match message ----------
+PYTEST_OUTPUT = (
+    "exit code: 1\nsummary: 1 failed, 2 passed\nstdout:\n"
+    + "============================= test session starts ==============================\n"
+    + "platform linux -- Python 3.12.1, pytest-8.3.2, pluggy-1.5.0\n" * 8
+    + "tests/test_calc.py F..                                                   [100%]\n"
+    + "FAILED tests/test_calc.py::test_add_positive_numbers - assert -1 == 5\n"
+    + "1 failed, 2 passed in 0.05s"
+)
+
+
+async def test_no_match_message_shows_the_end_of_a_long_pytest_output() -> None:
+    assert len(PYTEST_OUTPUT) > 700  # longer than the 500 characters the message keeps
+    p = ScriptedProvider(SCRIPT)
+    with pytest.raises(ProviderError) as exc:
+        await _call(p, _turn(9, PYTEST_OUTPUT))
+    message = exc.value.message
+    assert "FAILED tests/test_calc.py::test_add_positive_numbers" in message
+    assert "1 failed, 2 passed in 0.05s" in message
+    assert "test session starts" not in message
+
+
+async def test_no_match_message_shows_a_short_result_in_full() -> None:
+    p = ScriptedProvider(SCRIPT)
+    with pytest.raises(ProviderError, match="last_tool_result='all good'"):
+        await _call(p, _turn(9, "all good"))
+
+
+async def test_no_match_message_shows_the_user_text(tmp_path: Path) -> None:
+    p = ScriptedProvider(
+        _write(tmp_path, "steps:\n  - match: {turn_index: 99}\n    respond: {text: hi}\n")
+    )
+    with pytest.raises(ProviderError, match="user_text='Hint from @sam: look at mod3'"):
+        await _call(p, [*_turn(1), _user("Hint from @sam: look at mod3")])
+
+
+# ---------- inputs are copies ----------
+async def test_returned_inputs_do_not_share_objects_with_the_script(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "steps:\n"
+        "  - respond:\n"
+        "      tool_calls:\n"
+        "        - {name: run_tests, input: {target: [tests/a.py], opts: {k: 1}}}\n",
+    )
+    p = ScriptedProvider(path)
+    original = {"target": ["tests/a.py"], "opts": {"k": 1}}
+    first = await _call(p, _turn(0), tools=[_tool("run_tests")])
+    block = first.content[0]
+    assert isinstance(block, ToolUseBlock)
+    # A consumer that normalises arguments in place must not change the script.
+    first.tool_calls[0].input["target"].append("tests/b.py")
+    first.tool_calls[0].input["opts"]["k"] = 2
+    assert block.input == original
+    block.input["target"].append("tests/c.py")
+    second = await _call(p, _turn(0), tools=[_tool("run_tests")])
+    assert second.tool_calls[0].input == original
+    assert second == await _call(p, _turn(0), tools=[_tool("run_tests")])
+
+
+# ---------- script validation ----------
+@pytest.mark.parametrize(
+    ("body", "fragment"),
+    [
+        ("respond: {text: hi, stop_reason: tool_use}", "stop_reason tool_use needs a tool call"),
+        (
+            "respond: {tool_calls: [{name: x}], stop_reason: end_turn}",
+            "stop_reason end_turn cannot come with tool calls",
+        ),
+        ("respond: {raise: overloaded, text: hi}", "raise replaces the reply.*text"),
+        (
+            "respond: {raise: overloaded, tool_calls: [{name: x}]}",
+            "raise replaces the reply.*tool_calls",
+        ),
+        (
+            "respond: {raise: overloaded, stop_reason: end_turn}",
+            "raise replaces the reply.*stop_reason",
+        ),
+        ("respond: {text: hi, retry_after_s: 2}", "retry_after_s only applies to a raise step"),
+        ("respond: {text: hi, times: 2}", "times only applies to a raise step"),
+        ("respond: {raise: overloaded, retry_after_s: -5}", "greater than or equal to 0"),
+        ("respond: {raise: overloaded, retry_after_s: .nan}", "finite number"),
+        ("respond: {raise_: overloaded}", "raise_"),
+        ("respond: {raise: nonsense}", r"respond\.raise\n"),
+        ("respond: {raise: overloaded, times: 0}", "greater than or equal to 1"),
+        ("respond: {}", "respond is empty"),
+        ("match: {turn_index: -1}\n    respond: {text: hi}", "greater than or equal to 0"),
+        ("respond: {tool_calls: [{name: ''}]}", "at least 1 character"),
+    ],
+)
+def test_impossible_responses_are_rejected(tmp_path: Path, body: str, fragment: str) -> None:
+    with pytest.raises(ValueError, match=fragment):
+        ScriptedProvider(_write(tmp_path, f"steps:\n  - {body}\n"))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "respond: {text: hi}",
+        "respond: {text: hi, stop_reason: max_tokens}",
+        "respond: {tool_calls: [{name: x}], stop_reason: max_tokens}",
+        "respond: {tool_calls: [{name: x}], stop_reason: tool_use}",
+        "respond: {raise: rate_limit, retry_after_s: 0}",
+        "respond: {raise: timeout, times: 3}",
+    ],
+)
+def test_ordinary_responses_still_load(tmp_path: Path, body: str) -> None:
+    ScriptedProvider(_write(tmp_path, f"steps:\n  - {body}\n"))
+
+
+def test_a_repeated_key_is_an_error_not_a_silent_override(tmp_path: Path) -> None:
+    path = _write(tmp_path, "steps:\n  - respond: {text: first}\n    respond: {text: second}\n")
+    with pytest.raises(ValueError, match="duplicate key 'respond'") as exc:
+        ScriptedProvider(path)
+    assert str(path) in str(exc.value)
+    nested = _write(
+        tmp_path, "steps:\n  - match: {turn_index: 1, turn_index: 2}\n    respond: {text: hi}\n"
+    )
+    with pytest.raises(ValueError, match="duplicate key 'turn_index'"):
+        ScriptedProvider(nested)
+
+
+@pytest.mark.parametrize("body", ["steps: [unclosed\n", "steps:\n  - ? [a, b]\n    : c\n"])
+def test_yaml_syntax_errors_are_value_errors_that_name_the_file(tmp_path: Path, body: str) -> None:
+    path = _write(tmp_path, body)
+    with pytest.raises(ValueError) as exc:
+        ScriptedProvider(path)
+    assert str(path) in str(exc.value)
+    assert type(exc.value) is ValueError
+
+
+async def test_anchors_and_merge_keys_still_work(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+steps:
+  - respond: &say {text: "again"}
+  - match: {turn_index: 5}
+    respond: *say
+  - match: {turn_index: 6}
+    respond:
+      <<: *say
+      stop_reason: max_tokens
+""",
+    )
+    p = ScriptedProvider(path)
+    assert (await _call(p, _turn(0))).content == [TextBlock(text="again")]
+    assert (await _call(p, _turn(5))).content == [TextBlock(text="again")]
+    assert (await _call(p, _turn(6))).stop_reason == "max_tokens"

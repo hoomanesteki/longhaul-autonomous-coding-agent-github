@@ -1,7 +1,9 @@
+import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -15,6 +17,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "config" / "longhaul.example.yaml"
 ENV_EXAMPLE = ROOT / ".env.example"
+COMPOSE = ROOT / "docker-compose.yml"
 ENV_PREFIX = "LONGHAUL_"
 
 
@@ -228,3 +231,48 @@ def test_script_setting_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("LONGHAUL_SCRIPT", "tests/fixtures/scripts/calc_fix.yaml")
     assert EnvSettings().script == Path("tests/fixtures/scripts/calc_fix.yaml")
+
+
+def _compose_services() -> dict[str, Any]:
+    data = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    services = data["services"]
+    assert isinstance(services, dict)
+    return services
+
+
+def _binds_loopback(port: Any) -> bool:
+    if isinstance(port, dict):
+        return bool(port.get("host_ip") == "127.0.0.1")
+    return str(port).startswith("127.0.0.1:")
+
+
+def test_compose_publishes_ports_on_loopback_only() -> None:
+    """No host address in a port mapping means 0.0.0.0, which exposes the stack to the LAN."""
+    published = 0
+    exposed: list[str] = []
+    for name, service in _compose_services().items():
+        for port in service.get("ports", []):
+            published += 1
+            if not _binds_loopback(port):
+                exposed.append(f"{name}: {port}")
+
+    assert published > 0
+    assert not exposed, "ports published on every interface:\n" + "\n".join(exposed)
+
+
+def test_compose_database_password_comes_from_the_environment() -> None:
+    password = _compose_services()["postgres"]["environment"]["POSTGRES_PASSWORD"]
+
+    match = re.fullmatch(r"\$\{LH_POSTGRES_PASSWORD:-(?P<default>[^}]+)\}", str(password))
+    assert match is not None, f"POSTGRES_PASSWORD is {password!r}"
+    # The local defaults must agree, or a fresh clone cannot log in.
+    example = _env_example()
+    assert example["LH_POSTGRES_PASSWORD"] == match["default"]
+    assert urlsplit(example["LONGHAUL_DATABASE_URL"]).password == match["default"]
+
+
+def test_env_example_lists_every_compose_variable() -> None:
+    used = set(re.findall(r"\$\{(LH_[A-Z_]+)", COMPOSE.read_text(encoding="utf-8")))
+
+    assert used
+    assert used <= set(_env_example())

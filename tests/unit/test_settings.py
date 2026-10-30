@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 import pytest
 import yaml
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 from longhaul.contracts import SandboxLimits
 from longhaul.settings import AppConfig, EnvSettings, get_settings, load_config
@@ -79,15 +79,40 @@ def test_example_config_loads() -> None:
     assert config.loop.max_tokens_per_turn == 8192
 
 
-def test_unknown_key_rejected(tmp_path: Path) -> None:
+# Each entry is the path to a section and a realistic typo for a key in it. Every section
+# repeats extra="forbid" on its own model, so each one needs its own case.
+UNKNOWN_KEY_CASES = [
+    pytest.param((), "pricing_fle", id="top level"),
+    pytest.param(("poller",), "interval_secnds", id="poller"),
+    pytest.param(("repos", 0), "test_comand", id="repos[0]"),
+    pytest.param(("repos", 0, "budgets"), "task_usdd", id="repos[0].budgets"),
+    pytest.param(("models",), "plannr", id="models"),
+    pytest.param(("sandbox",), "imge", id="sandbox"),
+    pytest.param(("sandbox", "limits"), "cpu", id="sandbox.limits"),
+    pytest.param(("context",), "compact_att", id="context"),
+    pytest.param(("loop",), "max_verify_round", id="loop"),
+    pytest.param(("stuck",), "no_progress_turn", id="stuck"),
+]
+
+
+@pytest.mark.parametrize(("where", "typo"), UNKNOWN_KEY_CASES)
+def test_unknown_key_rejected(tmp_path: Path, where: tuple[str | int, ...], typo: str) -> None:
     data = _example_data()
-    data["poller"]["interval_secnds"] = 30
+    section: Any = data
+    for step in where:
+        section = section[step]
+    section[typo] = 30
     path = _write_yaml(tmp_path / "longhaul.yaml", data)
 
     with pytest.raises(ValidationError) as excinfo:
         load_config(path)
 
-    assert "interval_secnds" in str(excinfo.value)
+    # Exactly one error, at the typo's own location, so a typo is never silently dropped.
+    errors = excinfo.value.errors()
+    assert [(error["type"], error["loc"]) for error in errors] == [
+        ("extra_forbidden", (*where, typo))
+    ]
+    assert typo in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -104,10 +129,97 @@ def test_secret_keys_rejected_in_yaml(tmp_path: Path, key_path: str, patch: Any)
     patch(data)
     path = _write_yaml(tmp_path / "longhaul.yaml", data)
 
-    with pytest.raises(ValueError) as excinfo:
+    # These names are also unknown to the schema, so a bare ValueError check would pass
+    # without the scanner. The scanner's own message and exception type prove it ran.
+    with pytest.raises(ValueError, match="secret-looking key") as excinfo:
         load_config(path)
 
-    assert key_path in str(excinfo.value)
+    assert not isinstance(excinfo.value, ValidationError)
+    assert f"'{key_path}'" in str(excinfo.value)
+
+
+class _AcceptsAnyKeys(AppConfig):
+    """A schema that takes extra keys, like a future free-form settings mapping would."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+@pytest.fixture
+def permissive_schema(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("longhaul.settings.AppConfig", _AcceptsAnyKeys)
+
+
+SECRET_LOOKING_NAMES = [
+    "github_token",
+    "githubToken",
+    "apiKey",
+    "apikey",
+    "API_KEY",
+    "Admin_Token",
+    "clientSecret",
+    "client-secret",
+    "SECRET",
+    "authToken",
+    "tokens",
+    "keys",
+    "secrets",
+    "api_keys",
+    "token_budget",
+    "key_files",
+]
+
+# Counts and sizes that contain the word "token" but are not credentials.
+COUNT_NAMES = ["max_tokens_per_turn", "tool_output_max_tokens", "window_tokens", "maxTokensPerTurn"]
+
+
+@pytest.mark.parametrize("name", SECRET_LOOKING_NAMES)
+def test_scanner_rejects_secret_looking_names(
+    tmp_path: Path, permissive_schema: None, name: str
+) -> None:
+    # The schema accepts the key here, so only the scanner can reject it.
+    data = _example_data()
+    data[name] = "x"
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValueError, match="secret-looking key") as excinfo:
+        load_config(path)
+
+    assert not isinstance(excinfo.value, ValidationError)
+    assert f"'{name}'" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", COUNT_NAMES)
+def test_scanner_allows_count_keys(tmp_path: Path, permissive_schema: None, name: str) -> None:
+    data = _example_data()
+    data[name] = 5
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path) is not None
+
+
+def test_scanner_finds_secret_keys_inside_nested_lists(
+    tmp_path: Path, permissive_schema: None
+) -> None:
+    data = _example_data()
+    data["repos"][0]["notes"] = [{"label": "fine"}, [{"clientSecret": "x"}]]
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValueError, match="secret-looking key") as excinfo:
+        load_config(path)
+
+    assert "'repos[0].notes[1][0].clientSecret'" in str(excinfo.value)
+
+
+def test_repo_is_not_allowlisted_unless_the_yaml_says_so(tmp_path: Path) -> None:
+    # Longhaul must never work in a repo it was not invited to, so omitting the key means no.
+    data = _example_data()
+    data["repos"] = [{"repo": "acme/not-invited"}]
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    entry = load_config(path).repos[0]
+
+    assert entry.allowlisted is False
+    assert load_config(EXAMPLE).repos[0].allowlisted is True
 
 
 def test_env_overrides(monkeypatch: pytest.MonkeyPatch, fresh_settings_cache: None) -> None:

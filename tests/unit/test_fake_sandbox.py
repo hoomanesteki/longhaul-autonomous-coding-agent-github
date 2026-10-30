@@ -39,6 +39,21 @@ async def test_exec_env_passthrough(sbx: FakeSandbox) -> None:
     assert r.stdout.strip() == "bar"
 
 
+async def test_exec_finds_tools_in_the_workspace_venv_first(sbx: FakeSandbox) -> None:
+    # Same rule as the Docker sandbox: <workspace>/.venv/bin leads PATH.
+    await sbx.write_file(".venv/bin/hello-tool", b"#!/bin/sh\necho from-venv\n")
+    await sbx.write_file(".venv/bin/ls", b"#!/bin/sh\necho shadowed\n")
+    await sbx.exec("chmod +x .venv/bin/hello-tool .venv/bin/ls", timeout_s=5)
+    assert (await sbx.exec("hello-tool", timeout_s=5)).stdout.strip() == "from-venv"
+    assert (await sbx.exec("ls", timeout_s=5)).stdout.strip() == "shadowed"
+    assert (await sbx.exec("echo $PATH", timeout_s=5)).stdout.startswith(f"{sbx.root}/.venv/bin:")
+
+
+async def test_exec_still_works_without_a_venv(sbx: FakeSandbox) -> None:
+    r = await sbx.exec("command -v sh", timeout_s=5)
+    assert r.exit_code == 0 and r.stdout.strip()
+
+
 async def test_file_roundtrip_nested_and_absolute(sbx: FakeSandbox) -> None:
     data = bytes(range(256))
     await sbx.write_file("a/b/c.bin", data)
@@ -62,6 +77,25 @@ def test_env_only_allowlist_plus_explicit() -> None:
     merged = merge_env({"X": "1", "HOME": "/h"})
     assert merged["X"] == "1" and merged["HOME"] == "/h"
     assert set(ENV_ALLOWLIST) == {"PATH", "HOME", "LANG", "PYTHONUNBUFFERED"}
+
+
+def test_path_starts_with_the_workspace_venv() -> None:
+    # Packages go into /workspace/.venv because the root filesystem is read-only.
+    # Putting its bin first means installed tools work without activating it.
+    entries = ENV_ALLOWLIST["PATH"].split(":")
+    assert entries[0] == "/workspace/.venv/bin"
+    assert merge_env(None)["PATH"].startswith("/workspace/.venv/bin:")
+    assert merge_env({"X": "1"})["PATH"].startswith("/workspace/.venv/bin:")
+    # The image's own directories still follow, in their original order.
+    assert entries[1:] == [
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ]
 
 
 def test_cap_output() -> None:

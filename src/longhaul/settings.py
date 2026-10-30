@@ -15,14 +15,28 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from longhaul.contracts import Budgets, RepoSettings, SandboxLimits
 
-# Matched against whole words of a key name, so "max_tokens_per_turn" passes
-# while "github_token" and "api_key" fail. A plain substring match would reject
-# legitimate keys such as max_tokens_per_turn and tool_output_max_tokens.
-_SECRET_WORDS = frozenset({"token", "key", "secret"})
+# A key is secret-looking when its name contains one of these after it is lower-cased and
+# stripped of separators. Matching inside the flattened name catches camelCase (githubToken),
+# names without separators (apikey) and plurals (api_keys), which whole-word matching missed.
+_SECRET_FRAGMENTS = ("token", "key", "secret")
+
+# Count and size settings that contain "token" but are not credentials, in flattened form.
+# Add a name here only for a setting that holds a number, never a value that could be a secret.
+_COUNT_KEYS = frozenset({"maxtokensperturn", "tooloutputmaxtokens", "windowtokens"})
 
 
 class EnvSettings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="LONGHAUL_", extra="ignore")
+    # .env is read from the working directory; real environment variables win over it.
+    # env_ignore_empty makes a blank assignment (a copied .env.example is full of them)
+    # mean "unset". Without it a blank admin token becomes SecretStr(""), a blank base URL
+    # becomes "", and a blank app id fails to parse.
+    model_config = SettingsConfigDict(
+        env_prefix="LONGHAUL_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
     database_url: SecretStr | None = None
     temporal_address: str = "localhost:7233"
@@ -41,6 +55,8 @@ class EnvSettings(BaseSettings):
     github_app_key_path: Path | None = None
     admin_token: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
+    # Script file for the scripted provider; the provider factory reads it (LH-197).
+    script: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )
@@ -118,8 +134,8 @@ class AppConfig(StrictModel):
 
 
 def _looks_secret(name: str) -> bool:
-    words = re.split(r"[^a-z0-9]+", name.lower())
-    return any(word in _SECRET_WORDS for word in words)
+    flat = re.sub(r"[^a-z0-9]", "", name.lower())
+    return flat not in _COUNT_KEYS and any(fragment in flat for fragment in _SECRET_FRAGMENTS)
 
 
 def _reject_secret_keys(node: Any, path: str = "") -> None:

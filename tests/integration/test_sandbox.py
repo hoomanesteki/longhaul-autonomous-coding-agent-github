@@ -53,6 +53,13 @@ async def _make(manager: DockerSandboxManager, tid: str, network: bool = False) 
     return await manager.create(tid, IMAGE, SandboxLimits(), network=network)
 
 
+async def _sh(sbx: Sandbox, script: str) -> str:
+    """Run a setup or probe script that must succeed and return its stdout."""
+    r = await sbx.exec(script, timeout_s=60)
+    assert r.exit_code == 0, r.stderr
+    return r.stdout
+
+
 async def test_runs_as_non_root(manager: DockerSandboxManager, task_id: str) -> None:
     sbx = await _make(manager, task_id)
     r = await sbx.exec("id -u", timeout_s=10)
@@ -128,6 +135,112 @@ async def test_file_roundtrip_binary(manager: DockerSandboxManager, task_id: str
     )
     assert r.stdout.split() == ["10001:10001", "10001:10001"], r.stderr
     assert r.exit_code == 0
+
+
+async def test_write_file_stamps_a_current_mtime(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await sbx.write_file("fresh.txt", b"x")
+    # An mtime of 0 (1970) made Python trust stale bytecode and broke make-style checks.
+    # Both clocks are read inside the container, so the test cannot depend on the host's.
+    age = int(await _sh(sbx, "echo $(( $(date +%s) - $(stat -c %Y fresh.txt) ))"))
+    assert abs(age) < 300
+
+
+async def test_write_file_keeps_the_mode_of_an_existing_file(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "printf '#!/bin/sh\\necho one\\n' > run.sh && chmod 755 run.sh")
+    await sbx.write_file("run.sh", b"#!/bin/sh\necho two\n")
+    # An edit must not strip the executable bit: git would record the mode change.
+    assert (await _sh(sbx, "stat -c %a run.sh && ./run.sh")).split() == ["755", "two"]
+    await sbx.write_file("fresh.txt", b"x")
+    assert (await _sh(sbx, "stat -c %a fresh.txt")).strip() == "644"
+
+
+async def test_write_file_leaves_existing_directories_alone(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "mkdir -p keep/deep && chmod 700 keep keep/deep")
+    await sbx.write_file("keep/deep/new.txt", b"x")
+    await sbx.write_file("keep/made/later.txt", b"y")
+    assert (await _sh(sbx, "stat -c %a keep keep/deep")).split() == ["700", "700"]
+    # New directories belong to the agent user, not to root.
+    assert (await _sh(sbx, "stat -c %U:%a keep/made")).strip() == "agent:755"
+
+
+async def test_write_file_refuses_to_replace_a_directory(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "mkdir -p src/pkg && echo a > src/pkg/a.py")
+    with pytest.raises(IsADirectoryError):
+        await sbx.write_file("src", b"oops")
+    with pytest.raises(IsADirectoryError):
+        await sbx.write_file("/workspace/src/pkg", b"oops")
+    with pytest.raises(IsADirectoryError):
+        await sbx.write_file(".", b"oops")
+    # The tree is exactly as it was: nothing was deleted or turned into a file.
+    assert (await _sh(sbx, "test -d src/pkg && cat src/pkg/a.py")).strip() == "a"
+
+
+async def test_write_file_refuses_a_parent_that_is_a_file(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "echo keep > README.md")
+    for path in ("README.md/x", "README.md/deeper/x"):
+        with pytest.raises(NotADirectoryError):
+            await sbx.write_file(path, b"z")
+    assert (await _sh(sbx, "test -f README.md && cat README.md")).strip() == "keep"
+
+
+async def test_write_file_follows_symlinks_that_stay_inside_the_workspace(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "mkdir src && echo old > src/mod.py && ln -s src srclink && ln -s src/mod.py m")
+    await sbx.write_file("srclink/new.py", b"through the link")
+    await sbx.write_file("m", b"new")
+    # The links are still links, and the files behind them changed.
+    out = await _sh(sbx, "test -L srclink && test -L m && cat src/new.py src/mod.py")
+    assert out == "through the linknew"
+
+
+async def test_write_file_does_not_follow_a_symlink_out_of_the_workspace(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "ln -s /etc outlink && ln -s /etc/hostname hostlink")
+    with pytest.raises(PermissionError):
+        await sbx.write_file("outlink/evil", b"x")
+    with pytest.raises(PermissionError):
+        await sbx.write_file("hostlink", b"x")
+    assert (await sbx.exec("test -e /etc/evil", timeout_s=10)).exit_code != 0
+    assert (await _sh(sbx, "test -L hostlink && echo link")).strip() == "link"
+
+
+async def test_same_size_edit_is_seen_by_python(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    run = "python -c 'import calc; print(calc.add(2, 3))'"
+    await sbx.write_file("calc.py", b"def add(a, b):\n    return a - b\n")
+    assert (await _sh(sbx, run)).strip() == "-1"
+    # Same byte length, so a stale .pyc would still look valid to Python.
+    await sbx.write_file("calc.py", b"def add(a, b):\n    return a + b\n")
+    assert (await _sh(sbx, run)).strip() == "5"
+    assert (await _sh(sbx, "find . -name '*.pyc' | wc -l")).strip() == "0"
+
+
+async def test_python_does_not_write_bytecode(manager: DockerSandboxManager, task_id: str) -> None:
+    sbx = await _make(manager, task_id)
+    out = await _sh(sbx, "python -c 'import sys; print(sys.dont_write_bytecode)'")
+    assert out.strip() == "True"
+    assert ENV_ALLOWLIST["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
 async def test_cleanup(manager: DockerSandboxManager, task_id: str) -> None:

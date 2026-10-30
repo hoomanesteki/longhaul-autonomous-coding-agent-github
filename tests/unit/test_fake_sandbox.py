@@ -1,3 +1,8 @@
+import os
+import shutil
+import sys
+import tempfile
+
 import pytest
 
 from longhaul.sandbox.docker_manager import (
@@ -66,6 +71,69 @@ async def test_path_escape_rejected(sbx: FakeSandbox) -> None:
         await sbx.write_file("../evil", b"x")
 
 
+# ---------- write_file does what the Docker sandbox does ----------
+
+
+async def test_write_file_refuses_a_directory(sbx: FakeSandbox) -> None:
+    await sbx.write_file("pkg/a.py", b"x")
+    for path in ("pkg", "/workspace/pkg", "."):
+        with pytest.raises(IsADirectoryError):
+            await sbx.write_file(path, b"oops")
+    assert await sbx.read_file("pkg/a.py") == b"x"
+
+
+async def test_write_file_refuses_a_parent_that_is_a_file(sbx: FakeSandbox) -> None:
+    await sbx.write_file("README.md", b"keep")
+    # One level and two levels down used to raise different errors.
+    for path in ("README.md/x", "README.md/deeper/x"):
+        with pytest.raises(NotADirectoryError):
+            await sbx.write_file(path, b"z")
+    assert await sbx.read_file("README.md") == b"keep"
+
+
+async def test_write_file_keeps_the_mode_of_an_existing_file(sbx: FakeSandbox) -> None:
+    await sbx.write_file("run.sh", b"#!/bin/sh\necho one\n")
+    await sbx.exec("chmod 755 run.sh", timeout_s=5)
+    await sbx.write_file("run.sh", b"#!/bin/sh\necho two\n")
+    assert (await sbx.exec("./run.sh", timeout_s=5)).stdout.strip() == "two"
+
+
+async def test_write_file_follows_a_symlink_inside_the_workspace(sbx: FakeSandbox) -> None:
+    await sbx.write_file("src/mod.py", b"old")
+    await sbx.exec("ln -s src srclink && ln -s src/mod.py m", timeout_s=5)
+    await sbx.write_file("srclink/new.py", b"through the link")
+    await sbx.write_file("m", b"new")
+    assert await sbx.read_file("src/new.py") == b"through the link"
+    assert await sbx.read_file("src/mod.py") == b"new"
+
+
+async def test_write_file_does_not_follow_a_symlink_out_of_the_workspace(sbx: FakeSandbox) -> None:
+    outside = tempfile.mkdtemp(prefix="lh-outside-")
+    try:
+        await sbx.exec(f"ln -s {outside} outlink", timeout_s=5)
+        with pytest.raises(PermissionError):
+            await sbx.write_file("outlink/evil", b"x")
+        assert os.listdir(outside) == []
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+async def test_bytecode_is_never_written(sbx: FakeSandbox) -> None:
+    r = await sbx.exec("echo $PYTHONDONTWRITEBYTECODE", timeout_s=5)
+    assert r.stdout.strip() == "1"
+
+
+async def test_same_size_edit_is_seen_by_python(sbx: FakeSandbox) -> None:
+    # A stale .pyc made the second run print -1 in most back-to-back runs, because
+    # the edit lands in the same second as the first import and keeps the byte size.
+    run = f"{sys.executable} -c 'import calc; print(calc.add(2, 3))'"
+    for _ in range(5):
+        await sbx.write_file("calc.py", b"def add(a, b):\n    return a - b\n")
+        assert (await sbx.exec(run, timeout_s=30)).stdout.strip() == "-1"
+        await sbx.write_file("calc.py", b"def add(a, b):\n    return a + b\n")
+        assert (await sbx.exec(run, timeout_s=30)).stdout.strip() == "5"
+
+
 def test_names() -> None:
     assert container_name("t1", "abcd1234") == "lh-sbx-t1-abcd1234"
     assert len(container_name("t1")) == len("lh-sbx-t1-") + 8
@@ -76,7 +144,13 @@ def test_env_only_allowlist_plus_explicit() -> None:
     assert merge_env(None) == ENV_ALLOWLIST
     merged = merge_env({"X": "1", "HOME": "/h"})
     assert merged["X"] == "1" and merged["HOME"] == "/h"
-    assert set(ENV_ALLOWLIST) == {"PATH", "HOME", "LANG", "PYTHONUNBUFFERED"}
+    assert set(ENV_ALLOWLIST) == {
+        "PATH",
+        "HOME",
+        "LANG",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+    }
 
 
 def test_path_starts_with_the_workspace_venv() -> None:

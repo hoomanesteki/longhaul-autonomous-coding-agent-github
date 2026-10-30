@@ -21,7 +21,11 @@ RUN git config --system user.name "longhaul" \
 WORKDIR /workspace
 RUN chown agent:agent /workspace
 
+# No bytecode: a same-size edit keeps the source mtime and size that Python checks,
+# so a .pyc from before the edit would still be trusted. The sandbox manager passes
+# the same variable, so the setting also holds for other images.
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     LANG=C.UTF-8
 
 USER agent

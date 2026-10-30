@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import errno
 import io
+import json
 import posixpath
 import tarfile
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 import docker
-from docker.errors import NotFound
+import requests
+from docker.errors import APIError, NotFound
 
 from longhaul.contracts import ExecResult, Sandbox, SandboxLimits
+from longhaul.sandbox.common import WORKDIR, mount_for, resolve_path
 
-WORKDIR = "/workspace"
 AGENT_USER = "agent"
 AGENT_UID = 10001
 OUTPUT_CAP = 1_000_000
@@ -38,6 +43,9 @@ ENV_ALLOWLIST: dict[str, str] = {
     "HOME": "/home/agent",
     "LANG": "C.UTF-8",
     "PYTHONUNBUFFERED": "1",
+    # An edit keeps the byte size, and Python trusts a .pyc whose source mtime and
+    # size match. Without bytecode there is nothing stale to run after an edit.
+    "PYTHONDONTWRITEBYTECODE": "1",
 }
 
 
@@ -70,27 +78,16 @@ def cap_output(data: bytes | None, limit: int = OUTPUT_CAP) -> str:
     return text
 
 
-def resolve_path(path: str) -> str:
-    joined = path if path.startswith("/") else posixpath.join(WORKDIR, path)
-    return posixpath.normpath(joined)
-
-
-WRITABLE_MOUNTS = (WORKDIR, "/tmp", "/home/agent")  # noqa: S108
-
-
-def mount_for(path: str) -> str:
-    """Writable mount that holds `path`. Docker refuses put_archive elsewhere."""
-    for mount in WRITABLE_MOUNTS:
-        if path == mount or path.startswith(mount + "/"):
-            return mount
-    raise PermissionError(f"path is not on a writable mount: {path}")
-
-
-def build_tar(path: str, data: bytes) -> bytes:
+def build_tar(path: str, data: bytes, *, mode: int = 0o644) -> bytes:
     """Tar holding one file, owned by the agent user, with parent dirs included.
 
-    `path` is relative to the extraction directory.
+    `path` is relative to the extraction directory, and every directory in it is
+    created: the caller passes only the directories that do not exist yet,
+    because an entry for an existing one would reset its mode and mtime.
+    Every entry gets the current time. An mtime of 0 would leave Python trusting
+    an old .pyc after a same-size edit.
     """
+    now = time.time()
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
         parts = path.strip("/").split("/")
@@ -99,13 +96,77 @@ def build_tar(path: str, data: bytes) -> bytes:
             d.type = tarfile.DIRTYPE
             d.mode = 0o755
             d.uid = d.gid = AGENT_UID
+            d.mtime = now
             tar.addfile(d)
         info = tarfile.TarInfo(path.strip("/"))
         info.size = len(data)
-        info.mode = 0o644
+        info.mode = mode
         info.uid = info.gid = AGENT_UID
+        info.mtime = now
         tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+# Docker reports the mode of a path as a Go os.FileMode: the permission bits plus
+# one flag per file type.
+_MODE_DIR = 1 << 31
+_MODE_SYMLINK = 1 << 27
+_MODE_SPECIAL = (1 << 26) | (1 << 25) | (1 << 24) | (1 << 21) | (1 << 19)  # device, pipe, socket...
+
+
+@dataclass(frozen=True)
+class PathStat:
+    """What Docker's archive API says about one path, without following a final symlink."""
+
+    mode: int
+    link_target: str  # fully resolved by Docker, so a chain of links is already one hop
+
+    @property
+    def is_dir(self) -> bool:
+        return bool(self.mode & _MODE_DIR)
+
+    @property
+    def is_symlink(self) -> bool:
+        return bool(self.mode & _MODE_SYMLINK)
+
+    @property
+    def is_regular(self) -> bool:
+        return not self.mode & (_MODE_DIR | _MODE_SYMLINK | _MODE_SPECIAL)
+
+    @property
+    def permissions(self) -> int:
+        return self.mode & 0o777
+
+
+def parse_stat(header: str) -> PathStat:
+    """Read the X-Docker-Container-Path-Stat header: base64 of a JSON object."""
+    raw = json.loads(base64.b64decode(header))
+    return PathStat(mode=int(raw["mode"]), link_target=raw.get("linkTarget") or "")
+
+
+# Linux gives up on a path after this many symlinks.
+MAX_LINK_HOPS = 40
+
+
+@dataclass(frozen=True)
+class Resolved:
+    """Where a path leads once its symlinks are followed, and what is there."""
+
+    path: str
+    found: PathStat | None  # the last name; None when it does not exist
+    parent: str  # the deepest directory that exists on the way
+    new_names: list[str]  # names still to be created below `parent`, the last one is the file
+
+    @property
+    def name(self) -> str:
+        return posixpath.basename(self.path)
+
+
+def _message(res: requests.Response) -> str:
+    try:
+        return str(res.json()["message"])
+    except (ValueError, KeyError, TypeError):
+        return res.text[:300]
 
 
 class DockerSandbox:
@@ -166,13 +227,108 @@ class DockerSandbox:
 
         return await asyncio.to_thread(run)
 
+    # The archive API cannot do what open() does, so the rules are applied here:
+    # put_archive replaces whatever sits at a path with the type in the tar, which
+    # would turn a directory into a file or a file into a directory without an error.
+
+    def _archive_url(self) -> str:
+        api = self._client.api
+        return f"{api.base_url}/v{api.api_version}/containers/{self.id}/archive"
+
+    def _stat(self, path: str) -> PathStat | None:
+        """Like lstat: what is at `path`, or None when nothing is."""
+        api = self._client.api
+        res = api.head(self._archive_url(), params={"path": path}, timeout=api.timeout)
+        if res.status_code == 200:
+            return parse_stat(res.headers["X-Docker-Container-Path-Stat"])
+        if res.status_code == 404:
+            # HEAD has no body, so a missing container looks like a missing path.
+            api.inspect_container(self.id)  # raises NotFound when the container is gone
+            return None
+        raise APIError(f"cannot stat {path}", response=res)
+
+    def _walk(self, path: str) -> Resolved | str:
+        """Check `path` one name at a time from its mount down.
+
+        Returns what was found, or the path to carry on with when a symlink was met.
+        """
+        mount = mount_for(path)
+        names = [name for name in path[len(mount) :].split("/") if name]
+        if not names:
+            root = self._stat(mount)
+            if root is None:
+                raise FileNotFoundError(errno.ENOENT, "no such directory", mount)
+            return Resolved(mount, root, mount, [])
+        parent = mount
+        for index, name in enumerate(names):
+            below = names[index + 1 :]
+            child = posixpath.join(parent, name)
+            found = self._stat(child)
+            if found is None:
+                # Nothing here, so nothing below it either.
+                return Resolved(posixpath.join(child, *below), None, parent, [name, *below])
+            if found.is_symlink:
+                # Docker has already followed the whole chain. The target may lie on
+                # another mount or outside every mount, which mount_for() refuses.
+                return posixpath.join(found.link_target, *below)
+            if not below:
+                return Resolved(child, found, parent, [])
+            if not found.is_dir:
+                raise NotADirectoryError(errno.ENOTDIR, "not a directory", child)
+            parent = child
+        raise AssertionError("unreachable: names is not empty")  # pragma: no cover
+
+    def _resolve(self, path: str) -> Resolved:
+        """Like realpath for the part of `path` that exists, with the same limits on links."""
+        for _ in range(MAX_LINK_HOPS):
+            step = self._walk(path)
+            if isinstance(step, Resolved):
+                return step
+            path = step
+        raise OSError(errno.ELOOP, "too many levels of symbolic links", path)
+
+    def _extract(self, directory: str, archive: bytes) -> None:
+        """Unpack `archive` into `directory`, refusing to swap a file for a directory."""
+        api = self._client.api
+        # noOverwriteDirNonDir is the daemon's own guard if the tree changes
+        # between our stat and this call.
+        params: dict[str, str | int] = {"path": directory, "noOverwriteDirNonDir": 1}
+        res = api.put(self._archive_url(), params=params, data=archive, timeout=api.timeout)
+        if res.status_code == 200:
+            return
+        message = _message(res)
+        if res.status_code == 404 and message.startswith("No such container"):
+            raise NotFound(message, response=res)
+        if res.status_code == 404:
+            raise FileNotFoundError(errno.ENOENT, "no such directory", directory)
+        if "read-only" in message:
+            raise PermissionError(errno.EACCES, f"{directory} is not on the workspace volume")
+        if "cannot overwrite directory" in message:
+            raise IsADirectoryError(errno.EISDIR, "is a directory", directory)
+        if "not a directory" in message or "cannot overwrite non-directory" in message:
+            raise NotADirectoryError(errno.ENOTDIR, "not a directory", directory)
+        raise APIError(message, response=res)
+
+    def _write(self, full: str, data: bytes) -> None:
+        target = self._resolve(full)
+        if target.found is None:
+            mode = 0o644
+        elif target.found.is_dir:
+            raise IsADirectoryError(errno.EISDIR, "is a directory", target.path)
+        elif not target.found.is_regular:
+            raise FileExistsError(errno.EEXIST, "not a regular file", target.path)
+        else:
+            # The file is replaced, not rewritten in place, so its mode is passed on.
+            mode = target.found.permissions
+        # Only directories that do not exist yet go into the tar. The daemon would
+        # create them as root, so the tar lists them with the agent as owner.
+        relative = "/".join(target.new_names) if target.found is None else target.name
+        self._extract(target.parent, build_tar(relative, data, mode=mode))
+
     async def write_file(self, path: str, data: bytes) -> None:
         full = resolve_path(path)
-        # The root fs is read-only, so extract inside the mount that holds the
-        # path. Parent dirs come from the archive and are owned by the agent user.
-        mount = mount_for(full)
-        archive = build_tar(posixpath.relpath(full, mount), data)
-        await asyncio.to_thread(self._container().put_archive, mount, archive)
+        mount_for(full)
+        await asyncio.to_thread(self._write, full, data)
 
     async def destroy(self) -> None:
         def run() -> None:

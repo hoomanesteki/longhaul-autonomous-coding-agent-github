@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import os
 import shutil
 import tempfile
@@ -11,6 +12,7 @@ import time
 from pathlib import Path
 
 from longhaul.contracts import ExecResult
+from longhaul.sandbox.common import PathEscapeError
 
 
 class FakeSandbox:
@@ -26,7 +28,7 @@ class FakeSandbox:
         rel = path.removeprefix(self.workdir).lstrip("/")
         target = (self.root / rel).resolve()
         if not target.is_relative_to(self.root.resolve()):
-            raise ValueError(f"path escapes sandbox: {path}")
+            raise PathEscapeError(f"path escapes sandbox: {path}")
         return target
 
     async def exec(
@@ -35,7 +37,9 @@ class FakeSandbox:
         # Same rule as the Docker sandbox: the workspace venv leads PATH.
         venv_bin = str(self.root / ".venv" / "bin")
         path = os.pathsep.join(filter(None, [venv_bin, os.environ.get("PATH")]))
-        full_env = {"PATH": path, "HOME": str(self.root)}
+        # No bytecode, as in Docker: an edit that keeps the byte size and lands in
+        # the same second as the last import would otherwise run the old code.
+        full_env = {"PATH": path, "HOME": str(self.root), "PYTHONDONTWRITEBYTECODE": "1"}
         full_env.update(env or {})
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
@@ -69,6 +73,15 @@ class FakeSandbox:
 
     async def write_file(self, path: str, data: bytes) -> None:
         target = self._path(path)
+        # The same refusals as the Docker sandbox, with the same error types.
+        if target.is_dir():
+            raise IsADirectoryError(errno.EISDIR, "is a directory", path)
+        root = self.root.resolve()
+        for ancestor in target.parents:
+            if ancestor == root:
+                break
+            if ancestor.exists() and not ancestor.is_dir():
+                raise NotADirectoryError(errno.ENOTDIR, "not a directory", path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 

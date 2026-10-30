@@ -156,6 +156,8 @@ jobs:
           else:
               raise SystemExit("minio bucket was not ready in time")
           PY
+      - name: Build sandbox image
+        run: make sandbox-image
       - run: uv run pytest -m integration -q
       - name: Show Temporal log on failure
         if: failure()

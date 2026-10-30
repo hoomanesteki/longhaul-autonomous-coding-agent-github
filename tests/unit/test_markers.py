@@ -7,14 +7,21 @@ import subprocess
 import sys
 import tomllib
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import yaml
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+# Opt-in tests: paid live calls, slow tests and the full chaos suite. Gates, `make itest`
+# and the CI integration job leave them out. chaos_lite is the short run they keep.
+OPT_IN = "not live and not slow and not (chaos and not chaos_lite)"
 
 
 def _load(name: str, path: Path) -> ModuleType:
@@ -45,6 +52,140 @@ def test_marker_expression() -> None:
         markers.marker_expression(10)
     with pytest.raises(ValueError):
         markers.marker_expression(-1)
+
+
+# --- the command line that `make gate` calls -------------------------------------------
+
+
+def _markers_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "markers.py"), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_cli_prints_the_phase_expression() -> None:
+    result = _markers_cli("2")
+    assert result.returncode == 0
+    assert result.stdout == "phase0 or phase1 or phase2\n"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["10"], ["-1"], ["abc"], [""], [], ["2", "3"]],
+    ids=["too-big", "negative", "not-a-number", "empty", "missing", "extra-argument"],
+)
+def test_cli_rejects_bad_input_with_exit_2_and_no_output(args: list[str]) -> None:
+    result = _markers_cli(*args)
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert "usage" in result.stderr
+
+
+# --- the Makefile recipes, run against a stand-in for uv -------------------------------
+
+UV_STUB = """\
+#!/bin/sh
+# Stands in for uv: python scripts run for real, pytest calls are only recorded.
+[ "$1" = run ] && shift
+cmd="$1"
+shift
+case "$cmd" in
+  python)
+    [ -n "$STUB_SILENT" ] && exit 0
+    exec "$STUB_PYTHON" "$@" ;;
+  pytest)
+    printf '%s\\n' "$@" > "$STUB_LOG" ;;
+  *)
+    echo "stub uv: unexpected command: $cmd" >&2
+    exit 99 ;;
+esac
+"""
+
+
+@dataclass
+class MakeRun:
+    returncode: int
+    stderr: str
+    pytest_args: list[str] | None
+
+    @property
+    def expression(self) -> str:
+        assert self.pytest_args and self.pytest_args[0] == "-m", self.pytest_args
+        return self.pytest_args[1]
+
+
+def _make(work: Path, *args: str, silent_python: bool = False) -> MakeRun:
+    """Run a Makefile target with `check` skipped and uv replaced by a recording stub."""
+    bin_dir = work / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    stub = bin_dir / "uv"
+    stub.write_text(UV_STUB, encoding="utf-8")
+    stub.chmod(0o755)
+    log = work / "pytest-args.txt"
+    log.unlink(missing_ok=True)
+    env = _clean_env(
+        PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        STUB_PYTHON=sys.executable,
+        STUB_LOG=str(log),
+    )
+    if silent_python:
+        env["STUB_SILENT"] = "1"
+    result = subprocess.run(
+        ["make", "--no-print-directory", "-C", str(ROOT), "-o", "check", *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    recorded = log.read_text(encoding="utf-8").splitlines() if log.exists() else None
+    return MakeRun(result.returncode, result.stderr, recorded)
+
+
+def test_gate_selects_phases_and_leaves_out_opt_in_tests(tmp_path: Path) -> None:
+    run = _make(tmp_path, "gate", "PHASE=2")
+    assert run.returncode == 0, run.stderr
+    assert run.pytest_args == ["-m", f"(phase0 or phase1 or phase2) and {OPT_IN}"]
+
+
+@pytest.mark.parametrize("phase", ["10", "abc", "", "-1"])
+def test_gate_stops_when_the_markers_script_fails(tmp_path: Path, phase: str) -> None:
+    run = _make(tmp_path, "gate", f"PHASE={phase}")
+    assert run.returncode != 0
+    assert run.pytest_args is None, f"pytest ran with {run.pytest_args}"
+    assert "usage" in run.stderr
+
+
+def test_gate_stops_when_the_markers_script_prints_nothing(tmp_path: Path) -> None:
+    run = _make(tmp_path, "gate", "PHASE=2", silent_python=True)
+    assert run.returncode != 0
+    assert run.pytest_args is None, f"pytest ran with {run.pytest_args}"
+
+
+def test_gate_passes_phase_to_the_script_as_one_quoted_word(tmp_path: Path) -> None:
+    marker = tmp_path / "injected"
+    run = _make(tmp_path, "gate", f"PHASE=2; touch {marker}")
+    assert run.returncode != 0
+    assert not marker.exists()
+
+
+def test_itest_and_e2e_leave_out_opt_in_tests(tmp_path: Path) -> None:
+    assert _make(tmp_path, "itest").pytest_args == ["-m", f"integration and {OPT_IN}"]
+    assert _make(tmp_path, "e2e").pytest_args == ["-m", f"e2e and {OPT_IN}"]
+
+
+def test_gate_still_runs_check_first() -> None:
+    dry = subprocess.run(
+        ["make", "--no-print-directory", "-C", str(ROOT), "-n", "gate", "PHASE=1"],
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dry.returncode == 0, dry.stderr
+    assert dry.stdout.index("mypy src") < dry.stdout.index("pytest -m")
 
 
 # --- scratch trees: real pytest runs with the repo's own config and conftest -----------
@@ -106,12 +247,48 @@ SELECTION_FILES = {
     "tests/chaos/test_full.py": ("chaos", "phase2"),
     "tests/chaos/test_lite.py": ("chaos", "chaos_lite", "phase2"),
 }
+GATE_2 = [
+    "tests/chaos/test_lite.py::test_it",
+    "tests/e2e/test_flow.py::test_it",
+    "tests/integration/test_forgot.py::test_it",
+    "tests/integration/test_stack.py::test_it",
+    "tests/unit/test_core.py::test_it",
+    "tests/unit/test_stack.py::test_it",
+]
+ITEST = [
+    "tests/integration/test_forgot.py::test_it",
+    "tests/integration/test_stack.py::test_it",
+]
 
 
 @pytest.fixture(scope="module")
 def selection_tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     files = {rel: _module(*marks) for rel, marks in SELECTION_FILES.items()}
     return _make_tree(tmp_path_factory.mktemp("selection") / "tree", files)
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [(("gate", "PHASE=2"), GATE_2), (("itest",), ITEST)],
+    ids=["gate-2", "itest"],
+)
+def test_makefile_expressions_select_the_right_tests(
+    tmp_path: Path, selection_tree: Path, target: tuple[str, ...], expected: list[str]
+) -> None:
+    expression = _make(tmp_path, *target).expression
+    result = _pytest(selection_tree, "--collect-only", "-q", "-m", expression)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _collected(result) == expected
+
+
+def test_ci_integration_job_uses_the_itest_selection(tmp_path: Path) -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["integration"]["steps"]
+    runs = [step["run"] for step in steps if "pytest" in step.get("run", "")]
+    assert len(runs) == 1, runs
+    found = re.search(r'-m\s+"([^"]+)"', runs[0])
+    assert found, runs[0]
+    assert found.group(1) == _make(tmp_path, "itest").expression
 
 
 # --- tests/conftest.py: layer marker from the directory, phase marker required ---------

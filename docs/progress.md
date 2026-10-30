@@ -17,15 +17,15 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 1: Agent core without durability (tag v0.1.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-101 | Shared contracts module | 3 | Todo | | |
+| LH-101 | Shared contracts module | 3 | Done | merge | 2026-10-30 |
 | LH-102 | Spike: Messages API tool use, caching and token counting | 2 | Todo | | |
-| LH-103 | Provider protocol and ScriptedProvider | 3 | Todo | | |
+| LH-103 | Provider protocol and ScriptedProvider | 3 | Done | merge | 2026-10-30 |
 | LH-104 | AnthropicProvider | 5 | Todo | | |
-| LH-105 | OpenAI-compatible provider (Should) | 3 | Todo | | |
-| LH-106 | Sandbox image | 2 | Todo | | |
-| LH-107 | Docker sandbox manager | 5 | Todo | | |
-| LH-108 | Tool registry and file tools | 5 | Todo | | |
-| LH-109 | Exec and git tools | 3 | Todo | | |
+| LH-105 | OpenAI-compatible provider (Should) | 3 | Done | merge | 2026-10-30 |
+| LH-106 | Sandbox image | 2 | Done | merge | 2026-10-30 |
+| LH-107 | Docker sandbox manager | 5 | Done | merge | 2026-10-30 |
+| LH-108 | Tool registry and file tools | 5 | Done | merge | 2026-10-30 |
+| LH-109 | Exec and git tools | 3 | Done | merge | 2026-10-30 |
 | LH-110 | Turn functions and in-process loop | 5 | Todo | | |
 | LH-111 | run-local CLI and first e2e | 3 | Todo | | |
 

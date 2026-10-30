@@ -245,7 +245,8 @@ def story_labels(story: Story) -> list[str]:
 
 @dataclass
 class _Remote:
-    milestones: set[str]
+    milestones: set[str]  # every milestone title, open or closed
+    closed_milestones: dict[str, int]  # title -> milestone number, for the closed ones
     labels: set[str]
     issues: dict[str, tuple[int, str]]  # LH id -> (issue number, body)
 
@@ -292,6 +293,9 @@ def _load_remote(runner: Runner, repo: str) -> _Remote:
             issue_map[prefix.group(1)] = (int(issue["number"]), issue.get("body") or "")
     return _Remote(
         milestones={m["title"] for m in milestones},
+        closed_milestones={
+            m["title"]: int(m["number"]) for m in milestones if m.get("state") == "closed"
+        },
         labels={label["name"] for label in labels},
         issues=issue_map,
     )
@@ -304,6 +308,33 @@ def _number_from_url(output: str) -> int:
 
 def _default_repo(runner: Runner) -> str:
     return runner.run(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"]).strip()
+
+
+def _ensure_milestones(
+    gh: Runner, target: str, remote: _Remote, milestones: dict[int, str], in_use: set[str]
+) -> None:
+    """Create the missing milestones and reopen the closed ones that are about to get an issue."""
+    for name in milestones.values():
+        if name not in remote.milestones:
+            gh.run(["api", "-X", "POST", f"repos/{target}/milestones", "-f", f"title={name}"])
+            remote.milestones.add(name)
+            print(f"created milestone {name}")
+        elif name in in_use and name in remote.closed_milestones:
+            # gh can only attach an issue to an open milestone.
+            number = remote.closed_milestones.pop(name)
+            gh.run(
+                ["api", "-X", "PATCH", f"repos/{target}/milestones/{number}", "-f", "state=open"]
+            )
+            print(f"reopened milestone {name}")
+
+
+def _ensure_labels(gh: Runner, target: str, remote: _Remote, stories: list[Story]) -> None:
+    for label in sorted({label for story in stories for label in story_labels(story)}):
+        if label in remote.labels:
+            continue
+        gh.run(["label", "create", label, "--repo", target, "--force"])
+        remote.labels.add(label)
+        print(f"created label {label}")
 
 
 def import_backlog(
@@ -333,20 +364,10 @@ def import_backlog(
     target = repo if repo is not None else _default_repo(gh)
     remote = _load_remote(gh, target)
 
-    for name in milestones.values():
-        if name in remote.milestones:
-            continue
-        gh.run(["api", "-X", "POST", f"repos/{target}/milestones", "-f", f"title={name}"])
-        remote.milestones.add(name)
-        print(f"created milestone {name}")
-
-    wanted_labels = sorted({label for story in stories for label in story_labels(story)})
-    for label in wanted_labels:
-        if label in remote.labels:
-            continue
-        gh.run(["label", "create", label, "--repo", target, "--force"])
-        remote.labels.add(label)
-        print(f"created label {label}")
+    # Milestones come first, so one that cannot be reopened stops the run before any issue.
+    in_use = {milestones[story.phase] for story in stories if story.id not in remote.issues}
+    _ensure_milestones(gh, target, remote, milestones, in_use)
+    _ensure_labels(gh, target, remote, stories)
 
     numbers: dict[str, int] = {}
     for story in stories:

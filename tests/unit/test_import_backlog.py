@@ -243,6 +243,8 @@ class FakeGh:
             return self._milestone_list(parse_qs(endpoint.query))
         if (method, resource) == ("POST", "milestones"):
             return self._milestone_create(fields)
+        if method == "PATCH" and resource.startswith("milestones/"):
+            return self._milestone_patch(int(resource.removeprefix("milestones/")), fields)
         raise AssertionError(f"unexpected gh api call: {rest}")
 
     def _milestone_list(self, query: dict[str, list[str]]) -> str:
@@ -256,6 +258,14 @@ class FakeGh:
             raise backlog.GhError("gh: Validation Failed (HTTP 422)")
         milestone = {"number": len(self.milestones) + 1, "title": fields["title"], "state": "open"}
         self.milestones.append(milestone)
+        return json.dumps(milestone)
+
+    def _milestone_patch(self, number: int, fields: dict[str, str]) -> str:
+        milestone = next((m for m in self.milestones if m["number"] == number), None)
+        if milestone is None:
+            raise backlog.GhError("gh: Not Found (HTTP 404)")
+        assert set(fields) == {"state"} and fields["state"] in {"open", "closed"}
+        milestone["state"] = fields["state"]
         return json.dumps(milestone)
 
     def _repo_view(self, rest: list[str]) -> str:
@@ -771,17 +781,82 @@ def test_closed_issues_still_count_as_imported(tmp_path: Path) -> None:
     assert len(gh.issues) == 4
 
 
-def test_a_closed_milestone_is_not_created_again(tmp_path: Path) -> None:
+@pytest.mark.parametrize("update", [False, True])
+def test_a_closed_milestone_is_left_closed_when_nothing_needs_it(
+    tmp_path: Path, update: bool
+) -> None:
     plan = _write(tmp_path, MINI_PLAN)
     gh = FakeGh()
     backlog.import_backlog(plan, "o/r", gh)
     gh.milestones[0]["state"] = "closed"  # the owner closes Phase 0 after its gate
     gh.calls.clear()
 
-    backlog.import_backlog(plan, "o/r", gh)
+    backlog.import_backlog(plan, "o/r", gh, update=update)
 
     assert gh.writes() == []
     assert [m["state"] for m in gh.milestones] == ["closed", "open"]
+
+
+def test_a_closed_milestone_is_reopened_for_a_new_story(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    plan = _write(tmp_path, MINI_PLAN)
+    gh = FakeGh()
+    backlog.import_backlog(plan, "o/r", gh)
+    gh.milestones[0]["state"] = "closed"
+    gh.calls.clear()
+    capsys.readouterr()
+    # A failed gate adds a fix story to Phase 0, whose milestone is already closed.
+    plan.write_text(_add_fix_story(MINI_PLAN, "LH-091"), encoding="utf-8")
+
+    numbers = backlog.import_backlog(plan, "o/r", gh)
+
+    writes = gh.writes()
+    assert writes[0] == ["api", "-X", "PATCH", "repos/o/r/milestones/1", "-f", "state=open"]
+    assert [write[:2] for write in writes[1:]] == [["label", "create"], ["issue", "create"]]
+    assert [write[0] for write in writes].count("api") == 1  # Phase 1 was not touched
+    assert numbers["LH-091"] == 5
+    assert gh.issue("LH-091")["milestone"] == "Phase 0: Foundation"
+    assert [m["state"] for m in gh.milestones] == ["open", "open"]
+    assert "reopened milestone Phase 0: Foundation" in capsys.readouterr().out.splitlines()
+
+
+def test_a_closed_milestone_stays_closed_when_the_new_story_is_elsewhere(tmp_path: Path) -> None:
+    plan = _write(tmp_path, MINI_PLAN)
+    gh = FakeGh()
+    backlog.import_backlog(plan, "o/r", gh)
+    gh.milestones[0]["state"] = "closed"
+    gh.calls.clear()
+    extra = FIX_STORY.format(id="LH-191", slug="lh-191").replace("E0", "E1")
+    plan.write_text(MINI_PLAN + "\n" + extra, encoding="utf-8")
+
+    backlog.import_backlog(plan, "o/r", gh)
+
+    # Only type:fix is a new label, and Phase 0 is not touched at all.
+    assert [write[:2] for write in gh.writes()] == [["label", "create"], ["issue", "create"]]
+    assert gh.issue("LH-191")["milestone"] == "Phase 1: Agent core"
+    assert [m["state"] for m in gh.milestones] == ["closed", "open"]
+
+
+def test_a_milestone_that_cannot_be_reopened_stops_the_run_before_any_issue(
+    tmp_path: Path,
+) -> None:
+    class NoReopen(FakeGh):
+        def _milestone_patch(self, number: int, fields: dict[str, str]) -> str:
+            raise backlog.GhError("gh: Must have admin rights to Repository. (HTTP 403)")
+
+    plan = _write(tmp_path, MINI_PLAN)
+    gh = NoReopen()
+    backlog.import_backlog(plan, "o/r", gh)
+    gh.milestones[0]["state"] = "closed"
+    gh.calls.clear()
+    plan.write_text(_add_fix_story(MINI_PLAN, "LH-091"), encoding="utf-8")
+
+    with pytest.raises(backlog.GhError, match="403"):
+        backlog.import_backlog(plan, "o/r", gh)
+
+    assert gh.writes() == [["api", "-X", "PATCH", "repos/o/r/milestones/1", "-f", "state=open"]]
+    assert len(gh.issues) == 4
 
 
 def test_update_leaves_unchanged_issues_alone(tmp_path: Path) -> None:

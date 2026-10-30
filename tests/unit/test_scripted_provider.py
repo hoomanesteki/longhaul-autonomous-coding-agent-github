@@ -385,3 +385,190 @@ async def test_calls_in_one_response_get_distinct_ids(tmp_path: Path) -> None:
     assert len(ids) == 2
     assert len(set(ids)) == 2
     assert _tool_use_ids([_assistant(resp)]) == ids
+
+
+# ---------- matching on user text ----------
+COMPACTOR = "Role: compactor\nWrite the notes."
+COMPACTOR_SCRIPT = """
+steps:
+  - match: {role: compactor, user_text_contains: "fixed mod3"}
+    respond: {tool_calls: [{name: record_notes, input: {files_touched: [mod1, mod2, mod3]}}]}
+  - match: {role: compactor, user_text_contains: "fixed mod2"}
+    respond: {tool_calls: [{name: record_notes, input: {files_touched: [mod1, mod2]}}]}
+  - match: {role: compactor}
+    respond: {tool_calls: [{name: record_notes, input: {files_touched: [mod1]}}]}
+"""
+
+
+def _user(text: str) -> Message:
+    return Message(role="user", content=[TextBlock(text=text)])
+
+
+async def test_compactor_rounds_are_told_apart_by_user_text(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, COMPACTOR_SCRIPT))
+    rounds = [
+        "Previous notes: none\nTranscript: fixed mod1",
+        "Previous notes: mod1\nTranscript: fixed mod1, fixed mod2",
+        "Previous notes: mod1, mod2\nTranscript: fixed mod2, fixed mod3",
+    ]
+    files = [
+        (await _call(p, [_user(text)], COMPACTOR)).tool_calls[0].input["files_touched"]
+        for text in rounds
+    ]
+    assert files == [["mod1"], ["mod1", "mod2"], ["mod1", "mod2", "mod3"]]
+
+
+async def test_user_text_comes_from_the_last_user_message(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+steps:
+  - match: {user_text_contains: "Hint from"}
+    respond: {text: "thanks for the hint"}
+  - match: {role: coder}
+    respond: {tool_calls: [{name: x, input: {}}]}
+""",
+    )
+    p = ScriptedProvider(path)
+    hint = _user("Hint from @sam: try the other file")
+    thanks = [TextBlock(text="thanks for the hint")]
+    # The hint is a user message of its own, so there is no tool result in the last message.
+    assert (await _call(p, [*_turn(1), hint])).content == thanks
+    assert (await _call(p, _turn(1))).tool_calls[0].name == "x"
+    # Once newer turns follow the hint, it is no longer the last user message.
+    later = [*_turn(1), hint, *_turn(2)[3:]]
+    assert (await _call(p, later)).tool_calls[0].name == "x"
+
+
+async def test_user_text_and_tool_result_can_be_in_one_message(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+steps:
+  - match: {last_tool_result_contains: "FAILED", user_text_contains: "Hint from"}
+    respond: {text: "hint and failure"}
+  - match: {role: coder}
+    respond: {tool_calls: [{name: x, input: {}}]}
+""",
+    )
+    p = ScriptedProvider(path)
+    merged = Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_use_id="toolu_000_0", content="1 FAILED"),
+            TextBlock(text="Hint from @sam: try the other file"),
+        ],
+    )
+    msgs = [*_turn(1)[:-1], merged]
+    assert (await _call(p, msgs)).content == [TextBlock(text="hint and failure")]
+    no_hint = [*_turn(1)[:-1], Message(role="user", content=merged.content[:1])]
+    assert (await _call(p, no_hint)).tool_calls[0].name == "x"
+
+
+async def test_request_contains_searches_text_and_tool_results(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+steps:
+  - match: {request_contains: "needle"}
+    respond: {text: "found"}
+  - match: {role: coder}
+    respond: {text: "not found"}
+""",
+    )
+    p = ScriptedProvider(path)
+    found, missing = [TextBlock(text="found")], [TextBlock(text="not found")]
+    in_task = [_user("the needle is in the task"), *_turn(1)[1:]]
+    assert (await _call(p, in_task)).content == found
+    assert (await _call(p, _turn(2, "a needle in the output"))).content == found
+    # Tool inputs and the system prompt are not searched.
+    use = Message(role="assistant", content=[ToolUseBlock(id="t", name="x", input={"q": "needle"})])
+    assert (await _call(p, [*_turn(0), use, _user("ok")])).content == missing
+    assert (await _call(p, _turn(1), system="Role: coder\nneedle")).content == missing
+
+
+@pytest.mark.parametrize(
+    "key", ["last_tool_result_contains", "user_text_contains", "request_contains"]
+)
+def test_text_matchers_reject_an_empty_string(tmp_path: Path, key: str) -> None:
+    body = f'steps:\n  - match: {{{key}: ""}}\n    respond: {{text: hi}}\n'
+    with pytest.raises(ValueError, match=rf"{key}[\s\S]*at least 1 character"):
+        ScriptedProvider(_write(tmp_path, body))
+
+
+# ---------- bounded raise steps ----------
+async def test_raise_with_times_stops_after_that_many_identical_requests(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        """
+steps:
+  - match: {role: coder}
+    respond: {raise: overloaded, retry_after_s: 1.5, times: 2}
+  - match: {role: coder}
+    respond: {text: "recovered"}
+""",
+    )
+    p = ScriptedProvider(path)
+    request = _turn(2)
+    for _ in range(2):
+        with pytest.raises(ProviderError) as exc:
+            await _call(p, request)
+        assert exc.value.kind is ProviderErrorKind.OVERLOADED
+        assert exc.value.retry_after_s == 1.5
+    assert (await _call(p, request)).content == [TextBlock(text="recovered")]
+    assert (await _call(p, request)).content == [TextBlock(text="recovered")]
+    # A different request has its own budget.
+    with pytest.raises(ProviderError):
+        await _call(p, _turn(3))
+
+
+async def test_raise_without_times_never_stops(tmp_path: Path) -> None:
+    path = _write(tmp_path, "steps:\n  - respond: {raise: overloaded}\n")
+    p = ScriptedProvider(path)
+    for _ in range(8):
+        with pytest.raises(ProviderError) as exc:
+            await _call(p, _turn(0))
+        assert exc.value.kind is ProviderErrorKind.OVERLOADED
+
+
+async def test_a_spent_raise_that_leaves_no_step_says_so(tmp_path: Path) -> None:
+    path = _write(tmp_path, "steps:\n  - respond: {raise: overloaded, times: 1}\n")
+    p = ScriptedProvider(path)
+    with pytest.raises(ProviderError) as first:
+        await _call(p, _turn(0))
+    assert first.value.kind is ProviderErrorKind.OVERLOADED
+    with pytest.raises(ProviderError) as second:
+        await _call(p, _turn(0))
+    assert second.value.kind is ProviderErrorKind.INVALID_REQUEST
+    assert "already raised" in second.value.message
+    assert "[0]" in second.value.message
+
+
+OVERFLOW_ONCE = """
+steps:
+  - match:
+      role: coder
+      request_contains: "longhaul:turn_offset="
+      last_tool_result_contains: "5000 lines of noise"
+    respond: {tool_calls: [{name: run_command, input: {command: after compaction}}]}
+  - match: {role: coder, last_tool_result_contains: "5000 lines of noise"}
+    respond: {raise: context_too_long, times: 1}
+  - match: {role: coder}
+    respond: {tool_calls: [{name: run_command, input: {command: normal}}]}
+"""
+
+
+async def test_overflow_raises_once_then_the_compacted_retry_succeeds(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, OVERFLOW_ONCE))
+    msgs, chosen = await _play(p, 4)
+    assert chosen == ["normal"] * 4
+    resp = await _call(p, msgs)
+    big = [*msgs, _assistant(resp), _results(resp, "...5000 lines of noise...")]
+    with pytest.raises(ProviderError) as exc:
+        await _call(p, big)
+    assert exc.value.kind is ProviderErrorKind.CONTEXT_TOO_LONG
+    # LH-404 compacts to the last two turns and sends the turn again.
+    retry = await _call(p, _compact(big, keep_recent_turns=2))
+    assert retry.tool_calls[0].input == {"command": "after compaction"}
+    # The raise was one-shot: sending the first request again no longer fails.
+    assert (await _call(p, big)).tool_calls[0].input == {"command": "normal"}

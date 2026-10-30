@@ -287,10 +287,25 @@ def test_get_provider_scripted_and_unimplemented() -> None:
     scripted = get_provider(EnvSettings(provider="scripted"), script_path=SCRIPT)
     assert scripted.name == "scripted"
     with pytest.raises(ValueError, match="script_path"):
-        get_provider(EnvSettings(provider="scripted"))
+        get_provider(EnvSettings(provider="scripted", _env_file=None))
     for kind, story in (("anthropic", "LH-104"), ("replay", "LH-209")):
         with pytest.raises(NotImplementedError, match=story):
             get_provider(EnvSettings(provider=kind))  # type: ignore[arg-type]
+
+
+def test_get_provider_reads_the_script_from_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LONGHAUL_SCRIPT", raising=False)
+    other = _write(tmp_path, "steps:\n  - respond: {text: other}\n")
+    from_settings = get_provider(EnvSettings(provider="scripted", script=SCRIPT))
+    assert isinstance(from_settings, ScriptedProvider)
+    assert from_settings.script_path == SCRIPT
+    explicit = get_provider(EnvSettings(provider="scripted", script=SCRIPT), script_path=other)
+    assert isinstance(explicit, ScriptedProvider)
+    assert explicit.script_path == other
+    with pytest.raises(ValueError, match="LONGHAUL_SCRIPT"):
+        get_provider(EnvSettings(provider="scripted", _env_file=None))
 
 
 async def test_match_on_turn_index(tmp_path: Path) -> None:

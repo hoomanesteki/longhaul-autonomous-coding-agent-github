@@ -111,8 +111,10 @@ def get_provider(settings: EnvSettings, *, script_path: Path | None = None) -> L
             raise ValueError("provider 'openai' needs OPENAI_API_KEY in the environment")
         from longhaul.providers.openai_compat import OpenAICompatProvider
 
-        return OpenAICompatProvider(
-            settings.openai_api_key.get_secret_value(), base_url=settings.openai_base_url
-        )
+        api_key = settings.openai_api_key.get_secret_value()
+        # An empty OPENAI_BASE_URL is not a URL. Leaving it out lets the SDK use its default.
+        if settings.openai_base_url:
+            return OpenAICompatProvider(api_key, base_url=settings.openai_base_url)
+        return OpenAICompatProvider(api_key)
     story = _PENDING[settings.provider]
     raise NotImplementedError(f"provider {settings.provider!r} is not implemented yet ({story})")

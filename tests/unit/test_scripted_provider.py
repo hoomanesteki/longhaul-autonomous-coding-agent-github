@@ -1,10 +1,10 @@
 import json
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, SecretStr
 
 from longhaul.contracts import (
     LLMResponse,
@@ -1027,3 +1027,26 @@ async def test_block_types_the_provider_does_not_know_are_ignored(tmp_path: Path
     assert (await _call(p, request("x" * 400), tools=tools)).tool_calls == first.tool_calls
     other = await _call(p, request("y" * 400), tools=tools)
     assert other.tool_calls[0].id != first.tool_calls[0].id
+
+
+# ---------- get_provider ----------
+def test_get_provider_passes_base_url_only_when_it_is_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    class Recorder:
+        name = "openai"
+
+        def __init__(self, api_key: str, **kwargs: Any) -> None:
+            seen.append({"api_key": api_key, **kwargs})
+
+    monkeypatch.setattr("longhaul.providers.openai_compat.OpenAICompatProvider", Recorder)
+    key = SecretStr("sk-test")
+    for url in (None, "", "http://localhost:9/v1"):
+        get_provider(EnvSettings(provider="openai", OPENAI_API_KEY=key, OPENAI_BASE_URL=url))
+    assert seen == [
+        {"api_key": "sk-test"},
+        {"api_key": "sk-test"},
+        {"api_key": "sk-test", "base_url": "http://localhost:9/v1"},
+    ]

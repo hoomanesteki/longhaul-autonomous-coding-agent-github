@@ -11,6 +11,7 @@ dependencies = [
     "asyncpg>=0.32.0",
     "docker>=7.2.0",
     "jsonschema>=4.26.0",
+    "openai>=3.41.0",
     "pgvector>=0.5.1",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.1",

@@ -176,7 +176,7 @@ def test_get_provider_scripted_and_unimplemented() -> None:
     assert scripted.name == "scripted"
     with pytest.raises(ValueError, match="script_path"):
         get_provider(EnvSettings(provider="scripted"))
-    for kind, story in (("anthropic", "LH-104"), ("openai", "LH-105"), ("replay", "LH-209")):
+    for kind, story in (("anthropic", "LH-104"), ("replay", "LH-209")):
         with pytest.raises(NotImplementedError, match=story):
             get_provider(EnvSettings(provider=kind))  # type: ignore[arg-type]
 

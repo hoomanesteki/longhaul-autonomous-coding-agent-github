@@ -92,6 +92,10 @@ class OpenAICompatProvider:
                 max_retries=0,
                 http_client=http_client,
             )
+        elif client.max_retries != 0:
+            # The durable layer owns retries. SDK retries would repeat paid calls
+            # that the activity retry policy and the cost ledger never see.
+            client = client.with_options(max_retries=0)
         self._client = client
         self._max_tokens_param = max_tokens_param or _default_max_tokens_param(client)
 

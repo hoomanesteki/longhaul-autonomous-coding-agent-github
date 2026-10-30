@@ -373,6 +373,10 @@ def _timeout(request: httpx2.Request) -> httpx2.Response:
     raise httpx2.ReadTimeout("read timed out")
 
 
+def _connect_error(request: httpx2.Request) -> httpx2.Response:
+    raise httpx2.ConnectError("connection refused")
+
+
 @pytest.mark.parametrize(
     ("handler", "kind", "retry_after_s"),
     [
@@ -419,20 +423,20 @@ def _timeout(request: httpx2.Request) -> httpx2.Response:
             id="400-other",
         ),
         pytest.param(_timeout, ProviderErrorKind.TIMEOUT, None, id="timeout"),
+        # The commonest transient failure. It must stay retryable.
+        pytest.param(_connect_error, ProviderErrorKind.SERVER, None, id="connect-error"),
     ],
 )
 async def test_error_mapping(
     handler: Handler, kind: ProviderErrorKind, retry_after_s: float | None
 ) -> None:
-    provider = _provider(handler)
+    seen = Recorder(handler)
     with pytest.raises(ProviderError) as info:
-        await provider.complete(
-            model="gpt-test",
-            system="sys",
-            messages=[Message(role="user", content=[TextBlock(text="hi")])],
-            tools=[],
-            max_tokens=10,
-        )
+        await _ask(_provider(seen))
+    # One transport call per attempt: the SDK must not retry. Temporal owns
+    # retries (LH-104), and SDK retries would repeat paid calls the cost ledger
+    # never sees.
+    assert len(seen.requests) == 1
     assert info.value.kind == kind
     assert info.value.retry_after_s == retry_after_s
     assert info.value.retryable == (
@@ -444,6 +448,25 @@ async def test_error_mapping(
             ProviderErrorKind.TIMEOUT,
         }
     )
+
+
+async def test_prebuilt_client_gets_no_sdk_retries() -> None:
+    # An SDK client built elsewhere keeps the default of two retries unless the
+    # provider turns them off.
+    seen = Recorder(_status(500, {"error": {"message": "internal"}}))
+    client = AsyncOpenAI(
+        api_key="sk-test",
+        base_url=BASE_URL,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(seen)),
+        max_retries=2,
+    )
+    provider = OpenAICompatProvider(api_key="sk-test", client=client)
+
+    with pytest.raises(ProviderError) as info:
+        await _ask(provider)
+
+    assert info.value.kind == ProviderErrorKind.SERVER
+    assert len(seen.requests) == 1
 
 
 async def test_malformed_arguments() -> None:

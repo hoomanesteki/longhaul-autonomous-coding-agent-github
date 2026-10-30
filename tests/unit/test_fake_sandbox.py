@@ -2,6 +2,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -51,7 +52,8 @@ async def test_exec_finds_tools_in_the_workspace_venv_first(sbx: FakeSandbox) ->
     await sbx.exec("chmod +x .venv/bin/hello-tool .venv/bin/ls", timeout_s=5)
     assert (await sbx.exec("hello-tool", timeout_s=5)).stdout.strip() == "from-venv"
     assert (await sbx.exec("ls", timeout_s=5)).stdout.strip() == "shadowed"
-    assert (await sbx.exec("echo $PATH", timeout_s=5)).stdout.startswith(f"{sbx.root}/.venv/bin:")
+    # The command sees the workspace as /workspace, as it does in Docker.
+    assert (await sbx.exec("echo $PATH", timeout_s=5)).stdout.startswith("/workspace/.venv/bin:")
 
 
 async def test_exec_still_works_without_a_venv(sbx: FakeSandbox) -> None:
@@ -69,6 +71,87 @@ async def test_file_roundtrip_nested_and_absolute(sbx: FakeSandbox) -> None:
 async def test_path_escape_rejected(sbx: FakeSandbox) -> None:
     with pytest.raises(ValueError):
         await sbx.write_file("../evil", b"x")
+
+
+# ---------- paths: the same rules as the Docker sandbox ----------
+
+
+async def test_paths_outside_the_workspace_are_rejected_for_reads_and_writes(
+    sbx: FakeSandbox,
+) -> None:
+    await sbx.write_file("good.txt", b"ok")
+    # Docker raises PermissionError for these and the fake used to raise ValueError
+    # or quietly treat them as paths below the root. Both types must work.
+    for path in ("../../etc/passwd", "/etc/passwd", "/workspace/../etc/passwd", "//etc/hosts"):
+        with pytest.raises(PermissionError):
+            await sbx.read_file(path)
+        with pytest.raises(ValueError):
+            await sbx.write_file(path, b"x")
+    assert await sbx.read_file("good.txt") == b"ok"
+    assert not (sbx.root / "etc").exists()
+
+
+async def test_a_symlink_that_leaves_the_workspace_is_rejected_for_reads(sbx: FakeSandbox) -> None:
+    outside = tempfile.mkdtemp(prefix="lh-outside-")
+    try:
+        (Path(outside) / "secret.txt").write_text("secret")
+        await sbx.exec(
+            f"ln -s {outside} outlink && ln -s {outside}/secret.txt filelink", timeout_s=5
+        )
+        for path in ("outlink/secret.txt", "filelink"):
+            with pytest.raises(PermissionError):
+                await sbx.read_file(path)
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
+
+
+async def test_read_file_errors_match_docker(sbx: FakeSandbox) -> None:
+    await sbx.write_file("src/pkg/a.py", b"x")
+    await sbx.write_file("README.md", b"keep")
+    with pytest.raises(FileNotFoundError):
+        await sbx.read_file("missing.txt")
+    with pytest.raises(IsADirectoryError):
+        await sbx.read_file("src")
+    with pytest.raises(IsADirectoryError):
+        await sbx.read_file(".")
+    with pytest.raises(NotADirectoryError):
+        await sbx.read_file("README.md/x")
+
+
+# ---------- exec and the file API agree on where /workspace is ----------
+
+
+async def test_exec_sees_what_write_file_wrote_at_the_workdir(sbx: FakeSandbox) -> None:
+    assert sbx.workdir == "/workspace"
+    await sbx.write_file(f"{sbx.workdir}/src/x.txt", b"hello")
+    r = await sbx.exec(f"cat {sbx.workdir}/src/x.txt", timeout_s=5)
+    assert (r.exit_code, r.stdout) == (0, "hello")
+
+
+async def test_pwd_and_realpath_answer_with_the_workdir(sbx: FakeSandbox) -> None:
+    await sbx.write_file("src/x.txt", b"hello")
+    r = await sbx.exec("pwd; realpath src/x.txt; cd src && pwd", timeout_s=5)
+    lines = r.stdout.split()
+    assert lines == ["/workspace", "/workspace/src/x.txt", "/workspace/src"]
+    assert all(line.startswith(sbx.workdir) for line in lines)
+
+
+async def test_commands_can_use_the_workdir_by_name(sbx: FakeSandbox) -> None:
+    git = "git -c user.name=t -c user.email=t@example.com"
+    script = (
+        "cd /workspace && git init -q && echo hi > f.txt && "
+        f"git -C /workspace add -A && {git} -C /workspace commit -qm first && "
+        "git -C /workspace log --oneline | wc -l"
+    )
+    r = await sbx.exec(script, timeout_s=60)
+    assert r.exit_code == 0, r.stderr
+    assert r.stdout.strip() == "1"
+    assert (await sbx.read_file("f.txt")) == b"hi\n"
+
+
+async def test_exec_env_values_may_name_the_workdir(sbx: FakeSandbox) -> None:
+    r = await sbx.exec("ls -d $WHERE && echo $WHERE", timeout_s=5, env={"WHERE": "/workspace"})
+    assert (r.exit_code, r.stdout.split()) == (0, ["/workspace", "/workspace"])
 
 
 # ---------- write_file does what the Docker sandbox does ----------

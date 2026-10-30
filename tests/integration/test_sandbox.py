@@ -137,6 +137,85 @@ async def test_file_roundtrip_binary(manager: DockerSandboxManager, task_id: str
     assert r.exit_code == 0
 
 
+async def test_read_file_is_confined_to_the_writable_roots(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "ln -s /etc/passwd pwlink && ln -s /etc etclink && echo ok > good.txt")
+    # ValueError is what the fake raises for the same paths, so both are checked.
+    escapes = [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "//etc/passwd",
+        "/workspace/../etc/passwd",
+        "/proc/self/environ",
+        "pwlink",  # a symlink to a file outside
+        "etclink/passwd",  # a symlink to a directory outside
+    ]
+    for path in escapes:
+        with pytest.raises(PermissionError):
+            await sbx.read_file(path)
+        with pytest.raises(ValueError):
+            await sbx.read_file(path)
+    assert await sbx.read_file("good.txt") == b"ok\n"
+
+
+async def test_read_file_follows_links_that_stay_inside_the_workspace(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "mkdir src && echo mod > src/mod.py && ln -s src/mod.py modlink")
+    await _sh(sbx, "ln -s src srclink && ln -s ../src/mod.py src/up")
+    # As open() would: a file link, a directory link and a relative link.
+    assert await sbx.read_file("modlink") == b"mod\n"
+    assert await sbx.read_file("srclink/mod.py") == b"mod\n"
+    assert await sbx.read_file("src/up") == b"mod\n"
+    assert await sbx.read_file("/workspace/srclink/up") == b"mod\n"
+
+
+async def test_tmpfs_mounts_are_refused_instead_of_looking_empty(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # Docker's archive API cannot see /tmp or the home directory. Without a clear error
+    # a file a command just wrote there would read as "not found".
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "printf tmp > /tmp/t.txt && printf home > $HOME/h.txt && ln -s /tmp tmplink")
+    for path in ("/tmp/t.txt", "/home/agent/h.txt", "tmplink/t.txt"):
+        with pytest.raises(PermissionError, match="tmpfs"):
+            await sbx.read_file(path)
+        with pytest.raises(PermissionError, match="tmpfs"):
+            await sbx.write_file(path, b"x")
+
+
+async def test_read_file_errors_match_the_fake(manager: DockerSandboxManager, task_id: str) -> None:
+    sbx = await _make(manager, task_id)
+    await _sh(sbx, "mkdir -p src/pkg && echo keep > README.md && ln -s nowhere dangling")
+    with pytest.raises(FileNotFoundError):
+        await sbx.read_file("missing.txt")
+    with pytest.raises(FileNotFoundError):
+        await sbx.read_file("dangling")
+    with pytest.raises(IsADirectoryError):
+        await sbx.read_file("src")
+    with pytest.raises(IsADirectoryError):
+        await sbx.read_file(".")
+    with pytest.raises(NotADirectoryError):
+        await sbx.read_file("README.md/x")
+
+
+async def test_a_missing_container_still_raises_not_found(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # Recovery (F3) tells a lost container from a lost path by this exception.
+    sbx = await _make(manager, task_id)
+    await sbx.destroy()
+    with pytest.raises(NotFound):
+        await sbx.read_file("anything.txt")
+    with pytest.raises(NotFound):
+        await sbx.write_file("anything.txt", b"x")
+    with pytest.raises(NotFound):
+        await sbx.exec("true", timeout_s=5)
+
+
 async def test_write_file_stamps_a_current_mtime(
     manager: DockerSandboxManager, task_id: str
 ) -> None:

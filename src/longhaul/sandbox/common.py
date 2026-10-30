@@ -9,9 +9,9 @@ from __future__ import annotations
 import posixpath
 
 WORKDIR = "/workspace"
-# Files can be read from any of these. Only WORKDIR can be written through the
-# archive API: Docker refuses put_archive on the tmpfs mounts because the root
-# filesystem is read-only.
+# The places a command can write to. read_file and write_file stay inside them.
+# Docker's archive API only sees WORKDIR, a volume: it cannot reach the tmpfs
+# mounts, so the Docker sandbox refuses those two even though they are listed.
 WRITABLE_MOUNTS = (WORKDIR, "/tmp", "/home/agent")  # noqa: S108
 
 

@@ -211,21 +211,35 @@ class DockerSandbox:
             duration_ms=int(elapsed * 1000),
         )
 
+    def _read(self, full: str) -> bytes:
+        target = self._resolve(full)
+        if target.found is None:
+            raise FileNotFoundError(errno.ENOENT, "no such file or directory", target.path)
+        if target.found.is_dir:
+            raise IsADirectoryError(errno.EISDIR, "is a directory", target.path)
+        if not target.found.is_regular:
+            raise OSError(errno.EINVAL, "not a regular file", target.path)
+        api = self._client.api
+        try:
+            stream, _ = api.get_archive(self.id, target.path)
+            raw = b"".join(stream)
+        except NotFound:
+            api.inspect_container(self.id)  # raises NotFound when the container is gone
+            raise FileNotFoundError(
+                errno.ENOENT, "no such file or directory", target.path
+            ) from None
+        with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
+            member = tar.next()
+            if member is None or not member.isfile():
+                raise IsADirectoryError(errno.EISDIR, "is a directory", target.path)
+            f = tar.extractfile(member)
+            assert f is not None
+            return f.read()
+
     async def read_file(self, path: str) -> bytes:
         full = resolve_path(path)
-
-        def run() -> bytes:
-            stream, _ = self._container().get_archive(full)
-            buf = io.BytesIO(b"".join(stream))
-            with tarfile.open(fileobj=buf) as tar:
-                member = tar.next()
-                if member is None or not member.isfile():
-                    raise IsADirectoryError(full)
-                f = tar.extractfile(member)
-                assert f is not None
-                return f.read()
-
-        return await asyncio.to_thread(run)
+        mount_for(full)  # the same roots as write_file, so '..' cannot climb out
+        return await asyncio.to_thread(self._read, full)
 
     # The archive API cannot do what open() does, so the rules are applied here:
     # put_archive replaces whatever sits at a path with the type in the tar, which
@@ -253,6 +267,12 @@ class DockerSandbox:
         Returns what was found, or the path to carry on with when a symlink was met.
         """
         mount = mount_for(path)
+        if mount != WORKDIR:
+            # Docker's archive API does not see tmpfs mounts: a file made there by a
+            # command reads as "not found" and put_archive is refused. Say so.
+            raise PermissionError(
+                errno.EACCES, f"{mount} is a tmpfs mount, which the file API cannot reach", path
+            )
         names = [name for name in path[len(mount) :].split("/") if name]
         if not names:
             root = self._stat(mount)

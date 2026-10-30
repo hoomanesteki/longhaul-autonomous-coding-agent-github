@@ -1,5 +1,8 @@
 # Fixes tests/fixtures/repos/calc: add() subtracts instead of adding.
-# Steps have no match, so they run by turn index (0..4).
+# The first four steps have no match, so they run by turn index (0..3). The last
+# step also waits for a passing test run ("3 passed" is the whole calc suite), so
+# a broken edit, or a run that could not import calc, ends with a no-match error
+# instead of a finish call that claims the tests pass.
 steps:
   - respond:
       text: "Looking at the repo layout."
@@ -19,7 +22,10 @@ steps:
   - respond:
       tool_calls:
         - {name: run_tests, input: {}}
-  - respond:
+  - match:
+      turn_index: 4
+      last_tool_result_contains: "3 passed"
+    respond:
       tool_calls:
         - name: finish
           input: {summary: "Changed add() to return a + b. All tests pass."}

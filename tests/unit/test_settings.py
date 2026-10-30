@@ -6,6 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from longhaul.contracts import SandboxLimits
 from longhaul.settings import AppConfig, EnvSettings, get_settings, load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase0]
@@ -107,3 +108,9 @@ def test_env_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.task_queue == "longhaul"
     assert settings.provider == "scripted"
     assert settings.config == Path("config/longhaul.example.yaml")
+
+
+def test_sandbox_limits_reuse_contract_model() -> None:
+    cfg = load_config(EXAMPLE)
+    assert isinstance(cfg.sandbox.limits, SandboxLimits)
+    assert cfg.sandbox.limits.pids == 512

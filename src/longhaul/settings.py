@@ -13,7 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from longhaul.contracts import Budgets, RepoSettings
+from longhaul.contracts import Budgets, RepoSettings, SandboxLimits
 
 # Matched against whole words of a key name, so "max_tokens_per_turn" passes
 # while "github_token" and "api_key" fail. A plain substring match would reject
@@ -73,15 +73,13 @@ class ModelIds(StrictModel):
     compactor: str
 
 
-class SandboxLimits(StrictModel):
-    cpus: float
-    memory_mb: int
-    pids: int
+class SandboxLimitsEntry(SandboxLimits):
+    model_config = ConfigDict(extra="forbid")
 
 
 class Sandbox(StrictModel):
     image: str
-    limits: SandboxLimits
+    limits: SandboxLimitsEntry
     command_timeout_s: int
 
 

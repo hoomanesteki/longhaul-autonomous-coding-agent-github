@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from docker.errors import NotFound
 
 from longhaul.contracts import Sandbox, SandboxLimits, ToolCall, ToolContext, ToolResult
 from longhaul.sandbox.docker_manager import DockerSandboxManager
@@ -187,3 +188,13 @@ async def test_list_dir_ignores_noise(reg: ToolRegistry, sbx: Sandbox) -> None:
     for noise in ("node_modules", ".git", "__pycache__"):
         assert noise not in r.output
     assert "calc/" in r.output and "pyproject.toml" in r.output
+
+
+async def test_a_lost_container_is_not_a_tool_result(reg: ToolRegistry, sbx: Sandbox) -> None:
+    # Failure mode F3: the workflow recreates a sandbox that is gone. It can only do that
+    # when the error reaches it, so the registry must not turn it into text for the model.
+    await sbx.destroy()
+    with pytest.raises(NotFound):
+        await call(reg, sbx, "read_file", path=MODULE)
+    with pytest.raises(NotFound):
+        await call(reg, sbx, "edit_file", path=MODULE, old_str="a", new_str="b")

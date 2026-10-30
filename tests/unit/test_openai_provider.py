@@ -13,6 +13,7 @@ import pytest
 from pydantic import SecretStr
 
 from longhaul.contracts import (
+    LLMResponse,
     Message,
     ProviderError,
     ProviderErrorKind,
@@ -21,6 +22,7 @@ from longhaul.contracts import (
     ToolResultBlock,
     ToolSpec,
     ToolUseBlock,
+    Usage,
 )
 from longhaul.providers.base import get_provider
 from longhaul.providers.openai_compat import OpenAICompatProvider
@@ -62,6 +64,23 @@ READ_FILE = ToolSpec(
     description="Read a file",
     input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
 )
+HI = [Message(role="user", content=[TextBlock(text="hi")])]
+
+
+async def _ask(
+    provider: OpenAICompatProvider,
+    *,
+    messages: list[Message] | None = None,
+    tools: list[ToolSpec] | None = None,
+    max_tokens: int = 10,
+) -> LLMResponse:
+    return await provider.complete(
+        model="gpt-test",
+        system="sys",
+        messages=messages or HI,
+        tools=tools or [],
+        max_tokens=max_tokens,
+    )
 
 
 async def test_tool_roundtrip() -> None:
@@ -161,11 +180,73 @@ async def test_tool_roundtrip() -> None:
         TextBlock(text="Let me check."),
         ToolUseBlock(id="call_9", name="read_file", input={"path": "c.py"}),
     ]
-    assert resp.usage.input_tokens == 120
+    # prompt_tokens (120) already counts the 64 cached tokens. Usage keeps the
+    # buckets apart, like the Anthropic usage the contract follows.
+    assert resp.usage.input_tokens == 56
     assert resp.usage.output_tokens == 30
     assert resp.usage.cache_read_tokens == 64
+    assert resp.usage.cache_write_tokens == 0
     assert resp.model == "gpt-test"
     assert resp.latency_ms >= 0
+
+
+def _usage_body(prompt: int, details: dict[str, Any] | None) -> dict[str, Any]:
+    usage: dict[str, Any] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": 7,
+        "total_tokens": prompt + 7,
+    }
+    if details is not None:
+        usage["prompt_tokens_details"] = details
+    return _completion(content="ok", usage=usage)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "details", "input_tokens", "cache_read_tokens"),
+    [
+        pytest.param(100_000, {"cached_tokens": 90_000}, 10_000, 90_000, id="mostly-cached"),
+        pytest.param(120, {"cached_tokens": 64}, 56, 64, id="partly-cached"),
+        pytest.param(50, {"cached_tokens": 0}, 50, 0, id="nothing-cached"),
+        pytest.param(50, {"cached_tokens": 50}, 0, 50, id="fully-cached"),
+        pytest.param(50, {"cached_tokens": None}, 50, 0, id="cached-null"),
+        pytest.param(50, None, 50, 0, id="no-details"),
+        # A server that over-reports cached tokens must not make input negative.
+        pytest.param(50, {"cached_tokens": 80}, 0, 80, id="cached-above-prompt"),
+    ],
+)
+async def test_usage_input_excludes_cached_tokens(
+    prompt: int, details: dict[str, Any] | None, input_tokens: int, cache_read_tokens: int
+) -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=_usage_body(prompt, details))
+
+    usage = (await _ask(_provider(handler))).usage
+
+    assert usage.input_tokens == input_tokens
+    assert usage.cache_read_tokens == cache_read_tokens
+    assert usage.cache_write_tokens == 0
+    assert usage.output_tokens == 7
+
+
+async def test_usage_buckets_add_up_to_the_prompt() -> None:
+    # LH-405 reads cache_read / (input + cache_read) and LH-701 prices the three
+    # buckets separately, so they must not overlap.
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(200, json=_usage_body(100_000, {"cached_tokens": 90_000}))
+
+    usage = (await _ask(_provider(handler))).usage
+
+    assert usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens == 100_000
+    assert usage.cache_read_tokens / (usage.input_tokens + usage.cache_read_tokens) == 0.9
+
+
+async def test_missing_usage_is_zero() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        body = _completion(content="ok")
+        del body["usage"]
+        return httpx2.Response(200, json=body)
+
+    assert (await _ask(_provider(handler))).usage == Usage()
 
 
 _RATE_LIMIT_BODY = {"error": {"message": "slow down", "type": "rate_limit_error"}}

@@ -7,6 +7,12 @@ off (max_retries=0) because the durable layer owns them.
 cache_system is accepted for protocol compatibility and ignored. Chat
 completions has no cache_control marker; caching, when the endpoint does it,
 happens on the server side.
+
+Usage buckets do not overlap, as with the Anthropic provider: input_tokens
+leaves out cache_read_tokens. Chat completions reports prompt_tokens with the
+cached tokens inside it, so the cached part is taken out here. Cost (LH-701)
+and cache_ratio (LH-405) add the buckets up and would count cached tokens twice
+otherwise.
 """
 
 import json
@@ -208,11 +214,11 @@ def _usage(raw: CompletionUsage | None) -> Usage:
     if raw is None:
         return Usage()
     details = raw.prompt_tokens_details
-    cached = details.cached_tokens if details is not None else None
+    cached = (details.cached_tokens if details is not None else None) or 0
     return Usage(
-        input_tokens=raw.prompt_tokens,
+        input_tokens=max(raw.prompt_tokens - cached, 0),
         output_tokens=raw.completion_tokens,
-        cache_read_tokens=cached or 0,
+        cache_read_tokens=cached,
     )
 
 

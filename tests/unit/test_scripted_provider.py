@@ -1,8 +1,10 @@
 import json
 import re
 from pathlib import Path
+from typing import Literal
 
 import pytest
+from pydantic import BaseModel
 
 from longhaul.contracts import (
     LLMResponse,
@@ -68,10 +70,10 @@ def _write(tmp_path: Path, body: str) -> Path:
     return path
 
 
-def _turn(i: int, result: str = "ok") -> list[Message]:
-    """Transcript with i completed assistant turns, ending on a user tool_result."""
+def _turns(results: list[str]) -> list[Message]:
+    """Transcript with one completed assistant turn per result, ending on a user tool_result."""
     msgs = [Message(role="user", content=[TextBlock(text="go")])]
-    for n in range(i):
+    for n, result in enumerate(results):
         msgs.append(
             Message(
                 role="assistant",
@@ -85,6 +87,11 @@ def _turn(i: int, result: str = "ok") -> list[Message]:
             )
         )
     return msgs
+
+
+def _turn(i: int, result: str = "ok") -> list[Message]:
+    """Transcript with i completed assistant turns that all got the same result."""
+    return _turns([result] * i)
 
 
 def _assistant(resp: LLMResponse) -> Message:
@@ -143,13 +150,18 @@ def _ten_steps() -> str:
     )
 
 
+PASSING = "exit code: 0\nsummary: 3 passed\nstdout:\n...\n3 passed in 0.02s"
+# What the five calc_fix.yaml calls get back, in order. The last call needs the passing run.
+CALC_RESULTS = ["listing", "def add(a, b): ...", "edited", PASSING]
+
+
 async def test_sequence() -> None:
     p = ScriptedProvider(SCRIPT)
     assert p.name == "scripted"
     names = []
     ids = []
     for i in range(5):
-        resp = await _call(p, _turn(i))
+        resp = await _call(p, _turns(CALC_RESULTS[:i]))
         names.append(resp.tool_calls[0].name)
         ids.append(resp.tool_calls[0].id)
         assert resp.stop_reason == "tool_use"
@@ -888,3 +900,130 @@ steps:
     assert (await _call(p, _turn(0))).content == [TextBlock(text="again")]
     assert (await _call(p, _turn(5))).content == [TextBlock(text="again")]
     assert (await _call(p, _turn(6))).stop_reason == "max_tokens"
+
+
+# ---------- calc_fix.yaml ----------
+@pytest.mark.parametrize(
+    "output",
+    [
+        "ok",
+        "exit code: 1\nsummary: 1 failed, 2 passed\nstdout:\nFAILED tests/test_calc.py::test_add",
+        "exit code: 2\nstderr:\nModuleNotFoundError: No module named 'calc'\n1 error in 0.12s",
+        "exit code: 5\nsummary: no tests ran",
+    ],
+)
+async def test_calc_fix_does_not_finish_without_a_passing_test_run(output: str) -> None:
+    p = ScriptedProvider(SCRIPT)
+    with pytest.raises(ProviderError, match="no scripted step matches.*turn_index=4") as exc:
+        await _call(p, _turns([*CALC_RESULTS[:3], output]))
+    assert exc.value.kind is ProviderErrorKind.INVALID_REQUEST
+    # An earlier passing run does not count either, only the last result does.
+    with pytest.raises(ProviderError, match="no scripted step matches"):
+        await _call(p, _turns([PASSING, "listing", "edited", output]))
+
+
+async def test_calc_fix_finishes_after_a_passing_test_run() -> None:
+    p = ScriptedProvider(SCRIPT)
+    resp = await _call(p, _turns(CALC_RESULTS))
+    assert resp.tool_calls[0].name == "finish"
+    assert resp.stop_reason == "tool_use"
+
+
+# ---------- last tool result and token counts ----------
+LAST_RESULT_SCRIPT = """
+steps:
+  - match: {last_tool_result_contains: "FAILED"}
+    respond: {tool_calls: [{name: edit_file, input: {}}]}
+  - match: {role: coder}
+    respond: {text: "all good"}
+"""
+TEXT_ONLY = "steps:\n  - match: {role: coder}\n    respond: {text: ok}\n"
+
+
+def _results_message(*outputs: str, text: str | None = None) -> Message:
+    blocks: list[ToolResultBlock | TextBlock] = [
+        ToolResultBlock(tool_use_id=f"toolu_{n:03d}_9", content=out)
+        for n, out in enumerate(outputs)
+    ]
+    if text is not None:
+        blocks.append(TextBlock(text=text))
+    return Message(role="user", content=list(blocks))
+
+
+async def test_an_earlier_failure_does_not_match_after_the_tests_pass(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, LAST_RESULT_SCRIPT))
+    good = [TextBlock(text="all good")]
+    assert (await _call(p, _turns(["1 FAILED", "all passed"]))).content == good
+    assert (await _call(p, _turns(["all passed", "1 FAILED"]))).tool_calls[0].name == "edit_file"
+
+
+async def test_with_two_tool_results_in_the_final_message_the_last_one_counts(
+    tmp_path: Path,
+) -> None:
+    p = ScriptedProvider(_write(tmp_path, LAST_RESULT_SCRIPT))
+    head = _turns(["ok"])[:-1]
+    good = [TextBlock(text="all good")]
+    assert (await _call(p, [*head, _results_message("1 FAILED", "all passed")])).content == good
+    failed = await _call(p, [*head, _results_message("all passed", "1 FAILED")])
+    assert failed.tool_calls[0].name == "edit_file"
+
+
+async def test_text_after_the_tool_results_is_not_a_tool_result(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, LAST_RESULT_SCRIPT))
+    head = _turns(["ok"])[:-1]
+    note = "Hint: FAILED earlier, ignore it"
+    good = [TextBlock(text="all good")]
+    assert (await _call(p, [*head, _results_message("all passed", text=note)])).content == good
+    kept = await _call(p, [*head, _results_message("1 FAILED", text="Hint: all passed now")])
+    assert kept.tool_calls[0].name == "edit_file"
+
+
+async def test_tool_use_and_tool_result_blocks_count_towards_input_tokens(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, TEXT_ONLY))
+
+    async def tokens(messages: list[Message]) -> int:
+        return (await _call(p, messages, tools=[])).usage.input_tokens
+
+    def use(size: int) -> Message:
+        block = ToolUseBlock(id="t", name="x", input={"path": "a" * size})
+        return Message(role="assistant", content=[block])
+
+    start = [_user("go")]
+    plain = [*start, use(0), _results_message("")]
+    # 400 more characters are 100 more tokens, in a tool input and in a tool result.
+    assert await tokens([*start, use(400)]) - await tokens([*start, use(0)]) == 100
+    assert await tokens([*start, use(0), _results_message("r" * 400)]) - await tokens(plain) == 100
+    assert await tokens(plain) > await tokens(start)
+    counted = await p.count_tokens(model="m", system=SYSTEM, messages=plain, tools=[])
+    assert counted == await tokens(plain)
+
+
+class _Thinking(BaseModel):
+    """Stands in for a block type that the contracts add later."""
+
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+
+
+async def test_block_types_the_provider_does_not_know_are_ignored(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "steps:\n  - match: {role: coder, turn_index: 1}\n"
+        "    respond: {tool_calls: [{name: x, input: {}}]}\n",
+    )
+    p = ScriptedProvider(path)
+    tools = [_tool("x")]
+
+    def request(thinking: str) -> list[Message]:
+        unknown = Message.model_construct(role="assistant", content=[_Thinking(thinking=thinking)])
+        return [_user("go"), unknown, _user("more")]
+
+    first = await _call(p, request("x" * 400), tools=tools)
+    # The unknown block adds no characters and still counts as an assistant turn,
+    # because the step above only matches turn 1.
+    expected_chars = len(SYSTEM) + len("go") + len("more") + _spec_chars(tools[0])
+    assert first.usage.input_tokens == expected_chars // 4
+    # It is part of the request: the same text gives the same ids, other text other ids.
+    assert (await _call(p, request("x" * 400), tools=tools)).tool_calls == first.tool_calls
+    other = await _call(p, request("y" * 400), tools=tools)
+    assert other.tool_calls[0].id != first.tool_calls[0].id

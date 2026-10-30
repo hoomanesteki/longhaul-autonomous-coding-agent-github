@@ -256,11 +256,14 @@ def _request_text(messages: list[Message]) -> str:
 
 
 def _block_chars(block: Block) -> int:
+    # Block types that are not listed here, such as thinking blocks, add no characters.
     if isinstance(block, TextBlock):
         return len(block.text)
     if isinstance(block, ToolResultBlock):
         return len(block.content)
-    return len(str(block.input))
+    if isinstance(block, ToolUseBlock):
+        return len(str(block.input))
+    return 0
 
 
 def _spec_chars(spec: ToolSpec) -> int:

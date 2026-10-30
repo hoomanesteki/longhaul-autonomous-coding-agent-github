@@ -128,4 +128,14 @@ async def test_file_tools_on_fake_sandbox() -> None:
 
 def test_default_registry_names() -> None:
     names = [s.name for s in default_registry().specs()]
-    assert names == ["list_dir", "read_file", "edit_file", "write_file", "search"]
+    assert names == [
+        "list_dir",
+        "read_file",
+        "edit_file",
+        "write_file",
+        "search",
+        "run_command",
+        "run_tests",
+        "git_diff",
+        "finish",
+    ]

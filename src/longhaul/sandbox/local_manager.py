@@ -32,7 +32,10 @@ class FakeSandbox:
     async def exec(
         self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
     ) -> ExecResult:
-        full_env = {"PATH": os.environ.get("PATH", ""), "HOME": str(self.root)}
+        # Same rule as the Docker sandbox: the workspace venv leads PATH.
+        venv_bin = str(self.root / ".venv" / "bin")
+        path = os.pathsep.join(filter(None, [venv_bin, os.environ.get("PATH")]))
+        full_env = {"PATH": path, "HOME": str(self.root)}
         full_env.update(env or {})
         start = time.monotonic()
         proc = await asyncio.create_subprocess_exec(

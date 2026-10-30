@@ -3,7 +3,8 @@
 Stdlib only. Every GitHub call goes through `gh`, so the login that `gh` holds
 is the only credential involved. Re-running is safe: milestones, labels and
 issues that already exist are matched by name or by the `LH-xxx:` title prefix
-and left alone.
+and left alone. With --update, an existing issue is edited when its title, body,
+derived labels or milestone differ from the plan. Labels added by hand stay.
 """
 
 from __future__ import annotations
@@ -33,6 +34,9 @@ POINTS_FIELD_RE = re.compile(r"\*\*Points:\*\* (\d+)")
 BRANCH_FIELD_RE = re.compile(r"\*\*Branch:\*\* (.+?) · \*\*Depends on:\*\*")
 DEPENDS_FIELD_RE = re.compile(r"\*\*Depends on:\*\* (.+)$")
 COULD_SUFFIX = " (Could)"
+COULD_LABEL = "could"
+# Labels the importer derives from a story. Any other label on an issue is a person's.
+DERIVED_LABEL_PREFIXES = ("phase:", "epic:", "pts:", "theme:", "type:")
 TITLE_PREFIX_RE = re.compile(r"^(LH-\d{3}): ")
 PROGRESS_ROW_RE = re.compile(r"^\| (LH-\d{3}) \|")
 
@@ -239,8 +243,25 @@ def story_labels(story: Story) -> list[str]:
         f"type:{story.kind}",
     ]
     if story.could:
-        labels.append("could")
+        labels.append(COULD_LABEL)
     return labels
+
+
+def issue_title(story: Story) -> str:
+    return f"{story.id}: {story.title}"
+
+
+def _is_derived_label(label: str) -> bool:
+    return label == COULD_LABEL or label.startswith(DERIVED_LABEL_PREFIXES)
+
+
+@dataclass(frozen=True)
+class _Issue:
+    number: int
+    title: str
+    body: str
+    labels: frozenset[str]
+    milestone: str | None
 
 
 @dataclass
@@ -248,7 +269,7 @@ class _Remote:
     milestones: set[str]  # every milestone title, open or closed
     closed_milestones: dict[str, int]  # title -> milestone number, for the closed ones
     labels: set[str]
-    issues: dict[str, tuple[int, str]]  # LH id -> (issue number, body)
+    issues: dict[str, _Issue]  # LH id -> issue
 
 
 def _gh_list(runner: Runner, args: list[str]) -> list[dict[str, Any]]:
@@ -268,6 +289,17 @@ def _gh_list(runner: Runner, args: list[str]) -> list[dict[str, Any]]:
     return data
 
 
+def _remote_issue(raw: dict[str, Any]) -> _Issue:
+    milestone = raw.get("milestone") or {}
+    return _Issue(
+        number=int(raw["number"]),
+        title=raw["title"],
+        body=raw.get("body") or "",
+        labels=frozenset(label["name"] for label in raw.get("labels") or []),
+        milestone=milestone.get("title"),
+    )
+
+
 def _load_remote(runner: Runner, repo: str) -> _Remote:
     milestones = _gh_list(runner, ["api", f"repos/{repo}/milestones?state=all&per_page=100"])
     labels = _gh_list(runner, ["label", "list", "--repo", repo, "--limit", "500", "--json", "name"])
@@ -283,14 +315,14 @@ def _load_remote(runner: Runner, repo: str) -> _Remote:
             "--limit",
             "500",
             "--json",
-            "number,title,body",
+            "number,title,body,labels,milestone",
         ],
     )
-    issue_map: dict[str, tuple[int, str]] = {}
-    for issue in issues:
-        prefix = TITLE_PREFIX_RE.match(issue["title"])
+    issue_map: dict[str, _Issue] = {}
+    for raw in issues:
+        prefix = TITLE_PREFIX_RE.match(raw["title"])
         if prefix:
-            issue_map[prefix.group(1)] = (int(issue["number"]), issue.get("body") or "")
+            issue_map[prefix.group(1)] = _remote_issue(raw)
     return _Remote(
         milestones={m["title"] for m in milestones},
         closed_milestones={
@@ -337,6 +369,97 @@ def _ensure_labels(gh: Runner, target: str, remote: _Remote, stories: list[Story
         print(f"created label {label}")
 
 
+def _milestones_in_use(
+    stories: list[Story], remote: _Remote, milestones: dict[int, str], update: bool
+) -> set[str]:
+    """Names of the milestones that an issue is about to be created in or moved to."""
+    names: set[str] = set()
+    for story in stories:
+        issue = remote.issues.get(story.id)
+        name = milestones[story.phase]
+        if issue is None or (update and issue.milestone != name):
+            names.add(name)
+    return names
+
+
+def _create_issue(gh: Runner, target: str, story: Story, milestone: str) -> int:
+    output = gh.run(
+        [
+            "issue",
+            "create",
+            "--repo",
+            target,
+            "--title",
+            issue_title(story),
+            "--body",
+            story.body,
+            "--label",
+            ",".join(story_labels(story)),
+            "--milestone",
+            milestone,
+        ]
+    )
+    return _number_from_url(output)
+
+
+def _edit_flags(story: Story, issue: _Issue, milestone: str) -> tuple[list[str], list[str]]:
+    """Return the `gh issue edit` flags that bring an issue in line with its story.
+
+    The second value names the parts that differ. Only the labels the importer derives
+    are added or removed, so a label a person added by hand stays.
+    """
+    flags: list[str] = []
+    changed: list[str] = []
+    title = issue_title(story)
+    if issue.title != title:
+        flags += ["--title", title]
+        changed.append("title")
+    if _normalize(issue.body) != _normalize(story.body):
+        flags += ["--body", story.body]
+        changed.append("body")
+    wanted = story_labels(story)
+    missing = [label for label in wanted if label not in issue.labels]
+    stale = sorted(
+        label for label in issue.labels if _is_derived_label(label) and label not in wanted
+    )
+    if missing:
+        flags += ["--add-label", ",".join(missing)]
+    if stale:
+        flags += ["--remove-label", ",".join(stale)]
+    if missing or stale:
+        changed.append("labels")
+    if issue.milestone != milestone:
+        flags += ["--milestone", milestone]
+        changed.append("milestone")
+    return flags, changed
+
+
+def _sync_issues(
+    gh: Runner,
+    target: str,
+    remote: _Remote,
+    stories: list[Story],
+    milestones: dict[int, str],
+    update: bool,
+) -> dict[str, int]:
+    numbers: dict[str, int] = {}
+    for story in stories:
+        milestone = milestones[story.phase]
+        issue = remote.issues.get(story.id)
+        if issue is None:
+            numbers[story.id] = _create_issue(gh, target, story, milestone)
+            print(f"created {story.id} as #{numbers[story.id]}")
+            continue
+        numbers[story.id] = issue.number
+        flags, changed = _edit_flags(story, issue, milestone) if update else ([], [])
+        if changed:
+            gh.run(["issue", "edit", str(issue.number), "--repo", target, *flags])
+            print(f"updated {story.id} (#{issue.number}): {', '.join(changed)}")
+        else:
+            print(f"skipped {story.id} (#{issue.number})")
+    return numbers
+
+
 def import_backlog(
     plan_path: Path,
     repo: str | None,
@@ -365,41 +488,11 @@ def import_backlog(
     remote = _load_remote(gh, target)
 
     # Milestones come first, so one that cannot be reopened stops the run before any issue.
-    in_use = {milestones[story.phase] for story in stories if story.id not in remote.issues}
-    _ensure_milestones(gh, target, remote, milestones, in_use)
+    _ensure_milestones(
+        gh, target, remote, milestones, _milestones_in_use(stories, remote, milestones, update)
+    )
     _ensure_labels(gh, target, remote, stories)
-
-    numbers: dict[str, int] = {}
-    for story in stories:
-        existing = remote.issues.get(story.id)
-        if existing is None:
-            output = gh.run(
-                [
-                    "issue",
-                    "create",
-                    "--repo",
-                    target,
-                    "--title",
-                    f"{story.id}: {story.title}",
-                    "--body",
-                    story.body,
-                    "--label",
-                    ",".join(story_labels(story)),
-                    "--milestone",
-                    milestones[story.phase],
-                ]
-            )
-            numbers[story.id] = _number_from_url(output)
-            print(f"created {story.id} as #{numbers[story.id]}")
-            continue
-        number, body = existing
-        numbers[story.id] = number
-        if update and _normalize(body) != _normalize(story.body):
-            gh.run(["issue", "edit", str(number), "--repo", target, "--body", story.body])
-            print(f"updated {story.id} (#{number})")
-        else:
-            print(f"skipped {story.id} (#{number})")
-    return numbers
+    return _sync_issues(gh, target, remote, stories, milestones, update)
 
 
 def _normalize(body: str) -> str:
@@ -466,7 +559,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run", action="store_true", help="print what would happen, no gh calls"
     )
-    parser.add_argument("--update", action="store_true", help="rewrite issue bodies that differ")
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="edit existing issues whose title, body, labels or milestone differ",
+    )
     parser.add_argument("--repo", help="owner/name (default: the repo gh is set up for)")
     args = parser.parse_args(argv)
     try:

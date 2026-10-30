@@ -342,14 +342,25 @@ class FakeGh:
         return f"https://github.com/{self.repo}/issues/{number}\n"
 
     def _issue_edit(self, rest: list[str]) -> str:
-        positional, flags = _parse_flags(rest, {"--repo", "--body"})
+        allowed = {"--repo", "--title", "--body", "--add-label", "--remove-label", "--milestone"}
+        positional, flags = _parse_flags(rest, allowed)
         self._check_repo(flags)
+        if set(flags) == {"--repo"}:
+            raise backlog.GhError("specify at least one property to edit")
         (number,) = positional
         issue = next((i for i in self.issues if i["number"] == int(number)), None)
         if issue is None:
             raise backlog.GhError(f"Could not resolve to an issue with the number of {number}")
-        if "--body" in flags:
-            issue["body"] = flags["--body"][0]
+        added = _split_labels(flags.get("--add-label", []))
+        removed = _split_labels(flags.get("--remove-label", []))
+        self._require_labels(added)
+        if "--milestone" in flags:
+            self._require_open_milestone(flags["--milestone"][0])
+        for field, flag in (("title", "--title"), ("body", "--body"), ("milestone", "--milestone")):
+            if flag in flags:
+                issue[field] = flags[flag][0]
+        kept = [name for name in issue["labels"] if name not in removed]
+        issue["labels"] = kept + [name for name in added if name not in kept]
         return f"https://github.com/{self.repo}/issues/{number}\n"
 
 
@@ -797,28 +808,37 @@ def test_a_closed_milestone_is_left_closed_when_nothing_needs_it(
     assert [m["state"] for m in gh.milestones] == ["closed", "open"]
 
 
+def _mini_plan_with_fix_story(phase: int) -> str:
+    """MINI_PLAN plus a gate fix story, LH-091 in phase 0 or LH-191 in phase 1."""
+    if phase == 0:
+        return _add_fix_story(MINI_PLAN, "LH-091")
+    return MINI_PLAN + "\n" + FIX_STORY.format(id="LH-191", slug="lh-191").replace("E0", "E1")
+
+
+@pytest.mark.parametrize("phase", [0, 1])
 def test_a_closed_milestone_is_reopened_for_a_new_story(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], phase: int
 ) -> None:
     plan = _write(tmp_path, MINI_PLAN)
     gh = FakeGh()
     backlog.import_backlog(plan, "o/r", gh)
-    gh.milestones[0]["state"] = "closed"
+    name = gh.milestones[phase]["title"]
+    gh.milestones[phase]["state"] = "closed"
     gh.calls.clear()
     capsys.readouterr()
-    # A failed gate adds a fix story to Phase 0, whose milestone is already closed.
-    plan.write_text(_add_fix_story(MINI_PLAN, "LH-091"), encoding="utf-8")
+    # A failed gate adds a fix story to a phase whose milestone the owner already closed.
+    plan.write_text(_mini_plan_with_fix_story(phase), encoding="utf-8")
 
     numbers = backlog.import_backlog(plan, "o/r", gh)
 
     writes = gh.writes()
-    assert writes[0] == ["api", "-X", "PATCH", "repos/o/r/milestones/1", "-f", "state=open"]
+    patch = ["api", "-X", "PATCH", f"repos/o/r/milestones/{phase + 1}", "-f", "state=open"]
+    assert writes[0] == patch
     assert [write[:2] for write in writes[1:]] == [["label", "create"], ["issue", "create"]]
-    assert [write[0] for write in writes].count("api") == 1  # Phase 1 was not touched
-    assert numbers["LH-091"] == 5
-    assert gh.issue("LH-091")["milestone"] == "Phase 0: Foundation"
+    assert numbers[f"LH-{phase}91"] == 5
+    assert gh.issue(f"LH-{phase}91")["milestone"] == name
     assert [m["state"] for m in gh.milestones] == ["open", "open"]
-    assert "reopened milestone Phase 0: Foundation" in capsys.readouterr().out.splitlines()
+    assert f"reopened milestone {name}" in capsys.readouterr().out.splitlines()
 
 
 def test_a_closed_milestone_stays_closed_when_the_new_story_is_elsewhere(tmp_path: Path) -> None:
@@ -827,8 +847,7 @@ def test_a_closed_milestone_stays_closed_when_the_new_story_is_elsewhere(tmp_pat
     backlog.import_backlog(plan, "o/r", gh)
     gh.milestones[0]["state"] = "closed"
     gh.calls.clear()
-    extra = FIX_STORY.format(id="LH-191", slug="lh-191").replace("E0", "E1")
-    plan.write_text(MINI_PLAN + "\n" + extra, encoding="utf-8")
+    plan.write_text(_mini_plan_with_fix_story(1), encoding="utf-8")
 
     backlog.import_backlog(plan, "o/r", gh)
 
@@ -850,7 +869,7 @@ def test_a_milestone_that_cannot_be_reopened_stops_the_run_before_any_issue(
     backlog.import_backlog(plan, "o/r", gh)
     gh.milestones[0]["state"] = "closed"
     gh.calls.clear()
-    plan.write_text(_add_fix_story(MINI_PLAN, "LH-091"), encoding="utf-8")
+    plan.write_text(_mini_plan_with_fix_story(0), encoding="utf-8")
 
     with pytest.raises(backlog.GhError, match="403"):
         backlog.import_backlog(plan, "o/r", gh)
@@ -907,6 +926,161 @@ def test_update_rewrites_only_the_issue_whose_body_changed(
     lines = capsys.readouterr().out.splitlines()
     assert lines[0] == "skipped LH-001 (#1)"
     assert lines[1].startswith("updated LH-002 (#2)")
+
+
+def _imported(tmp_path: Path, text: str = MINI_PLAN) -> tuple[FakeGh, Path]:
+    """Import a plan into a fresh FakeGh and forget the calls that took."""
+    plan = _write(tmp_path, text)
+    gh = FakeGh()
+    backlog.import_backlog(plan, "o/r", gh)
+    gh.calls.clear()
+    return gh, plan
+
+
+def test_update_syncs_the_labels_when_the_points_change(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    plan.write_text(
+        MINI_PLAN.replace(
+            "**Points:** 3 · **Branch:** `feat/lh-002", "**Points:** 8 · **Branch:** `feat/lh-002"
+        ),
+        "utf-8",
+    )
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    issue = gh.issue("LH-002")
+    edit = ["issue", "edit", "2", "--repo", "o/r", "--body", issue["body"]]
+    edit += ["--add-label", "pts:8", "--remove-label", "pts:3"]
+    assert gh.writes() == [["label", "create", "pts:8", "--repo", "o/r", "--force"], edit]
+    assert "**Points:** 8" in issue["body"]
+    assert sorted(issue["labels"]) == ["epic:E0", "phase:0", "pts:8", "theme:T5", "type:story"]
+
+
+def test_update_syncs_the_title(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    plan.write_text(
+        MINI_PLAN.replace("LH-002 · Local stack", "LH-002 · Local compose stack"), "utf-8"
+    )
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert [write[:5] for write in gh.writes()] == [["issue", "edit", "2", "--repo", "o/r"]]
+    assert gh.issue("LH-002")["title"] == "LH-002: Local compose stack"
+    assert gh.writes()[0][5:7] == ["--title", "LH-002: Local compose stack"]
+
+
+def test_update_moves_an_issue_to_the_milestone_of_its_phase(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.issue("LH-001")["milestone"] = "Phase 1: Agent core"
+    gh.issue("LH-002")["milestone"] = None
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == [
+        ["issue", "edit", "1", "--repo", "o/r", "--milestone", "Phase 0: Foundation"],
+        ["issue", "edit", "2", "--repo", "o/r", "--milestone", "Phase 0: Foundation"],
+    ]
+    assert gh.issue("LH-001")["milestone"] == "Phase 0: Foundation"
+    assert gh.issue("LH-002")["milestone"] == "Phase 0: Foundation"
+
+
+def test_update_adds_a_missing_label_and_keeps_labels_a_person_added(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    without_theme = ["phase:0", "epic:E0", "pts:3", "type:story"]
+    gh.issue("LH-001")["labels"] = [*without_theme, "bug", "help wanted"]
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == [["issue", "edit", "1", "--repo", "o/r", "--add-label", "theme:T5"]]
+    assert sorted(gh.issue("LH-001")["labels"]) == sorted([*STANDARD_LABELS, "bug", "help wanted"])
+
+
+def test_update_fixes_several_labels_in_one_edit(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.issue("LH-001")["labels"] = ["phase:1", "epic:E1", "pts:3", "theme:T5", "type:story", "bug"]
+    gh.issue("LH-002")["labels"] = ["bug"]
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    first = ["issue", "edit", "1", "--repo", "o/r"]
+    first += ["--add-label", "phase:0,epic:E0", "--remove-label", "epic:E1,phase:1"]
+    second = ["issue", "edit", "2", "--repo", "o/r", "--add-label", ",".join(STANDARD_LABELS)]
+    assert gh.writes() == [first, second]
+    assert sorted(gh.issue("LH-001")["labels"]) == sorted([*STANDARD_LABELS, "bug"])
+    assert sorted(gh.issue("LH-002")["labels"]) == sorted([*STANDARD_LABELS, "bug"])
+
+
+def test_update_removes_a_derived_label_the_plan_no_longer_has(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    plan.write_text(MINI_PLAN.replace("Extras (Could)", "Extras"), "utf-8")
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    (edit,) = gh.writes()
+    assert edit[:5] == ["issue", "edit", "4", "--repo", "o/r"]
+    assert edit[-2:] == ["--remove-label", "could"]
+    assert "could" not in gh.issue("LH-109")["labels"]
+
+
+def test_update_converges(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    text = MINI_PLAN.replace("LH-002 · Local stack", "LH-002 · Local compose stack")
+    text = text.replace(
+        "**Points:** 3 · **Branch:** `feat/lh-002", "**Points:** 8 · **Branch:** `feat/lh-002"
+    )
+    plan.write_text(text, "utf-8")
+    gh.issue("LH-001")["milestone"] = None
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+    gh.calls.clear()
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == []
+
+
+def test_update_right_after_an_import_changes_nothing_in_the_real_plan() -> None:
+    gh = FakeGh()
+    backlog.import_backlog(PLAN, "o/r", gh)
+    gh.calls.clear()
+
+    backlog.import_backlog(PLAN, "o/r", gh, update=True)
+
+    assert gh.writes() == []
+
+
+def test_update_ignores_issues_that_are_not_stories(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.run(["issue", "create", "--repo", "o/r", "--title", "Crash on start", "--body", "help"])
+    gh.calls.clear()
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == []
+    assert gh.issues[-1]["labels"] == []
+
+
+def test_update_reopens_a_closed_milestone_it_moves_an_issue_into(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.milestones[0]["state"] = "closed"
+    gh.issue("LH-001")["milestone"] = None
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == [
+        ["api", "-X", "PATCH", "repos/o/r/milestones/1", "-f", "state=open"],
+        ["issue", "edit", "1", "--repo", "o/r", "--milestone", "Phase 0: Foundation"],
+    ]
+
+
+def test_drifted_labels_title_and_milestone_are_left_alone_without_update(tmp_path: Path) -> None:
+    gh, plan = _imported(tmp_path)
+    issue = gh.issue("LH-001")
+    issue.update(title="LH-001: Renamed by hand", labels=["bug"], milestone=None)
+
+    backlog.import_backlog(plan, "o/r", gh, update=False)
+
+    assert gh.writes() == []
+    assert issue["title"] == "LH-001: Renamed by hand"
 
 
 def test_a_changed_body_is_left_alone_without_update(tmp_path: Path) -> None:

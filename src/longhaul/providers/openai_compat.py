@@ -8,6 +8,9 @@ cache_system is accepted for protocol compatibility and ignored. Chat
 completions has no cache_control marker; caching, when the endpoint does it,
 happens on the server side.
 
+The reply cap is sent as max_completion_tokens to OpenAI's own endpoint and as
+max_tokens to every other server. Pass max_tokens_param to override the choice.
+
 Usage buckets do not overlap, as with the Anthropic provider: input_tokens
 leaves out cache_read_tokens. Chat completions reports prompt_tokens with the
 cached tokens inside it, so the cached part is taken out here. Cost (LH-701)
@@ -47,6 +50,12 @@ from longhaul.contracts import (
 
 _StopReason = Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "other"]
 
+# Name of the request field that caps the reply. OpenAI's reasoning models reject
+# the deprecated max_tokens; most other servers know only that name.
+MaxTokensParam = Literal["max_tokens", "max_completion_tokens"]
+_MAX_TOKENS_PARAMS: tuple[MaxTokensParam, ...] = ("max_tokens", "max_completion_tokens")
+_OPENAI_HOST = "api.openai.com"
+
 # Keys are the chat completions finish_reason values.
 _STOP_REASONS: dict[str, _StopReason] = {
     "stop": "end_turn",
@@ -69,7 +78,12 @@ class OpenAICompatProvider:
         base_url: str | None = None,
         client: AsyncOpenAI | None = None,
         http_client: httpx2.AsyncClient | None = None,
+        max_tokens_param: MaxTokensParam | None = None,
     ) -> None:
+        if max_tokens_param is not None and max_tokens_param not in _MAX_TOKENS_PARAMS:
+            raise ValueError(
+                f"max_tokens_param must be one of {_MAX_TOKENS_PARAMS}, got {max_tokens_param!r}"
+            )
         # A prebuilt client wins. Tests pass an http_client backed by MockTransport.
         if client is None:
             client = AsyncOpenAI(
@@ -79,6 +93,7 @@ class OpenAICompatProvider:
                 http_client=http_client,
             )
         self._client = client
+        self._max_tokens_param = max_tokens_param or _default_max_tokens_param(client)
 
     async def complete(
         self,
@@ -99,7 +114,10 @@ class OpenAICompatProvider:
                 model=model,
                 messages=_chat_messages(system, messages),
                 tools=chat_tools,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens if self._max_tokens_param == "max_tokens" else omit,
+                max_completion_tokens=(
+                    max_tokens if self._max_tokens_param == "max_completion_tokens" else omit
+                ),
             )
         except openai.APIError as exc:
             raise _map_error(exc) from exc
@@ -110,6 +128,15 @@ class OpenAICompatProvider:
         self, *, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
     ) -> int:
         return _estimate(system, messages)
+
+
+def _default_max_tokens_param(client: AsyncOpenAI) -> MaxTokensParam:
+    # Judge by where the client really points, so a prebuilt client or a base URL
+    # taken from the environment gets the right name too. OpenAI also serves
+    # regional hosts such as eu.api.openai.com.
+    host = client.base_url.host
+    official = host == _OPENAI_HOST or host.endswith(f".{_OPENAI_HOST}")
+    return "max_completion_tokens" if official else "max_tokens"
 
 
 # ---------- contracts -> chat completions ----------

@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx2
 import pytest
+from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from longhaul.contracts import (
@@ -34,9 +35,29 @@ BASE_URL = "https://api.test/v1"
 Handler = Callable[[httpx2.Request], httpx2.Response]
 
 
-def _provider(handler: Handler) -> OpenAICompatProvider:
+class Recorder:
+    """Wraps a handler and keeps every request, so tests can inspect and count them."""
+
+    def __init__(self, handler: Handler) -> None:
+        self._handler = handler
+        self.requests: list[httpx2.Request] = []
+
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        self.requests.append(request)
+        return self._handler(request)
+
+    @property
+    def bodies(self) -> list[dict[str, Any]]:
+        return [json.loads(r.content) for r in self.requests]
+
+
+def _provider(
+    handler: Handler, *, base_url: str | None = BASE_URL, **options: Any
+) -> OpenAICompatProvider:
     http_client = httpx2.AsyncClient(transport=httpx2.MockTransport(handler))
-    return OpenAICompatProvider(api_key="sk-test", base_url=BASE_URL, http_client=http_client)
+    return OpenAICompatProvider(
+        api_key="sk-test", base_url=base_url, http_client=http_client, **options
+    )
 
 
 def _completion(
@@ -247,6 +268,88 @@ async def test_missing_usage_is_zero() -> None:
         return httpx2.Response(200, json=body)
 
     assert (await _ask(_provider(handler))).usage == Usage()
+
+
+def _ok(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(200, json=_completion(content="ok"))
+
+
+@pytest.mark.parametrize(
+    ("base_url", "options", "host", "name", "other"),
+    [
+        pytest.param(
+            None, {}, "api.openai.com", "max_completion_tokens", "max_tokens", id="official"
+        ),
+        pytest.param(
+            "https://api.openai.com/v1",
+            {},
+            "api.openai.com",
+            "max_completion_tokens",
+            "max_tokens",
+            id="official-explicit-url",
+        ),
+        pytest.param(BASE_URL, {}, "api.test", "max_tokens", "max_completion_tokens", id="other"),
+        pytest.param(
+            BASE_URL,
+            {"max_tokens_param": "max_completion_tokens"},
+            "api.test",
+            "max_completion_tokens",
+            "max_tokens",
+            id="other-opt-in",
+        ),
+        pytest.param(
+            None,
+            {"max_tokens_param": "max_tokens"},
+            "api.openai.com",
+            "max_tokens",
+            "max_completion_tokens",
+            id="official-opt-out",
+        ),
+    ],
+)
+async def test_max_tokens_parameter_name(
+    monkeypatch: pytest.MonkeyPatch,
+    base_url: str | None,
+    options: dict[str, Any],
+    host: str,
+    name: str,
+    other: str,
+) -> None:
+    # OpenAI's reasoning models reject max_tokens. Other servers mostly know only that name.
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    seen = Recorder(_ok)
+
+    await _ask(_provider(seen, base_url=base_url, **options), max_tokens=321)
+
+    assert seen.requests[0].url.host == host
+    assert seen.bodies[0][name] == 321
+    assert other not in seen.bodies[0]
+
+
+@pytest.mark.parametrize(
+    ("base_url", "name"),
+    [
+        ("http://localhost:8000/v1", "max_tokens"),
+        ("https://api.openai.com/v1", "max_completion_tokens"),
+    ],
+)
+async def test_max_tokens_parameter_follows_a_prebuilt_client(base_url: str, name: str) -> None:
+    seen = Recorder(_ok)
+    client = AsyncOpenAI(
+        api_key="sk-test",
+        base_url=base_url,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(seen)),
+        max_retries=0,
+    )
+
+    await _ask(OpenAICompatProvider(api_key="sk-test", client=client), max_tokens=64)
+
+    assert seen.bodies[0][name] == 64
+
+
+def test_max_tokens_parameter_name_is_checked() -> None:
+    with pytest.raises(ValueError, match="max_tokens_param"):
+        OpenAICompatProvider(api_key="sk-test", max_tokens_param="max_new_tokens")  # type: ignore[arg-type]
 
 
 _RATE_LIMIT_BODY = {"error": {"message": "slow down", "type": "rate_limit_error"}}

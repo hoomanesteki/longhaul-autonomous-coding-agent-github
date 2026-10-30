@@ -72,7 +72,9 @@ disallow_untyped_calls = false
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "--strict-markers"
+# importlib mode gives each test file a name from its path, so tests/unit/test_x.py and
+# tests/integration/test_x.py can both exist. The default mode names them by basename.
+addopts = "--strict-markers --import-mode=importlib"
 markers = [
     "unit: pure logic, no Docker, network or DB",
     "integration: needs the local docker compose stack",

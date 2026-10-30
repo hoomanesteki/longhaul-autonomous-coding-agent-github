@@ -16,7 +16,7 @@ import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROGRESS = ROOT / "docs" / "progress.md"
@@ -250,26 +250,40 @@ class _Remote:
     issues: dict[str, tuple[int, str]]  # LH id -> (issue number, body)
 
 
+def _gh_list(runner: Runner, args: list[str]) -> list[dict[str, Any]]:
+    """Run a gh command that prints a JSON list and return the list.
+
+    gh prints nothing at all, not `[]`, when `label list` finds no labels.
+    """
+    output = runner.run(args)
+    if not output.strip():
+        return []
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise GhError(f"gh {' '.join(args)} printed invalid JSON: {exc}") from exc
+    if not isinstance(data, list):
+        raise GhError(f"gh {' '.join(args)} printed JSON that is not a list")
+    return data
+
+
 def _load_remote(runner: Runner, repo: str) -> _Remote:
-    milestones = json.loads(runner.run(["api", f"repos/{repo}/milestones?state=all&per_page=100"]))
-    labels = json.loads(
-        runner.run(["label", "list", "--repo", repo, "--limit", "500", "--json", "name"])
-    )
-    issues = json.loads(
-        runner.run(
-            [
-                "issue",
-                "list",
-                "--repo",
-                repo,
-                "--state",
-                "all",
-                "--limit",
-                "500",
-                "--json",
-                "number,title,body",
-            ]
-        )
+    milestones = _gh_list(runner, ["api", f"repos/{repo}/milestones?state=all&per_page=100"])
+    labels = _gh_list(runner, ["label", "list", "--repo", repo, "--limit", "500", "--json", "name"])
+    issues = _gh_list(
+        runner,
+        [
+            "issue",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "all",
+            "--limit",
+            "500",
+            "--json",
+            "number,title,body",
+        ],
     )
     issue_map: dict[str, tuple[int, str]] = {}
     for issue in issues:

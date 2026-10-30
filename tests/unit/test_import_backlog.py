@@ -638,6 +638,62 @@ def test_issue_body_is_the_story_block(tmp_path: Path) -> None:
     assert first.endswith("```bash\n#### LH-050 · A heading inside a fence is not a story\n```")
 
 
+def test_import_into_a_repo_without_labels(tmp_path: Path) -> None:
+    gh = FakeGh(labels=())
+
+    numbers = backlog.import_backlog(_write(tmp_path, MINI_PLAN), "o/r", gh)
+
+    assert len(numbers) == len(gh.issues) == 4
+    assert "phase:0" in gh.labels
+    assert "bug" not in gh.labels  # only the labels of the plan were added
+
+
+def test_second_import_into_a_repo_that_started_without_labels(tmp_path: Path) -> None:
+    plan = _write(tmp_path, MINI_PLAN)
+    gh = FakeGh(labels=())
+    first = backlog.import_backlog(plan, "o/r", gh)
+    gh.calls.clear()
+
+    assert backlog.import_backlog(plan, "o/r", gh) == first
+    assert gh.writes() == []
+
+
+class CannedGh:
+    """Answers every list call with a fixed reply, to see how the importer reads it."""
+
+    def __init__(
+        self, label_reply: str = "[]", issue_reply: str = "[]", api_reply: str = "[]"
+    ) -> None:
+        self.replies = {"label list": label_reply, "issue list": issue_reply, "api": api_reply}
+        self.calls: list[list[str]] = []
+
+    def run(self, args: list[str]) -> str:
+        self.calls.append(args)
+        return self.replies[args[0] if args[0] == "api" else " ".join(args[:2])]
+
+
+@pytest.mark.parametrize(
+    ("reply", "command"),
+    [
+        pytest.param({"label_reply": "no labels yet"}, "gh label list --repo o/r", id="labels"),
+        pytest.param({"issue_reply": "<html>"}, "gh issue list --repo o/r", id="issues"),
+        pytest.param({"api_reply": "{"}, "gh api repos/o/r/milestones", id="milestones"),
+        pytest.param(
+            {"label_reply": '{"name": "bug"}'}, "gh label list --repo o/r", id="not-a-list"
+        ),
+    ],
+)
+def test_a_gh_reply_that_is_not_a_json_list_names_the_command(
+    tmp_path: Path, reply: dict[str, str], command: str
+) -> None:
+    gh = CannedGh(**reply)
+
+    with pytest.raises(backlog.GhError, match=re.escape(command)):
+        backlog.import_backlog(_write(tmp_path, MINI_PLAN), "o/r", gh)
+
+    assert gh.calls  # it did ask, and it stopped before writing anything
+
+
 def test_import_places_every_story_of_the_real_plan() -> None:
     plan_text = PLAN.read_text(encoding="utf-8")
     heading_phases, heading_stories = _plan_headings(plan_text)

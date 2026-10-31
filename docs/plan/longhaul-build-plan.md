@@ -1569,6 +1569,124 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 - **Tests:** `tests/e2e/test_run_local.py::test_calc_scripted` (marker `e2e, phase1`)
 - **Files:** `src/longhaul/cli.py`, `.github/workflows/ci.yml`, tests
 
+### Phase 1 fix stories (from the pre-gate review)
+
+The gatekeeper ran an adversarial review of everything merged during Phase 0 and Phase 1 before the Phase 1 gate. Each finding below was reproduced with a failing test before it was fixed. Findings that did not reproduce are recorded in the gate report.
+
+#### LH-191 · Sandbox write and exec safety
+- **Epic:** E3 · **Points:** 5 · **Branch:** `fix/lh-191-sandbox-safety` · **Depends on:** LH-107, LH-108
+- **Story:** As the agent runtime, I want sandbox writes and commands to behave like a normal filesystem and shell, so that edits take effect, data is never destroyed silently, and one noisy command cannot take down the worker.
+- **Build:**
+  - `write_file` sets a real mtime, keeps an existing file mode, and raises `IsADirectoryError`, `NotADirectoryError` or `FileExistsError` on type conflicts instead of replacing nodes.
+  - `PYTHONDONTWRITEBYTECODE=1` is part of the fixed sandbox environment, so stale bytecode never runs after an edit.
+  - `read_file` is confined to the writable roots.
+  - `exec` streams output and keeps a bounded head and tail per stream; `timeout_s` must be positive; processes a command leaves in the background are killed when it returns.
+  - Containers run with an init that reaps children (`init=True`, `CMD` instead of `ENTRYPOINT`) and never inherit Docker proxy settings (`use_config_proxy=False`).
+  - No-network tests assert that no network is attached instead of relying on an outbound request failing.
+- **Acceptance criteria:**
+  - [ ] A same-size `edit_file` followed by a test run executes the new code.
+  - [ ] Writing onto a directory, or below a regular file, fails and leaves the tree unchanged.
+  - [ ] A command that prints 100 MB returns within its timeout and the worker memory stays bounded.
+  - [ ] A background `sleep` started by a command is gone after `exec` returns.
+- **Tests:** `tests/integration/test_sandbox.py` (new cases for each criterion), `tests/unit/test_fake_sandbox.py`
+- **Files:** `src/longhaul/sandbox/*`, `docker/sandbox/Dockerfile`, tests
+
+#### LH-192 · Tool input and output hardening
+- **Epic:** E2 · **Points:** 5 · **Branch:** `fix/lh-192-tool-hardening` · **Depends on:** LH-108, LH-109
+- **Story:** As the agent, I want every tool to reject unsafe input and return results I can act on, so that untrusted issue text cannot escape the workspace and I never act on stale or misleading output.
+- **Build:**
+  - No argument can inject options or escape `/workspace` through any tool, including dash-leading paths and symlinks; tools use the resolved in-workspace path.
+  - The registry turns bad-input errors into `ok=False` results and lets infrastructure errors propagate, so later stories can recreate a lost sandbox.
+  - `read_file` numbers lines on newlines only, handles CRLF files consistently with `edit_file`, stops at a budget derived from `output_max_tokens`, and rejects bad ranges. `edit_file` counts overlapping matches and rejects no-op edits.
+  - `search` returns results in a stable order and keeps partial results when `rg` reports unreadable files.
+  - Fixture repos run their tests in place and carry a `.gitignore`.
+- **Acceptance criteria:**
+  - [ ] Path-escape tests pass for every registered tool.
+  - [ ] Two identical `search` calls return identical output.
+  - [ ] A Docker `NotFound` error from a tool propagates out of the registry.
+- **Tests:** `tests/unit/test_registry.py`, `tests/unit/test_tool_helpers.py`, `tests/integration/test_file_tools.py`, `tests/integration/test_exec_tools.py`
+- **Files:** `src/longhaul/tools/*`, `tests/fixtures/repos/*`, tests
+
+#### LH-193 · OpenAI-compatible provider mapping fixes
+- **Epic:** E1 · **Points:** 3 · **Branch:** `fix/lh-193-openai-provider` · **Depends on:** LH-105
+- **Story:** As the cost owner and the retry policy, I want the OpenAI-compatible provider to report usage and errors with the same meaning as the Anthropic provider, so that cost and retries are right whichever provider runs.
+- **Build:**
+  - `Usage.input_tokens` excludes cached prompt tokens.
+  - Errors map to the right kind: `insufficient_quota` and other non-recoverable 429s are not retried, 408 is a timeout, context overflow is detected across common server wordings, and `retry_after_s` parses every documented form.
+  - The max tokens parameter name is configurable per endpoint; refusals and tool calls with `finish_reason: stop` are surfaced correctly; unexpected shapes raise `ProviderError`.
+- **Acceptance criteria:**
+  - [ ] A response with cached tokens yields disjoint `input_tokens` and `cache_read_tokens`.
+  - [ ] Error-mapping tests count transport calls and prove the SDK never retries.
+- **Tests:** `tests/unit/test_openai_provider.py`
+- **Files:** `src/longhaul/providers/openai_compat.py`, tests
+
+#### LH-194 · Settings, env and database safety
+- **Epic:** E0 · **Points:** 3 · **Branch:** `fix/lh-194-config-db` · **Depends on:** LH-005, LH-008
+- **Story:** As a developer, I want config to load the way the README says and tests that never touch real data, so that local runs are safe and predictable.
+- **Build:**
+  - `EnvSettings` reads `.env` and treats blank values as unset; `LONGHAUL_CONFIG` points at a file that exists; `LONGHAUL_SCRIPT` selects the scripted provider script.
+  - Compose publishes ports on `127.0.0.1` only and takes the Postgres password from the environment.
+  - The migration test runs in a throwaway database and compares the migrated schema with the models.
+  - The engine can be disposed between event loops; the YAML secret scanner handles camelCase names.
+- **Acceptance criteria:**
+  - [ ] Copying `.env.example` to `.env` gives a working `EnvSettings()`.
+  - [ ] The migration roundtrip never touches the application database.
+- **Tests:** `tests/unit/test_settings.py`, `tests/unit/test_db_session.py`, `tests/integration/test_migrations.py`
+- **Files:** `src/longhaul/settings.py`, `src/longhaul/db/*`, `.env.example`, `docker-compose.yml`, tests
+
+#### LH-195 · CI, gate and test collection integrity
+- **Epic:** E0 · **Points:** 3 · **Branch:** `fix/lh-195-ci-gate-integrity` · **Depends on:** LH-001, LH-003
+- **Story:** As the gatekeeper, I want every test to run where it should and every gate to fail loudly, so that green means what it says.
+- **Build:**
+  - Test files with the same name in different layers collect; a collection hook requires a phase marker on every test and derives the layer marker from the directory.
+  - `make gate` fails when the marker script fails and excludes opt-in layers; the mypy strict override applies only to the strict modules.
+  - The fixture repo builder is deterministic; CI pins the Temporal CLI; Dependabot targets `dev`; the CI config tests check the aggregate job, every secrets reference and the branch protection body.
+- **Acceptance criteria:**
+  - [ ] A test without a phase marker fails collection.
+  - [ ] Two fixture builds give the same commit.
+- **Tests:** `tests/unit/test_ci_config.py`, `tests/unit/test_markers.py`, `tests/unit/test_fixtures.py`, `tests/unit/test_docs_style.py`
+- **Files:** `pyproject.toml`, `Makefile`, `tests/conftest.py`, `.github/*`, `scripts/*`, tests
+
+#### LH-196 · Backlog import safety
+- **Epic:** E0 · **Points:** 2 · **Branch:** `fix/lh-196-backlog-import` · **Depends on:** LH-006
+- **Story:** As the product owner, I want the backlog import to validate the plan and behave like real `gh`, so that a run against GitHub cannot leave half-created or mislabelled issues.
+- **Build:**
+  - Story counts come from the plan, so appending fix stories keeps CI green.
+  - The fake `gh` is strict like the real one; the plan is validated before any write; closed milestones and empty label lists are handled; `--update` syncs title, labels and milestone.
+- **Acceptance criteria:**
+  - [ ] Appending a fix story to the plan keeps the unit suite green.
+  - [ ] A mistyped phase heading fails before any GitHub call.
+- **Tests:** `tests/unit/test_import_backlog.py`, `tests/unit/test_progress.py`
+- **Files:** `scripts/import_backlog.py`, tests
+
+#### LH-197 · Scripted provider determinism
+- **Epic:** E1 · **Points:** 3 · **Branch:** `fix/lh-197-scripted-provider` · **Depends on:** LH-103
+- **Story:** As a test author, I want scripted runs to stay deterministic through retries and compaction, so that e2e and chaos tests mean what they say.
+- **Build:**
+  - Tool ids are unique within a transcript and stable for a retried identical request; the matched turn survives compaction through a documented marker; matchers can see user text; raise steps can be bounded.
+  - Scripted calls to tools that were not offered fail; role matching fails loudly; scripts are validated strictly; `calc_fix.yaml` finishes only after a passing test result.
+- **Acceptance criteria:**
+  - [ ] No two `tool_use` blocks in one transcript share an id.
+  - [ ] A script keyed on turn 5 still matches after a compaction rewrites the transcript.
+- **Tests:** `tests/unit/test_scripted_provider.py`
+- **Files:** `src/longhaul/providers/scripted.py`, `src/longhaul/providers/base.py`, `tests/fixtures/scripts/*`, tests
+
+#### LH-198 · Contracts v2 from the API research
+- **Epic:** E2 · **Points:** 5 · **Branch:** `feat/lh-198-contracts-v2` · **Depends on:** LH-102, LH-101 · **Gatekeeper review**
+- **Story:** As every provider and the loop, I want the shared contracts to carry what the current Messages API returns and accepts, so that refusals, effort, forced output and billed failures are handled without guessing.
+- **Build:**
+  - `LLMResponse.stop_reason` adds `refusal`, `pause_turn` and `model_context_window_exceeded`, plus `raw_stop_reason`, `stop_details`, `request_id` and `dropped_thinking_blocks`.
+  - `LLMProvider.complete()` and `count_tokens()` take `options: CallOptions | None` with `effort`, `force_tool` and `output_schema`. `ToolSpec` gains `strict`. `ProviderError` can carry the `usage` of a billed response.
+  - `CarryState.started_at` is timezone aware; block type tags always serialize; render never sends empty blocks or messages.
+  - Config: model ids `claude-sonnet-5-5` and `claude-haiku-5-5`, an `effort` section per role, `loop.max_tokens_retry`, and prices in `config/pricing.yaml` taken from the bundled docs.
+  - `contracts_version = "2"` with a changelog entry.
+- **Acceptance criteria:**
+  - [ ] Every contract model round-trips with non-default values for every field.
+  - [ ] A naive `started_at` is rejected.
+  - [ ] The example config loads with the effort section.
+- **Tests:** `tests/unit/test_contracts.py`, `tests/unit/test_render.py`, `tests/unit/test_settings.py`
+- **Files:** `src/longhaul/contracts.py`, `src/longhaul/agent/render.py`, `src/longhaul/settings.py`, `config/*.yaml`, `docs/architecture.md`, tests
+
 ### Integration checkpoint 1
 
 - **Cumulative tests:** `make gate PHASE=1`, which runs phase 0 and 1 markers including e2e `test_calc_scripted`.

@@ -1,14 +1,13 @@
 # Phase 1 gate: Agent core without durability
 
 - Date: 2026-10-31
-- Gatekeeper: Opus
 - Result: **Pass on code, pending owner actions** (a real-model run on calc and textkit, and the live API checks S1 to S10, both need an Anthropic key). See "Owner actions".
 
 ## Test summary
 
 | Check | Result |
 |---|---|
-| `make gate PHASE=1` on the full compose stack | 1678 passed (second run). The first run had 1677 passed and one transient failure in `test_stack.py::test_services_reachable` while four agents ran Docker tests in parallel; it passed alone and in the full rerun. |
+| `make gate PHASE=1` on the full compose stack | 1678 passed (second run). The first run had 1677 passed and one transient failure in `test_stack.py::test_services_reachable` while other Docker-heavy test runs shared the machine; it passed alone and in the full rerun. |
 | Unit coverage | 93.5% (floor 80%), 1585 unit tests, also reproduced in a Linux container |
 | GitHub Actions `ci` on `dev` | The `unit` job failed on 87e117c and 60f6b44 in `test_run_local_help_lists_every_option` only: rich adds color codes on GitHub Actions and they split the option names. The new failure annotations (`pytest-github-actions-annotate-failures`) named the test; it now compares plain text. Every other job, including the new `e2e` job, is green. |
 | Scripted e2e `test_calc_scripted` | Passed locally and in the new CI `e2e` job |
@@ -63,8 +62,7 @@ $ docker ps -a --filter label=longhaul.task_id   # nothing left
 
 1. A pre-gate adversarial review of everything merged in Phase 0 and Phase 1 produced about 120 findings across the sandbox, tools, providers, settings and db, CI and the backlog script. They became fix stories LH-191 to LH-197, and every finding was reproduced with a failing test before it was fixed or recorded as not a defect.
 2. The LH-102 research found that the plan predates the current Messages API: thinking is on by default, forced tool choice is rejected on Sonnet 5.5, and edits to history invalidate thinking blocks. Decisions D1 to D11 in ADR-0003 and contracts v2 (LH-198) adapt the design.
-3. The account usage limit stopped agents mid-task several times; their saved work was continued in place.
-4. `run-local` sent the absolute local path (with the user name) to the model in the system prompt. It now sends only the folder name, with a test.
+3. `run-local` sent the absolute local path (with the user name) to the model in the system prompt. It now sends only the folder name, with a test.
 
 ## Fix stories created
 

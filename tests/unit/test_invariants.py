@@ -424,3 +424,152 @@ def test_workflow_modules_lists_the_package_and_its_workflows(tmp_path: Path) ->
         "longhaul.durable.workflows",
         "longhaul.durable.workflows.task",
     ]
+
+
+# ---------- I4: every GitHub write goes through github/side_effects.py (LH-304) ----------
+#
+# The GitHub client keeps its write methods private and says that only side_effects.py may
+# call them. That module adds the idempotency key and the search for an earlier attempt. A
+# write from anywhere else would be posted twice when a retry follows a reply that never
+# arrived, so a scan of the source is the guard. The scan also looks at the client's own file:
+# nothing in it may call a write method either. It names the three write methods and does not
+# follow a call down to the helper under them (`_write`). Nothing outside client.py uses that
+# helper, and the same name belongs to an unrelated method of the Docker sandbox manager.
+
+phase3 = pytest.mark.phase3
+
+GITHUB_WRITE_METHODS = frozenset({"_post", "_patch", "_delete"})
+# getattr(obj, "_post") reaches a method without naming it as an attribute.
+ATTRIBUTE_BUILTINS = frozenset({"getattr", "hasattr", "setattr", "delattr"})
+SIDE_EFFECTS = SRC / "longhaul" / "github" / "side_effects.py"
+GITHUB_CLIENT = SRC / "longhaul" / "github" / "client.py"
+
+
+def write_method_uses(source: str) -> list[str]:
+    """One "line N: name" entry for each use of a write method of the GitHub client.
+
+    A use is the attribute wherever it appears: called, handed on as a callback
+    (functools.partial(client._post, path)), assigned, or reached by getattr with the name as
+    a string. A definition (`def _post`) is not a use. A name that is computed cannot be
+    compared, like in the scan for I1.
+    """
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Attribute) and node.attr in GITHUB_WRITE_METHODS:
+            found.append(f"line {node.lineno}: {node.attr}")
+        elif isinstance(node, ast.Call) and _dotted(node.func) in ATTRIBUTE_BUILTINS:
+            named = node.args[1] if len(node.args) > 1 else None
+            if isinstance(named, ast.Constant) and named.value in GITHUB_WRITE_METHODS:
+                found.append(f"line {node.lineno}: {named.value}")
+    return sorted(found)
+
+
+def writes_outside_side_effects(src: Path = SRC) -> dict[str, list[str]]:
+    """{file: its uses of the write methods} for every module under src but side_effects.py."""
+    allowed = src / "longhaul" / "github" / "side_effects.py"
+    found = {
+        path.relative_to(src).as_posix(): write_method_uses(path.read_text())
+        for path in sorted((src / "longhaul").rglob("*.py"))
+        if path != allowed
+    }
+    return {name: hits for name, hits in found.items() if hits}
+
+
+@phase3
+def test_github_writes_only_in_side_effects() -> None:
+    # I4: only side_effects.py calls _post, _patch or _delete of the GitHub client.
+    assert writes_outside_side_effects(SRC) == {}
+
+
+@phase3
+def test_the_write_scan_sees_the_methods_and_their_one_caller() -> None:
+    # Without this, a client whose write methods were renamed, or a side_effects.py that no
+    # longer used them, would pass the scan above for the wrong reason.
+    defined = {
+        node.name
+        for node in ast.walk(ast.parse(GITHUB_CLIENT.read_text()))
+        if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef)
+    }
+    assert defined >= GITHUB_WRITE_METHODS
+    used = {entry.partition(": ")[2] for entry in write_method_uses(SIDE_EFFECTS.read_text())}
+    assert {"_post", "_delete"} <= used
+
+
+@phase3
+@pytest.mark.parametrize(
+    "source",
+    [
+        "await client._post('/x', {})",
+        "await self.client._delete(path)",
+        "await gh._patch(path, body)",
+        "send = client._post",
+        "functools.partial(client._post, path)",
+        "GitHubClient._post(client, path, body)",
+        "client._delete = fake",
+        "getattr(client, '_post')",
+        "getattr(client, '_delete', None)",
+        "hasattr(client, '_patch')",
+        "setattr(client, '_post', fake)",
+        "def f():\n    return client._post('/x', {})",
+        "class A:\n    async def g(self):\n        await self._delete('/x')",
+        "try:\n    pass\nexcept Exception:\n    client._patch('/x', {})",
+    ],
+)
+def test_write_method_uses_finds_every_form(source: str) -> None:
+    assert write_method_uses(source)
+
+
+@phase3
+@pytest.mark.parametrize(
+    "source",
+    [
+        "",
+        # Other names, including ones that start with a write method's name.
+        "client.post('/x')",
+        "client._get('/x')",
+        "client._posted",
+        "client._post_comment()",
+        "client._deleted = True",
+        "x._delete_all()",
+        # A definition is not a use, and neither is a plain name.
+        "def _post(self): ...",
+        "async def _delete(self, path): ...",
+        "class C:\n    _patch = None",
+        "_post(x)",
+        # A string is a use only as the name that getattr is asked for, and a computed name
+        # cannot be compared.
+        "getattr(client, name)",
+        "getattr(client, '_get')",
+        "getattr(client)",
+        "print('_post')",
+        "{'_post': 1}",
+    ],
+)
+def test_write_method_uses_ignores_everything_else(source: str) -> None:
+    assert write_method_uses(source) == []
+
+
+@phase3
+def test_write_method_uses_reports_the_line_and_the_name() -> None:
+    source = "x = 1\nawait c._post('/a', {})\n\nfor n in ns:\n    await c._delete(n)\n"
+    assert write_method_uses(source) == ["line 2: _post", "line 5: _delete"]
+
+
+@phase3
+def test_the_write_scan_flags_other_modules_and_lets_side_effects_through(tmp_path: Path) -> None:
+    write_tree(
+        tmp_path,
+        {
+            "longhaul/__init__.py": "",
+            "longhaul/github/__init__.py": "",
+            "longhaul/github/side_effects.py": "async def f(c):\n    await c._post('/x', {})\n",
+            "longhaul/github/client.py": "class C:\n    async def _post(self, p, b): ...\n",
+            "longhaul/durable/activities/github.py": "async def g(c):\n    await c._delete('/x')\n",
+            "longhaul/github/intake.py": "def h(c):\n    return getattr(c, '_patch')\n",
+            "longhaul/other.py": "x = 1\n",
+        },
+    )
+    assert writes_outside_side_effects(tmp_path) == {
+        "longhaul/durable/activities/github.py": ["line 2: _delete"],
+        "longhaul/github/intake.py": ["line 2: _patch"],
+    }

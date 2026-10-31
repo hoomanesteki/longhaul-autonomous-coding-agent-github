@@ -1,7 +1,6 @@
 # Phase 0 gate: Foundation and backlog import
 
 - Date: 2026-10-25
-- Gatekeeper: Opus
 - Result: **Pass on code, pending two owner actions** (branch protection and the GitHub issue import need an authenticated `gh`). `main` and the `v0.0.1` tag move once both are done.
 
 ## Test summary

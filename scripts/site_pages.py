@@ -291,7 +291,7 @@ def adr_page(adr: Adr, doc_path: str, before: Adr | None, after: Adr | None) -> 
     """A page whose title and body both come from the ADR. `doc_path` is relative to the page.
 
     The way between ADRs is a line of plain links. A Quarto sidebar could list the pages, but
-    its globs fail when the project sits under a dot folder such as .claude/worktrees.
+    its globs fail when the project sits under a dot folder such as .worktrees.
     """
     links = [f"[Previous: ADR-{before.number}]({before.stem}.qmd)"] if before else []
     links.append("[All decisions](../decisions.qmd)")

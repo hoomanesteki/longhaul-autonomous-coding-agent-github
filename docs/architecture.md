@@ -16,7 +16,7 @@ Every change to `contracts.py` gets an entry here, with the new
 | Version | Change |
 |---|---|
 | 1 | First version (LH-101). Records, messages and blocks, provider errors, task and plan types, carry state, and the protocols for providers, sandboxes, blobs, checkpoints, memory and GitHub. `Budgets` and `RepoSettings` moved here from `settings.py`. |
-| 2 | Gatekeeper review (LH-198). Stop reasons `refusal`, `pause_turn` and `model_context_window_exceeded`, with `LLMResponse.raw_stop_reason` and `LLMResponse.stop_details` (`StopDetails`). `CallOptions` (`effort`, `force_tool`, `output_schema`) and an `options` argument on `LLMProvider.complete()` and `count_tokens()`. `ToolSpec.strict`. `LLMResponse.request_id` and `LLMResponse.dropped_thinking_blocks`. `ProviderError.usage`, so a call that was billed and then failed can still be ledgered. `CarryState.started_at` must carry a timezone and is stored in UTC. Block `type` tags are written in every dump, also with `exclude_unset` and `exclude_defaults`. |
+| 2 | Reviewer sign-off (LH-198). Stop reasons `refusal`, `pause_turn` and `model_context_window_exceeded`, with `LLMResponse.raw_stop_reason` and `LLMResponse.stop_details` (`StopDetails`). `CallOptions` (`effort`, `force_tool`, `output_schema`) and an `options` argument on `LLMProvider.complete()` and `count_tokens()`. `ToolSpec.strict`. `LLMResponse.request_id` and `LLMResponse.dropped_thinking_blocks`. `ProviderError.usage`, so a call that was billed and then failed can still be ledgered. `CarryState.started_at` must carry a timezone and is stored in UTC. Block `type` tags are written in every dump, also with `exclude_unset` and `exclude_defaults`. |
 
 ### Version 2 decisions
 

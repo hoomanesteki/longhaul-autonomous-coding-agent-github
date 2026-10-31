@@ -348,6 +348,26 @@ def _without_query(url: httpx2.URL) -> str:
     return f"{url.scheme}://{url.netloc.decode('ascii')}{url.path}"
 
 
+def _split_head(repo: str, head: str) -> tuple[str, str]:
+    """(owner, branch) of a pull request head written `branch` or `owner:branch`."""
+    owner, colon, branch = head.partition(":")
+    if not colon:
+        owner, branch = repo.partition("/")[0], head
+    if not owner or not branch:
+        raise GitHubFatal(f"{head!r} is not a head written branch or owner:branch")
+    return owner, branch
+
+
+def _is_from_head(pull: Mapping[str, Any], owner: str, branch: str) -> bool:
+    head = pull.get("head")
+    if not isinstance(head, dict):
+        return False
+    user = head.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    # GitHub ignores the case of an owner's name and not that of a branch name.
+    return head.get("ref") == branch and isinstance(login, str) and login.lower() == owner.lower()
+
+
 # ---------- auth ----------
 def _clean_token(raw: str) -> str:
     # A token read from a file or a Docker secret ends in a newline, which is not part of it.
@@ -574,6 +594,29 @@ class GitHubClient:
         """
         path = f"{repo_path(repo)}/collaborators/{quote(login, safe='')}/permission"
         return _json_object(await self._request("GET", path))
+
+    # ----- reads that side_effects.py uses to find the earlier attempt of a write -----
+
+    async def list_comments(self, repo: str, number: int) -> list[dict[str, Any]]:
+        """Every comment on an issue or pull request, oldest first.
+
+        `list_comments_since` cannot do this job: a comment from an attempt that was retried
+        an hour ago is older than any `since` the retry could know.
+        """
+        return await self._get_pages(f"{repo_path(repo)}/issues/{number}/comments", {})
+
+    async def list_open_pulls_by_head(self, repo: str, head: str) -> list[dict[str, Any]]:
+        """Open pull requests that come from `head`, a branch of the repo or `owner:branch`.
+
+        GitHub matches the filter only as owner:branch, so a bare branch gets the repo's
+        owner. With an empty branch it drops the filter and lists every open pull request,
+        which would name a stranger's work as the answer. So an empty branch is refused, and
+        each pull request in the answer is checked against the head that was asked for.
+        """
+        path = f"{repo_path(repo)}/pulls"
+        owner, branch = _split_head(repo, head)
+        pulls = await self._get_pages(path, {"head": f"{owner}:{branch}", "state": "open"})
+        return [pull for pull in pulls if _is_from_head(pull, owner, branch)]
 
     # ----- writes: only github/side_effects.py may call these (invariant I4, LH-304) -----
     # That module adds the idempotency key and the search for an earlier attempt. A write from

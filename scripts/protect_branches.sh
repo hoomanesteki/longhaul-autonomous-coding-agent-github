@@ -4,7 +4,7 @@
 # Usage: scripts/protect_branches.sh [OWNER/REPO]
 #
 # enforce_admins is false on purpose. The owner merges the phase-gate pull requests and the
-# gatekeeper pushes dev as the admin, so GitHub has to let admins through. These rules bind
+# maintainer pushes dev as the admin, so GitHub has to let admins through. These rules bind
 # collaborators and bots, not admins: a direct push to dev is rejected for a token without
 # admin rights and accepted for an admin. See the CI section of docs/runbook.md.
 set -euo pipefail

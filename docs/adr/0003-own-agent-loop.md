@@ -78,7 +78,7 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 - LH-104 locked `anthropic` 2.3.0 (recorded in ADR-0002). It sends API version 2026-10-21, and a unit test fails if an SDK upgrade changes that.
 - Tests inject `httpx2.MockTransport` through `anthropic.DefaultAsyncHttpxClient(transport=...)`. Tools that patch `httpx` stop seeing SDK traffic.
 - No sampling parameters (`temperature`, `top_p`, `top_k`) are ever sent. On API version `2026-10-21` any of them is a 400 on every model.
-- Invariant I1 and CLAUDE.md rule 4 list `httpx2` and `httpcore2` among the imports that workflow code may not use.
+- Invariant I1 and CONTRIBUTING.md rule 4 list `httpx2` and `httpcore2` among the imports that workflow code may not use.
 
 ## Appendix: API facts (LH-102)
 

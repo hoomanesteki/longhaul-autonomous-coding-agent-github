@@ -1,4 +1,4 @@
-# Longhaul: notes for coding agents
+# Contributing to Longhaul
 
 ## What this is
 Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Progress: docs/progress.md.
@@ -27,7 +27,6 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - Plain English in docs, comments, commits and PRs. No hype words. No emoji.
 - Commit messages: conventional commits, lowercase, imperative, under 72 chars. Body only when the why is not obvious.
 - Comments explain why, not what.
-- No AI attribution trailers in commits or PRs.
 
 ## When unsure
 Stop and leave a short note in the PR description under "Questions". Do not guess at shared contracts.

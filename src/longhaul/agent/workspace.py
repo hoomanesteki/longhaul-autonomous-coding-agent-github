@@ -9,7 +9,7 @@ What is not copied:
 * Build debris and the source's own history: .git, .venv, __pycache__, *.pyc, .pytest_cache,
   *.egg-info, two more tool caches and .DS_Store (BUILTIN_PATTERNS).
 * Files that usually hold secrets: .env and .env.*, except .env.example and its siblings.
-  CLAUDE.md rule 7 keeps secrets out of the sandbox, and a file in /workspace is as readable
+  CONTRIBUTING.md rule 7 keeps secrets out of the sandbox, and a file in /workspace is as readable
   to the model as a variable in its environment.
 * Whatever the source folder's .longhaulignore lists, in .gitignore syntax. The fixture repos
   use it to keep REFERENCE.patch and ISSUE.md away from the model. The ignore file is not

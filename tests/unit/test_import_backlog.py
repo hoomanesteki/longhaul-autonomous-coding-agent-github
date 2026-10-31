@@ -127,7 +127,7 @@ MINI_DRY_RUN = [
 ]
 STANDARD_LABELS = ["phase:0", "epic:E0", "pts:3", "theme:T5", "type:story"]
 
-# What the gatekeeper appends to a phase when its gate fails (plan section 5.4).
+# What the reviewer appends to a phase when its gate fails (plan section 5.4).
 FIX_STORY = """\
 #### {id} · Fix unit coverage below the CI floor
 - **Epic:** E0 · **Points:** 2 · **Branch:** `fix/{slug}-unit-coverage` · **Depends on:** LH-008

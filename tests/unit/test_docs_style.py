@@ -131,7 +131,7 @@ def test_long_dash_check_reads_every_doc_including_the_plan(
     tmp_path: Path, rel: str, dash: str
 ) -> None:
     # LH-004 leaves docs/style.md and docs/plan/ out of the banned-phrase check only. The plan
-    # is the document the gatekeeper edits most, so a dash there must still be found.
+    # is the document edited most, so a dash there must still be found.
     _write_tree(tmp_path, rel, f"one\ntwo {dash} three\n")
     assert long_dash_hits(tmp_path) == [f"{rel}:2"]
 

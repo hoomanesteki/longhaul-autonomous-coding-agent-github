@@ -15,6 +15,7 @@ import shlex
 from typing import Any
 
 from longhaul.contracts import ExecResult, Sandbox, ToolContext, ToolResult, ToolSpec
+from longhaul.tools import ToolError, to_utf8
 from longhaul.tools.files import fail
 
 DEFAULT_TIMEOUT_S = 300
@@ -163,6 +164,10 @@ class RunCommand:
         )
 
     async def run(self, sandbox: Sandbox, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        try:
+            to_utf8(args["command"], "the command")
+        except ToolError as exc:
+            return fail(str(exc))
         timeout_s = clamp_timeout(args.get("timeout_s"), self.max_timeout_s)
         res = await sandbox.exec(args["command"], timeout_s=timeout_s)
         hint = COMMAND_TIMEOUT_HINT.format(max_s=self.max_timeout_s)
@@ -201,7 +206,10 @@ class RunTests:
         if not self.test_command:
             return fail("no test command is configured for this repo; use run_command instead")
         try:
+            to_utf8(args.get("target") or "", "the target")
             command = build_test_command(self.test_command, args.get("target"))
+        except ToolError as exc:
+            return fail(str(exc))
         except ValueError as exc:
             return fail(f"could not read target: {exc}")
         # The model cannot pick a timeout here, and test suites are the commands

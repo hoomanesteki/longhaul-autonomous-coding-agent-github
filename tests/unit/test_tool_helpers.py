@@ -4,14 +4,21 @@ import pytest
 
 from longhaul.contracts import ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.tools import ToolError
 from longhaul.tools.files import (
     EditFile,
     ListDir,
     ReadFile,
     WriteFile,
+    find_all,
     format_diff,
+    looks_numbered,
     number_lines,
+    plan_edit,
     render_tree,
+    split_lines,
+    to_crlf,
+    uses_crlf,
 )
 from longhaul.tools.paths import PathError, check_resolved, normalize
 from longhaul.tools.registry import default_registry
@@ -78,14 +85,131 @@ def test_number_lines_and_paging() -> None:
 
 
 def test_number_lines_out_of_range() -> None:
-    assert "beyond" in number_lines("a\n", 5, None)
+    # An unreadable range is an error the caller reports, not a sentence in the output.
+    with pytest.raises(ToolError, match=r"start_line 5 is beyond the end of the file \(1 line\)"):
+        number_lines("a\n", 5, None)
+    with pytest.raises(ToolError, match=r"\(3 lines\)"):
+        number_lines("a\nb\nc\n", 4, None)
+
+
+def test_number_lines_rejects_an_inverted_range() -> None:
+    with pytest.raises(ToolError, match="end_line 1 is before start_line 3"):
+        number_lines("a\nb\nc\n", 3, 1)
+
+
+def test_number_lines_of_an_empty_file() -> None:
+    assert number_lines("", 1, None) == "(empty file)"
+    with pytest.raises(ToolError, match="it is empty"):
+        number_lines("", 2, None)
+
+
+def test_number_lines_cuts_an_end_line_that_is_past_the_end() -> None:
+    assert number_lines("a\nb\n", 2, 50) == "     2\tb"
+
+
+def test_number_lines_stops_at_the_character_budget() -> None:
+    text = "".join(f"{'x' * 40}\n" for _ in range(100))
+    out = number_lines(text, 1, None, max_chars=1000)
+    rows = out.splitlines()
+    assert len(out) <= 1000
+    # 47 characters and a newline per row, after 120 are kept back for the footer.
+    assert rows[-1] == "[showing lines 1-18 of 100; call again with start_line=19 to continue]"
+    assert len(rows) == 19
+    rest = number_lines(text, 19, None, max_chars=1000)
+    assert rest.startswith("    19\t")
+
+
+def test_a_page_always_has_a_line_even_when_the_budget_is_tiny() -> None:
+    out = number_lines("a\nb\nc\n", 1, None, max_chars=10)
+    assert out.splitlines()[0] == "     1\ta"
+
+
+def test_number_lines_cuts_a_line_that_alone_exceeds_the_budget() -> None:
+    out = number_lines("x" * 5000 + "\nnext\n", 1, None, max_chars=1000)
+    first = out.splitlines()[0]
+    assert len(first) < 1000 and first.endswith(" more characters]")
+    assert "[line cut: " in first
+    assert out.splitlines()[-1].endswith("start_line=2 to continue]")
+
+
+def test_split_lines_breaks_on_newlines_only() -> None:
+    assert split_lines("") == []
+    assert split_lines("a") == ["a"]
+    assert split_lines("a\n") == ["a"]
+    assert split_lines("a\n\n") == ["a", ""]
+    assert split_lines("\n") == [""]
+    # Form feed, vertical tab, NEL, line and paragraph separators, a lone carriage return.
+    odd = "a\x0cb\x0bc\x85d e f\rg"
+    assert split_lines(odd + "\nnext\n") == [odd, "next"]
+    assert split_lines("a\r\nb\r\n") == ["a", "b"]
+    assert split_lines("a\r\nb") == ["a", "b"]
+
+
+def test_find_all_counts_overlapping_matches() -> None:
+    assert find_all("aaa", "aa") == [0, 1]
+    assert find_all("ababa", "aba") == [0, 2]
+    assert find_all("abc", "d") == []
+    assert find_all("a.b.c", ".") == [1, 3]
+    assert find_all("abab", "ab") == [0, 2]
+
+
+def test_line_ending_helpers() -> None:
+    assert to_crlf("a\nb\r\nc") == "a\r\nb\r\nc"
+    assert to_crlf("no break") == "no break"
+    assert uses_crlf("a\r\nb\r\n") and not uses_crlf("a\nb\n")
+    assert not uses_crlf("") and not uses_crlf("single line")
+    assert uses_crlf("a\r\nb\r\nc\n") and not uses_crlf("a\r\nb\nc\n")
+
+
+def test_looks_numbered() -> None:
+    assert looks_numbered("     4\tdef add():\n     5\t    return 1")
+    assert looks_numbered("4\tx\n\n5\ty")
+    assert not looks_numbered("4\tx\nplain")
+    assert not looks_numbered("")
+    assert not looks_numbered("   \n")
+    assert not looks_numbered("4 spaces instead of a tab")
+
+
+def test_plan_edit_finds_one_place_and_keeps_the_rest_of_the_file() -> None:
+    edit = plan_edit("f.txt", "one two three", "two", "2")
+    assert edit.apply("one two three") == "one 2 three"
+    assert edit.note is None
+
+
+def test_plan_edit_refuses_none_and_many() -> None:
+    with pytest.raises(ToolError, match="found 0 matches for old_str in f.txt"):
+        plan_edit("f.txt", "abc", "x", "y")
+    with pytest.raises(ToolError, match="found 2 matches.*add more context"):
+        plan_edit("f.txt", "abab", "ab", "y")
+    with pytest.raises(ToolError, match="found 3 matches"):
+        plan_edit("f.txt", "aaaa", "aa", "y")
+
+
+def test_plan_edit_uses_the_line_endings_of_the_file() -> None:
+    text = "a\r\nb\r\nc\r\n"
+    edit = plan_edit("f.txt", text, "a\nb", "A\nB")
+    assert edit.apply(text) == "A\r\nB\r\nc\r\n"
+    assert edit.note is not None and "CRLF" in edit.note
+    # Nothing to convert, nothing to say.
+    quiet = plan_edit("f.txt", text, "c", "C")
+    assert quiet.apply(text) == "a\r\nb\r\nC\r\n" and quiet.note is None
 
 
 def test_render_tree_caps() -> None:
     paths = [f"d/f{i}" for i in range(500)]
-    out = render_tree(paths)
-    assert "more entries" in out
-    assert len(out.splitlines()) <= 402
+    lines = render_tree(paths).splitlines()
+    # 400 entries and the marker. A limit of 399 or 401 changes this count.
+    assert len(lines) == 401
+    assert lines[399] == "  f399"
+    assert lines[-1] == "... 100 more entries not shown"
+
+
+def test_render_tree_does_not_cut_at_the_limit() -> None:
+    paths = [f"f{i:03d}" for i in range(401)]
+    exactly = render_tree(paths[:400]).splitlines()
+    assert len(exactly) == 400 and exactly[-1] == "f399"
+    assert render_tree(paths).splitlines()[-1] == "... 1 more entries not shown"
+    assert render_tree([]) == "(empty)"
 
 
 def test_parse_rg_json() -> None:

@@ -236,6 +236,19 @@ async def test_run_tests_runs_the_configured_command_with_the_target() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [("run_command", {"command": "echo \ud800"}), ("run_tests", {"target": "\ud800"})],
+)
+async def test_a_lone_surrogate_in_a_command_is_a_result(
+    name: str, args: dict[str, str], sbx: FakeSandbox
+) -> None:
+    # No sandbox can be handed text that has no UTF-8 form.
+    reg = default_registry(test_command="pytest -q")
+    r = await reg.run(ToolCall(id="c", name=name, input=args), sbx, CTX)
+    assert not r.ok and "UTF-8" in r.output
+
+
 async def test_run_tests_reports_a_bad_target_as_a_result() -> None:
     sandbox = StubSandbox()
     r = await RunTests("pytest -q").run(sandbox, {"target": "tests/'oops"}, CTX)

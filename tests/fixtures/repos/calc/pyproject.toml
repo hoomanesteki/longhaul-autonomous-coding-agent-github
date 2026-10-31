@@ -15,3 +15,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The package is in src/. The fake sandbox has no setup step that installs it.
+pythonpath = ["src"]

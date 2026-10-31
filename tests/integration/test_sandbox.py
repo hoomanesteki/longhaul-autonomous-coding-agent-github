@@ -1,6 +1,9 @@
+import asyncio
 import json
 import os
 import subprocess
+import time
+import tracemalloc
 import uuid
 from collections.abc import AsyncIterator
 
@@ -9,6 +12,7 @@ import pytest
 from docker.errors import NotFound
 
 from longhaul.contracts import Sandbox, SandboxLimits
+from longhaul.sandbox.common import OUTPUT_CAP
 from longhaul.sandbox.docker_manager import ENV_ALLOWLIST, DockerSandboxManager, volume_name
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase1]
@@ -97,6 +101,119 @@ async def test_timeout_kills(manager: DockerSandboxManager, task_id: str) -> Non
     r = await sbx.exec("sleep 30", timeout_s=2)
     assert r.timed_out
     assert r.duration_ms < 5000
+
+
+async def test_exec_keeps_the_head_and_the_tail_of_big_output(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    # 24 MB on stdout and 3 MB on stderr, with a marker at each end of each stream.
+    script = (
+        "echo HEAD-OUT; head -c 24000000 /dev/zero | tr '\\0' a; echo; echo TAIL-OUT; "
+        "echo HEAD-ERR >&2; head -c 3000000 /dev/zero | tr '\\0' b >&2; echo >&2; echo TAIL-ERR >&2"
+    )
+    tracemalloc.start()
+    try:
+        r = await sbx.exec(script, timeout_s=120)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert r.exit_code == 0 and not r.timed_out
+    # The tools cut again to 8,000 plus 12,000 characters, so the real end must survive.
+    assert r.stdout.startswith("HEAD-OUT\n") and r.stdout.endswith("TAIL-OUT\n")
+    assert r.stderr.startswith("HEAD-ERR\n") and r.stderr.endswith("TAIL-ERR\n")
+    assert "bytes omitted" in r.stdout and "bytes omitted" in r.stderr
+    assert OUTPUT_CAP < len(r.stdout) < OUTPUT_CAP + 100
+    # The worker kept about the cap per stream, not the 27 MB the command printed.
+    # Buffering it all first took 1.1 GB for 20 MB of output.
+    assert peak < 12_000_000, peak
+
+
+async def test_a_flood_of_output_ends_at_the_timeout_with_bounded_memory(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    tracemalloc.start()
+    try:
+        started = time.monotonic()
+        r = await sbx.exec("yes", timeout_s=3)
+        elapsed = time.monotonic() - started
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert r.timed_out and r.exit_code == 137
+    assert elapsed < 30
+    assert r.stdout.startswith("y\ny\n") and r.stdout.endswith("y\n")
+    assert peak < 12_000_000, peak
+
+
+async def test_exec_rejects_a_timeout_that_is_not_positive(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # timeout reads 0 as "no limit", so a command could have run for ever.
+    sbx = await _make(manager, task_id)
+    for bad in (0, -5):
+        with pytest.raises(ValueError, match="timeout_s"):
+            await sbx.exec("true", timeout_s=bad)
+    assert (await _sh(sbx, "echo still fine")).strip() == "still fine"
+
+
+# A daemon: the first child starts a new session, and the grandchild is adopted by init
+# once the child exits. The newlines are real ones because python reads the program
+# from its argument.
+DOUBLE_FORK = (
+    "python3 -c 'import os\n"
+    "if os.fork() == 0:\n"
+    " os.setsid()\n"
+    " if os.fork() == 0:\n"
+    '  os.execv("/bin/sleep", ["sleep", "65"])\n'
+    " os._exit(0)'"
+)
+
+
+async def test_exec_kills_what_a_command_leaves_running(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    leftovers = (
+        "sleep 61 & "  # a plain background job
+        "nohup sleep 62 >/dev/null 2>&1 & "
+        "setsid -f sleep 63; "  # its own session, so the group kill cannot reach it
+        "env -i /usr/bin/setsid -f /bin/sleep 64; "  # and a scrubbed environment
+        f"{DOUBLE_FORK}; "  # a daemon: forks twice and is adopted by init
+        "echo started"
+    )
+    r = await sbx.exec(leftovers, timeout_s=60)
+    # An empty stderr shows the daemon snippet ran: a syntax error in it would print here.
+    assert (r.exit_code, r.stdout.strip(), r.stderr, r.timed_out) == (0, "started", "", False)
+    assert r.duration_ms < 15_000  # the sleepers do not hold the call open
+    left = await sbx.exec("pgrep -af '[s]leep 6'; echo rc=$?", timeout_s=15)
+    assert left.stdout.strip() == "rc=1", left.stdout
+    # The container's idle process is not the command's, so it survives, and so does exec.
+    idle = await _sh(sbx, "ps -eo args | grep -c '^sleep infinity$'")
+    assert idle.strip() == "1"
+
+
+async def test_a_timeout_also_kills_children_that_left_the_process_group(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    r = await sbx.exec("setsid -f sleep 66; sleep 30", timeout_s=2)
+    assert r.timed_out and r.exit_code == 137
+    assert r.duration_ms < 10_000
+    left = await sbx.exec("pgrep -af '[s]leep 6'; echo rc=$?", timeout_s=15)
+    assert left.stdout.strip() == "rc=1", left.stdout
+
+
+async def test_one_exec_does_not_kill_the_children_of_another(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    slow = asyncio.create_task(sbx.exec("sleep 6 & wait; echo slow-done", timeout_s=60))
+    await asyncio.sleep(1.5)
+    quick = await sbx.exec("setsid -f sleep 67; echo quick-done", timeout_s=60)
+    assert quick.stdout.strip() == "quick-done"
+    assert (await slow).stdout.strip() == "slow-done"
 
 
 async def test_no_secrets_in_container_env(

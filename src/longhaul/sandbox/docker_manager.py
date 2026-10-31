@@ -13,6 +13,7 @@ import tarfile
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import docker
@@ -20,13 +21,16 @@ import requests
 from docker.errors import APIError, NotFound
 
 from longhaul.contracts import ExecResult, Sandbox, SandboxLimits
-from longhaul.sandbox.common import WORKDIR, mount_for, resolve_path
+from longhaul.sandbox.common import WORKDIR, BoundedOutput, check_timeout, mount_for, resolve_path
 
 AGENT_USER = "agent"
 AGENT_UID = 10001
-OUTPUT_CAP = 1_000_000
 CONTAINER_PREFIX = "lh-sbx-"
 TASK_LABEL = "longhaul.task_id"
+
+# How long to wait for the daemon to record an exit status after the output ends.
+EXIT_POLLS = 100
+EXIT_POLL_S = 0.05
 
 # The root filesystem is read-only, so packages for the repo's tests go into a
 # virtualenv inside the workspace volume. Its bin directory leads PATH so pytest
@@ -69,13 +73,35 @@ def merge_env(extra: dict[str, str] | None) -> dict[str, str]:
     return env
 
 
-def cap_output(data: bytes | None, limit: int = OUTPUT_CAP) -> str:
-    if not data:
-        return ""
-    text = data[:limit].decode("utf-8", errors="replace")
-    if len(data) > limit:
-        text += "\n[output truncated]"
-    return text
+# The agent can write to the venv directory that leads PATH, so a file named
+# `python3`, `timeout` or `bash` there must not be able to take the place of the
+# real program, least of all the one that enforces the time limit.
+PYTHON = "/usr/local/bin/python3"
+TIMEOUT = "/usr/bin/timeout"
+BASH = "/bin/bash"
+
+# What runs inside the container around every command: see supervisor.py. It is sent
+# as text with each call, so it always matches this code and needs nothing installed
+# in the image except python3 at the path above, which the official python images
+# have. An image without it fails every exec loudly instead of skipping the cleanup.
+SUPERVISOR_SOURCE = Path(__file__).with_name("supervisor.py").read_text(encoding="utf-8")
+
+
+def exec_argv(cmd: str, timeout_s: float) -> list[str]:
+    """The command line for one `Sandbox.exec` call.
+
+    `timeout --signal=KILL` ends bash and the processes in its group when time is
+    up. The supervisor around it also kills what escaped the group (setsid, daemons)
+    and what a command left in the background. Plain `bash -c` is used: `-l` would
+    source /etc/profile, which resets PATH. `-I` keeps the working directory (the
+    agent's files) and PYTHON* variables out of the supervisor's own Python, and `-S`
+    skips the site machinery it does not need.
+    """
+    # GNU timeout reads 0 as "no limit", which would switch the F7 guarantee off.
+    check_timeout(timeout_s)
+    supervisor = [PYTHON, "-I", "-S", "-c", SUPERVISOR_SOURCE]
+    limited = [TIMEOUT, "--signal=KILL", str(timeout_s), BASH, "-c", cmd]
+    return supervisor + limited
 
 
 def build_tar(path: str, data: bytes, *, mode: int = 0o644) -> bytes:
@@ -182,34 +208,57 @@ class DockerSandbox:
     async def exec(
         self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
     ) -> ExecResult:
-        # `timeout --signal=KILL` kills bash and its children when time is up.
-        # Plain `bash -c` is used: `-l` would source /etc/profile, which resets PATH.
-        # Both programs are called by absolute path. The agent can write to the
-        # venv directory that leads PATH, and a file named `timeout` or `bash`
-        # there must not be able to switch the time limit off.
-        argv = ["/usr/bin/timeout", "--signal=KILL", str(timeout_s), "/bin/bash", "-c", cmd]
-
-        def run() -> tuple[int, Any]:
-            res = self._container().exec_run(
-                argv,
-                demux=True,
-                workdir=WORKDIR,
-                user=AGENT_USER,
-                environment=merge_env(env),
-            )
-            return int(res.exit_code), res.output
-
+        argv = exec_argv(cmd, timeout_s)  # also refuses a timeout that is not positive
         start = time.monotonic()
-        code, output = await asyncio.to_thread(run)
+        code, out, err = await asyncio.to_thread(self._stream_exec, argv, merge_env(env))
         elapsed = time.monotonic() - start
-        out, err = output if output else (None, None)
         return ExecResult(
             exit_code=code,
-            stdout=cap_output(out),
-            stderr=cap_output(err),
+            stdout=out.text(),
+            stderr=err.text(),
             timed_out=code == 137 and elapsed >= timeout_s,
             duration_ms=int(elapsed * 1000),
         )
+
+    def _stream_exec(
+        self, argv: list[str], env: dict[str, str]
+    ) -> tuple[int, BoundedOutput, BoundedOutput]:
+        """Run `argv` and read its output as it arrives, keeping the head and tail.
+
+        exec_run() returns only after it has collected everything. The worker holds
+        the credentials and has no memory limit, so a command that printed a lot
+        would grow it without bound. Here the stream is drained and trimmed as it goes.
+        """
+        api = self._client.api
+        created = api.exec_create(self.id, argv, workdir=WORKDIR, user=AGENT_USER, environment=env)
+        exec_id = str(created["Id"])
+        out, err = BoundedOutput(), BoundedOutput()
+        stream = api.exec_start(exec_id, stream=True, demux=True)
+        try:
+            for stdout, stderr in stream:
+                if stdout:
+                    out.feed(stdout)
+                if stderr:
+                    err.feed(stderr)
+        finally:
+            # The caller owns the connection of a stream. The peer may be gone already.
+            with contextlib.suppress(OSError):
+                stream.close()
+        return self._exit_code(exec_id), out, err
+
+    def _exit_code(self, exec_id: str) -> int:
+        """The exit status once the daemon has recorded it.
+
+        The output stream can end a moment before that, and the status reads as
+        None until then.
+        """
+        api = self._client.api
+        for _ in range(EXIT_POLLS):
+            info = api.exec_inspect(exec_id)
+            if not info["Running"] and info["ExitCode"] is not None:
+                return int(info["ExitCode"])
+            time.sleep(EXIT_POLL_S)
+        raise RuntimeError(f"exec {exec_id} ended without an exit status")
 
     def _read(self, full: str) -> bytes:
         target = self._resolve(full)

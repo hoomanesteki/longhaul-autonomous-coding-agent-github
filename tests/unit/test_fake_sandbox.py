@@ -1,15 +1,17 @@
+import contextlib
 import os
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
+from longhaul.sandbox.common import OUTPUT_CAP, BoundedOutput
 from longhaul.sandbox.docker_manager import (
     ENV_ALLOWLIST,
     build_tar,
-    cap_output,
     container_name,
     merge_env,
     mount_for,
@@ -38,6 +40,61 @@ async def test_exec_timeout(sbx: FakeSandbox) -> None:
     r = await sbx.exec("sleep 30", timeout_s=1)
     assert r.timed_out
     assert r.duration_ms < 5000
+
+
+async def test_exec_rejects_a_timeout_that_is_not_positive(sbx: FakeSandbox) -> None:
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="timeout_s"):
+            await sbx.exec("true", timeout_s=bad)
+
+
+async def test_exec_keeps_the_head_and_the_real_tail_of_big_output(sbx: FakeSandbox) -> None:
+    # 3 MB on each stream. The tools cut again to 8,000 plus 12,000 characters, so what
+    # matters is that the end of the output, not the start, is what survives.
+    script = (
+        "echo HEAD-OUT; head -c 3000000 /dev/zero | tr '\\0' a; echo; echo TAIL-OUT; "
+        "echo HEAD-ERR >&2; head -c 3000000 /dev/zero | tr '\\0' b >&2; echo >&2; echo TAIL-ERR >&2"
+    )
+    r = await sbx.exec(script, timeout_s=60)
+    assert r.exit_code == 0 and not r.timed_out
+    assert r.stdout.startswith("HEAD-OUT\n") and r.stdout.endswith("TAIL-OUT\n")
+    assert r.stderr.startswith("HEAD-ERR\n") and r.stderr.endswith("TAIL-ERR\n")
+    assert "bytes omitted" in r.stdout and "bytes omitted" in r.stderr
+    assert OUTPUT_CAP < len(r.stdout) < OUTPUT_CAP + 100
+
+
+async def test_background_jobs_do_not_outlive_exec(sbx: FakeSandbox) -> None:
+    # A job that keeps stdout open used to hold the call until the timeout.
+    r = await sbx.exec("sleep 61 & echo started", timeout_s=30)
+    assert (r.exit_code, r.stdout.strip(), r.timed_out) == (0, "started", False)
+    assert r.duration_ms < 10_000
+    left = await sbx.exec("pgrep -f '[s]leep 61'; echo rc=$?", timeout_s=15)
+    assert left.stdout.strip() == "rc=1", left.stdout
+
+
+async def test_a_job_in_its_own_session_does_not_hold_the_call(sbx: FakeSandbox) -> None:
+    # The group kill cannot reach a process that called setsid, and it keeps the output
+    # pipes open. The call waits a moment for it and then stops listening.
+    script = (
+        f"{sys.executable} -c 'import os, time\n"
+        "if os.fork() == 0:\n"
+        " os.setsid()\n"
+        " print(os.getpid(), flush=True)\n"
+        " time.sleep(60)'"
+    )
+    r = await sbx.exec(script, timeout_s=30)
+    pid = int(r.stdout.split()[0])
+    try:
+        assert (r.exit_code, r.timed_out) == (0, False)
+        assert r.duration_ms < 10_000
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+
+async def test_a_signal_death_is_reported_like_docker_does(sbx: FakeSandbox) -> None:
+    r = await sbx.exec("kill -9 $$", timeout_s=10)
+    assert r.exit_code == 137 and not r.timed_out
 
 
 async def test_exec_env_passthrough(sbx: FakeSandbox) -> None:
@@ -255,11 +312,18 @@ def test_path_starts_with_the_workspace_venv() -> None:
     ]
 
 
-def test_cap_output() -> None:
-    assert cap_output(None) == ""
-    assert cap_output(b"abc") == "abc"
-    capped = cap_output(b"a" * 20, limit=10)
-    assert capped.startswith("a" * 10) and "truncated" in capped
+def test_output_cap_keeps_both_ends() -> None:
+    # This was cap_output(), which kept the first `limit` bytes and added a note. That
+    # threw away the end of the output, and the end is what the exec tools show.
+    def capped(data: bytes, head: int, tail: int) -> str:
+        out = BoundedOutput(head=head, tail=tail)
+        out.feed(data)
+        return out.text()
+
+    assert capped(b"", 5, 5) == ""
+    assert capped(b"abc", 5, 5) == "abc"
+    text = capped(b"a" * 10 + b"b" * 10, 5, 5)
+    assert text.startswith("a" * 5) and text.endswith("b" * 5) and "omitted" in text
 
 
 def test_mount_for() -> None:

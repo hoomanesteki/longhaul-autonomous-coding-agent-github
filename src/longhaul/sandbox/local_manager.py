@@ -8,15 +8,43 @@ import errno
 import os
 import re
 import shutil
+import signal
 import tempfile
 import time
 from pathlib import Path
 
 from longhaul.contracts import ExecResult
-from longhaul.sandbox.common import WORKDIR, PathEscapeError, resolve_path
+from longhaul.sandbox.common import (
+    WORKDIR,
+    BoundedOutput,
+    PathEscapeError,
+    check_timeout,
+    resolve_path,
+)
 
 # "/workspace" as a whole path word: not the start of /workspace-old or the end of /a/workspace.
 _WORKDIR_WORD = re.compile(r"(?<![\w./-])" + re.escape(WORKDIR) + r"(?![\w.-])")
+
+
+# How long to keep reading after the process is gone. A job that left the process
+# group can hold the pipes open, and its output is not worth waiting for.
+PIPE_GRACE_S = 1.0
+
+
+async def _drain(stream: asyncio.StreamReader | None, sink: BoundedOutput) -> None:
+    """Read a pipe to the end, keeping only what the sink keeps."""
+    while stream is not None and (chunk := await stream.read(65536)):
+        sink.feed(chunk)
+
+
+async def _exited(proc: asyncio.subprocess.Process) -> None:
+    """Return once the process itself is gone.
+
+    Process.wait() also waits for the output pipes to close, and a background job
+    keeps them open, so it would hold the call until that job ended.
+    """
+    while proc.returncode is None:
+        await asyncio.sleep(0.005)
 
 
 class FakeSandbox:
@@ -59,6 +87,7 @@ class FakeSandbox:
     async def exec(
         self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
     ) -> ExecResult:
+        check_timeout(timeout_s)
         # Same rule as the Docker sandbox: the workspace venv leads PATH.
         venv_bin = str(self.root.resolve() / ".venv" / "bin")
         path = os.pathsep.join(filter(None, [venv_bin, os.environ.get("PATH")]))
@@ -77,18 +106,31 @@ class FakeSandbox:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        out, err = BoundedOutput(), BoundedOutput()
+        readers = [
+            asyncio.create_task(_drain(proc.stdout, out)),
+            asyncio.create_task(_drain(proc.stderr, err)),
+        ]
         timed_out = False
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout_s)
+            await asyncio.wait_for(_exited(proc), timeout_s)
         except TimeoutError:
             timed_out = True
+        finally:
+            # Whatever is left in the group dies: the command itself after a timeout, and
+            # any job it started in the background otherwise.
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, 9)
-            out, err = await proc.communicate()
+                os.killpg(proc.pid, signal.SIGKILL)
+        await asyncio.wait_for(_exited(proc), 10)
+        _, stragglers = await asyncio.wait(readers, timeout=PIPE_GRACE_S)
+        for task in stragglers:
+            task.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
+        code = proc.returncode or 0
         return ExecResult(
-            exit_code=137 if timed_out else (proc.returncode or 0),
-            stdout=self._to_workdir(out.decode("utf-8", errors="replace")),
-            stderr=self._to_workdir(err.decode("utf-8", errors="replace")),
+            exit_code=137 if timed_out else (128 - code if code < 0 else code),
+            stdout=self._to_workdir(out.text()),
+            stderr=self._to_workdir(err.text()),
             timed_out=timed_out,
             duration_ms=int((time.monotonic() - start) * 1000),
         )

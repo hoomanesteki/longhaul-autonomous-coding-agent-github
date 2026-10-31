@@ -34,3 +34,55 @@ def mount_for(path: str) -> str:
         if path == mount or path.startswith(mount + "/"):
             return mount
     raise PathEscapeError(f"path is not on a writable mount: {path}")
+
+
+# Each stream keeps at most this much (the 1 MB cap from LH-107): the first half
+# and the last half. Tools that trim further (LH-109 keeps 8,000 plus 12,000
+# characters) need the real tail, so the middle goes, not the end.
+OUTPUT_CAP = 1_000_000
+OUTPUT_HEAD = OUTPUT_CAP // 2
+OUTPUT_TAIL = OUTPUT_CAP - OUTPUT_HEAD
+
+
+def check_timeout(timeout_s: float) -> None:
+    """GNU timeout reads 0 as "no limit", which would switch the F7 guarantee off."""
+    if timeout_s <= 0:
+        raise ValueError(f"timeout_s must be positive, got {timeout_s}")
+
+
+class BoundedOutput:
+    """Collects a stream but keeps only its first and last bytes.
+
+    Memory stays at roughly the cap however much the command prints, and the
+    stream is still read to the end so the command never blocks on a full pipe.
+    """
+
+    def __init__(self, head: int = OUTPUT_HEAD, tail: int = OUTPUT_TAIL) -> None:
+        self._head_limit = head
+        self._tail_limit = tail
+        self._head = bytearray()
+        self._tail = bytearray()
+        self.total = 0
+
+    def feed(self, chunk: bytes) -> None:
+        self.total += len(chunk)
+        room = self._head_limit - len(self._head)
+        if room > 0:
+            self._head += chunk[:room]
+            chunk = chunk[room:]
+        if chunk and self._tail_limit:
+            self._tail += chunk
+            # Trimmed in batches so a long stream costs linear time.
+            if len(self._tail) > 2 * self._tail_limit:
+                del self._tail[: -self._tail_limit]
+
+    def text(self) -> str:
+        tail = bytes(self._tail[-self._tail_limit :]) if self._tail_limit else b""
+        omitted = self.total - len(self._head) - len(tail)
+        head = bytes(self._head)
+        if omitted <= 0:
+            return (head + tail).decode("utf-8", errors="replace")
+        marker = f"\n[... {omitted} bytes omitted ...]\n"
+        return (
+            head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
+        )

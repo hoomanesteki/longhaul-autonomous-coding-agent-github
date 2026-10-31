@@ -113,6 +113,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below) |
+| `e2e` | builds the sandbox image, then runs the end-to-end tests: `longhaul run-local` on the `calc` fixture with the scripted provider, on a real sandbox (see "Run the agent on a local folder") |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
@@ -134,7 +135,7 @@ Every test carries two markers:
 
 A test with no phase marker, or a test file outside a layer directory, fails collection with a message that names it. Without the phase marker, `make gate PHASE=N` would never run the test. Test files in different layers may share a name, because pytest imports them by path (`--import-mode=importlib`).
 
-Some tests run only on request: `live` (paid model calls), `slow`, and the full `chaos` suite. `make gate`, `make itest`, `make e2e` and the `integration` job all leave them out. `chaos_lite` stays in, because gates run it. To run the others, name the marker, for example `uv run pytest -m slow`.
+Some tests run only on request: `live` (paid model calls), `slow`, and the full `chaos` suite. `make gate`, `make itest`, `make e2e` and the `integration` and `e2e` jobs all leave them out. `chaos_lite` stays in, because gates run it. To run the others, name the marker, for example `uv run pytest -m slow`.
 
 `make gate PHASE=N` runs `make check`, then pytest with the markers `phase0` to `phaseN`. It stops with an error if `scripts/markers.py` rejects `N`, so a typo cannot select every test.
 

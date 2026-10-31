@@ -168,6 +168,26 @@ jobs:
         if: failure()
         run: docker logs temporal || true
 
+  # The agent end to end, on a real sandbox and the scripted provider: no keys, no services.
+  # The sandbox setup installs the fixture's dependencies from PyPI, so it needs the network.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Build sandbox image
+        run: make sandbox-image
+      # Same selection as `make e2e`. Live, slow and full chaos tests are opt-in.
+      - name: Run end-to-end tests
+        run: >-
+          uv run pytest -q
+          -m "e2e and not live and not slow and not (chaos and not chaos_lite)"
+
   compose:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -208,7 +228,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, types, unit, integration, security, compose]
+    needs: [lint, types, unit, integration, e2e, security, compose]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

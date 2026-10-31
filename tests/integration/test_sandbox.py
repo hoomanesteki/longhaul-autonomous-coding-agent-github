@@ -6,10 +6,12 @@ import time
 import tracemalloc
 import uuid
 from collections.abc import AsyncIterator
+from typing import Any
 
 import docker
 import pytest
 from docker.errors import NotFound
+from docker.utils.proxy import ProxyConfig
 
 from longhaul.contracts import Sandbox, SandboxLimits
 from longhaul.sandbox.common import OUTPUT_CAP
@@ -27,9 +29,8 @@ def _online() -> bool:
             "docker",
             "run",
             "--rm",
-            "--entrypoint",
-            "python",
             IMAGE,
+            "python",
             "-c",
             "import urllib.request as u; u.urlopen('https://pypi.org', timeout=5)",
         ],
@@ -62,6 +63,10 @@ async def _sh(sbx: Sandbox, script: str) -> str:
     r = await sbx.exec(script, timeout_s=60)
     assert r.exit_code == 0, r.stderr
     return r.stdout
+
+
+def _inspect(container_id: str) -> dict[str, Any]:
+    return docker.from_env().api.inspect_container(container_id)
 
 
 async def test_runs_as_non_root(manager: DockerSandboxManager, task_id: str) -> None:
@@ -214,6 +219,68 @@ async def test_one_exec_does_not_kill_the_children_of_another(
     quick = await sbx.exec("setsid -f sleep 67; echo quick-done", timeout_s=60)
     assert quick.stdout.strip() == "quick-done"
     assert (await slow).stdout.strip() == "slow-done"
+
+
+async def test_pid_1_is_an_init_that_reaps_orphans(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await _make(manager, task_id)
+    assert _inspect(sbx.id)["HostConfig"].get("Init") is True
+    # A process whose parent exits is adopted by PID 1. This one is started outside
+    # exec(), so no supervisor owns it and reaping it is up to PID 1. With `sleep
+    # infinity` there it stayed a zombie for the life of the container.
+    api = docker.from_env().api
+    created = api.exec_create(sbx.id, ["/bin/sh", "-c", "sleep 1 & exit 0"], user="agent")
+    api.exec_start(created["Id"], detach=True)
+    await asyncio.sleep(3)
+    zombies = await _sh(sbx, "ps -eo stat= | grep -c '^Z' || true")
+    assert zombies.strip() == "0"
+
+
+async def test_orphans_do_not_pile_up_against_the_pid_limit(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # Every round leaves 15 orphans behind. Nothing used to reap them, so they stayed
+    # zombies holding a pid each until fork failed and every command died with 125.
+    sbx = await manager.create(task_id, IMAGE, SandboxLimits(pids=48), network=False)
+    burst = "for i in $(seq 15); do (sleep 0.2 &); done; sleep 0.5; echo done"
+    for _ in range(6):
+        r = await sbx.exec(burst, timeout_s=30)
+        assert (r.exit_code, r.stdout.strip()) == (0, "done"), r.stderr
+    assert (await _sh(sbx, "ps -eo stat= | grep -c '^Z' || true")).strip() == "0"
+    assert int((await _sh(sbx, "ps -e --no-headers | wc -l")).strip()) < 10
+
+
+async def test_repeated_timeouts_leave_nothing_behind(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    sbx = await manager.create(task_id, IMAGE, SandboxLimits(pids=16), network=False)
+    for _ in range(9):  # bash and sleep leaked on every timeout: 7 rounds already filled 16 pids
+        assert (await sbx.exec("sleep 30; true", timeout_s=1)).timed_out
+    assert (await _sh(sbx, "echo alive")).strip() == "alive"
+    assert int((await _sh(sbx, "ps -e --no-headers | wc -l")).strip()) < 10
+
+
+async def test_host_proxy_settings_do_not_reach_the_container(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # docker-py copies the proxies block of ~/.docker/config.json into the env of every
+    # container it creates, credentials included, unless told not to (I3).
+    proxy = "http://corp-user:s3cret-pass@proxy.corp.example:3128"
+    proxies = ProxyConfig(http=proxy, https=proxy, ftp=None, no_proxy="localhost")
+    assert any("s3cret" in e for e in proxies.inject_proxy_environment([]))  # the control
+    client = docker.from_env()
+    client.api._proxy_configs = proxies  # what a config.json with a proxies block sets up
+    sbx = await _make(DockerSandboxManager(client), task_id)
+
+    cfg_env = _inspect(sbx.id)["Config"]["Env"]
+    assert not [e for e in cfg_env if "proxy" in e.lower()], cfg_env
+    inside = (await sbx.exec("env", timeout_s=10)).stdout
+    assert "proxy" not in inside.lower() and "s3cret" not in inside
+    # The check that already existed: nothing outside the allowlist and the image's own.
+    image_env = {e.split("=", 1)[0] for e in client.images.get(IMAGE).attrs["Config"]["Env"]}
+    allowed = set(ENV_ALLOWLIST) | image_env | {"HOSTNAME"}
+    assert {e.split("=", 1)[0] for e in cfg_env} <= allowed
 
 
 async def test_no_secrets_in_container_env(
@@ -466,6 +533,7 @@ async def test_hardening_flags(manager: DockerSandboxManager, task_id: str) -> N
     assert host["ReadonlyRootfs"] is True
     assert info["Config"]["User"] == "agent"
     assert "no-new-privileges:true" in host["SecurityOpt"]
+    assert host.get("Init") is True
     assert host["PidsLimit"] == SandboxLimits().pids
     assert host["Memory"] == SandboxLimits().memory_mb * 1024 * 1024
     assert host["NanoCpus"] == 2_000_000_000

@@ -9,12 +9,15 @@ from typing import Any
 
 import pytest
 
+from longhaul.contracts import SandboxLimits
 from longhaul.sandbox import docker_manager, supervisor
 from longhaul.sandbox.common import OUTPUT_CAP, OUTPUT_HEAD, OUTPUT_TAIL, BoundedOutput
 from longhaul.sandbox.docker_manager import (
     AGENT_UID,
+    ENV_ALLOWLIST,
     SUPERVISOR_SOURCE,
     DockerSandbox,
+    DockerSandboxManager,
     build_tar,
     exec_argv,
     merge_env,
@@ -270,3 +273,56 @@ async def test_a_kill_signal_after_the_deadline_is_a_timeout() -> None:
     api = FakeApi(Slow([]), [{"Running": False, "ExitCode": 137}])
     r = await sandbox_with(api).exec("sleep 30", timeout_s=1)
     assert (r.exit_code, r.timed_out) == (137, True)
+
+
+# ---------- DockerSandboxManager.create against a stand-in for the client ----------
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.runs: list[tuple[str, dict[str, Any]]] = []
+        self.detached: list[object] = []
+        self.containers = SimpleNamespace(run=self._run)
+        bridge = SimpleNamespace(disconnect=self.detached.append)
+        self.networks = SimpleNamespace(get=lambda name: bridge if name == "bridge" else None)
+
+    def _run(self, image: str, **kwargs: Any) -> SimpleNamespace:
+        self.runs.append((image, kwargs))
+        return SimpleNamespace(id="c-1")
+
+
+async def create(client: FakeClient, network: bool) -> DockerSandbox:
+    manager = DockerSandboxManager(client)  # type: ignore[arg-type]
+    box = await manager.create("t1", "img:tag", SandboxLimits(), network=network)
+    assert isinstance(box, DockerSandbox)
+    return box
+
+
+async def test_create_runs_an_init_so_orphans_are_reaped() -> None:
+    client = FakeClient()
+    await create(client, network=True)
+    ((image, kwargs),) = client.runs
+    assert image == "img:tag" and kwargs["init"] is True
+    # No command either: the image's CMD keeps the container idle.
+    assert "command" not in kwargs and "entrypoint" not in kwargs
+
+
+async def test_create_keeps_the_hosts_docker_proxy_settings_out_of_the_container() -> None:
+    # docker-py copies the proxies block of ~/.docker/config.json into the env of every
+    # container it creates unless told not to. That block can hold credentials (I3).
+    client = FakeClient()
+    await create(client, network=True)
+    ((_, kwargs),) = client.runs
+    assert kwargs["use_config_proxy"] is False
+    assert kwargs["environment"] == dict(ENV_ALLOWLIST)
+
+
+@pytest.mark.parametrize(("network", "detached"), [(False, 1), (True, 0)])
+async def test_create_leaves_the_bridge_only_when_the_network_is_off(
+    network: bool, detached: int
+) -> None:
+    client = FakeClient()
+    await create(client, network=network)
+    assert len(client.detached) == detached
+    ((_, kwargs),) = client.runs
+    assert kwargs["network_mode"] == "bridge"  # a `none` container could never get one later

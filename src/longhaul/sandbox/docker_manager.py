@@ -421,6 +421,10 @@ class DockerSandboxManager:
                 image,
                 name=container_name(task_id),
                 detach=True,
+                # PID 1 is an init that reaps, not `sleep infinity`. A process whose parent
+                # has gone is adopted by PID 1, and without a reaper it stays a zombie that
+                # holds a pid until fork fails and nothing can run.
+                init=True,
                 user=AGENT_USER,
                 labels={TASK_LABEL: task_id},
                 cap_drop=["ALL"],
@@ -438,6 +442,9 @@ class DockerSandboxManager:
                 volumes={volume_name(task_id): {"bind": WORKDIR, "mode": "rw"}},
                 network_mode="bridge",
                 environment=base_env(),
+                # docker-py would add the proxies block of ~/.docker/config.json to the
+                # environment, credentials included. The allowlist is all the sandbox gets.
+                use_config_proxy=False,
             )
             if not network:
                 self._client.networks.get("bridge").disconnect(container)

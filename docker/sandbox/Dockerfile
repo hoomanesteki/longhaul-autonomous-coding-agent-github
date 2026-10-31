@@ -30,4 +30,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 USER agent
 
-ENTRYPOINT ["sleep", "infinity"]
+# The container idles until a task uses it. This is CMD, not ENTRYPOINT: the manager
+# passes no command, so it still idles, and `docker run --rm longhaul-sandbox:py312
+# id -u` runs the command it is given instead of handing "id -u" to sleep.
+CMD ["sleep", "infinity"]

@@ -682,7 +682,7 @@ STATUS_CASES = (
 )
 
 
-# The exception class the bundled docs name for each status. Statuses the docs give no class
+# The exception class the API docs name for each status. Statuses the docs give no class
 # (402, 408, 409, 413) are recorded in the matrix but not compared.
 DOCUMENTED_CLASSES = {
     400: "BadRequestError",

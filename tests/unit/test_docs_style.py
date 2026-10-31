@@ -1,4 +1,5 @@
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -101,6 +102,23 @@ def test_no_long_dashes() -> None:
     assert not hits, "em or en dashes found:\n" + "\n".join(hits)
 
 
+def test_no_long_dashes_in_any_tracked_file() -> None:
+    # The check above reads the docs. Code comments, config and test data count too.
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True, text=True
+    ).stdout
+    hits: list[str] = []
+    for rel in filter(None, listed.split("\0")):
+        try:
+            text = (ROOT / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # binary, or deleted in the working tree
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if any(dash in line for dash in LONG_DASHES):
+                hits.append(f"{rel}:{lineno}")
+    assert not hits, "em or en dashes found:\n" + "\n".join(hits)
+
+
 # --- the checks themselves, run on small trees ----------------------------------------------
 
 
@@ -164,13 +182,13 @@ def test_banned_phrase_check_skips_only_the_style_guide_and_the_plan(
 def test_site_checks_skip_rendered_output_and_the_quarto_cache(tmp_path: Path, rel: str) -> None:
     # Neither folder holds source. A dash or a banned phrase there would be noise the author
     # cannot fix, so the checks must not report it.
-    _write_tree(tmp_path, rel, "We leverage this — and this.\n")
+    _write_tree(tmp_path, rel, "We leverage this \u2014 and this.\n")
     assert banned_phrase_hits(tmp_path) == []
     assert long_dash_hits(tmp_path) == []
 
 
 def test_site_checks_ignore_files_that_are_not_pages(tmp_path: Path) -> None:
     # Fragments under site/_generated/ come from docs/, which the checks already read.
-    _write_tree(tmp_path, "site/_generated/status.md", "We leverage this — and this.\n")
+    _write_tree(tmp_path, "site/_generated/status.md", "We leverage this \u2014 and this.\n")
     assert banned_phrase_hits(tmp_path) == []
     assert long_dash_hits(tmp_path) == []

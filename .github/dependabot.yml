@@ -1,14 +1,25 @@
 version: 2
 # Version bumps go to dev like any other change. main moves only through phase-gate pull
 # requests, so a bump merged there would skip dev's CI and the gate.
+#
+# Each ecosystem groups its updates into one pull request a week, so one branch instead of one
+# per package. Major Python bumps stay out of the group: they can need code changes and an
+# ADR-0002 update, so each gets its own pull request.
 updates:
   - package-ecosystem: github-actions
     directory: /
     target-branch: dev
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
   - package-ecosystem: uv
     directory: /
     target-branch: dev
     schedule:
       interval: weekly
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]

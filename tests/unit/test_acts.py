@@ -16,13 +16,15 @@ from temporalio.workflow import ActivityCancellationType
 from longhaul.contracts import (
     BlobRef,
     ProviderErrorKind,
+    RepoSettings,
     Role,
+    StopDetails,
     TaskSpec,
     ToolResult,
     Usage,
 )
 from longhaul.durable import acts
-from longhaul.durable.payload_guard import PayloadTooLargeError
+from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, assert_small
 from longhaul.settings import load_config
 from longhaul.tools.control import FINISH
 
@@ -31,6 +33,14 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 ROOT = Path(__file__).resolve().parents[2]
 REF = BlobRef(key="tasks/lh-x/turns/0001/transcript.json", sha256="0" * 64, size=10)
 SHA = "a" * 40
+SPEC = TaskSpec(
+    task_id="lh-x",
+    repo="acme/calc",
+    issue_number=42,
+    title="add() subtracts",
+    body="add(2, 3) returns -1",
+    settings=RepoSettings(repo="acme/calc"),
+)
 
 
 def test_activity_names_are_the_ones_in_section_3_7() -> None:
@@ -226,9 +236,12 @@ SAMPLES: list[BaseModel] = [
         task_id="lh-x",
         turn_index=3,
         role=Role.CODER,
+        spec=SPEC,
         transcript_ref=REF,
         memory_ref=REF,
         hints=["alice: use pytest -x"],
+        high_output_cap=True,
+        paused_ref=REF,
     ),
     acts.LlmTurnOutput(
         transcript_ref=REF,
@@ -241,6 +254,15 @@ SAMPLES: list[BaseModel] = [
         usage=Usage(input_tokens=10, output_tokens=5),
         cost_usd=0.02,
         input_tokens_total=10,
+        response_ref=REF,
+    ),
+    acts.LlmTurnOutput(
+        transcript_ref=REF,
+        stop_reason="refusal",
+        stop_details=StopDetails(category="cyber", explanation="no"),
+        raw_stop_reason="refusal",
+        usage=Usage(),
+        paused_ref=REF,
     ),
     acts.ToolExecInput(
         task_id="lh-x",
@@ -253,7 +275,11 @@ SAMPLES: list[BaseModel] = [
         task_id="lh-x",
         turn_index=3,
         transcript_ref=REF,
-        results=[ToolResult(call_id="t1", ok=True, output="x", pre_sha=SHA, post_sha=SHA)],
+        results=[
+            acts.ToolResultSummary(call_id="t1", ok=True, output_ref=REF),
+            acts.ToolResultSummary(call_id="t2", ok=False, output="finish needs a summary"),
+        ],
+        user_text="Use tools or call finish.",
     ),
     acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="cancelled by alice"),
     acts.Tuning(heartbeat_timeout_s=2.5),
@@ -267,3 +293,79 @@ def test_payloads_survive_the_pydantic_data_converter(sample: BaseModel) -> None
     converter = pydantic_data_converter.payload_converter
     payloads = converter.to_payloads([sample])
     assert converter.from_payloads(payloads, [type(sample)]) == [sample]
+
+
+# ---------- LH-204: what the activities added to the payloads ----------
+def test_a_model_turn_needs_the_spec_to_build_its_prompt() -> None:
+    with pytest.raises(ValidationError):
+        acts.LlmTurnInput.model_validate(
+            {"task_id": "lh-x", "turn_index": 0, "role": "coder", "transcript_ref": None}
+        )
+
+
+def test_a_model_turn_starts_without_a_raised_cap_or_paused_text() -> None:
+    first = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    assert (first.high_output_cap, first.paused_ref) == (False, None)
+
+
+def test_a_tool_result_summary_carries_its_text_inline_or_by_ref() -> None:
+    inline = acts.ToolResultSummary(call_id="t1", ok=True, output="ok")
+    empty = acts.ToolResultSummary(call_id="t2", ok=True, output="")
+    by_ref = acts.ToolResultSummary(call_id="t3", ok=True, output_ref=REF)
+    assert (inline.output_ref, empty.output, by_ref.output) == (None, "", None)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{}, {"output": "x", "output_ref": REF}],
+    ids=["neither", "both"],
+)
+def test_a_tool_result_summary_needs_exactly_one_of_output_and_output_ref(
+    kwargs: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        acts.ToolResultSummary(call_id="t1", ok=True, **kwargs)  # type: ignore[arg-type]
+
+
+def test_a_stored_result_is_summarized_by_its_ref() -> None:
+    stored = ToolResult(
+        call_id="t1", ok=False, output="preview...", output_ref=REF, exit_code=1, post_sha=SHA
+    )
+    assert acts.summarize_result(stored) == acts.ToolResultSummary(
+        call_id="t1", ok=False, output_ref=REF
+    )
+
+
+def test_a_result_without_a_stored_text_is_summarized_by_its_text() -> None:
+    # The bad-finish answer is made by the workflow itself, and nothing stores it.
+    plain = ToolResult(call_id="t1", ok=False, output="finish needs a summary")
+    assert acts.summarize_result(plain) == acts.ToolResultSummary(
+        call_id="t1", ok=False, output="finish needs a summary"
+    )
+
+
+def test_a_turn_with_many_large_results_stays_far_below_the_payload_limit() -> None:
+    # Fifty calls whose outputs are 15 KB each would be 750 KB inline. By ref they are a few KB.
+    results = [
+        ToolResult(call_id=f"toolu_{n:03d}", ok=True, output="x" * 15_000, output_ref=REF)
+        for n in range(50)
+    ]
+    payload = acts.AppendResultsInput(
+        task_id="lh-x",
+        turn_index=3,
+        transcript_ref=REF,
+        results=[acts.summarize_result(r) for r in results],
+    )
+    assert_small(payload)
+    assert len(payload.model_dump_json()) < DEFAULT_LIMIT // 10
+
+
+def test_the_inline_limits_leave_room_under_the_payload_limit() -> None:
+    # CLAUDE.md rule 5: nothing over 16 KB crosses inline. The total for one reply keeps the
+    # llm_turn output, with its per-call overhead, under the 256 KB cap (I2).
+    assert acts.INLINE_LIMIT_BYTES == 16_000
+    assert acts.INLINE_ARGS_TOTAL_BYTES < DEFAULT_LIMIT // 2
+    assert acts.INLINE_ARGS_TOTAL_BYTES >= acts.INLINE_LIMIT_BYTES
+    assert acts.OUTPUT_PREVIEW_CHARS < acts.INLINE_LIMIT_BYTES

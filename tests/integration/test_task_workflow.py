@@ -1,9 +1,12 @@
 """TaskWorkflow against a time skipping Temporal test server, with stub activities.
 
-The stubs take the place of the activities of LH-204 and later. They are registered under the
-names in acts.py, so the workflow cannot tell them from the real ones. Each test gets its own
-server and worker, so nothing is shared between tests. The first run downloads the test
-server (about 65 MB, ADR-0004); after that it starts in under a second.
+The stubs take the place of the activities. They are registered under the names in acts.py, so
+the workflow cannot tell them from the real ones. These tests check what the workflow itself
+does with what an activity returns: the phases, the signals, the order of the calls and how
+each stop reason is handled. tests/integration/test_activities.py runs the real activities, and
+tests/integration/test_parity.py compares the whole loop with the in-process one. Each test
+gets its own server and worker, so nothing is shared between tests. The first run downloads the
+test server (about 65 MB, ADR-0004); after that it starts in under a second.
 
 The worker runs under the same sandbox settings as a production worker (invalid_modules for
 the I/O libraries), so every test here also shows that the workflow loads under them.
@@ -19,12 +22,13 @@ from typing import Any
 
 import pytest
 from temporalio import activity
-from temporalio.client import WorkflowHandle, WorkflowHistory
+from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
+from longhaul.agent.rules import BAD_FINISH, MAX_PAUSES, NUDGE
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -33,6 +37,8 @@ from longhaul.contracts import (
     OutcomeKind,
     Phase,
     RepoSettings,
+    StopDetails,
+    StopReason,
     TaskSpec,
     TaskStatus,
     ToolResult,
@@ -415,6 +421,7 @@ async def test_tool_calls_run_in_order_and_each_starts_from_the_last_checkpoint(
         "tool_exec",
         "append_results",
         "llm_turn",
+        "append_results",  # the finish still gets its answer, so the transcript stays paired
     ]
     tools = stubs.payloads(acts.TOOL_EXEC.name)
     assert [t.call.id for t in tools] == ["c1", "c2", "c3"]
@@ -422,10 +429,17 @@ async def test_tool_calls_run_in_order_and_each_starts_from_the_last_checkpoint(
     assert [t.pre_sha for t in tools] == [BASE, BASE, sha(1)]
     assert {(t.task_id, t.turn_index, t.sandbox_id) for t in tools} == {(spec.task_id, 0, "sbx-1")}
 
-    (appended,) = stubs.payloads(acts.APPEND_RESULTS.name)
+    appended, finish_answer = stubs.payloads(acts.APPEND_RESULTS.name)
     assert appended.transcript_ref == ref("turns/0000/assistant.json")
     assert [r.call_id for r in appended.results] == ["c1", "c2", "c3"]
-    assert appended.results[1].post_sha == sha(1)
+    assert [r.output for r in appended.results] == [
+        "ran read_file",
+        "ran edit_file",
+        "ran run_tests",
+    ]
+    # Only the calls that ran have a result. finish gets its answer from append_results itself.
+    assert finish_answer.transcript_ref == ref("turns/0001/assistant.json")
+    assert finish_answer.results == []
 
     # The next turn reads the transcript that append_results wrote.
     first_turn, second_turn = stubs.payloads(acts.LLM_TURN.name)
@@ -452,9 +466,12 @@ async def test_finish_ends_the_run_and_skips_the_calls_after_it(
         final = await handle.query(TaskWorkflow.status)
 
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="all done")
-    # Nothing runs for finish itself, and there is no next turn to append results for.
-    assert stubs.names() == ["prepare_workspace", "llm_turn", "tool_exec"]
+    # Nothing runs for finish itself or for the call after it. The results are still appended,
+    # so finish gets its answer and c2 is marked as not run.
+    assert stubs.names() == ["prepare_workspace", "llm_turn", "tool_exec", "append_results"]
     assert [t.call.id for t in stubs.payloads(acts.TOOL_EXEC.name)] == ["c1"]
+    (appended,) = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert [r.call_id for r in appended.results] == ["c1"]
     assert (final.phase, final.last_checkpoint) == (Phase.DONE, sha(1))
 
 
@@ -524,7 +541,7 @@ async def test_add_budget_turns_raise_the_turn_limit(env: WorkflowEnvironment) -
     assert len(stubs.payloads(acts.LLM_TURN.name)) == 3
 
 
-async def test_a_turn_without_tool_calls_ends_the_run_with_an_error(
+async def test_a_turn_without_tool_calls_gets_a_nudge_and_a_second_one_ends_the_run(
     env: WorkflowEnvironment, spec: TaskSpec
 ) -> None:
     stubs = Stubs(lambda turn: [])
@@ -534,8 +551,27 @@ async def test_a_turn_without_tool_calls_ends_the_run_with_an_error(
         final = await handle.query(TaskWorkflow.status)
 
     assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="no tool calls")
-    assert stubs.names() == ["prepare_workspace", "llm_turn"]
-    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+    # One nudge, not two: the second idle turn is the last, and nothing is appended after it.
+    assert stubs.names() == ["prepare_workspace", "llm_turn", "append_results", "llm_turn"]
+    (nudge,) = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert (nudge.results, nudge.user_text) == ([], NUDGE)
+    assert nudge.transcript_ref == ref("turns/0000/assistant.json")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 2)
+
+
+async def test_idle_turns_that_are_not_in_a_row_do_not_end_the_run(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        return [] if turn in (0, 2) else [finish()] if turn == 4 else never_finishes(turn)
+
+    stubs = Stubs(script)
+    async with running(env, stubs) as queue:
+        outcome = await result_of(await start_task(env.client, spec, task_queue=queue))
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    nudges = [p.user_text for p in stubs.payloads(acts.APPEND_RESULTS.name) if p.user_text]
+    assert nudges == [NUDGE, NUDGE]
 
 
 async def test_the_cost_of_each_turn_adds_up(env: WorkflowEnvironment, spec: TaskSpec) -> None:
@@ -546,6 +582,205 @@ async def test_the_cost_of_each_turn_adds_up(env: WorkflowEnvironment, spec: Tas
         final = await handle.query(TaskWorkflow.status)
 
     assert final.cost_usd == pytest.approx(0.5)
+
+
+# ---------- the stop reasons (D8 and D9) ----------
+Reply = acts.LlmTurnOutput | ApplicationError
+
+
+def out(
+    name: str,
+    stop: StopReason = "tool_use",
+    calls: list[acts.ToolCallSummary] | None = None,
+    *,
+    cost: float = 0.0,
+    **fields: Any,
+) -> acts.LlmTurnOutput:
+    """A model turn as the llm_turn activity returns it. `name` makes its transcript ref."""
+    return acts.LlmTurnOutput(
+        transcript_ref=ref(f"{name}.json"),
+        tool_call_summaries=calls or [],
+        stop_reason=stop,
+        usage=Usage(),
+        cost_usd=cost,
+        **fields,
+    )
+
+
+class Replying(Stubs):
+    """Stubs whose model turns answer from a list of replies, or fail with a given error."""
+
+    def __init__(self, *replies: Reply) -> None:
+        super().__init__()
+        self.replies = list(replies)
+
+    @activity.defn(name=acts.LLM_TURN.name)
+    async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+        await self._enter(acts.LLM_TURN.name, inp)
+        reply = self.replies.pop(0)
+        if isinstance(reply, ApplicationError):
+            raise reply
+        return reply
+
+
+async def play(
+    env: WorkflowEnvironment, stubs: Stubs, spec: TaskSpec
+) -> tuple[Outcome, TaskStatus]:
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        outcome = await result_of(handle)
+        return outcome, await handle.query(TaskWorkflow.status)
+
+
+async def test_a_turn_cut_off_at_max_tokens_is_asked_again_once_at_the_higher_cap(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    cut = out("cut", "max_tokens", [call("write_file", "w1", path="big.py")], cost=0.1)
+    stubs = Replying(cut, out("done", "tool_use", [finish()], cost=0.2))
+    outcome, final = await play(env, stubs, spec)
+
+    first, second = stubs.payloads(acts.LLM_TURN.name)
+    assert (first.high_output_cap, second.high_output_cap) == (False, True)
+    # It is the same turn, and it carries on from the transcript the first call handed back.
+    assert first.turn_index == second.turn_index == 0
+    assert second.transcript_ref == ref("cut.json")
+    # The cut reply's call did not run. Both calls cost money.
+    assert acts.TOOL_EXEC.name not in stubs.names()
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="fixed add()")
+    assert final.cost_usd == pytest.approx(0.3)
+    assert final.turn_index == 1
+
+
+async def test_a_second_max_tokens_stop_ends_the_run_with_output_limit(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Replying(out("cut1", "max_tokens"), out("cut2", "max_tokens"))
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="output limit")
+    assert stubs.names() == ["prepare_workspace", "llm_turn", "llm_turn"]
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+
+
+async def test_the_retry_is_per_turn(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    stubs = Replying(
+        out("a", "max_tokens"),
+        out("b", "tool_use", never_finishes(0)),
+        out("c", "max_tokens"),
+        out("d", "tool_use", [finish()]),
+    )
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    caps = [i.high_output_cap for i in stubs.payloads(acts.LLM_TURN.name)]
+    assert caps == [False, True, False, True]
+
+
+async def test_a_refusal_ends_the_run_and_runs_nothing(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    details = StopDetails(category="cyber", explanation="The request looks like malware.")
+    refusal = out("r", "refusal", never_finishes(0), stop_details=details)
+    stubs = Replying(refusal)
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(
+        kind=OutcomeKind.ERROR,
+        summary="model declined (cyber): The request looks like malware.",
+    )
+    assert stubs.names() == ["prepare_workspace", "llm_turn"]
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+
+
+@pytest.mark.parametrize(
+    ("stop", "raw", "summary"),
+    [
+        ("model_context_window_exceeded", None, "context limit"),
+        ("stop_sequence", None, "unexpected stop reason: stop_sequence"),
+        ("other", "odd_reason", "unexpected stop reason: odd_reason"),
+    ],
+)
+async def test_the_other_stops_end_the_run(
+    env: WorkflowEnvironment, spec: TaskSpec, stop: StopReason, raw: str | None, summary: str
+) -> None:
+    stubs = Replying(out("x", stop, never_finishes(0), raw_stop_reason=raw))
+    outcome, _ = await play(env, stubs, spec)
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary=summary)
+    assert stubs.names() == ["prepare_workspace", "llm_turn"]
+
+
+async def test_a_paused_turn_is_continued_with_the_text_it_left(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    paused = out("p", "pause_turn", never_finishes(0), paused_ref=ref("paused.json"))
+    stubs = Replying(paused, out("done", "tool_use", [finish()]))
+    outcome, final = await play(env, stubs, spec)
+
+    first, second = stubs.payloads(acts.LLM_TURN.name)
+    assert (first.paused_ref, second.paused_ref) == (None, ref("paused.json"))
+    assert second.transcript_ref == ref("p.json")
+    # The call that came with the pause was not run, and the pause did not count as a turn.
+    assert acts.TOOL_EXEC.name not in stubs.names()
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert final.turn_index == 1
+
+
+async def test_a_pause_does_not_carry_into_the_next_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Replying(
+        out("p", "pause_turn", paused_ref=ref("paused.json")),
+        out("a", "tool_use", never_finishes(0)),
+        out("b", "tool_use", [finish()]),
+    )
+    await play(env, stubs, spec)
+    assert [i.paused_ref for i in stubs.payloads(acts.LLM_TURN.name)] == [
+        None,
+        ref("paused.json"),
+        None,
+    ]
+
+
+async def test_pauses_have_a_limit(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    stubs = Replying(*[out(f"p{n}", "pause_turn") for n in range(MAX_PAUSES + 1)])
+    outcome, _ = await play(env, stubs, spec)
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="pause limit")
+    assert len(stubs.payloads(acts.LLM_TURN.name)) == MAX_PAUSES + 1
+
+
+async def test_a_prompt_over_the_window_ends_the_run(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    too_long = ApplicationError("prompt is too long", type="context_too_long", non_retryable=True)
+    stubs = Replying(too_long)
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+
+
+async def test_a_failure_that_is_not_the_runs_to_end_fails_the_workflow(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    refused = ApplicationError("bad request", type="invalid_request", non_retryable=True)
+    async with running(env, Replying(refused)) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+
+async def test_a_finish_without_a_summary_is_answered_and_the_task_goes_on(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(lambda turn: [call("finish", "f1")] if turn == 0 else [finish("Done properly.")])
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Done properly.")
+    # Nothing runs for finish. The first one gets an error that tells the model what to fix.
+    assert acts.TOOL_EXEC.name not in stubs.names()
+    first, second = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert first.results == [acts.ToolResultSummary(call_id="f1", ok=False, output=BAD_FINISH)]
+    assert second.results == []
 
 
 # ---------- what reaches Temporal ----------

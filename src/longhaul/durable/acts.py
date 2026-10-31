@@ -10,9 +10,21 @@ The policies are the ones in plan section 3.7. Two activities are not in that ta
 their numbers here: `append_results`, which reads and writes one blob, and `cleanup`. Both are
 sized like `load_memory`.
 
-The fields of the payloads follow section 3.7 as well. LH-204 implements `llm_turn`,
-`tool_exec` and `append_results` against them and may add fields. The workflow reads only the
+The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
+`tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
+
+What crosses an activity boundary stays small (ADR-0005, invariants I2):
+
+- A model turn returns refs to its transcript and its reply, and a summary of each tool call:
+  the arguments inline up to INLINE_LIMIT_BYTES for one call and INLINE_ARGS_TOTAL_BYTES for
+  the whole reply, and by `args_ref` beyond that.
+- A tool call returns a `ToolResult` whose `output` is a preview of at most
+  OUTPUT_PREVIEW_CHARS and whose `output_ref` holds the whole text. The text the model reads is
+  the one in the blob.
+- `append_results` takes one `ToolResultSummary` for each result, which names that blob. A turn
+  of fifty calls with 15 KB of output each therefore adds a few KB to the history, and not
+  750 KB.
 """
 
 from __future__ import annotations
@@ -26,12 +38,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
+from longhaul.agent import rules
 from longhaul.contracts import (
     BlobRef,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
     Role,
+    StopDetails,
     StopReason,
     TaskSpec,
     ToolResult,
@@ -39,11 +53,20 @@ from longhaul.contracts import (
 )
 from longhaul.durable.payload_guard import PayloadTooLargeError
 
-# The `finish` control tool ends a task. The workflow reads its summary from the call and
-# runs nothing for it. The name is copied from longhaul.tools.control.FINISH, so that the
-# workflow does not load the tools package for one string. A unit test keeps the two equal.
-FINISH_TOOL = "finish"
+# The `finish` control tool ends a task. The workflow runs nothing for it: rules.run_calls reads
+# its summary. A unit test keeps the name equal to longhaul.tools.control.FINISH.
+FINISH_TOOL = rules.FINISH
 NO_SUMMARY = "finished without a summary"
+
+# Anything over this crosses an activity boundary as a BlobRef (CLAUDE.md rule 5).
+INLINE_LIMIT_BYTES = 16_000
+# The arguments of one reply that may travel inline together. Twelve calls of 10 KB each are
+# all under the limit above and still add up to half the payload cap, so once a reply has this
+# much inline the rest of its calls go by reference.
+INLINE_ARGS_TOTAL_BYTES = 96_000
+# How much of a tool's output stays in the `ToolResult` that the workflow history keeps. The
+# rest is in the blob, and the model reads it from there.
+OUTPUT_PREVIEW_CHARS = 2_000
 
 # The longest a single tool command may run, in seconds. The workflow cannot read the config
 # file, so the number is copied from `sandbox.command_timeout_s`. A unit test keeps the two
@@ -84,21 +107,43 @@ class LlmTurnInput(BaseModel):
     task_id: str
     turn_index: int
     role: Role
+    # The system prompt is built from it, in the same bytes on every call of a transcript (D7).
+    spec: TaskSpec
     transcript_ref: BlobRef | None  # None before the first turn
+    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6, and
+    # a hint reaches it with the pause and hint flow of LH-506.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
     memory_ref: BlobRef | None = None
     hints: list[str] = Field(default_factory=list)
+    # D8: the one retry of a turn that stopped on max_tokens runs at the higher cap. The
+    # activity maps this to the number in the config, which the workflow cannot read.
+    high_output_cap: bool = False
+    # The text of a reply that stopped on pause_turn, for the call that continues it.
+    paused_ref: BlobRef | None = None
 
 
 class LlmTurnOutput(BaseModel):
-    transcript_ref: BlobRef  # the transcript with this turn's reply appended
+    """What one model call came to.
+
+    `transcript_ref` is the transcript to carry on from. A reply that is complete (end_turn or
+    tool_use) is appended to it. Any other reply is not stored, so the ref is the input's, or the
+    first message alone when the turn had no transcript yet. The workflow decides what to do
+    next from `stop_reason`, with the rules in longhaul.agent.rules.
+    """
+
+    transcript_ref: BlobRef
     tool_calls_ref: BlobRef | None = None  # every call with its full arguments
     tool_call_summaries: list[ToolCallSummary] = Field(default_factory=list)
     stop_reason: StopReason
     usage: Usage
     cost_usd: float = Field(default=0.0, ge=0)  # 0.0 until the pricing table arrives (LH-701)
-    input_tokens_total: int = Field(default=0, ge=0)
+    input_tokens_total: int = Field(default=0, ge=0)  # input, cache read and cache write
+    # The next four are what the rules read, or what the next call needs.
+    stop_details: StopDetails | None = None
+    raw_stop_reason: str | None = None
+    response_ref: BlobRef | None = None  # the provider's reply, whole
+    paused_ref: BlobRef | None = None  # the text so far of a turn that stopped on pause_turn
 
 
 class ToolExecInput(BaseModel):
@@ -109,11 +154,33 @@ class ToolExecInput(BaseModel):
     sandbox_id: str
 
 
+class ToolResultSummary(BaseModel):
+    """A tool result as append_results gets it: the text it answers with, by ref or inline.
+
+    `output_ref` names the blob that tool_exec stored. A result that no tool made, such as the
+    answer to a `finish` without a summary, has nothing stored and carries its short text in
+    `output`. Exactly one of the two is set.
+    """
+
+    call_id: str
+    ok: bool
+    output: str | None = None
+    output_ref: BlobRef | None = None
+
+    @model_validator(mode="after")
+    def _text_is_inline_or_by_ref(self) -> Self:
+        if (self.output is None) == (self.output_ref is None):
+            raise ValueError("set exactly one of output and output_ref")
+        return self
+
+
 class AppendResultsInput(BaseModel):
     task_id: str
     turn_index: int
     transcript_ref: BlobRef
-    results: list[ToolResult]
+    results: list[ToolResultSummary]
+    # Text from the harness, such as the nudge. It goes after the results, as the API requires.
+    user_text: str | None = None
 
 
 class CleanupInput(BaseModel):
@@ -249,8 +316,17 @@ def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.Activi
 
 
 def finish_summary(call: ToolCallSummary) -> str:
-    """The text the model gave to `finish`, or a fixed line when it gave none."""
-    text = (call.input or {}).get("summary")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    return NO_SUMMARY
+    """The text the model gave to `finish`, or a fixed line when it gave none.
+
+    The workflow no longer calls this: rules.run_calls decides what a finish is, and a finish
+    with no text is answered with an error and the task goes on. It stays as a way to put a
+    line next to a finish call that has none.
+    """
+    return rules.finish_summary(call.input) or NO_SUMMARY
+
+
+def summarize_result(result: ToolResult) -> ToolResultSummary:
+    """What append_results needs from a result: its blob when tool_exec stored one."""
+    if result.output_ref is not None:
+        return ToolResultSummary(call_id=result.call_id, ok=result.ok, output_ref=result.output_ref)
+    return ToolResultSummary(call_id=result.call_id, ok=result.ok, output=result.output)

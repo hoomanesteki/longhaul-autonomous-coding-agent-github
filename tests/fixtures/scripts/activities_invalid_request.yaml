@@ -1,0 +1,5 @@
+# The provider refuses the request as invalid, and a retry would be refused the same way. The
+# error kind is not retryable, so the activity must fail on its first attempt.
+steps:
+  - match: {turn_index: 0}
+    respond: {raise: invalid_request}

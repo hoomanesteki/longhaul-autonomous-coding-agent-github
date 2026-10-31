@@ -1,0 +1,5 @@
+# The prompt is over the context window, which the workflow ends the run for with "context limit".
+# The kind is not retryable, so the activity must fail on its first attempt.
+steps:
+  - match: {turn_index: 0}
+    respond: {raise: context_too_long}

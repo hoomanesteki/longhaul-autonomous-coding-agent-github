@@ -69,3 +69,13 @@ boto3 moves from the dev group to the runtime dependencies, and `types-boto3[s3]
 - **Postgres large objects or `bytea`.** One service fewer, but large writes would sit in the database that holds task state and the cost ledger, and the AWS deployment would not use the same API as the local stack.
 - **A shared volume or local disk.** Activities can run on any worker, so this ties a task to one host and defeats recovery after a host is lost (failure mode F4).
 - **Content-addressed keys, where the key is the hash.** This removes duplicates, but keys become opaque to people debugging a run. Readable keys plus a hash in the ref give the same integrity guarantee.
+
+## Appendix: how LH-204 applies it
+
+The LLM and tool activities were the first code to put the rule into practice. These are the choices it made, with the numbers in `longhaul.durable.acts`.
+
+- **Tool arguments.** A call's arguments travel inline up to 16,000 bytes. A whole model reply may keep 96,000 bytes of arguments inline, because twelve calls of 10 KB are each under the limit and together fill half of the 256 KB cap. A call over either limit is stored and named by `args_ref`. The full list of calls is stored too, as `tool_calls_ref`.
+- **Tool output.** `tool_exec` stores the text the model reads and returns a `ToolResult` with a preview of 2,000 characters in `output` and the blob in `output_ref`. The preview is for the Temporal UI. `append_results` takes one `ToolResultSummary` per result that names the blob, so a turn of fifty calls with 15 KB of output each adds a few KB to the history and not 750 KB. A result that no tool made, such as the answer to a `finish` without a summary, carries its short text inline.
+- **The guard.** Every activity input and output goes through `support.small`, which calls `assert_small` and turns `PayloadTooLargeError` into a non-retryable `ApplicationError`. The retry policies also list the error type, as a second guard.
+- **Blob keys of a model call.** A turn can be asked more than once (the retry after `max_tokens`, a continued `pause_turn`, a Temporal retry), so the response and the transcript are stored under `response-<attempt>` and `transcript-<attempt>`. A `turns` row keeps the key of its response, and a later call does not overwrite it. The attempt number is one more than the rows of the turn, so a key is written again only by the retry of a call that left no row, and then no ref to the earlier content exists.
+- **The task statement.** `LlmTurnInput` carries the `TaskSpec`, because the activity builds the system prompt from it on every call. The issue body and the comments have no size limit yet. LH-303 adds one, as the deferred contract change in `docs/architecture.md` says.

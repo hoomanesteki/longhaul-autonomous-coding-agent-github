@@ -60,7 +60,12 @@ def cli_environment() -> dict[str, str]:
     shell would also change what the run does.
     """
     drop = {"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENAI_BASE_URL"}
-    return {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in drop}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_") and k not in drop}
+    # The console script finds the package through the editable install's .pth file, which
+    # Python on macOS skips when the file carries the hidden flag. Name src explicitly.
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [src, env.get("PYTHONPATH")]))
+    return env
 
 
 def cli_command(script: Path, *extra: str) -> list[str]:

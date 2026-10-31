@@ -24,7 +24,7 @@ RUNBOOK = ROOT / "docs" / "runbook.md"
 
 # A minimum. Later stories add jobs (console, chaos-lite), and the `ci` job has to wait for each
 # of them, which test_ci_has_required_jobs checks against the real file.
-REQUIRED_JOBS = {"lint", "types", "unit", "integration", "e2e", "security", "compose", "ci"}
+REQUIRED_JOBS = {"lint", "types", "unit", "integration", "e2e", "security", "compose", "docs", "ci"}
 
 
 def load_workflow() -> dict[str, Any]:

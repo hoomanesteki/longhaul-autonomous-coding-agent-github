@@ -8,10 +8,12 @@ import contextlib
 import errno
 import io
 import json
+import os
 import posixpath
 import tarfile
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,14 @@ import requests
 from docker.errors import APIError, NotFound
 
 from longhaul.contracts import ExecResult, Sandbox, SandboxLimits
-from longhaul.sandbox.common import WORKDIR, BoundedOutput, check_timeout, mount_for, resolve_path
+from longhaul.sandbox.common import (
+    WORKDIR,
+    WRITABLE_MOUNTS,
+    BoundedOutput,
+    check_timeout,
+    mount_for,
+    resolve_path,
+)
 
 AGENT_USER = "agent"
 AGENT_UID = 10001
@@ -59,6 +68,51 @@ def container_name(task_id: str, suffix: str | None = None) -> str:
 
 def volume_name(task_id: str) -> str:
     return f"lh-ws-{task_id}"
+
+
+def _overlaps(a: str, b: str) -> bool:
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def bind_mounts(mounts: Mapping[str, str] | None) -> dict[str, dict[str, str]]:
+    """Docker `volumes` entries for host folders that go into the sandbox, read-write.
+
+    `mounts` maps a host folder to a container path. Everything is checked before a container
+    exists: Docker would create a missing host folder as root, and a bad target would only
+    fail halfway through the start.
+    """
+    binds: dict[str, dict[str, str]] = {}
+    targets: list[str] = []
+    for host, target in (mounts or {}).items():
+        real = _real_host_folder(host)
+        _check_target(target, targets)
+        if real in binds:
+            raise ValueError(f"mount source {real} is mounted twice")
+        binds[real] = {"bind": target, "mode": "rw"}
+        targets.append(target)
+    return binds
+
+
+def _real_host_folder(host: str) -> str:
+    if not os.path.isabs(host):
+        raise ValueError(f"mount source {host!r} must be an absolute path")
+    # Docker Desktop shares real paths, and /tmp and /var are links on a Mac.
+    real = os.path.realpath(host)
+    if real == "/":
+        raise ValueError("the host root cannot be mounted into a sandbox")
+    if not os.path.isdir(real):
+        raise ValueError(f"mount source {host!r} is not a directory")
+    return real
+
+
+def _check_target(target: str, taken: list[str]) -> None:
+    if not posixpath.isabs(target) or posixpath.normpath(target) != target or target == "/":
+        raise ValueError(f"container path {target!r} must be absolute and normalized, not /")
+    # The manager mounts these itself: the workspace volume and the two tmpfs folders.
+    if any(_overlaps(target, mount) for mount in WRITABLE_MOUNTS):
+        raise ValueError(f"container path {target!r} would cover a writable folder of the sandbox")
+    if any(_overlaps(target, other) for other in taken):
+        raise ValueError(f"container path {target!r} would overlap another mount")
 
 
 def base_env() -> dict[str, str]:
@@ -412,8 +466,20 @@ class DockerSandboxManager:
         self._client = client or docker.from_env()
 
     async def create(
-        self, task_id: str, image: str, limits: SandboxLimits, network: bool
+        self,
+        task_id: str,
+        image: str,
+        limits: SandboxLimits,
+        network: bool,
+        mounts: Mapping[str, str] | None = None,
     ) -> Sandbox:
+        """Start a sandbox. `mounts` maps host folders to container paths, read-write.
+
+        It is not part of the SandboxManager protocol. The checkpoint store uses it to put a
+        task's bare repo at /ckpt (ADR-0006); see bind_mounts for the rules.
+        """
+        binds = bind_mounts(mounts)  # before anything is created, so a bad mount leaves nothing
+
         def run() -> str:
             # Always created on bridge: Docker cannot move a `none` container onto
             # a network later. When network=False we disconnect straight away.
@@ -439,7 +505,7 @@ class DockerSandboxManager:
                     "/tmp": "size=512m",
                     "/home/agent": f"size=64m,uid={AGENT_UID},gid={AGENT_UID}",
                 },
-                volumes={volume_name(task_id): {"bind": WORKDIR, "mode": "rw"}},
+                volumes={volume_name(task_id): {"bind": WORKDIR, "mode": "rw"}, **binds},
                 network_mode="bridge",
                 environment=base_env(),
                 # docker-py would add the proxies block of ~/.docker/config.json to the

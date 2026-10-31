@@ -8,7 +8,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 
 def test_baseline_tables_registered() -> None:
-    assert set(Base.metadata.tables) == {"repo_settings", "tasks"}
+    # One entry per migration. LH-205 adds checkpoints.
+    assert set(Base.metadata.tables) == {"repo_settings", "tasks", "checkpoints"}
 
 
 def test_task_columns_match_data_model() -> None:

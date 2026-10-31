@@ -327,6 +327,16 @@ def test_dependabot_opens_pull_requests_against_dev() -> None:
         assert update.get("target-branch") == "dev", update["package-ecosystem"]
 
 
+def test_dependabot_groups_its_updates() -> None:
+    # Ungrouped, every package gets its own branch and pull request, and one week left
+    # eight of them open at once. One group per ecosystem keeps it to one a week each.
+    updates = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))["updates"]
+    for update in updates:
+        groups = update.get("groups", {}).values()
+        patterns = [pattern for group in groups for pattern in group.get("patterns", [])]
+        assert "*" in patterns, update["package-ecosystem"]
+
+
 # --- branch protection ---------------------------------------------------------------------
 
 REQUIRED_FIELDS = {

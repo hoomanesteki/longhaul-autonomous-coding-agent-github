@@ -62,6 +62,20 @@ def test_pages_builds_then_deploys_one_deployment_at_a_time() -> None:
     assert steps_using(deploy, "actions/deploy-pages")
 
 
+def test_pages_deploys_only_after_the_owner_turns_it_on() -> None:
+    # Without Pages turned on, configure-pages and deploy-pages fail and main would show red.
+    pages = workflow("pages.yml")
+    gate = "vars.PAGES_ENABLED == 'true'"
+    build, deploy = pages["jobs"]["build"], pages["jobs"]["deploy"]
+    assert deploy["if"] == gate
+    for action in ("actions/configure-pages", "actions/upload-pages-artifact"):
+        (step,) = steps_using(build, action)
+        assert step["if"] == gate
+    # The render itself is never gated, so a broken page still fails the run.
+    render = [s for s in build["steps"] if s.get("run") == "quarto render site"]
+    assert render and "if" not in render[0]
+
+
 def test_only_the_pages_deploy_job_can_mint_a_token() -> None:
     # The write scopes belong to one workflow. The id-token scope, which lets a job ask GitHub
     # for an OIDC token, belongs to its deploy job alone. Every other job keeps what the

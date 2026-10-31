@@ -92,3 +92,30 @@ class Checkpoint(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class SideEffect(Base):
+    """One GitHub write that happened, found again by its idempotency key (LH-304).
+
+    The ledger of github/side_effects.py. A row is written after the effect, so a retry that
+    finds the key returns `external_id` and writes nothing. `payload_hash` lets the next use
+    of a key tell a retry (same payload) from a different effect that reused the key.
+    """
+
+    __tablename__ = "side_effects"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('comment', 'label_add', 'label_remove', 'pr', 'push')", name="kind"
+        ),
+        Index("ix_side_effects_task_id", "task_id"),
+    )
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    task_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # A comment id, a pull request URL, a label name or a pushed commit id, by kind.
+    external_id: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

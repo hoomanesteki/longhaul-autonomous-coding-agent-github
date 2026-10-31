@@ -59,6 +59,8 @@ class EnvSettings(BaseSettings):
     config: Path = Path("config/longhaul.example.yaml")
     # Script file for the scripted provider; the provider factory reads it (LH-197).
     script: Path | None = None
+    # Where the worker keeps one bare repo per task. Unset means ~/.longhaul/ckpt (ADR-0006).
+    ckpt_dir: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )

@@ -4,7 +4,18 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, MetaData, Numeric, Text, func, text
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Index,
+    Integer,
+    MetaData,
+    Numeric,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -56,6 +67,28 @@ class Task(Base):
     settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Checkpoint(Base):
+    """One saved workspace state of a task: a commit in its bare repo (ADR-0006)."""
+
+    __tablename__ = "checkpoints"
+    __table_args__ = (
+        CheckConstraint("kind IN ('tool', 'step', 'compaction', 'bundle')", name="kind"),
+        Index("ix_checkpoints_task_id", "task_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sha: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    step_id: Mapped[str | None] = mapped_column(Text)
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    # A BlobRef (key, sha256, size) as JSON, so a reader can verify the bundle it downloads.
+    bundle_ref: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

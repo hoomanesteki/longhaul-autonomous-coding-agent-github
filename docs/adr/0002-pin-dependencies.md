@@ -15,7 +15,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 
 | Package | Pinned version |
 |---|---|
-| temporalio | 1.34.0 |
+| temporalio | 1.34.0 (runtime since LH-203, see ADR-0004) |
 | anthropic | 2.3.0 (`anthropic>=2.3,<3`, see ADR-0003) |
 | openai | 3.41.0 |
 | httpx2 | 2.16.0 |
@@ -33,9 +33,9 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | pgvector | 0.5.1 |
 | psycopg | 3.3.6 |
 | opentelemetry-sdk | not yet added; pinned when first added |
-| boto3 | 1.43.118 |
+| boto3 | 1.43.118 (runtime since LH-202, see ADR-0005) |
 
-`temporalio`, `boto3` and `psycopg` sit in the `dev` dependency group of `pyproject.toml` today. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.3.0 requires `httpx2>=2.0.0,<3` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`. `anthropic` 2.3.0 sends API version `2026-10-21` unless told otherwise. A test in `tests/unit/test_anthropic_provider.py` fails when an upgrade moves that version, so the change is read before it merges.
+`psycopg` sits in the `dev` dependency group of `pyproject.toml` today. `boto3` moved to the runtime dependencies with LH-202, and its type stubs sit in the `dev` group. `temporalio` moved to the runtime dependencies with LH-203, because the workflow and the client in `longhaul.durable` import it, and a worker image built without the `dev` group needs it. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.3.0 requires `httpx2>=2.0.0,<3` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`. `anthropic` 2.3.0 sends API version `2026-10-21` unless told otherwise. A test in `tests/unit/test_anthropic_provider.py` fails when an upgrade moves that version, so the change is read before it merges.
 
 Development tools, as locked in `uv.lock` on 2026-10-30:
 
@@ -47,6 +47,7 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 | pytest-cov | 7.1.0 |
 | ruff | 0.17.2 |
 | pre-commit | 4.7.0 |
+| types-boto3 | 1.43.123 |
 | types-docker | 7.2.0.20261006 |
 | types-jsonschema | 4.26.0.20261006 |
 | types-pyyaml | 6.0.12.20260906 |

@@ -1,0 +1,20 @@
+/*-- scss:defaults --*/
+
+// The dark variant of cosmo. The page colors change first, then the diagram colors.
+$body-bg: #14171c;
+$body-color: #d8dde6;
+$link-color: #7fb4ff;
+$navbar-bg: #1b2028;
+$navbar-fg: #e8ebf1;
+$navbar-hl: #ffffff;
+$code-bg: #1d222a;
+$code-color: #f0a8d0;
+$border-color: #2d343f;
+
+// Mermaid diagrams: light lines and text, and dark boxes with a blue outline.
+$mermaid-edge-color: #a3aebd;
+$mermaid-fg-color--lighter: #3a4352;
+$mermaid-fg-color--lightest: #1a1f27;
+$mermaid-label-fg-color: #e3e8ef;
+$mermaid-node-bg-color: #1e2a3d;
+$mermaid-node-fg-color: #5b9cf0;

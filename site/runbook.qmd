@@ -1,0 +1,12 @@
+---
+title: Runbook
+toc-depth: 2
+---
+
+::: {.source-note}
+Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md). To change it, edit that file.
+:::
+
+::: {.drop-title}
+{{< include ../docs/runbook.md >}}
+:::

@@ -1,0 +1,41 @@
+---
+title: Architecture
+toc-depth: 2
+---
+
+::: {.source-note}
+The diagrams and the component table are read from sections 3.1 to 3.3 of the [plan](plan.qmd) each time the site is built. The notes after them are [`docs/architecture.md`]({{< meta source-repo >}}/blob/main/docs/architecture.md). To change either, edit those files.
+:::
+
+## System context
+
+A poller finds the issues that carry the `longhaul` label and starts one workflow for each. The worker runs the activities, and activities do all the I/O. The console reads from the API, and the API reads Postgres and signals Temporal.
+
+```{mermaid}
+%%| label: fig-system-context
+%%| fig-cap: "System context: GitHub, Longhaul and the services around it."
+%%| column: screen-inset
+%%| file: _generated/system-context.mmd
+```
+
+## Task lifecycle
+
+One task, from a labeled issue to a pull request or a stuck report. The workflow only schedules activities, so every model turn and every tool call can retry on its own.
+
+```{mermaid}
+%%| label: fig-task-lifecycle
+%%| fig-cap: "Task lifecycle: the messages between GitHub, the workflows, the activities, the sandbox and the model."
+%%| column: screen-inset
+%%| file: _generated/task-lifecycle.mmd
+```
+
+## Components
+
+::: {fragment="_generated/components.md"}
+:::
+
+## Workflow, activities and shared types
+
+::: {.drop-title}
+{{< include ../docs/architecture.md >}}
+:::

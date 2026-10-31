@@ -166,8 +166,12 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs/Zensical documentation
-/site
+# Quarto docs site (site/): rendered output, Quarto's cache, and the pages that
+# scripts/site_pages.py writes from docs/ before each render
+site/_site/
+site/.quarto/
+site/_generated/
+site/adr/
 
 # mypy
 .mypy_cache/

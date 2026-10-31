@@ -1,0 +1,68 @@
+project:
+  type: website
+  output-dir: _site
+  # Listed on purpose. Without a list Quarto finds no pages when the checkout sits under a dot
+  # folder such as .claude/worktrees, and it renders nothing without saying so.
+  render:
+    - "*.qmd"
+    - "adr/*.qmd"
+  # Writes the pages that are derived from docs/ (ADR pages, indexes, diagram sources).
+  # python3 is whatever is on the PATH, so the script uses only the standard library.
+  pre-render: python3 ../scripts/site_pages.py
+
+# Used by the "rendered from" links as {{< meta source-repo >}}.
+source-repo: https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github
+
+# fragments.lua runs first, so docs.lua also sees the files it embeds.
+filters:
+  - filters/fragments.lua
+  - filters/docs.lua
+
+website:
+  title: Longhaul
+  description: A durable background coding agent for GitHub issues. Design, decisions and progress.
+  site-url: https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/
+  favicon: favicon.svg
+  navbar:
+    search: true
+    left:
+      - text: Overview
+        href: index.qmd
+      - text: Architecture
+        href: architecture.qmd
+      - text: Decisions
+        href: decisions.qmd
+      - text: Progress
+        href: progress.qmd
+      - text: Gate reports
+        href: gates.qmd
+      - text: Results
+        href: results.qmd
+      - text: Runbook
+        href: runbook.qmd
+      - text: Plan
+        href: plan.qmd
+    tools:
+      - icon: github
+        href: https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github
+        text: Longhaul on GitHub
+  page-footer:
+    center: >-
+      Longhaul is open source under the MIT license.
+      [Source on GitHub](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github).
+
+format:
+  html:
+    theme:
+      light: [cosmo, theme-light.scss]
+      dark: [cosmo, theme-dark.scss]
+    css: styles.css
+    respect-user-color-scheme: true
+    # The tab title is set in filters/docs.lua, so Quarto must not add its own site name.
+    title-prefix: ""
+    toc: true
+    toc-depth: 3
+    toc-title: On this page
+    smooth-scroll: true
+    code-copy: true
+    lang: en

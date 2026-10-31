@@ -27,6 +27,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "boto3>=1.43.118",
+    "fastapi>=0.162.0",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "psycopg[binary]>=3.3.6",
@@ -38,6 +39,7 @@ dev = [
     "types-docker>=7.2.0.20261006",
     "types-jsonschema>=4.26.0.20261006",
     "types-pyyaml>=6.0.12.20260906",
+    "uvicorn>=0.54.0",
 ]
 
 [tool.ruff]

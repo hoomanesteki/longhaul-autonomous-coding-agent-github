@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "ci.yml"
 PROTECT = ROOT / "scripts" / "protect_branches.sh"
+COMPOSE = ROOT / "docker-compose.yml"
+DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 RUNBOOK = ROOT / "docs" / "runbook.md"
 
 # A minimum. Later stories add jobs (e2e, console, chaos-lite), and the `ci` job has to wait
@@ -175,6 +177,87 @@ def test_actions_use_pinned_major_versions() -> None:
     assert uses
     for ref in uses:
         assert re.search(r"@v\d+$", ref), f"{ref} is not pinned to a major version"
+
+
+# --- the Temporal server CI starts is the one the compose file pins -------------------------
+
+# An image name with an optional tag and digest. The lookahead keeps a longer name such as
+# temporalio/temporal-admin-tools from matching.
+_TEMPORAL_IMAGE = re.compile(
+    r"temporalio/temporal(?![\w./-])(?::(?P<tag>[^\s@\"']+))?(?:@(?P<digest>sha256:[0-9a-f]{64}))?"
+)
+
+
+def temporal_image_problems(workflow_text: str, compose_image: str) -> list[str]:
+    """Why the Temporal image in the workflows is not the one docker-compose.yml pins."""
+    wanted = _TEMPORAL_IMAGE.fullmatch(compose_image)
+    assert wanted and wanted["tag"], f"docker-compose.yml must pin a tag: {compose_image}"
+    refs = list(_TEMPORAL_IMAGE.finditer(workflow_text))
+    if not refs:
+        return ["no workflow starts the temporalio/temporal image"]
+    problems: list[str] = []
+    for ref in refs:
+        if ref["tag"] != wanted["tag"]:
+            problems.append(f"{ref[0]}: the compose file pins tag {wanted['tag']}")
+        if ref["digest"] is None:
+            problems.append(f"{ref[0]}: pin the image by digest as well as by tag")
+        elif wanted["digest"] and ref["digest"] != wanted["digest"]:
+            problems.append(f"{ref[0]}: the compose file pins a different digest")
+    return problems
+
+
+def test_ci_starts_the_temporal_image_that_compose_pins() -> None:
+    # `make up` and the CI integration job must run the same dev server (ADR-0002). A CLI
+    # downloaded without a version follows whatever Temporal released last.
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))
+    text = "\n".join(path.read_text(encoding="utf-8") for path in workflow_files())
+    assert temporal_image_problems(text, compose["services"]["temporal"]["image"]) == []
+
+
+_DIGEST = "sha256:" + "ab" * 32
+
+
+@pytest.mark.parametrize(
+    ("workflow_text", "fragment"),
+    [
+        ("run: curl -sSf https://temporal.download/cli.sh | sh", "no workflow starts"),
+        (f"image: temporalio/temporal:1.6.0@{_DIGEST}", "pins tag 1.5.1"),
+        (f"image: temporalio/temporal:latest@{_DIGEST}", "pins tag 1.5.1"),
+        (f"image: temporalio/temporal@{_DIGEST}", "pins tag 1.5.1"),
+        ("image: temporalio/temporal:1.5.1", "by digest"),
+        (f"image: temporalio/temporal:1.5.1@{_DIGEST}\nimage: temporalio/temporal:1.4.0", "1.4.0"),
+    ],
+    ids=["unversioned-cli", "other-tag", "latest", "no-tag", "no-digest", "second-reference"],
+)
+def test_temporal_image_check_notices_drift(workflow_text: str, fragment: str) -> None:
+    problems = temporal_image_problems(workflow_text, "temporalio/temporal:1.5.1")
+    assert any(fragment in problem for problem in problems), problems
+
+
+def test_temporal_image_check_accepts_the_pinned_image() -> None:
+    text = f"env:\n  TEMPORAL_IMAGE: temporalio/temporal:1.5.1@{_DIGEST}\n"
+    assert temporal_image_problems(text, "temporalio/temporal:1.5.1") == []
+    # The compose file may take a digest later. CI then has to use the same one.
+    assert temporal_image_problems(text, f"temporalio/temporal:1.5.1@{_DIGEST}") == []
+    other = f"temporalio/temporal:1.5.1@sha256:{'cd' * 32}"
+    assert temporal_image_problems(text, other)
+
+
+def test_temporal_image_check_ignores_longer_image_names() -> None:
+    text = f"image: temporalio/temporal:1.5.1@{_DIGEST}\nimage: temporalio/temporal-admin-tools:9"
+    assert temporal_image_problems(text, "temporalio/temporal:1.5.1") == []
+
+
+# --- dependabot: version bumps go to dev, never straight to main ----------------------------
+
+
+def test_dependabot_opens_pull_requests_against_dev() -> None:
+    # main moves only through phase-gate pull requests. A bump aimed at main would skip dev's
+    # CI and the gate, and leave main holding a commit that dev lacks.
+    updates = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))["updates"]
+    assert {update["package-ecosystem"] for update in updates} >= {"github-actions", "uv"}
+    for update in updates:
+        assert update.get("target-branch") == "dev", update["package-ecosystem"]
 
 
 # --- branch protection ---------------------------------------------------------------------

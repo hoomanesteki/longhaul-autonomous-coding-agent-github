@@ -108,23 +108,24 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked
-      - name: Install Temporal CLI
-        run: |
-          curl -sSf https://temporal.download/cli.sh | sh
-          echo "$HOME/.temporalio/bin" >> "$GITHUB_PATH"
+      # The image docker-compose.yml uses (ADR-0002), pinned by digest. A tag can be moved to
+      # other content and a digest cannot, so CI and `make up` run the same server.
       - name: Start Temporal dev server
+        env:
+          TEMPORAL_IMAGE: temporalio/temporal:1.5.1@sha256:597a5dbbcc6e7716b326dde4a51622d5ea0879eb0cf06ff8a94381361d0a987d
         run: |
-          nohup "$HOME/.temporalio/bin/temporal" server start-dev --headless \
-            > temporal.log 2>&1 &
+          docker run -d --name temporal -p 7233:7233 "$TEMPORAL_IMAGE" \
+            server start-dev --ip 0.0.0.0 --headless
           for _ in $(seq 1 60); do
-            if (echo > /dev/tcp/127.0.0.1/7233) 2>/dev/null; then
+            if docker exec temporal temporal operator cluster health \
+              --address localhost:7233 > /dev/null 2>&1; then
               echo "temporal is up"
               exit 0
             fi
             sleep 1
           done
           echo "temporal did not start within 60s" >&2
-          cat temporal.log >&2
+          docker logs temporal >&2
           exit 1
       - name: Ensure the blob bucket exists
         run: |
@@ -165,7 +166,7 @@ jobs:
           -m "integration and not live and not slow and not (chaos and not chaos_lite)"
       - name: Show Temporal log on failure
         if: failure()
-        run: cat temporal.log || true
+        run: docker logs temporal || true
 
   compose:
     runs-on: ubuntu-latest

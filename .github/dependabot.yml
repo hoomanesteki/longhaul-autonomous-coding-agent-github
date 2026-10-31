@@ -1,10 +1,14 @@
 version: 2
+# Version bumps go to dev like any other change. main moves only through phase-gate pull
+# requests, so a bump merged there would skip dev's CI and the gate.
 updates:
   - package-ecosystem: github-actions
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly
   - package-ecosystem: uv
     directory: /
+    target-branch: dev
     schedule:
       interval: weekly

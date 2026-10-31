@@ -34,6 +34,7 @@ from longhaul.sandbox.local_manager import FakeSandbox
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase1]
 
+ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "repos"
 LIMITS = SandboxLimits()
 
@@ -125,6 +126,19 @@ RULE_CASES = [
 @pytest.mark.parametrize(("patterns", "path", "is_dir", "ignored"), RULE_CASES)
 def test_ignore_rules(patterns: str, path: str, is_dir: bool, ignored: bool) -> None:
     assert IgnoreRules.parse(patterns).ignores(path, is_dir=is_dir) is ignored
+
+
+def test_the_runbook_example_means_what_the_runbook_says() -> None:
+    text = (ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
+    found = re.search(r"Its syntax is the one of `\.[a-z]+ignore`:\n\n```\n(.*?)\n```", text, re.S)
+    assert found, "the .longhaulignore example is gone from the runbook"
+    rules = IgnoreRules.parse(found.group(1))
+    hidden = ["REFERENCE.patch", "ISSUE.md", "sub/ISSUE.md", "build/out.bin", "run.log"]
+    hidden += ["docs/private/notes.md", "docs/private/deep/x.md"]
+    for path in hidden:
+        assert rules.ignores(path), path
+    for path in ("README.md", "docs/guide.md", "docs/private/keep.md"):
+        assert not rules.ignores(path), path
 
 
 def test_a_pattern_that_cannot_be_read_is_an_error() -> None:

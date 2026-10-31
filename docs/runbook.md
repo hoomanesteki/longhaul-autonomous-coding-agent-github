@@ -38,6 +38,61 @@ Loopback binding does not keep out containers. On Docker Desktop a container on 
 
 A pooled database connection belongs to the event loop that opened it. Code that runs more than one loop in a process, such as a CLI that calls `asyncio.run` twice or tests that each get their own loop, must `await dispose_engine()` before each loop ends. Code that builds its own engine can pass `pooled=False` to `make_engine` instead.
 
+## Run the agent on a local folder
+
+`longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.
+
+```bash
+make sandbox-image    # once, and again when docker/sandbox/Dockerfile changes
+uv run longhaul run-local \
+  --path tests/fixtures/repos/calc \
+  --issue-file tests/fixtures/repos/calc/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/calc_fix.yaml
+```
+
+That run needs no key, because the scripted provider plays `calc_fix.yaml`. For a real model, put `ANTHROPIC_API_KEY` in your shell or in `.env` and use `--provider anthropic` instead of the last line. A real run costs money. The command has no cost cap, only `--max-turns`.
+
+| Option | Meaning |
+|---|---|
+| `--path DIR` | The repo to work on. It is copied and never changed. |
+| `--issue-file FILE` | The task. The first line is the title (leading `#` removed) and the rest is the body. |
+| `--provider` | `scripted`, `anthropic` or `openai`. Default: `LONGHAUL_PROVIDER`. |
+| `--script YAML` | Script for the scripted provider. Default: `LONGHAUL_SCRIPT`. |
+| `--model ID` | Default: `models.coder` in the config (`LONGHAUL_CONFIG`). With `--provider openai` pass it, because the configured ids are Claude ids. |
+| `--test-command CMD` | How `run_tests` runs the tests. Default: `python -m pytest -q`. |
+| `--max-turns N` | Stop after N turns. Default: 150. |
+
+What it does, in order:
+
+1. Copies the files into the sandbox, commits them as the base commit and tags it `base`, which is what `git_diff` compares against.
+2. Runs the setup command with the network on, then cuts the network. With a `pyproject.toml` the setup is `python -m venv .venv` and `pip install -e '.[dev]'` (or `-e . pytest` when there is no `dev` extra), because the sandbox's root filesystem is read-only. The command is printed before it runs. It builds the repo's own code with network access, so run folders you trust, and read "Ports and the database password" above if the local stack is up.
+3. Runs the agent and prints one line per turn, such as `turn 3 coder: edit_file src/calc/__init__.py`, then how the run ended, then the final diff. Progress notes, warnings and errors go to stderr.
+4. Removes the container and the volume, also after an error, Ctrl-C, SIGTERM or SIGHUP. After SIGKILL or a crash they stay. The first output line holds the task id, so `docker rm -f $(docker ps -aq --filter label=longhaul.task_id=<id>)` and `docker volume rm lh-ws-<id>` clean up by hand.
+
+Exit codes: 0 when the agent called `finish`, 2 when the run failed (turn limit, no tool calls, a refusal, a failing setup, a provider error, no Docker or image) or was interrupted, and 1 for a bug in longhaul, which prints a traceback. The diff is cut like any tool output, to its first 8,000 and last 12,000 characters.
+
+### What is not copied
+
+A file called `.longhaulignore` in the folder lists what the sandbox must not get. Its syntax is the one of `.gitignore`:
+
+```
+# The reference fix and the issue text stay out of the sandbox.
+REFERENCE.patch
+ISSUE.md
+build/
+*.log
+docs/private/**
+!docs/private/keep.md
+```
+
+- A pattern without a slash matches a name at any depth. A slash at the start or inside anchors it to the folder. A slash at the end means directories only.
+- `*` and `?` stay inside one name. `**` between slashes crosses directories. `[a-z]` is a range. A `!` line brings back what an earlier line matched, but not inside an ignored directory. A `#` in the first column starts a comment.
+- The file is not copied, because it names what it hides. A bad pattern, or an ignore file that cannot be read, stops the run before any sandbox exists.
+- Always skipped, whatever the file says: `.git`, `.venv`, `__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.egg-info`, `.DS_Store`, and `.env` and `.env.*` files (but not `.env.example`, `.env.sample` and `.env.template`). A secret in `/workspace` is as readable to the model as one in its environment.
+- Links and special files are skipped with a warning. The executable bit is kept.
+
+The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
+
 ## Commit attribution
 
 Claude Code adds co-author trailers to commits and pull requests by default. This repo turns that off in `.claude/settings.json`:

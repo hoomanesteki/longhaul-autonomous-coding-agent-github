@@ -4,32 +4,19 @@
 the same steps as activities. It stays afterwards as the test harness and as the baseline for
 the durability overhead measure.
 
-How a run ends. Finish is the one good end. Every other end is an ERROR outcome with a fixed
-summary, so a caller can tell them apart without reading prose:
+The decisions of the loop are in rules.py, which TaskWorkflow calls as well: what each stop
+reason leads to (D8, D9), the nudge, the finish rule and the fixed summaries of every end that
+is not a finish. This module only drives them: it makes the model calls and the tool calls
+directly, keeps the transcript in memory and reports each turn to `on_event`. The docstring of
+rules.py lists how a run ends.
 
-- the model calls `finish` with a summary: PR_OPENED with that summary and no pr_url, since
-  no pull request exists in-process;
-- `max_turns` turns pass: "turn limit";
-- two turns in a row end without a tool call: "no tool calls". After the first the loop sends
-  one nudge;
-- a turn stops on max_tokens, is retried once at `max_tokens_retry`, and stops on it again:
-  "output limit";
-- the model refuses: "model declined (<category>): <explanation>";
-- the context window fills, or the provider says the prompt is over it: "context limit".
-  Compaction arrives in Phase 4;
-- a turn is paused more than MAX_PAUSES times: "pause limit";
-- a stop reason with no rule (stop_sequence, other): "unexpected stop reason: <reason>".
-
-Stop reasons (D8, D9). The loop reads `stop_reason` before it reads any content. A reply that
-stopped on max_tokens, a refusal or a full window is never stored and none of its tool calls
-run: a tool_use cut off at max_tokens can be a valid but partial object, and a refusal may
-hold output the model withdrew. Tool calls run only after a tool_use stop. A paused turn is
-continued: the text so far goes back as the last message of the next request, and the stored
-transcript gets one assistant message for the whole turn. Longhaul declares no server-side
-tools, so the API should never send pause_turn. The rule is there so that one does not end the
-run or run a half-finished reply. It has not met the live API: a request that ends on
-assistant text is a prefill, which ADR-0003 lists as a 400 on Sonnet 5.5, and a 400 would
-reach the caller as a ProviderError.
+A reply that stopped on max_tokens, a refusal or a full window is never stored and none of its
+tool calls run. A paused turn is continued: the text so far goes back as the last message of
+the next request, and the stored transcript gets one assistant message for the whole turn.
+Longhaul declares no server-side tools, so the API should never send pause_turn. The rule is
+there so that one does not end the run or run a half-finished reply. It has not met the live
+API: a request that ends on assistant text is a prefill, which ADR-0003 lists as a 400 on
+Sonnet 5.5, and a 400 would reach the caller as a ProviderError.
 
 Errors that are not about the model's output are not caught. A ProviderError other than
 CONTEXT_TOO_LONG goes up to the caller, because retries belong to Temporal and an in-process
@@ -43,9 +30,31 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.rules import (
+    BAD_FINISH,
+    CONTEXT_LIMIT,
+    MAX_PAUSES,
+    NO_TOOL_CALLS,
+    NUDGE,
+    OUTPUT_LIMIT,
+    PAUSE_LIMIT,
+    SKIPPED_AFTER_FINISH,
+    TURN_LIMIT,
+    Move,
+    Sampling,
+    carried_text,
+    finished,
+    idle_turn,
+    join_pauses,
+    judge,
+    provider_error_outcome,
+    run_calls,
+    runnable_calls,
+    turn_limit_outcome,
+)
 from longhaul.agent.turns import (
+    answer_tool_calls,
     append_assistant,
-    append_tool_results,
     append_user_text,
     llm_step,
     tool_step,
@@ -60,37 +69,40 @@ from longhaul.contracts import (
     LLMResponse,
     Message,
     Outcome,
-    OutcomeKind,
     ProviderError,
-    ProviderErrorKind,
     Role,
     Sandbox,
-    StopDetails,
     TaskSpec,
-    TextBlock,
     ToolCall,
     ToolContext,
     ToolResult,
     ToolResultBlock,
 )
 from longhaul.settings import AppConfig
-from longhaul.tools.control import FINISH
 from longhaul.tools.registry import ToolRegistry
 
-NUDGE = "Use tools or call finish."
-MAX_PAUSES = 5
+# The constants moved to rules.py. They stay importable from here, where callers and tests
+# have always found them.
+__all__ = [
+    "BAD_FINISH",
+    "CONTEXT_LIMIT",
+    "MAX_PAUSES",
+    "NO_TOOL_CALLS",
+    "NUDGE",
+    "OUTPUT_LIMIT",
+    "PAUSE_LIMIT",
+    "SKIPPED_AFTER_FINISH",
+    "TURN_LIMIT",
+    "CallEvent",
+    "EventSink",
+    "LoopConfig",
+    "LoopResult",
+    "TurnEvent",
+    "run_in_process",
+    "run_loop",
+]
+
 SUMMARY_WIDTH = 60
-
-TURN_LIMIT = "turn limit"
-OUTPUT_LIMIT = "output limit"
-CONTEXT_LIMIT = "context limit"
-PAUSE_LIMIT = "pause limit"
-NO_TOOL_CALLS = "no tool calls"
-
-BAD_FINISH = (
-    "finish needs a summary: a short text that says what you changed. Call finish again with one."
-)
-SKIPPED_AFTER_FINISH = "finish was called earlier in this turn"
 
 # The argument that says most about a call, in the order they are tried.
 _SUMMARY_KEYS = ("path", "command", "pattern", "target", "summary")
@@ -236,7 +248,7 @@ class _Loop:
             outcome = await self._turn(turn)
             if outcome is not None:
                 return LoopResult(outcome, self.transcript, turn + 1)
-        return LoopResult(_error(TURN_LIMIT), self.transcript, self.cfg.max_turns)
+        return LoopResult(turn_limit_outcome(), self.transcript, self.cfg.max_turns)
 
     async def _turn(self, turn: int) -> Outcome | None:
         # A transcript the API would reject fails here, with a message, and not as a 400.
@@ -245,7 +257,7 @@ class _Loop:
         if isinstance(sampled, Outcome):
             return sampled
         self.transcript = append_assistant(self.transcript, sampled.resp)
-        calls = sampled.resp.tool_calls if sampled.resp.stop_reason == "tool_use" else []
+        calls = runnable_calls(sampled.resp, sampled.resp.tool_calls)
         if not calls:
             return self._idle_turn(turn, sampled.notes)
         self.idle = 0
@@ -254,26 +266,24 @@ class _Loop:
     # ----- one model reply -----
     async def _sample(self) -> _Reply | Outcome:
         """Call the model until one reply can be used, or the run has to end."""
-        cap, retried, pauses = self.cfg.max_tokens_per_turn, False, 0
+        sampling = Sampling()
         paused: list[Block] = []
         while True:
-            resp = await self._complete(paused, cap)
+            resp = await self._complete(paused, self._cap(sampling))
             if isinstance(resp, Outcome):
                 return resp
-            ended = _ending(resp)
-            if ended is not None:
-                return ended
-            if resp.stop_reason == "max_tokens":
-                if retried:
-                    return _error(OUTPUT_LIMIT)
-                retried, cap = True, self.cfg.max_tokens_retry
-            elif resp.stop_reason == "pause_turn":
-                pauses += 1
-                if pauses > MAX_PAUSES:
-                    return _error(PAUSE_LIMIT)
-                paused.extend(_text_of(resp))
-            else:
-                return _Reply(_after_pauses(resp, paused), self._sampling_notes(retried, pauses))
+            verdict = judge(sampling, resp)
+            sampling = verdict.sampling
+            if verdict.outcome is not None:
+                return verdict.outcome
+            if verdict.move is Move.CONTINUE:
+                paused.extend(carried_text(resp))
+            elif verdict.move is Move.USE:
+                return _Reply(join_pauses(resp, paused), self._sampling_notes(sampling))
+
+    def _cap(self, sampling: Sampling) -> int:
+        # D8: one retry of a cut turn, at the higher cap. It stays raised for the rest of the turn.
+        return self.cfg.max_tokens_retry if sampling.retried else self.cfg.max_tokens_per_turn
 
     async def _complete(self, paused: list[Block], cap: int) -> LLMResponse | Outcome:
         request = self.transcript
@@ -284,24 +294,26 @@ class _Loop:
                 self.provider, self.cfg.model, self.system, request, self.tools, cap, self.options
             )
         except ProviderError as exc:
-            if exc.kind is ProviderErrorKind.CONTEXT_TOO_LONG:
-                return _error(CONTEXT_LIMIT)
-            raise
+            outcome = provider_error_outcome(exc.kind)
+            if outcome is None:
+                raise
+            return outcome
 
-    def _sampling_notes(self, retried: bool, pauses: int) -> list[str]:
+    def _sampling_notes(self, sampling: Sampling) -> list[str]:
         notes = []
-        if retried:
+        if sampling.retried:
             notes.append(f"retried at max_tokens {self.cfg.max_tokens_retry}")
-        if pauses:
-            notes.append(f"continued after pause_turn x{pauses}")
+        if sampling.pauses:
+            notes.append(f"continued after pause_turn x{sampling.pauses}")
         return notes
 
     # ----- what a reply leads to -----
     def _idle_turn(self, turn: int, notes: list[str]) -> Outcome | None:
-        self.idle += 1
-        if self.idle >= 2:
+        idle = idle_turn(self.idle)
+        self.idle = idle.count
+        if idle.outcome is not None:
             self._emit(turn, [], [*notes, "no tool calls twice in a row; stopping"])
-            return _error(NO_TOOL_CALLS)
+            return idle.outcome
         self.transcript = append_user_text(self.transcript, NUDGE)
         self._emit(turn, [], [*notes, "no tool calls; nudged"])
         return None
@@ -315,25 +327,14 @@ class _Loop:
             blob_prefix=f"tasks/{self.spec.task_id}",
             output_max_tokens=self.cfg.tool_output_max_tokens,
         )
-        results: list[ToolResult] = []
-        summary: str | None = None
-        for call in calls:
-            if call.name == FINISH:
-                # The loop handles finish itself and nothing runs for it. A good finish ends the
-                # task and the calls after it are skipped. A bad one is answered like any bad call.
-                summary = _finish_summary(call)
-                if summary is not None:
-                    break
-                results.append(ToolResult(call_id=call.id, ok=False, output=BAD_FINISH))
-            else:
-                results.append(await tool_step(self.registry, self.sandbox, call, ctx))
-        self.transcript = append_tool_results(
-            self.transcript, calls, results, not_run_reason=SKIPPED_AFTER_FINISH
-        )
+
+        async def run(call: ToolCall) -> ToolResult:
+            return await tool_step(self.registry, self.sandbox, call, ctx)
+
+        ran = await run_calls(calls, run)
+        self.transcript = answer_tool_calls(self.transcript, calls, ran.results)
         self._emit(turn, calls, notes)
-        if summary is None:
-            return None
-        return Outcome(kind=OutcomeKind.PR_OPENED, summary=summary)
+        return finished(ran.finish) if ran.finish is not None else None
 
     def _emit(self, turn: int, calls: list[ToolCall], notes: list[str]) -> None:
         if self.on_event is None:
@@ -347,49 +348,6 @@ class _Loop:
 
 
 # ---------- helpers ----------
-def _error(summary: str) -> Outcome:
-    return Outcome(kind=OutcomeKind.ERROR, summary=summary)
-
-
-def _ending(resp: LLMResponse) -> Outcome | None:
-    """The outcome for a stop reason that ends the run, or None when the reply goes on."""
-    match resp.stop_reason:
-        case "refusal":
-            return _error(_declined(resp.stop_details))
-        case "model_context_window_exceeded":
-            return _error(CONTEXT_LIMIT)
-        case "stop_sequence" | "other":
-            return _error(f"unexpected stop reason: {resp.raw_stop_reason or resp.stop_reason}")
-        case _:
-            return None
-
-
-def _declined(details: StopDetails | None) -> str:
-    # The API can send a refusal with no details at all, or with one of the two missing.
-    category = (details.category or "").strip() if details is not None else ""
-    explanation = (details.explanation or "").strip() if details is not None else ""
-    return f"model declined ({category or 'unknown'}): {explanation or 'no explanation given'}"
-
-
-def _text_of(resp: LLMResponse) -> list[Block]:
-    # Only text carries over a pause. A tool_use in a paused reply is never answered, so it
-    # must not reach a request or the transcript.
-    return [b for b in resp.content if isinstance(b, TextBlock) and b.text.strip()]
-
-
-def _after_pauses(resp: LLMResponse, paused: list[Block]) -> LLMResponse:
-    if not paused:
-        return resp
-    return resp.model_copy(update={"content": [*paused, *resp.content]})
-
-
-def _finish_summary(call: ToolCall) -> str | None:
-    summary = call.input.get("summary")
-    if not isinstance(summary, str):
-        return None
-    return summary.strip() or None
-
-
 def _short_args(call: ToolCall) -> str:
     for key in _SUMMARY_KEYS:
         value = call.input.get(key)

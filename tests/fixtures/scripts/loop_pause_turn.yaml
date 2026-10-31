@@ -1,0 +1,15 @@
+# The first reply pauses, with text and a tool call that must not run. The loop sends the
+# text back to continue the same turn, and the continuation finishes. The two steps are told
+# apart by the number of assistant messages in the request: 0 at first, 1 on the continuation.
+steps:
+  - match: {turn_index: 0}
+    respond:
+      text: "Checking the repo first."
+      tool_calls:
+        - {name: write_file, input: {path: paused.py, content: "x = 1\n"}}
+      stop_reason: pause_turn
+  - match: {turn_index: 1, request_contains: "Checking the repo first."}
+    respond:
+      text: "Nothing to change."
+      tool_calls:
+        - {name: finish, input: {summary: "Finished after one pause."}}

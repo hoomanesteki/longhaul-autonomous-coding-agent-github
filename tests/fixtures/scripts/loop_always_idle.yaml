@@ -1,0 +1,5 @@
+# Answers with text and no tool call every time, nudge or not.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "I have nothing to run."

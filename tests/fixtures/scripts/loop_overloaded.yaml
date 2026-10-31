@@ -1,0 +1,4 @@
+# The provider is overloaded. The in-process loop has no retry policy, so the error is the caller's.
+steps:
+  - match: {role: coder}
+    respond: {raise: overloaded, retry_after_s: 2.0}

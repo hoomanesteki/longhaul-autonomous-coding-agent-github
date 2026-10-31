@@ -1,0 +1,6 @@
+# Lists the directory on every turn and never calls finish. Used to reach the turn limit.
+steps:
+  - match: {role: coder}
+    respond:
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}

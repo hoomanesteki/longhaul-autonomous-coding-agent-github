@@ -6,7 +6,23 @@ authors = [
     { name = "Hooman Esteki", email = "esteki.net@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "alembic>=1.20.1",
+    "anthropic>=2.3,<3",
+    "asyncpg>=0.32.0",
+    "docker>=7.2.0",
+    "jsonschema>=4.26.0",
+    "openai>=3.41.0",
+    "pgvector>=0.5.1",
+    "pydantic>=2.14.1",
+    "pydantic-settings>=2.16.1",
+    "pyyaml>=6.0.3",
+    "sqlalchemy[asyncio]>=2.1.6",
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+longhaul = "longhaul.cli:app"
 
 [build-system]
 requires = ["uv_build>=0.12.3,<0.13.0"]
@@ -14,12 +30,19 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "boto3>=1.43.118",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
+    "psycopg[binary]>=3.3.6",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.1",
     "pytest-cov>=7.1.0",
+    "pytest-github-actions-annotate-failures>=0.4.2",
     "ruff>=0.17.2",
+    "temporalio>=1.34.0",
+    "types-docker>=7.2.0.20261006",
+    "types-jsonschema>=4.26.0.20261006",
+    "types-pyyaml>=6.0.12.20260906",
 ]
 
 [tool.ruff]
@@ -36,7 +59,12 @@ python_version = "3.12"
 mypy_path = "src"
 packages = ["longhaul"]
 warn_unused_configs = true
+# Part of --strict, but mypy accepts it only as a global setting, never in an override.
+warn_redundant_casts = true
 
+# `strict = true` is a global switch even inside an override, so it would make every module
+# strict. These are the flags it stands for, so only the four packages named in the plan
+# are strict.
 [[tool.mypy.overrides]]
 module = [
     "longhaul.contracts",
@@ -44,12 +72,31 @@ module = [
     "longhaul.context.*",
     "longhaul.cost.*",
 ]
-strict = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+warn_unused_ignores = true
+warn_return_any = true
+implicit_reexport = false
+strict_equality = true
+extra_checks = true
+
+[[tool.mypy.overrides]]
+module = ["longhaul.db.migrations.*"]
+disallow_untyped_defs = false
+disallow_untyped_calls = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "--strict-markers"
+pythonpath = ["src"]
+# importlib mode gives each test file a name from its path, so tests/unit/test_x.py and
+# tests/integration/test_x.py can both exist. The default mode names them by basename.
+addopts = "--strict-markers --import-mode=importlib"
 markers = [
     "unit: pure logic, no Docker, network or DB",
     "integration: needs the local docker compose stack",

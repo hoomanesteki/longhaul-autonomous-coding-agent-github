@@ -1,0 +1,44 @@
+poller:
+  interval_seconds: 60
+  label: longhaul
+repos:
+  - repo: hoomanesteki/lh-demo-calc
+    allowlisted: true
+    plan_approval_required: true
+    # The sandbox root filesystem is read-only, so packages go into a venv in the workspace.
+    setup_command: "python -m venv .venv && .venv/bin/pip install -e '.[dev]'"
+    test_command: "pytest -q"
+    budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
+models:                 # every id here needs an entry in the pricing file
+  planner: "claude-sonnet-5-5"
+  coder: "claude-sonnet-5-5"
+  verifier: "claude-sonnet-5-5"
+  compactor: "claude-haiku-5-5"
+effort:                 # reasoning effort per role: low, medium, high, xhigh or max
+  planner: medium       # sent with every call, and fixed for the life of a transcript
+  coder: medium
+  verifier: medium
+  compactor: low
+sandbox:
+  image: "longhaul-sandbox:py312"
+  limits: { cpus: 2, memory_mb: 4096, pids: 512 }
+  command_timeout_s: 600
+context:
+  window_tokens: 200000
+  compact_at: 0.60
+  hard_limit: 0.85
+  keep_recent_turns: 6
+  elide_tool_outputs_after_turns: 4
+  tool_output_max_tokens: 4000
+loop:
+  max_verify_rounds: 3
+  continue_as_new_every_turns: 40
+  max_tokens_per_turn: 8192
+  max_tokens_retry: 64000   # cap for the one retry of a turn that stopped on max_tokens
+stuck:
+  no_progress_turns: 15
+  repeated_failure_count: 3
+  churn_edits: 4
+  consecutive_tool_errors: 5
+  hint_wait_hours: 24
+pricing_file: config/pricing.yaml   # fill from the provider's pricing page; never hardcode in code

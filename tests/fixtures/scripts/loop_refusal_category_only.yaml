@@ -1,0 +1,6 @@
+# A refusal whose details name a category and no explanation.
+steps:
+  - match: {role: coder}
+    respond:
+      stop_reason: refusal
+      stop_details: {category: bio}

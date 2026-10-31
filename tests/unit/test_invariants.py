@@ -271,6 +271,8 @@ def test_the_closure_walk_reaches_what_the_task_workflow_imports() -> None:
         "longhaul.contracts",
         "longhaul.durable.acts",
         "longhaul.durable.payload_guard",
+        # The turn rules that the workflow shares with the in-process loop (LH-204).
+        "longhaul.agent.rules",
     } <= set(closure)
 
 

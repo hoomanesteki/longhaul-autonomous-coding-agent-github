@@ -1,0 +1,9 @@
+# What the retry of a cut turn gets once the higher max_tokens lets the reply finish.
+# The test pairs this script with loop_max_tokens_cut.yaml through a provider that picks
+# a script by the max_tokens it was given.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "Short version this time."
+      tool_calls:
+        - {name: finish, input: {summary: "Finished on the retry."}}

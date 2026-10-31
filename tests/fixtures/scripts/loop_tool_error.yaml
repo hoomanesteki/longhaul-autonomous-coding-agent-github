@@ -1,0 +1,11 @@
+# A call the registry rejects. The error goes back to the model as a tool_result and the
+# loop goes on. The second step sits first so that it wins once the error is in the transcript.
+steps:
+  - match: {last_tool_result_contains: "invalid input"}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Recovered after a bad call."}}
+  - match: {turn_index: 0}
+    respond:
+      tool_calls:
+        - {name: read_file, input: {}}

@@ -1,0 +1,4 @@
+# A refusal with no details at all, which the API can send.
+steps:
+  - match: {role: coder}
+    respond: {stop_reason: refusal}

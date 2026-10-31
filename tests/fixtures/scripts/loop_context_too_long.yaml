@@ -1,0 +1,4 @@
+# The prompt is over the window, so the provider refuses the request before any reply.
+steps:
+  - match: {role: coder}
+    respond: {raise: context_too_long}

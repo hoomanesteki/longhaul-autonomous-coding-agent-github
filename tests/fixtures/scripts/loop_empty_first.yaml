@@ -1,0 +1,8 @@
+# An empty end_turn as the very first reply (no text, no tool call), then a finish after the nudge.
+steps:
+  - match: {user_text_contains: "Use tools or call finish."}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Finished after an empty reply."}}
+  - match: {turn_index: 0}
+    respond: {stop_reason: end_turn}

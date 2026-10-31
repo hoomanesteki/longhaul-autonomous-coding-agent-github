@@ -1,0 +1,11 @@
+# A refusal with details, and a tool call the loop must not run.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "I can't help with that."
+      tool_calls:
+        - {name: write_file, input: {path: refused.py, content: "x = 1\n"}}
+      stop_reason: refusal
+      stop_details:
+        category: cyber
+        explanation: "The request looks like malware development."

@@ -1,0 +1,6 @@
+# The reply filled the context window while it was being written.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "Reading every file in the repo"
+      stop_reason: model_context_window_exceeded

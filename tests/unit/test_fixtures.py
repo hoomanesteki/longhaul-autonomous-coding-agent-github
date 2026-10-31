@@ -173,6 +173,32 @@ def test_build_ignores_the_users_git_config(
     )
 
 
+def test_build_ignores_the_users_ignore_and_attributes_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # git reads these two files from the user's config directory even when it reads no
+    # gitconfig. An ignore rule drops files from the commit, and `text=auto` rewrites CRLF.
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "NOTES.md").write_text("notes\n", encoding="utf-8")
+    (source / "crlf.txt").write_bytes(b"one\r\ntwo\r\n")
+    clean = make_fixture_git(source, tmp_path / "clean")
+
+    config_dir = tmp_path / "home" / ".config" / "git"
+    config_dir.mkdir(parents=True)
+    (config_dir / "ignore").write_text("*.md\n", encoding="utf-8")
+    (config_dir / "attributes").write_text("* text=auto\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "home" / ".config"))
+    hostile = make_fixture_git(source, tmp_path / "hostile")
+
+    assert _git_out(hostile, "ls-files") == _git_out(clean, "ls-files")
+    assert _git_out(hostile, "rev-parse", "base:crlf.txt") == _git_out(
+        clean, "rev-parse", "base:crlf.txt"
+    )
+    assert _git_out(hostile, "rev-parse", "base") == _git_out(clean, "rev-parse", "base")
+
+
 def test_build_ignores_git_variables_set_by_a_running_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

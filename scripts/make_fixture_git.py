@@ -34,11 +34,16 @@ _IDENTITY = {
     "GIT_COMMITTER_DATE": _DATE,
 }
 # Settings that would otherwise come from the user's config: signing, hooks, line endings.
+# The last two name files git reads from ~/.config/git even when no gitconfig is read, so
+# GIT_CONFIG_GLOBAL does not cover them. Global ignore rules would drop files from the
+# commit, and global attributes could rewrite line endings in it.
 _CONFIG = {
     "core.hooksPath": os.devnull,
     "commit.gpgsign": "false",
     "tag.gpgsign": "false",
     "core.autocrlf": "false",
+    "core.excludesFile": os.devnull,
+    "core.attributesFile": os.devnull,
 }
 _SETTINGS = [arg for key, value in _CONFIG.items() for arg in ("-c", f"{key}={value}")]
 

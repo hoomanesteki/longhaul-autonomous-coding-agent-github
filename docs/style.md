@@ -1,6 +1,6 @@
 # Voice and style guide
 
-The repo should read like one careful engineer wrote it.
+These rules cover the README, docs, comments, commit messages and PR descriptions.
 
 - **README:** lead with the problem in one sentence and one real number. Then the architecture diagram, quickstart (three commands), results table, and design decisions with links to ADRs. Keep the top screen short.
 - **Docs:** short paragraphs. Active voice. Say what the thing does and why. Prefer tables for facts and code blocks for commands.
@@ -16,8 +16,7 @@ The repo should read like one careful engineer wrote it.
     - `WIP`
 - **PR descriptions:** three short sections (What, Why, How I tested it), plus `Closes #N`. Three to ten lines is normal.
 - **Banned phrases:**
-  - robust, seamless, seamlessly, leverage, delve, comprehensive, cutting-edge, state-of-the-art (unless citing a paper)
-  - game-changer, unlock, empower, elevate, harness the power, supercharge, in today's fast-paced, it's worth noting
-  - furthermore, moreover, plethora, a testament to, navigate the complexities, best-in-class
+  - robust, seamless, seamlessly, leverage, comprehensive, cutting-edge, state-of-the-art (unless citing a paper)
+  - game-changer, unlock, empower, elevate, supercharge, best-in-class
   - em dashes, emoji
-- **Ownership:** Hooman reads every phase gate report and every "Defend it" block. If he can't explain a decision in an interview, it isn't done.
+  - `tests/unit/test_docs_style.py` checks the docs for these and for a few filler phrases.

@@ -1,7 +1,7 @@
 # Phase 1 gate: Agent core without durability
 
 - Date: 2026-10-31
-- Result: **Pass on code, pending owner actions** (a real-model run on calc and textkit, and the live API checks S1 to S10, both need an Anthropic key). See "Owner actions".
+- Result: **Pass on code, pending manual steps** (a real-model run on calc and textkit, and the live API checks S1 to S10, both need an Anthropic key). See "Steps to close the gate".
 
 ## Test summary
 
@@ -20,13 +20,13 @@
 | LH-101 | Every model round-trips through JSON | `test_roundtrip_all_models` (non-default values for every field since LH-198) | Pass |
 | LH-101 | contracts.py imports only stdlib, pydantic and typing | `test_contracts_imports_are_pure` | Pass |
 | LH-101 | mypy strict on the module | `mypy src` in CI `types` | Pass |
-| LH-102 | ADR-0003 appendix lists the five facts with the SDK version | docs/adr/0003-own-agent-loop.md, appendix part 1 and part 3 (offline checks on anthropic 2.3.0) | Pass, live confirmation pending owner |
+| LH-102 | ADR-0003 appendix lists the five facts with the SDK version | docs/adr/0003-own-agent-loop.md, appendix part 1 and part 3 (offline checks on anthropic 2.3.0) | Pass, live confirmation pending |
 | LH-102 | Script under spikes/, excluded from mypy and the package | spikes/messages_api.py; `mypy src` only | Pass |
 | LH-103 | Five calls return the five expected tool calls | `test_sequence` | Pass |
 | LH-103 | A non-matching request raises with a helpful message | `test_no_match_raises` | Pass |
 | LH-104 | Mocked tests for success, tool use, 429, 529, 500, timeout, context too long, 401 | `tests/unit/test_anthropic_provider.py` (httpx2 mock transport; a 32-mutation check) | Pass |
 | LH-104 | Each error maps to the right kind, retry_after_s parsed | `test_error_mapping` and the retry-after tests, one HTTP request per error | Pass |
-| LH-104 | Opt-in live round trip | `tests/live/test_anthropic_live.py::test_round_trip` (skipped without a key) | Pending owner |
+| LH-104 | Opt-in live round trip | `tests/live/test_anthropic_live.py::test_round_trip` (skipped without a key) | Pending |
 | LH-105 | Mocked tool round trip and error mapping | `test_tool_roundtrip`, `test_error_mapping` | Pass |
 | LH-105 | Transcript renders back without loss of tool ids | `test_tool_roundtrip` | Pass |
 | LH-106 | Image builds in CI, `id -u` prints 10001 | CI `integration` builds it; `test_the_acceptance_command_runs_as_written` | Pass |
@@ -36,7 +36,7 @@
 | LH-109 | run_tests reports 1 failed on calc, output cap marker, git_diff after edit | `tests/integration/test_exec_tools.py` | Pass |
 | LH-110 | Scripted calc fix on FakeSandbox, pairs valid, turn limit | `test_scripted_calc_fix`, `test_pairs_valid`, `test_turn_limit` plus the D8 and D9 rules (a 20-mutation check) | Pass |
 | LH-111 | e2e run-local on calc with the scripted provider | `tests/e2e/test_run_local.py::test_calc_scripted`; the printed diff applied to a fresh copy matches REFERENCE.patch | Pass |
-| LH-111 | Real-model run fixes calc and textkit | needs a key | Pending owner |
+| LH-111 | Real-model run fixes calc and textkit | needs a key | Pending |
 | LH-191 to LH-198 | Fix and contract stories from the pre-gate review | each finding reproduced with a failing test first; see their story blocks | Pass |
 
 ## Invariants
@@ -68,7 +68,7 @@ $ docker ps -a --filter label=longhaul.task_id   # nothing left
 
 LH-191 to LH-198, all Done.
 
-## Owner actions to close the gate
+## Steps to close the gate
 
 1. With an Anthropic key: `uv run --with "anthropic>=2.3,<3" python spikes/messages_api.py --live` (S1 to S10, about 1 USD), then update the "confirmed live" markers in ADR-0003.
 2. With an Anthropic key: `uv run longhaul run-local --path tests/fixtures/repos/calc --issue-file tests/fixtures/repos/calc/ISSUE.md --provider anthropic` and the same for textkit; paste the output tails here.

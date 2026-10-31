@@ -12,7 +12,7 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - make gate PHASE=N # everything for phases 0..N
 
 ## Working rules
-1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge.
+1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge. Delete the branch once it is merged.
 2. Write the story's listed tests first. Make them fail. Then implement.
 3. Do not edit src/longhaul/contracts.py unless the story says so. If you must, explain why in the PR.
 4. Workflow code (src/longhaul/durable/workflows/) must stay deterministic: no I/O, no datetime.now(), no random, no imports of httpx/httpx2/httpcore2/docker/sqlalchemy/boto3/anthropic/openai/subprocess. Use workflow.now() and activities.
@@ -29,4 +29,4 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - Comments explain why, not what.
 
 ## When unsure
-Stop and leave a short note in the PR description under "Questions". Do not guess at shared contracts.
+Leave a short note in the PR description under "Questions" instead of changing a shared contract on a guess.

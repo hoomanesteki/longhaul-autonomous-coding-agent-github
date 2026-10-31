@@ -3,7 +3,7 @@
 This script checks, against the real API, the facts that
 docs/adr/0003-own-agent-loop.md marks as "confirmed live: pending". Each check
 has an id, S1 to S10, that matches the "Live confirmation log" at the end of that
-ADR's appendix. Hooman runs it once with a real key. Nothing in src/ imports it,
+ADR's appendix. Run it once with a real key. Nothing in src/ imports it,
 mypy does not check it, and it never calls the API without --live.
 
     export ANTHROPIC_API_KEY=sk-ant-...
@@ -682,7 +682,7 @@ STATUS_CASES = (
 )
 
 
-# The exception class the bundled docs name for each status. Statuses the docs give no class
+# The exception class the API docs name for each status. Statuses the docs give no class
 # (402, 408, 409, 413) are recorded in the matrix but not compared.
 DOCUMENTED_CLASSES = {
     400: "BadRequestError",

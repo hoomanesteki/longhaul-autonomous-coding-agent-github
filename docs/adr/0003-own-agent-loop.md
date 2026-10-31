@@ -7,7 +7,7 @@
 
 Longhaul runs tasks that last hours and must survive crashes, restarts and a sleeping laptop. That makes one model turn and one tool call the unit of durability. Each of them has to be its own Temporal activity, with its own retry policy, timeout, heartbeat and checkpoint, so a failure replays one step and not the whole run.
 
-Three ways to get an agent loop were on the table: the Claude Agent SDK, a LangGraph graph, or our own code on the Messages API. Hooman has shipped with both of the first two. They are good tools for interactive and graph-shaped agents. The facts that matter here:
+Three ways to get an agent loop were on the table: the Claude Agent SDK, a LangGraph graph, or our own code on the Messages API. We have shipped with both of the first two. They are good tools for interactive and graph-shaped agents. The facts that matter here:
 
 - The Agent SDK owns its loop and its session transcript. We cannot checkpoint or retry between its internal steps.
 - LangGraph with a Postgres checkpointer can checkpoint per node. We would still need a job runner, durable timers (24 hour hint waits), schedules, signals and a history UI. Temporal gives us all of those (ADR-0004).
@@ -43,7 +43,7 @@ What to watch:
 
 ## Decisions from the API research
 
-These decisions came out of the LH-102 research on the bundled Claude API docs. The live calls are still pending, so each decision names the check that could change it. Models: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. Both think by default (adaptive thinking) and have a 1M token window. The labels D1, D3, D7, D8 and D10 are the ones used in the research notes, so they are not renumbered here.
+These decisions came out of the LH-102 research on the Claude API docs. The live calls are still pending, so each decision names the check that could change it. Models: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. Both think by default (adaptive thinking) and have a 1M token window. The labels D1, D3, D7, D8 and D10 are the ones used in the research notes, so they are not renumbered here.
 
 ### D1. Thinking blocks are stripped at ingestion (v1)
 
@@ -82,11 +82,11 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 
 ## Appendix: API facts (LH-102)
 
-Drafted on 2026-10-30 from the bundled Claude API documentation (claude-api skill bundle 2.1.310). Every fact names its source file and section inside that bundle. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. Hooman runs them and replaces "pending" with the result and the date.
+Drafted on 2026-10-30 from a local snapshot of the Claude API documentation. Every fact names its source file and section in that snapshot. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. After a run, replace "pending" with the result and the date.
 
 - Model scope: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. A fact that names no model applies to both.
 - SDK: `anthropic` 2.3.0 is locked (LH-104, ADR-0002). It sends `anthropic-version` 2026-10-21, pinned by `test_the_sdk_sends_the_api_version_adr_0003_records`.
-- The bundle is a snapshot. The skill's model table is marked as cached on 2026-10-06, and the preserved-thinking notes quote the live page as of 2026-10-14. Check prices, model lists, beta names and enforcement rules against the live pages before code depends on them.
+- The snapshot can be out of date. Its model table is marked as cached on 2026-10-06, and the preserved-thinking notes quote the live page as of 2026-10-14. Check prices, model lists, beta names and enforcement rules against the live pages before code depends on them.
 
 ### Part 1. The five facts LH-102 asks for
 
@@ -278,7 +278,7 @@ Run on 2026-10-30 in the project environment with `anthropic` 2.3.0 and `httpx2`
 | S9 | Model ids, context windows, output caps, effort capability | pending | | |
 | S10 | Mid-conversation system message on both models | pending | | |
 
-Running the spike (Hooman, with a real key):
+Running the spike (with a real key):
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...

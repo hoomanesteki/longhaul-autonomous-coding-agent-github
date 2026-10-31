@@ -116,6 +116,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `e2e` | builds the sandbox image, then runs the end-to-end tests: `longhaul run-local` on the `calc` fixture with the scripted provider, on a real sandbox (see "Run the agent on a local folder") |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
+| `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 
 The required check is `ci`. Branch protection points at that one name, so a new job must be added to the `needs` list of `ci`. `tests/unit/test_ci_config.py` fails if any job is missing from that list.
@@ -151,3 +152,29 @@ scripts/protect_branches.sh OWNER/REPO # or name it
 It requires a pull request and an up-to-date `ci` check, and blocks force pushes and deletions.
 
 `enforce_admins` is false on purpose. The owner merges the phase-gate pull requests and the gatekeeper pushes `dev` as the admin, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
+
+## Docs site
+
+The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy nothing, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview, is short and leaves the numbers that change to tables generated from `docs/`.
+
+| Command | What it does |
+|---|---|
+| `make site` | renders the site to `site/_site/` |
+| `make site-preview` | serves the site with live reload |
+
+You need [Quarto](https://quarto.org/docs/download/) 1.10.18, which is the version CI pins, and `python3` on the PATH. View the pages through the preview server or any local web server. Opening an `.html` file straight from disk can break the table of contents.
+
+Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, and the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
+
+Things that are easy to trip over:
+
+- `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.claude/worktrees`.
+- A page cannot include a file from `site/_generated/` with the include shortcode. Quarto expands that shortcode while it scans the project, before `scripts/site_pages.py` has run, so on a clean checkout the file is missing and the render stops. `site/filters/fragments.lua` embeds those files later instead, and `tests/unit/test_site_pages.py` fails a page that includes one.
+- `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content.
+- `tests/unit/test_docs_style.py` applies the voice rules to the `.qmd` pages as it does to the docs.
+
+### Publishing
+
+The `docs` job in `ci.yml` renders the site on every pull request. `.github/workflows/pages.yml` renders it again and deploys it to GitHub Pages on every push to `main`, and on a manual run.
+
+The owner has to set the Pages source of the repository to GitHub Actions once: Settings, Pages, Build and deployment, Source, GitHub Actions. Until then the deploy job fails and the site stays offline. The site goes live after the first push to `main` that runs the workflow, which is the first phase gate merge. The address is `https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/`, and the README links to it.

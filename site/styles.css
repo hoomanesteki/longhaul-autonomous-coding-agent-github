@@ -1,0 +1,76 @@
+/* Where a page's text lives, shown under the title. */
+.source-note {
+  color: var(--bs-secondary-color);
+  font-size: 0.9rem;
+  margin-bottom: 1.5rem;
+}
+
+/* The links to the previous and the next ADR, at the end of an ADR page. */
+.page-links {
+  border-top: 1px solid var(--bs-border-color);
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+}
+
+/* The docs hold wide tables. Let them scroll sideways instead of stretching the page. */
+.table-scroll {
+  margin-bottom: 1rem;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.table-scroll > table {
+  margin-bottom: 0;
+}
+
+/* Long URLs, as in the plan's reference list, and long command lines in inline code break at
+   the edge of the page instead of widening it. */
+main.content {
+  overflow-wrap: break-word;
+}
+:not(pre) > code {
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* The two architecture diagrams are about 2200px wide. Fitted to a narrow page their text is
+   too small to read, so below 1300px they keep that width and scroll sideways in their frame. */
+figure.quarto-float-fig > div {
+  overflow-x: auto;
+}
+svg.mermaid-js {
+  min-width: 1300px;
+}
+
+/* Mermaid paints edge labels on a light gray box. In dark mode that hides the text, so the box
+   takes the page color. Mermaid writes its own styles into each SVG, hence the !important. */
+svg.mermaid-js .labelBkg,
+svg.mermaid-js .edgeLabel p {
+  background-color: var(--mermaid-label-bg-color) !important;
+}
+
+/* Status words in tables become badges (site/filters/docs.lua). */
+.badge-status {
+  border-radius: 1rem;
+  display: inline-block;
+  font-size: 0.85em;
+  font-weight: 600;
+  line-height: 1.5;
+  padding: 0 0.65em;
+  white-space: nowrap;
+}
+.badge-status.done {
+  background: var(--bs-success-bg-subtle);
+  color: var(--bs-success-text-emphasis);
+}
+.badge-status.active {
+  background: var(--bs-warning-bg-subtle);
+  color: var(--bs-warning-text-emphasis);
+}
+.badge-status.blocked {
+  background: var(--bs-danger-bg-subtle);
+  color: var(--bs-danger-text-emphasis);
+}
+.badge-status.idle {
+  background: var(--bs-secondary-bg);
+  color: var(--bs-secondary-color);
+}

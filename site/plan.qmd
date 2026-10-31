@@ -1,0 +1,12 @@
+---
+title: Build plan
+toc-depth: 3
+---
+
+::: {.source-note}
+Rendered from [`docs/plan/longhaul-build-plan.md`]({{< meta source-repo >}}/blob/main/docs/plan/longhaul-build-plan.md). To change it, edit that file. The two mermaid diagrams in sections 3.1 and 3.2 show as code here. They are drawn on the [architecture page](architecture.qmd).
+:::
+
+::: {.drop-title}
+{{< include ../docs/plan/longhaul-build-plan.md >}}
+:::

@@ -37,9 +37,19 @@ BANNED_PHRASES = [
 LONG_DASHES = ("\u2014", "\u2013")  # em dash, en dash
 
 
+def _site_pages(root: Path) -> list[Path]:
+    """The Quarto pages under site/. Rendered output and Quarto's cache are not source."""
+    site = root / "site"
+    return sorted(
+        path
+        for path in site.rglob("*.qmd")
+        if not {"_site", ".quarto"} & set(path.relative_to(site).parts)
+    )
+
+
 def _doc_files(root: Path) -> list[Path]:
-    """README.md and every Markdown file under docs/, the plan included."""
-    return [root / "README.md", *sorted((root / "docs").rglob("*.md"))]
+    """README.md, every Markdown file under docs/ (the plan included) and the site pages."""
+    return [root / "README.md", *sorted((root / "docs").rglob("*.md")), *_site_pages(root)]
 
 
 def _phrase_files(root: Path) -> list[Path]:
@@ -110,6 +120,8 @@ DOC_PATHS = [
     "docs/gates/phase-1.md",
     "docs/style.md",
     "docs/plan/longhaul-build-plan.md",
+    "site/index.qmd",
+    "site/adr/0001-record-decisions.qmd",
 ]
 
 
@@ -135,6 +147,8 @@ def test_long_dash_check_passes_clean_docs(tmp_path: Path) -> None:
         ("README.md", True),
         ("docs/runbook.md", True),
         ("docs/gates/phase-1.md", True),
+        ("site/index.qmd", True),
+        ("site/adr/0001-record-decisions.qmd", True),
         ("docs/style.md", False),
         ("docs/plan/longhaul-build-plan.md", False),
     ],
@@ -144,3 +158,19 @@ def test_banned_phrase_check_skips_only_the_style_guide_and_the_plan(
 ) -> None:
     _write_tree(tmp_path, rel, "We leverage this.\n")
     assert bool(banned_phrase_hits(tmp_path)) is found
+
+
+@pytest.mark.parametrize("rel", ["site/_site/index.qmd", "site/.quarto/idx/index.qmd"])
+def test_site_checks_skip_rendered_output_and_the_quarto_cache(tmp_path: Path, rel: str) -> None:
+    # Neither folder holds source. A dash or a banned phrase there would be noise the author
+    # cannot fix, so the checks must not report it.
+    _write_tree(tmp_path, rel, "We leverage this — and this.\n")
+    assert banned_phrase_hits(tmp_path) == []
+    assert long_dash_hits(tmp_path) == []
+
+
+def test_site_checks_ignore_files_that_are_not_pages(tmp_path: Path) -> None:
+    # Fragments under site/_generated/ come from docs/, which the checks already read.
+    _write_tree(tmp_path, "site/_generated/status.md", "We leverage this — and this.\n")
+    assert banned_phrase_hits(tmp_path) == []
+    assert long_dash_hits(tmp_path) == []

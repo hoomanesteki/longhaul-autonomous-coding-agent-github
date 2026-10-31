@@ -34,7 +34,7 @@ The review of `contracts.py` raised more than version 2 holds. Each of these wai
 | Change | Story | Why it waits |
 |---|---|---|
 | `CarryState` keeps the ref of the append-only log blob and the window of recent stuck signals | LH-404, LH-505 | The log and the detector do not exist yet. The window needs `TurnSignal` moved into the contracts from `roles/stuck.py`. |
-| `CheckpointStore` attaches the checkpoint volume to a sandbox, and `SandboxManager.create` can mount it | LH-205 | The checkpoint design is in that story. |
+| `CheckpointStore` attaches the checkpoint volume to a sandbox, and `SandboxManager.create` can mount it | LH-205 | Settled in LH-205 (deferred item contracts-8) without a contracts change. `DockerSandboxManager.create` takes an optional `mounts` argument, a map of host folder to container path, and `GitCheckpointStore` has `mounts(task_id)` and `attach(sandbox, task_id)`. The `SandboxManager` and `CheckpointStore` protocols and `contracts_version` stay as they are, because only the Docker manager can mount a host folder and the worker builds both objects. Revisit if a second manager needs mounts. The reasons are in ADR-0006. |
 | `MemoryItem.source_ref`, and a lookup by it | LH-606 | Promotion on a merged PR is the first code that reads it. |
 | A size limit on `TaskSpec.body` and `comments`, with a blob ref for the full text | LH-303 | Issue intake is the first code that writes long text. |
 | `Message.role == "system"` | LH-405 | Decided together with the prompt layout. |

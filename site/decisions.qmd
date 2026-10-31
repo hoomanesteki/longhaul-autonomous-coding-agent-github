@@ -1,0 +1,11 @@
+---
+title: Decisions
+toc: false
+---
+
+Choices that are not obvious get a short architecture decision record (ADR) in `docs/adr/`, in the same pull request as the code. Each record states the context, the decision, its consequences and the alternatives that were rejected.
+
+New records appear here as soon as they are added to that folder. To write one, start from [`0000-template.md`]({{< meta source-repo >}}/blob/main/docs/adr/0000-template.md).
+
+::: {fragment="_generated/adr-index.md"}
+:::

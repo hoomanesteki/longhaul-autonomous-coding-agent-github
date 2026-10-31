@@ -17,6 +17,7 @@ construction and `validate_pairs` checks it (D9):
 - harness text, such as a nudge, goes after the results and never in front of them.
 """
 
+from longhaul.agent.rules import SKIPPED_AFTER_FINISH
 from longhaul.contracts import (
     Block,
     CallOptions,
@@ -119,6 +120,17 @@ def append_tool_results(
     by_id = _results_by_call(calls, results)
     blocks: list[Block] = [_result_block(c, by_id.get(c.id), not_run_reason) for c in calls]
     return [*transcript, Message(role="user", content=blocks)]
+
+
+def answer_tool_calls(
+    transcript: list[Message], calls: list[ToolCall], results: list[ToolResult]
+) -> list[Message]:
+    """`append_tool_results` with the reason both loops give for a call that did not run.
+
+    The in-process loop and the append_results activity call this one, so a call skipped
+    after a good finish reads the same in every transcript.
+    """
+    return append_tool_results(transcript, calls, results, not_run_reason=SKIPPED_AFTER_FINISH)
 
 
 def append_user_text(transcript: list[Message], text: str) -> list[Message]:

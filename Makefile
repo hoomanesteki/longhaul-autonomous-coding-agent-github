@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e up down migrate sandbox-image gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image site site-preview gate
 
 PHASE ?= 0
 
@@ -30,6 +30,10 @@ itest:
 e2e:
 	uv run pytest -m "e2e and $(OPT_IN)"
 
+# An empty FakeGitHub on port 8099, for end-to-end runs. Stop it with ctrl-c.
+fake-github:
+	uv run python tests/fakes/fake_github.py --port 8099
+
 up:
 	docker compose up -d --wait
 
@@ -41,6 +45,14 @@ migrate:
 
 sandbox-image:
 	docker build -t longhaul-sandbox:py312 docker/sandbox
+
+# The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
+# are read from docs/, so there is nothing to copy before a render.
+site:
+	quarto render site
+
+site-preview:
+	quarto preview site
 
 # Capture the expression before running pytest. Written inline as a command substitution
 # argument, a failing markers.py is ignored and `pytest -m ""` runs every test.

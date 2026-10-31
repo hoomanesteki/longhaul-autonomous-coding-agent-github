@@ -1,0 +1,11 @@
+# The provider is overloaded for the first two identical requests and then answers. Both steps
+# match the first turn. The raise step comes first, and `times: 2` makes it stop matching a
+# request once it has raised for it twice, so the third attempt reaches the second step. The
+# activity retries with the same request each time, so the count carries over.
+steps:
+  - match: {turn_index: 0}
+    respond: {raise: overloaded, times: 2}
+  - match: {turn_index: 0}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Finished after two overloads."}}

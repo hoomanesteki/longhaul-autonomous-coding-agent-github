@@ -40,12 +40,12 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 2: Temporal durability and checkpoints (tag v0.2.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-201 | Spike: Temporal Python SDK patterns | 2 | Todo | | |
-| LH-202 | Blob store | 3 | Todo | | |
-| LH-203 | Task workflow skeleton | 5 | Todo | | |
-| LH-204 | LLM and tool activities | 5 | Todo | | |
-| LH-205 | Git checkpoint store | 5 | Todo | | |
-| LH-206 | Sandbox recovery and retry-safe tool execution | 5 | Todo | | |
+| LH-201 | Spike: Temporal Python SDK patterns | 2 | Done | merge | 2026-10-31 |
+| LH-202 | Blob store | 3 | Done | merge | 2026-10-31 |
+| LH-203 | Task workflow skeleton | 5 | Done | merge | 2026-10-31 |
+| LH-204 | LLM and tool activities | 5 | Done | merge | 2026-10-31 |
+| LH-205 | Git checkpoint store | 5 | Done | merge | 2026-10-31 |
+| LH-206 | Sandbox recovery and retry-safe tool execution | 5 | In progress | | |
 | LH-207 | Continue-As-New | 3 | Todo | | |
 | LH-208 | Worker process and run CLI | 3 | Todo | | |
 | LH-209 | Chaos test v1 | 5 | Todo | | |
@@ -53,10 +53,10 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 3: GitHub integration (tag v0.3.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-301 | FakeGitHub test server | 3 | Todo | | |
-| LH-302 | GitHub client and auth | 5 | Todo | | |
-| LH-303 | Repo allowlist and issue intake | 3 | Todo | | |
-| LH-304 | Idempotent side-effect activities | 5 | Todo | | |
+| LH-301 | FakeGitHub test server | 3 | Done | merge | 2026-10-31 |
+| LH-302 | GitHub client and auth | 5 | Done | merge | 2026-10-31 |
+| LH-303 | Repo allowlist and issue intake | 3 | Done | merge | 2026-10-31 |
+| LH-304 | Idempotent side-effect activities | 5 | In progress | | |
 | LH-305 | Clone from GitHub and push from the host | 5 | Todo | | |
 | LH-306 | PR creation and label lifecycle | 3 | Todo | | |
 | LH-307 | Poller workflow on a Temporal Schedule | 5 | Todo | | |
@@ -65,7 +65,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 4: Context engineering (tag v0.4.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-401 | Token meter and context budget | 3 | Todo | | |
+| LH-401 | Token meter and context budget | 3 | Done | merge | 2026-10-31 |
 | LH-402 | Output handles and read_output | 3 | Todo | | |
 | LH-403 | Structured compaction | 5 | Todo | | |
 | LH-404 | Eviction and compaction in the workflow | 3 | Todo | | |
@@ -98,7 +98,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 7: Budgets, cost and observability (tag v0.7.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-701 | Pricing table and cost ledger | 3 | Todo | | |
+| LH-701 | Pricing table and cost ledger | 3 | In progress | | |
 | LH-702 | Budget enforcement and top-ups | 5 | Todo | | |
 | LH-703 | OpenTelemetry traces | 5 | Todo | | |
 | LH-704 | Prometheus metrics and Grafana dashboard | 3 | Todo | | |

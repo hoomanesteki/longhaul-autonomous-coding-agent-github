@@ -4,6 +4,8 @@ A background coding agent that takes a GitHub issue, works on it for hours in a 
 
 Status: Phase 1 of 9 done (`v0.1.0`). The agent fixes a local repo end to end inside a hardened Docker sandbox, with a scripted, Anthropic or OpenAI-compatible model. Phase 2 (Temporal durability and git checkpoints) is in progress. See [docs/progress.md](docs/progress.md).
 
+Docs site: [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/), built from `docs/` with Quarto.
+
 [![ci](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml)
 
 ## Why

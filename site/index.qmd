@@ -1,0 +1,36 @@
+---
+title: Longhaul
+subtitle: A background coding agent that survives crashes
+toc: false
+---
+
+Longhaul takes a GitHub issue, works on it for hours in a sandbox, survives crashes, resumes where it stopped, and asks a person only at checkpoints. It ends with a pull request or an honest report of where it got stuck.
+
+It is a durable, observable harness around a coding agent. It does not try to win a leaderboard. It tries to show, with honest numbers, what durability, context compaction and verification are worth.
+
+## The problem
+
+Teams have a long tail of small, well-specified issues: a bug with a clear repro, a missing flag, a test that fails after a dependency bump. Coding agents can fix many of them, but people usually run the agent by hand in a terminal. That stops scaling after a handful of issues a day, and it fails in five predictable ways.
+
+1. **Runs die.** A laptop sleeps, a container is killed, the API returns 529 for ten minutes. The agent loses its state and pays for the same tokens twice.
+2. **Context fills up.** A long task overflows the context window. The agent forgets what it already tried and loops.
+3. **Nobody knows it is stuck.** The agent keeps editing the same three lines for forty minutes. Cost climbs and nobody is told.
+4. **Side effects repeat.** A retry posts the same comment twice or opens a second pull request.
+5. **Cost is a surprise.** With no per-task budget and no ledger, the bill is the first signal.
+
+## How it works
+
+- Every model turn and every tool call is its own Temporal activity, with its own timeout, retry and heartbeat.
+- Every workspace change is a git checkpoint, so a retried tool call always starts from a known commit.
+- Large tool outputs become handles, and older turns become structured progress notes, so long tasks fit the context window.
+- A planner, coder and verifier work inside one workflow. A stuck detector pauses the run and asks one specific question.
+- Budgets are hard limits per task and per repo. The agent never pushes to a default branch, and a person merges every pull request.
+
+The [architecture page](architecture.qmd) shows how the pieces connect. The [decisions page](decisions.qmd) records why they were chosen.
+
+## Where it stands
+
+::: {fragment="_generated/status.md"}
+:::
+
+Each phase ends with a gate. The [gate reports](gates.qmd) say what passed and what did not, and the [progress page](progress.qmd) lists every story. The [results page](results.qmd) holds the questions the evaluation will answer in Phase 9.

@@ -196,6 +196,19 @@ jobs:
       - name: Validate docker-compose.yml
         run: docker compose config -q
 
+  # Builds the docs site (site/) so a broken include, diagram or page fails the pull request.
+  # pages.yml publishes it from main with the same Quarto version.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: quarto-dev/quarto-actions/setup@v2
+        with:
+          version: 1.10.18
+      - name: Render the docs site
+        run: quarto render site
+
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -228,7 +241,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, types, unit, integration, e2e, security, compose]
+    needs: [lint, types, unit, integration, e2e, security, compose, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

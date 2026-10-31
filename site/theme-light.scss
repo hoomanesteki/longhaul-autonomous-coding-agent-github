@@ -1,0 +1,10 @@
+/*-- scss:defaults --*/
+
+// Colors for the mermaid diagrams. Quarto derives them from the theme, and for cosmo that
+// paints the subgraph boxes dark gray, so the diagrams get their own values.
+$mermaid-edge-color: #4b5663;
+$mermaid-fg-color--lighter: #c8d0da;
+$mermaid-fg-color--lightest: #f3f6fa;
+$mermaid-label-fg-color: #1f2933;
+$mermaid-node-bg-color: #e6f0fc;
+$mermaid-node-fg-color: #2780e3;

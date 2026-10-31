@@ -1,0 +1,13 @@
+---
+title: Results
+toc: false
+---
+
+Results arrive in Phase 9. Until then there is nothing to report, and this page does not guess.
+
+What it holds for now is the list of questions the evaluation will answer. Each one needs a number from a recorded run before the README can claim an answer. Every result file will record the config hash, the model id, the git sha and the seed. The [result tables in the plan](plan.qmd#results-table-templates-filled-only-from-result-files) stay empty until a result file fills them.
+
+::: {fragment="_generated/eval-questions.md"}
+:::
+
+The method, the task sets, the run matrix and the formulas are in [section 8 of the plan](plan.qmd#evaluation-and-proof-plan).

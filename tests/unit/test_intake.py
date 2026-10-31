@@ -510,7 +510,7 @@ def test_one_huge_comment_is_cut_to_the_room_there_is() -> None:
 
 
 def test_text_at_every_limit_still_fits_the_16_kb_rule() -> None:
-    # CLAUDE.md rule 5: anything over 16 KB that crosses an activity boundary goes to the blob
+    # CONTRIBUTING.md rule 5: anything over 16 KB that crosses an activity boundary goes to the blob
     # store. The spec is part of the carry state, so its text has to stay under that.
     big = "€" * 50_000
     title = "t" * 256

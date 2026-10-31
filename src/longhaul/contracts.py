@@ -1,6 +1,6 @@
 """Shared contracts. No I/O; imports only stdlib typing helpers and pydantic.
 
-Changing this module needs a note in the PR and a gatekeeper check. Record
+Changing this module needs a note in the PR and a reviewer check. Record
 every change in the "Contracts changelog" section of docs/architecture.md.
 """
 

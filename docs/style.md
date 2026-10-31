@@ -20,5 +20,4 @@ The repo should read like one careful engineer wrote it.
   - game-changer, unlock, empower, elevate, harness the power, supercharge, in today's fast-paced, it's worth noting
   - furthermore, moreover, plethora, a testament to, navigate the complexities, best-in-class
   - em dashes, emoji
-- **Attribution:** turn off Claude Code's commit and PR co-author/attribution trailers in the project's `.claude/settings.json`. The key has changed between versions, so check the current Claude Code settings docs for the attribution or co-authored-by option before Phase 0 and record it in `docs/runbook.md`.
 - **Ownership:** Hooman reads every phase gate report and every "Defend it" block. If he can't explain a decision in an interview, it isn't done.

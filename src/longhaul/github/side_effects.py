@@ -37,7 +37,7 @@ database connection, keeps its own type and gets Temporal's default: retry.
 Timeouts and retry policies are not set here. Plan section 3.7 gives each name two minutes and
 ten attempts, and they belong in acts.py with the workflow that calls the activities. A comment
 or pull request body travels inside the activity input, which invariant I2 caps at 256 KB. A
-text that may pass 16 KB (CLAUDE.md rule 5) is built inside an activity that calls the plain
+text that may pass 16 KB (CONTRIBUTING.md rule 5) is built inside an activity that calls the plain
 functions, as the plan has `deliver` do with the pull request body (LH-306).
 
 Only this module calls the client's write methods (invariant I4,

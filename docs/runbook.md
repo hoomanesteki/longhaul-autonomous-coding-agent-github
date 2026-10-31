@@ -10,7 +10,7 @@ make up       # local stack via docker compose
 make check    # ruff, format check, mypy, unit tests
 ```
 
-The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/progress.md`. Working rules for coding agents are in `CLAUDE.md`. Voice rules are in `docs/style.md`.
+The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/progress.md`. Contribution rules are in `CONTRIBUTING.md`. Voice rules are in `docs/style.md`.
 
 ## Local stack
 
@@ -93,16 +93,6 @@ docs/private/**
 
 The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
 
-## Commit attribution
-
-Claude Code adds co-author trailers to commits and pull requests by default. This repo turns that off in `.claude/settings.json`:
-
-```json
-{"attribution": {"commit": "", "pr": ""}, "includeCoAuthoredBy": false}
-```
-
-The `attribution` key is the current setting. The older `includeCoAuthoredBy: false` key was its predecessor. It stays in the file so that older Claude Code versions also leave out the trailer.
-
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -151,7 +141,7 @@ scripts/protect_branches.sh OWNER/REPO # or name it
 
 It requires a pull request and an up-to-date `ci` check, and blocks force pushes and deletions.
 
-`enforce_admins` is false on purpose. The owner merges the phase-gate pull requests and the gatekeeper pushes `dev` as the admin, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
+`enforce_admins` is false on purpose. The owner merges the phase-gate pull requests and the maintainer pushes `dev` as the admin, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
 
 ## Docs site
 
@@ -168,7 +158,7 @@ Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and w
 
 Things that are easy to trip over:
 
-- `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.claude/worktrees`.
+- `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.worktrees`.
 - A page cannot include a file from `site/_generated/` with the include shortcode. Quarto expands that shortcode while it scans the project, before `scripts/site_pages.py` has run, so on a clean checkout the file is missing and the render stops. `site/filters/fragments.lua` embeds those files later instead, and `tests/unit/test_site_pages.py` fails a page that includes one.
 - `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content.
 - `tests/unit/test_docs_style.py` applies the voice rules to the `.qmd` pages as it does to the docs.

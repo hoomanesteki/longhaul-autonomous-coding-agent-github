@@ -25,7 +25,7 @@ What goes into the spec, and why:
   and they are left out even though a personal token gives them an author with write access.
 * A login that is missing from `permissions` counts as no access. Unknown means no.
 * The text is cut to MAX_BODY_BYTES and MAX_COMMENTS_BYTES, and the cut says so. This is a
-  stopgap. CLAUDE.md rule 5 sends anything over 16 KB across an activity boundary as a
+  stopgap. CONTRIBUTING.md rule 5 sends anything over 16 KB across an activity boundary as a
   BlobRef, and the spec is part of the carry state. GitHub allows 65,536 characters per body
   and per comment, so one long thread would break the rule. The real fix is a BlobRef for the full
   text on TaskSpec, which is a contracts change and is listed in docs/architecture.md under
@@ -81,7 +81,7 @@ WRITE_PERMISSIONS = frozenset({"admin", "write"})
 # long. The bound on the key keeps a body full of unclosed markers from making the search slow.
 _OWN_COMMENT = re.compile(r"<!--\s*longhaul:key=[^>]{0,500}-->")
 
-# Together with the title and the settings, these keep the spec under 16 KB (CLAUDE.md rule
+# Together with the title and the settings, these keep the spec under 16 KB (CONTRIBUTING.md rule
 # 5). The limits count UTF-8 bytes, which is what the JSON payload counts.
 MAX_BODY_BYTES = 8_000
 MAX_COMMENTS_BYTES = 6_000

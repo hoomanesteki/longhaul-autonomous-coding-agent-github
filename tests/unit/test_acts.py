@@ -363,7 +363,7 @@ def test_a_turn_with_many_large_results_stays_far_below_the_payload_limit() -> N
 
 
 def test_the_inline_limits_leave_room_under_the_payload_limit() -> None:
-    # CLAUDE.md rule 5: nothing over 16 KB crosses inline. The total for one reply keeps the
+    # CONTRIBUTING.md rule 5: nothing over 16 KB crosses inline. The total for one reply keeps the
     # llm_turn output, with its per-call overhead, under the 256 KB cap (I2).
     assert acts.INLINE_LIMIT_BYTES == 16_000
     assert acts.INLINE_ARGS_TOTAL_BYTES < DEFAULT_LIMIT // 2

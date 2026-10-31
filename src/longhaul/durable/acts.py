@@ -58,7 +58,7 @@ from longhaul.durable.payload_guard import PayloadTooLargeError
 FINISH_TOOL = rules.FINISH
 NO_SUMMARY = "finished without a summary"
 
-# Anything over this crosses an activity boundary as a BlobRef (CLAUDE.md rule 5).
+# Anything over this crosses an activity boundary as a BlobRef (CONTRIBUTING.md rule 5).
 INLINE_LIMIT_BYTES = 16_000
 # The arguments of one reply that may travel inline together. Twelve calls of 10 KB each are
 # all under the limit above and still add up to half the payload cap, so once a reply has this
@@ -88,7 +88,7 @@ class ToolCallSummary(BaseModel):
     """A tool call as the workflow sees it, small enough for the history.
 
     The arguments are inline in `input`, or in the blob store under `args_ref` when they are
-    over 16 KB (CLAUDE.md rule 5). Exactly one of the two is set.
+    over 16 KB (CONTRIBUTING.md rule 5). Exactly one of the two is set.
     """
 
     id: str  # the provider's tool_use id

@@ -72,10 +72,10 @@ def test_no_secrets_in_ci() -> None:
 @pytest.mark.parametrize(
     "snippet",
     [
-        "env:\n  KEY: ${{ secrets.CLAUDE_KEY }}",
-        "env:\n  KEY: ${{secrets.CLAUDE_KEY}}",
-        "env:\n  KEY: ${{ secrets['CLAUDE_KEY'] }}",
-        'env:\n  KEY: ${{ secrets["CLAUDE_KEY"] }}',
+        "env:\n  KEY: ${{ secrets.DEPLOY_KEY }}",
+        "env:\n  KEY: ${{secrets.DEPLOY_KEY}}",
+        "env:\n  KEY: ${{ secrets['DEPLOY_KEY'] }}",
+        'env:\n  KEY: ${{ secrets["DEPLOY_KEY"] }}',
         "env:\n  ALL: ${{ toJSON(secrets) }}",
         "with:\n  token: ${{ format('{0}', secrets.PAT) }}",
         "if: ${{ github.event_name == 'push' && secrets.X != '' }}",
@@ -373,7 +373,7 @@ def test_protect_script_targets_main_and_dev() -> None:
 
 
 def test_admins_are_deliberately_not_enforced() -> None:
-    # The owner merges gate pull requests and the gatekeeper pushes dev as the admin, so the
+    # The owner merges gate pull requests and the maintainer pushes dev as the admin, so the
     # rules bind collaborators and bots but not admins. The value stays false only while the
     # script and the runbook both say so, because LH-003 reads as if every push is rejected.
     script = PROTECT.read_text(encoding="utf-8")

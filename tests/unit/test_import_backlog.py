@@ -1066,6 +1066,19 @@ def test_update_removes_a_derived_label_the_plan_no_longer_has(tmp_path: Path) -
     assert "could" not in gh.issue("LH-109")["labels"]
 
 
+# One stale label per prefix the importer owns. Written out here, not read from the
+# importer, so a prefix that drops out of the importer's list fails this test.
+@pytest.mark.parametrize("stale", ["phase:9", "epic:E9", "pts:99", "theme:T9", "type:fix"])
+def test_update_removes_a_stale_label_of_every_derived_kind(tmp_path: Path, stale: str) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.issue("LH-001")["labels"] = [*STANDARD_LABELS, stale, "bug"]
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    assert gh.writes() == [["issue", "edit", "1", "--repo", "o/r", "--remove-label", stale]]
+    assert sorted(gh.issue("LH-001")["labels"]) == sorted([*STANDARD_LABELS, "bug"])
+
+
 def test_update_converges(tmp_path: Path) -> None:
     gh, plan = _imported(tmp_path)
     text = MINI_PLAN.replace("LH-002 · Local stack", "LH-002 · Local compose stack")
@@ -1080,6 +1093,30 @@ def test_update_converges(tmp_path: Path) -> None:
     backlog.import_backlog(plan, "o/r", gh, update=True)
 
     assert gh.writes() == []
+
+
+def test_update_says_which_parts_of_an_issue_it_changed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    gh, plan = _imported(tmp_path)
+    text = MINI_PLAN.replace("LH-002 · Local stack", "LH-002 · Local compose stack")
+    text = text.replace(
+        "**Points:** 3 · **Branch:** `feat/lh-002", "**Points:** 8 · **Branch:** `feat/lh-002"
+    )
+    plan.write_text(text, "utf-8")
+    gh.issue("LH-001")["milestone"] = None
+    capsys.readouterr()
+
+    backlog.import_backlog(plan, "o/r", gh, update=True)
+
+    # This is the only trace of what --update did to the public issues.
+    assert capsys.readouterr().out.splitlines() == [
+        "created label pts:8",
+        "updated LH-001 (#1): milestone",
+        "updated LH-002 (#2): title, body, labels",
+        "skipped LH-102 (#3)",
+        "skipped LH-109 (#4)",
+    ]
 
 
 def test_update_right_after_an_import_changes_nothing_in_the_real_plan() -> None:
@@ -1114,6 +1151,20 @@ def test_update_reopens_a_closed_milestone_it_moves_an_issue_into(tmp_path: Path
         ["api", "-X", "PATCH", "repos/o/r/milestones/1", "-f", "state=open"],
         ["issue", "edit", "1", "--repo", "o/r", "--milestone", "Phase 0: Foundation"],
     ]
+
+
+def test_without_update_a_drifted_issue_does_not_reopen_its_closed_milestone(
+    tmp_path: Path,
+) -> None:
+    gh, plan = _imported(tmp_path)
+    gh.milestones[0]["state"] = "closed"
+    gh.issue("LH-001")["milestone"] = None
+
+    backlog.import_backlog(plan, "o/r", gh, update=False)
+
+    # Nothing is moved without --update, so there is no reason to touch the milestone.
+    assert gh.writes() == []
+    assert gh.milestones[0]["state"] == "closed"
 
 
 def test_drifted_labels_title_and_milestone_are_left_alone_without_update(tmp_path: Path) -> None:

@@ -10,14 +10,14 @@ dependencies = [
     "alembic>=1.20.1",
     "anthropic>=2.3,<3",
     "asyncpg>=0.32.0",
-    "boto3>=1.43.118",
+    "boto3>=1.43.120",
     "cryptography>=50.0.2",
     "docker>=7.2.0",
     "jsonschema>=4.26.0",
     "openai>=3.41.0",
     "pgvector>=0.5.1",
     "pydantic>=2.14.1",
-    "pydantic-settings>=2.16.1",
+    "pydantic-settings>=2.16.2",
     "pyjwt>=2.15.1",
     "pyyaml>=6.0.3",
     "sqlalchemy[asyncio]>=2.1.6",
@@ -29,7 +29,7 @@ dependencies = [
 longhaul = "longhaul.cli:app"
 
 [build-system]
-requires = ["uv_build>=0.12.3,<0.13.0"]
+requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
@@ -38,11 +38,11 @@ dev = [
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "psycopg[binary]>=3.3.6",
-    "pytest>=9.1.1",
+    "pytest>=9.2.0",
     "pytest-asyncio>=1.4.1",
     "pytest-cov>=7.1.0",
     "pytest-github-actions-annotate-failures>=0.4.2",
-    "ruff>=0.17.2",
+    "ruff>=0.17.3",
     "types-boto3[s3]>=1.43.123",
     "types-docker>=7.2.0.20261006",
     "types-jsonschema>=4.26.0.20261006",

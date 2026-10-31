@@ -198,3 +198,14 @@ async def test_a_lost_container_is_not_a_tool_result(reg: ToolRegistry, sbx: San
         await call(reg, sbx, "read_file", path=MODULE)
     with pytest.raises(NotFound):
         await call(reg, sbx, "edit_file", path=MODULE, old_str="a", new_str="b")
+
+
+async def test_a_crlf_file_keeps_its_line_endings_through_an_edit(
+    reg: ToolRegistry, sbx: Sandbox
+) -> None:
+    await sbx.write_file("/workspace/win.txt", b"alpha\r\nbeta\r\ngamma\r\n")
+    shown = await call(reg, sbx, "read_file", path="win.txt")
+    assert shown.output == "     1\talpha\n     2\tbeta\n     3\tgamma"
+    r = await call(reg, sbx, "edit_file", path="win.txt", old_str="alpha\nbeta", new_str="A\nB")
+    assert r.ok, r.output
+    assert await sbx.read_file("/workspace/win.txt") == b"A\r\nB\r\ngamma\r\n"

@@ -7,6 +7,7 @@ import requests
 from jsonschema.exceptions import SchemaError
 
 from longhaul.contracts import Sandbox, ToolCall, ToolContext, ToolResult, ToolSpec
+from longhaul.providers.openai_compat import _parse_arguments
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools import ToolError
 from longhaul.tools.paths import PathError
@@ -130,6 +131,19 @@ async def test_bad_input_errors_are_results(exc: Exception, told: str, sbx: Fake
     assert r.output == told
 
 
+async def test_a_write_below_a_file_is_a_result_and_leaves_the_file_alone(
+    sbx: FakeSandbox,
+) -> None:
+    # The real tool and a real type conflict. DockerSandbox raises NotADirectoryError here,
+    # and FakeSandbox raises one of the two errors that a mkdir below a file can give.
+    await sbx.write_file("a.py", b"x\n")
+    call = ToolCall(id="c", name="write_file", input={"path": "a.py/b.txt", "content": "y"})
+    r = await default_registry().run(call, sbx, CTX)
+    assert not r.ok and r.call_id == "c"
+    assert r.output.split(":")[0] in {"NotADirectoryError", "FileExistsError"}, r.output
+    assert await sbx.read_file("a.py") == b"x\n"
+
+
 # What goes wrong around the sandbox is not the model's doing. It has to reach the caller,
 # so a lost container can be recreated and a dropped connection retried.
 INFRASTRUCTURE = [
@@ -194,6 +208,24 @@ async def test_blank_arguments_mean_no_arguments(raw: str, sbx: FakeSandbox) -> 
     assert listing.ok, listing.output
     missing = await reg.run(ToolCall(id="c", name="read_file", input={"_raw": raw}), sbx, CTX)
     assert not missing.ok and "'path' is a required property" in missing.output
+
+
+async def test_the_registry_reads_the_arguments_the_openai_provider_makes(
+    sbx: FakeSandbox,
+) -> None:
+    # The input comes from the provider's own parser, so the two sides cannot drift apart
+    # on the key or on what counts as unparseable.
+    reg = default_registry()
+    for text in (CUT_OFF, "[1, 2]", '"just text"', "{"):
+        call = ToolCall(id="c", name="write_file", input=_parse_arguments(text))
+        r = await reg.run(call, sbx, CTX)
+        assert not r.ok and "not a complete JSON object" in r.output, text
+    whole = _parse_arguments('{"path": "a.txt", "content": "hi"}')
+    made = await reg.run(ToolCall(id="c", name="write_file", input=whole), sbx, CTX)
+    assert made.ok, made.output
+    # A server that sends "" for a call without parameters.
+    listing = await reg.run(ToolCall(id="c", name="list_dir", input=_parse_arguments("")), sbx, CTX)
+    assert listing.ok, listing.output
 
 
 async def test_raw_next_to_other_keys_is_ordinary_unknown_input(sbx: FakeSandbox) -> None:

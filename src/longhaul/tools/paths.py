@@ -19,9 +19,13 @@ from dataclasses import dataclass
 from typing import Literal
 
 from longhaul.contracts import Sandbox
-from longhaul.tools import ToolError
+from longhaul.tools import ToolError, to_utf8
 
 WORKDIR = "/workspace"
+# What a Linux filesystem accepts. The sandbox raises an OSError for more on the fake and
+# an APIError on Docker, and the registry lets both through as faults of the sandbox.
+MAX_NAME_BYTES = 255
+MAX_PATH_BYTES = 4096
 
 Kind = Literal["file", "dir", "other", "missing"]
 _KINDS = ("file", "dir", "other", "missing")
@@ -74,6 +78,7 @@ def normalize(raw: str) -> str:
     """Return a workspace-relative path, or raise PathError on an escape."""
     if "\0" in raw:
         raise PathError("path contains a NUL byte")
+    to_utf8(raw, "the path", error=PathError)
     path = raw.strip() or "."
     if path.startswith("/"):
         if path != WORKDIR and not path.startswith(WORKDIR + "/"):
@@ -82,6 +87,13 @@ def normalize(raw: str) -> str:
     norm = posixpath.normpath(path)
     if norm == ".." or norm.startswith("../"):
         raise PathError(f"path is outside {WORKDIR}: {raw}")
+    if len(norm.encode()) > MAX_PATH_BYTES:
+        raise PathError(f"the path is longer than {MAX_PATH_BYTES} bytes")
+    for name in norm.split("/"):
+        if len(name.encode()) > MAX_NAME_BYTES:
+            raise PathError(
+                f"a name in the path is longer than {MAX_NAME_BYTES} bytes: {name[:40]}..."
+            )
     return norm
 
 

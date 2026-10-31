@@ -151,6 +151,55 @@ async def test_resolve_refuses_lexical_escapes(sbx: AuditedSandbox, raw: str) ->
         await resolve(sbx, raw)
 
 
+# ---------- names the filesystem cannot hold ----------
+
+# A name is at most 255 bytes and a path at most 4096. The sandbox raises an OSError, or
+# on Docker an APIError, for more, and the registry lets both through as infrastructure.
+TOO_LONG = [
+    pytest.param("x" * 256, id="name-of-256-bytes"),
+    pytest.param("a/" + "x" * 256, id="second-name-of-256-bytes"),
+    pytest.param("\u00e9" * 128, id="name-of-128-two-byte-characters"),
+    pytest.param("/".join(["abcdefghij"] * 500), id="path-of-5499-bytes"),
+    pytest.param("/".join(["x" * 255] * 15 + ["y" * 200, "z" * 56]), id="path-of-4097-bytes"),
+]
+FITS = [
+    pytest.param("x" * 255, id="name-of-255-bytes"),
+    pytest.param("a/" + "x" * 255, id="second-name-of-255-bytes"),
+    pytest.param("\u00e9" * 127, id="name-of-127-two-byte-characters"),
+    pytest.param("/".join(["abcdefghij"] * 300), id="path-of-3299-bytes"),
+    pytest.param("/".join(["x" * 255] * 15 + ["y" * 200, "z" * 55]), id="path-of-4096-bytes"),
+]
+
+
+@pytest.mark.parametrize("raw", TOO_LONG)
+def test_normalize_rejects_names_and_paths_that_are_too_long(raw: str) -> None:
+    with pytest.raises(PathError, match="longer than"):
+        normalize(raw)
+
+
+@pytest.mark.parametrize("raw", FITS)
+def test_normalize_accepts_the_longest_names_that_fit(raw: str) -> None:
+    assert normalize(raw) == raw
+
+
+def test_normalize_rejects_a_lone_surrogate() -> None:
+    # A reply cut off in the middle of an emoji can leave half of a surrogate pair.
+    with pytest.raises(PathError, match="UTF-8"):
+        normalize("a\ud800.txt")
+
+
+@pytest.mark.parametrize(
+    "path", [*TOO_LONG[:2], pytest.param("bad\ud800.txt", id="lone-surrogate")]
+)
+async def test_a_path_no_filesystem_can_hold_is_a_result_for_every_tool(
+    path: str, sbx: AuditedSandbox, reg: ToolRegistry
+) -> None:
+    for name in tools_with_a_path(reg):
+        r = await call(reg, sbx, name, **args_for(reg, name, path))
+        assert not r.ok, name
+        assert "longer than" in r.output or "UTF-8" in r.output, (name, r.output)
+
+
 # ---------- every tool with a path ----------
 
 ESCAPES = [
@@ -190,6 +239,55 @@ async def test_every_tool_with_a_path_refuses_to_leave_the_workspace(
             assert not r.ok, (name, path, r.output)
             assert "outside" in r.output, (name, path, r.output)
     assert snapshot(outside) == before
+
+
+# ---------- a path that cannot be resolved ----------
+
+
+def answer(stdout: str = "", stderr: str = "", code: int = 0) -> ExecResult:
+    return ExecResult(exit_code=code, stdout=stdout, stderr=stderr, timed_out=False, duration_ms=1)
+
+
+class BrokenResolver(FakeSandbox):
+    """A FakeSandbox whose path check, the python3 one-liner, gives a fixed answer."""
+
+    def __init__(self, result: ExecResult) -> None:
+        super().__init__()
+        self.result = result
+
+    async def exec(
+        self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        if cmd.startswith("python3 -c "):
+            return self.result
+        return await super().exec(cmd, timeout_s=timeout_s, env=env)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        answer(stderr="python3: command not found", code=127),
+        answer(stdout="not json at all"),
+        answer(stdout='{"only": "one key"}'),
+        answer(stdout='["/workspace/a.py", "/workspace", "nonsense"]'),
+        answer(stdout='[1, "/workspace", "file"]'),
+    ],
+    ids=["no-python", "not-json", "wrong-shape", "unknown-kind", "wrong-type"],
+)
+async def test_a_path_that_cannot_be_resolved_is_refused_by_every_tool(
+    result: ExecResult, reg: ToolRegistry
+) -> None:
+    # Failing to learn where a path leads must never fall back to trusting the spelling.
+    box = BrokenResolver(result)
+    try:
+        await box.write_file("a.py", b"x\n")
+        for name in tools_with_a_path(reg):
+            r = await call(reg, box, name, **args_for(reg, name, "a.py"))
+            assert not r.ok, name
+            assert "could not resolve path: a.py" in r.output, (name, r.output)
+        assert await box.read_file("a.py") == b"x\n"
+    finally:
+        await box.destroy()
 
 
 # ---------- dash-leading names ----------
@@ -313,6 +411,8 @@ async def test_a_missing_path_is_reported_by_the_name_the_model_used(
 
 async def test_a_fifo_is_never_opened(sbx: AuditedSandbox, reg: ToolRegistry) -> None:
     await sh(sbx, "mkfifo pipe")
+    listing = await call(reg, sbx, "list_dir", path="pipe")
+    assert not listing.ok and "pipe is not a directory" in listing.output
     for name in ("read_file", "edit_file"):
         r = await call(reg, sbx, name, **file_args(name, "pipe"))
         assert not r.ok and "not a regular file" in r.output, (name, r.output)

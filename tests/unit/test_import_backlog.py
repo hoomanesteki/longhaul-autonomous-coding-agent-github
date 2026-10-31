@@ -14,6 +14,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 ROOT = Path(__file__).resolve().parents[2]
 PLAN = ROOT / "docs" / "plan" / "longhaul-build-plan.md"
+PROGRESS = ROOT / "docs" / "progress.md"
 
 _SPEC = importlib.util.spec_from_file_location(
     "import_backlog", ROOT / "scripts" / "import_backlog.py"
@@ -98,6 +99,32 @@ MINI_PROGRESS = """\
 | LH-102 | Spike: tool use | 2 | Todo | | |
 | LH-109 | Extras | 5 | Todo | | |
 """
+# MINI_PROGRESS after an import: one new column, and nothing else touched.
+IMPORTED_PROGRESS = """\
+# Progress
+
+## Phase 0: Foundation (tag v0.0.1)
+| ID | Title | Pts | Status | PR | Merged | Issue |
+|---|---|---|---|---|---|---|
+| LH-001 | Repo scaffold | 3 | Todo | | | #1 |
+| LH-002 | Local stack | 3 | Todo | | | #2 |
+
+## Phase 1: Agent core (tag v0.1.0)
+| ID | Title | Pts | Status | PR | Merged | Issue |
+|---|---|---|---|---|---|---|
+| LH-102 | Spike: tool use | 2 | Todo | | | #3 |
+| LH-109 | Extras | 5 | Todo | | | #4 |
+"""
+# What --dry-run prints for MINI_PLAN.
+MINI_DRY_RUN = [
+    "milestone  Phase 0: Foundation",
+    "milestone  Phase 1: Agent core",
+    "story      LH-001: Repo scaffold  [phase:0, epic:E0, pts:3, theme:T5, type:story]",
+    "story      LH-002: Local stack  [phase:0, epic:E0, pts:3, theme:T5, type:story]",
+    "story      LH-102: Spike: tool use  [phase:1, epic:E1, pts:2, theme:T1, type:spike]",
+    "story      LH-109: Extras  [phase:1, epic:E1, pts:5, theme:T1, type:story, could]",
+    "4 stories, 2 milestones",
+]
 STANDARD_LABELS = ["phase:0", "epic:E0", "pts:3", "theme:T5", "type:story"]
 
 # What the gatekeeper appends to a phase when its gate fails (plan section 5.4).
@@ -685,6 +712,17 @@ def test_import_creates_milestones_labels_and_issues(
     assert lines[-1] == "created LH-109 as #4"
 
 
+def test_the_issue_number_comes_from_the_last_line_gh_prints(tmp_path: Path) -> None:
+    class Chatty(FakeGh):
+        def _issue_create(self, rest: list[str]) -> str:
+            return "Creating issue in o/r\n\n" + super()._issue_create(rest)
+
+    numbers = backlog.import_backlog(_write(tmp_path, MINI_PLAN), "o/r", Chatty())
+
+    # These numbers end up in progress.md, so a misread one would be written there.
+    assert numbers == {"LH-001": 1, "LH-002": 2, "LH-102": 3, "LH-109": 4}
+
+
 def test_issue_body_is_the_story_block(tmp_path: Path) -> None:
     gh = FakeGh()
     backlog.import_backlog(_write(tmp_path, MINI_PLAN), "o/r", gh)
@@ -1214,15 +1252,7 @@ def test_dry_run_lists_every_milestone_and_story(
     backlog.import_backlog(_write(tmp_path, MINI_PLAN), None, gh, dry_run=True)
 
     assert gh.calls == []
-    assert capsys.readouterr().out.splitlines() == [
-        "milestone  Phase 0: Foundation",
-        "milestone  Phase 1: Agent core",
-        "story      LH-001: Repo scaffold  [phase:0, epic:E0, pts:3, theme:T5, type:story]",
-        "story      LH-002: Local stack  [phase:0, epic:E0, pts:3, theme:T5, type:story]",
-        "story      LH-102: Spike: tool use  [phase:1, epic:E1, pts:2, theme:T1, type:spike]",
-        "story      LH-109: Extras  [phase:1, epic:E1, pts:5, theme:T1, type:story, could]",
-        "4 stories, 2 milestones",
-    ]
+    assert capsys.readouterr().out.splitlines() == MINI_DRY_RUN
 
 
 @dataclass
@@ -1254,6 +1284,36 @@ def test_main_imports_and_writes_issue_numbers_into_progress(workspace: Workspac
     assert "| LH-109 | Extras | 5 | Todo | | | #4 |" in text
 
 
+def test_main_adds_only_the_issue_column_to_progress(workspace: Workspace) -> None:
+    assert backlog.main([str(workspace.plan), "--repo", "o/r"]) == 0
+
+    assert workspace.progress.read_text(encoding="utf-8") == IMPORTED_PROGRESS
+
+
+def test_main_writes_into_the_progress_file_of_the_repo() -> None:
+    # The fixture swaps this path out, so only this test sees the real one.
+    assert backlog.DEFAULT_PROGRESS == PROGRESS
+    assert PROGRESS.is_file()
+
+
+def test_issue_numbers_of_a_full_import_fit_the_real_progress_file() -> None:
+    numbers = backlog.import_backlog(PLAN, "o/r", FakeGh())
+    phases, _ = _plan_headings(PLAN.read_text(encoding="utf-8"))
+
+    updated = backlog.add_issue_numbers(PROGRESS.read_text(encoding="utf-8"), numbers)
+
+    lines = updated.splitlines()
+    headers = [line for line in lines if line.startswith("| ID |")]
+    rows = [line for line in lines if line.startswith("| LH-")]
+    assert len(headers) == len(phases)
+    assert all(line.endswith(" | Issue |") for line in headers)
+    assert rows
+    for row in rows:
+        story_id = row.split(" | ", 1)[0].removeprefix("| ")
+        assert row.endswith(f" | #{numbers.get(story_id)} |"), row
+    assert backlog.add_issue_numbers(updated, numbers) == updated
+
+
 def test_main_run_twice_keeps_the_same_numbers(workspace: Workspace) -> None:
     backlog.main([str(workspace.plan), "--repo", "o/r"])
     first = workspace.progress.read_text(encoding="utf-8")
@@ -1277,7 +1337,7 @@ def test_main_dry_run_calls_nothing_and_keeps_progress(
 
     assert workspace.gh.calls == []
     assert workspace.progress.read_text(encoding="utf-8") == MINI_PROGRESS
-    assert capsys.readouterr().out.splitlines()[-1] == "4 stories, 2 milestones"
+    assert capsys.readouterr().out.splitlines() == MINI_DRY_RUN
 
 
 def test_main_update_flag_rewrites_changed_bodies(workspace: Workspace) -> None:

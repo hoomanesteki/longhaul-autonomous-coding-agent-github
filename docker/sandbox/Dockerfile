@@ -21,9 +21,16 @@ RUN git config --system user.name "longhaul" \
 WORKDIR /workspace
 RUN chown agent:agent /workspace
 
+# No bytecode: a same-size edit keeps the source mtime and size that Python checks,
+# so a .pyc from before the edit would still be trusted. The sandbox manager passes
+# the same variable, so the setting also holds for other images.
 ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     LANG=C.UTF-8
 
 USER agent
 
-ENTRYPOINT ["sleep", "infinity"]
+# The container idles until a task uses it. This is CMD, not ENTRYPOINT: the manager
+# passes no command, so it still idles, and `docker run --rm longhaul-sandbox:py312
+# id -u` runs the command it is given instead of handing "id -u" to sleep.
+CMD ["sleep", "infinity"]

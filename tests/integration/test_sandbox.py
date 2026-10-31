@@ -69,6 +69,20 @@ def _inspect(container_id: str) -> dict[str, Any]:
     return docker.from_env().api.inspect_container(container_id)
 
 
+def _networks(container_id: str) -> set[str]:
+    """The networks Docker says the container is attached to."""
+    return set(_inspect(container_id)["NetworkSettings"]["Networks"])
+
+
+async def _routes(sbx: Sandbox) -> set[str]:
+    """The interfaces the container has an IPv4 route through, read from inside it.
+
+    No routes means no way out. The interface list is no use for this: the Docker VM's
+    kernel adds tunnel placeholders (gre0, erspan0...) to every network namespace.
+    """
+    return set((await _sh(sbx, "awk 'NR>1 {print $1}' /proc/net/route")).split())
+
+
 async def test_runs_as_non_root(manager: DockerSandboxManager, task_id: str) -> None:
     sbx = await _make(manager, task_id)
     r = await sbx.exec("id -u", timeout_s=10)
@@ -83,21 +97,36 @@ async def test_runs_as_non_root(manager: DockerSandboxManager, task_id: str) -> 
 
 async def test_no_network_when_disabled(manager: DockerSandboxManager, task_id: str) -> None:
     sbx = await _make(manager, task_id, network=False)
-    r = await sbx.exec(PYPI, timeout_s=20)
-    assert r.exit_code != 0
+    # Checked from the inside and from Docker's side, so it holds on a machine with no
+    # internet too. A failed download alone proves nothing: the host may just be offline.
+    assert _networks(sbx.id) == set()
+    assert await _routes(sbx) == set()
+    assert (await sbx.exec(PYPI, timeout_s=20)).exit_code != 0
+
+
+async def test_network_is_attached_when_enabled(
+    manager: DockerSandboxManager, task_id: str
+) -> None:
+    # The control for the test above: the same two checks see a network when there is one.
+    sbx = await _make(manager, task_id, network=True)
+    assert _networks(sbx.id) == {"bridge"}
+    assert await _routes(sbx) == {"eth0"}
 
 
 async def test_network_toggle(manager: DockerSandboxManager, task_id: str) -> None:
     sbx = await _make(manager, task_id, network=True)
-    online = _online()
-    if online:
+    if _online():
         assert (await sbx.exec(PYPI, timeout_s=20)).exit_code == 0
     else:
-        print("no outbound network on this machine; checking the disabled case only")
+        print("no outbound network on this machine; the structural checks still run")
     await manager.set_network(sbx.id, False)
+    assert _networks(sbx.id) == set() and await _routes(sbx) == set()
     assert (await sbx.exec(PYPI, timeout_s=20)).exit_code != 0
     await manager.set_network(sbx.id, True)
+    assert _networks(sbx.id) == {"bridge"} and await _routes(sbx) == {"eth0"}
     await manager.set_network(sbx.id, False)  # idempotent in both directions
+    await manager.set_network(sbx.id, False)
+    assert _networks(sbx.id) == set() and await _routes(sbx) == set()
     assert (await sbx.exec(PYPI, timeout_s=20)).exit_code != 0
 
 

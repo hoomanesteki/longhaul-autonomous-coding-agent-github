@@ -263,6 +263,17 @@ def test_workflow_import_closure_has_no_io_imports() -> None:
     assert closure_violations(roots, SRC) == {}
 
 
+def test_the_closure_walk_reaches_what_the_task_workflow_imports() -> None:
+    # Without this, a walk that found nothing would pass the scan above for the wrong reason.
+    closure = import_closure(workflow_modules(), SRC)
+    assert {
+        "longhaul.durable.workflows.task",
+        "longhaul.contracts",
+        "longhaul.durable.acts",
+        "longhaul.durable.payload_guard",
+    } <= set(closure)
+
+
 @pytest.mark.parametrize(
     "source",
     [

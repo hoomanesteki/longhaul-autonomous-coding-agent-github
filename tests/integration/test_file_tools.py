@@ -1,3 +1,4 @@
+import re
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -24,7 +25,8 @@ async def sbx() -> AsyncIterator[Sandbox]:
     try:
         box = await manager.create(tid, IMAGE, SandboxLimits(), network=False)
         for f in CALC.rglob("*"):
-            if f.is_file() and "__pycache__" not in f.parts:
+            # The agent never sees the reference fix, and its diff would match a search.
+            if f.is_file() and "__pycache__" not in f.parts and f.name != "REFERENCE.patch":
                 await box.write_file(f"/workspace/{f.relative_to(CALC)}", f.read_bytes())
         yield box
     finally:
@@ -188,6 +190,66 @@ async def test_list_dir_ignores_noise(reg: ToolRegistry, sbx: Sandbox) -> None:
     for noise in ("node_modules", ".git", "__pycache__"):
         assert noise not in r.output
     assert "calc/" in r.output and "pyproject.toml" in r.output
+
+
+def hits(output: str) -> list[tuple[str, int]]:
+    """The file and line of each match row, in the order shown."""
+    rows = [re.match(r"(.+?):(\d+): ", line) for line in output.splitlines()]
+    return [(m[1].removeprefix("./"), int(m[2])) for m in rows if m]
+
+
+async def test_search_path_glob_and_max_results(reg: ToolRegistry, sbx: Sandbox) -> None:
+    await sbx.write_file("/workspace/src/calc/extra.py", b"def add_more():\n    return 0\n")
+    await sbx.write_file("/workspace/docs/notes.md", b"def add is explained here\n")
+    init, extra, notes = ("src/calc/__init__.py", 4), ("src/calc/extra.py", 1), ("docs/notes.md", 1)
+
+    everywhere = await call(reg, sbx, "search", pattern="def add")
+    assert hits(everywhere.output) == [notes, init, extra]
+    in_dir = await call(reg, sbx, "search", pattern="def add", path="src/calc")
+    assert hits(in_dir.output) == [init, extra]
+    one_file = await call(reg, sbx, "search", pattern="def add", path="src/calc/extra.py")
+    assert hits(one_file.output) == [extra]
+    markdown = await call(reg, sbx, "search", pattern="def add", glob="*.md")
+    assert hits(markdown.output) == [notes]
+    python = await call(reg, sbx, "search", pattern="def add", glob="*.py", path="src")
+    assert hits(python.output) == [init, extra]
+    first_only = await call(reg, sbx, "search", pattern="def add", max_results=1)
+    assert hits(first_only.output) == [notes]
+    assert first_only.output.splitlines()[-1] == "... 2 more matches not shown"
+
+
+async def test_search_gives_the_same_text_on_every_call(reg: ToolRegistry, sbx: Sandbox) -> None:
+    # rg prints files in the order its threads finish them, which differs from call to call.
+    await sh(
+        sbx,
+        "for i in $(seq 1 160); do mkdir -p big/d$((i % 16)); "
+        'echo "def target_$i" > big/d$((i % 16))/f$i.py; done',
+    )
+    cut = [
+        (await call(reg, sbx, "search", pattern="def target", path="big", max_results=5)).output
+        for _ in range(5)
+    ]
+    assert len(set(cut)) == 1, cut
+    full = await call(reg, sbx, "search", pattern="def target", path="big", max_results=1000)
+    rows = hits(full.output)
+    assert len(rows) == 160
+    assert rows == sorted(rows)
+
+
+async def test_search_keeps_its_matches_when_a_file_cannot_be_read(
+    reg: ToolRegistry, sbx: Sandbox
+) -> None:
+    # rg exits 2 for the locked file, after it printed the match from the other one.
+    await sh(
+        sbx,
+        "printf 'target = 1\\n' > real.py && printf 'target = 2\\n' > locked.py "
+        "&& chmod 000 locked.py",
+    )
+    r = await call(reg, sbx, "search", pattern="target")
+    assert r.ok, r.output
+    assert hits(r.output) == [("real.py", 1)]
+    note = r.output.splitlines()[-1]
+    assert note.startswith("note: ") and "locked.py" in note and "Permission denied" in note
 
 
 async def test_a_lost_container_is_not_a_tool_result(reg: ToolRegistry, sbx: Sandbox) -> None:

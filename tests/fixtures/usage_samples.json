@@ -1,0 +1,92 @@
+{
+  "synthetic": true,
+  "note": "Synthetic samples. They come from a model of an agent transcript, not from recorded API calls. Replace them with real samples once the live spike S4 has run (spikes/messages_api.py --live, ADR-0003 appendix), and set synthetic to false. A real sample is the usage object of one call, as the spike saves it under usage/, plus request_chars. The spike does not record request_chars yet: compute it with count_request_chars on the request that the call sent.",
+  "how_built": "Each session is a list of transcript chunks: the system prompt with the tool definitions, the task, then a tool call and a tool result per turn. Every kind of chunk has an assumed chars-per-token ratio, from 2.4 for test logs to 3.4 for prose, with up to 6 percent noise per chunk. The ratios are assumptions, chosen near what ADR-0003 says about the 5.5 models (about 30 percent more tokens than Haiku 4.5 and Sonnet 4.6 for the same text). They are not measurements. Token counts add up chunk by chunk and are then split into the usage counters the way the API reports them for the session's cache layout. The mix of content moves the overall ratio, so it drifts over a session as it would in a real one.",
+  "cache_layouts": {
+    "static_prefix": "Only the system prompt and the tool definitions carry a cache breakpoint, as in LH-104. The messages are never cached, so they land in input_tokens.",
+    "incremental": "A second breakpoint sits on the last assistant block of each turn, as planned in LH-405. input_tokens holds only the newest tool result."
+  },
+  "request_chars": "Characters of the request as longhaul.context.tokens.count_request_chars counts them: the system prompt, message text, tool call ids, names and arguments, tool result ids and content, and the tool definitions.",
+  "usage": "The fields of the API usage object. The size of the prompt is input_tokens + cache_read_input_tokens + cache_creation_input_tokens, because input_tokens alone leaves out what the cache served or stored. output_tokens is billed output, thinking included. Thinking is stripped before the next request (ADR-0003, D1), so none of it is part of a later prompt.",
+  "imitates_model": "claude-sonnet-5-5",
+  "sessions": [
+    {
+      "name": "calc_fix_static_prefix",
+      "description": "Nine requests of a small bug fix. Only the system prompt and tools are cached.",
+      "cache_layout": "static_prefix",
+      "samples": [
+        {"turn": 1, "request_chars": 20550, "usage": {"input_tokens": 336, "output_tokens": 482, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 6504}},
+        {"turn": 2, "request_chars": 21310, "usage": {"input_tokens": 618, "output_tokens": 190, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 3, "request_chars": 25380, "usage": {"input_tokens": 2058, "output_tokens": 1242, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 4, "request_chars": 28260, "usage": {"input_tokens": 3104, "output_tokens": 289, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 5, "request_chars": 28765, "usage": {"input_tokens": 3283, "output_tokens": 281, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 6, "request_chars": 31195, "usage": {"input_tokens": 4270, "output_tokens": 233, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 7, "request_chars": 33165, "usage": {"input_tokens": 4990, "output_tokens": 549, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 8, "request_chars": 33640, "usage": {"input_tokens": 5157, "output_tokens": 655, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}},
+        {"turn": 9, "request_chars": 34410, "usage": {"input_tokens": 5457, "output_tokens": 1388, "cache_read_input_tokens": 6504, "cache_creation_input_tokens": 0}}
+      ]
+    },
+    {
+      "name": "inventory_incremental",
+      "description": "Sixteen requests with a cache breakpoint on the last assistant block of each turn.",
+      "cache_layout": "incremental",
+      "samples": [
+        {"turn": 1, "request_chars": 23700, "usage": {"input_tokens": 548, "output_tokens": 436, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 7289}},
+        {"turn": 2, "request_chars": 24830, "usage": {"input_tokens": 337, "output_tokens": 1264, "cache_read_input_tokens": 7289, "cache_creation_input_tokens": 602}},
+        {"turn": 3, "request_chars": 31410, "usage": {"input_tokens": 2326, "output_tokens": 800, "cache_read_input_tokens": 7891, "cache_creation_input_tokens": 407}},
+        {"turn": 4, "request_chars": 36800, "usage": {"input_tokens": 1754, "output_tokens": 1303, "cache_read_input_tokens": 8298, "cache_creation_input_tokens": 2401}},
+        {"turn": 5, "request_chars": 41310, "usage": {"input_tokens": 1512, "output_tokens": 494, "cache_read_input_tokens": 10699, "cache_creation_input_tokens": 1833}},
+        {"turn": 6, "request_chars": 45250, "usage": {"input_tokens": 1602, "output_tokens": 265, "cache_read_input_tokens": 12532, "cache_creation_input_tokens": 1565}},
+        {"turn": 7, "request_chars": 45820, "usage": {"input_tokens": 33, "output_tokens": 1296, "cache_read_input_tokens": 14097, "cache_creation_input_tokens": 1766}},
+        {"turn": 8, "request_chars": 48850, "usage": {"input_tokens": 1282, "output_tokens": 510, "cache_read_input_tokens": 15863, "cache_creation_input_tokens": 80}},
+        {"turn": 9, "request_chars": 56640, "usage": {"input_tokens": 2767, "output_tokens": 1198, "cache_read_input_tokens": 15943, "cache_creation_input_tokens": 1352}},
+        {"turn": 10, "request_chars": 57270, "usage": {"input_tokens": 33, "output_tokens": 331, "cache_read_input_tokens": 17295, "cache_creation_input_tokens": 2958}},
+        {"turn": 11, "request_chars": 61500, "usage": {"input_tokens": 1707, "output_tokens": 980, "cache_read_input_tokens": 20253, "cache_creation_input_tokens": 80}},
+        {"turn": 12, "request_chars": 64980, "usage": {"input_tokens": 1197, "output_tokens": 1017, "cache_read_input_tokens": 20333, "cache_creation_input_tokens": 1777}},
+        {"turn": 13, "request_chars": 65520, "usage": {"input_tokens": 32, "output_tokens": 1380, "cache_read_input_tokens": 22110, "cache_creation_input_tokens": 1357}},
+        {"turn": 14, "request_chars": 68250, "usage": {"input_tokens": 1028, "output_tokens": 1121, "cache_read_input_tokens": 23467, "cache_creation_input_tokens": 82}},
+        {"turn": 15, "request_chars": 74320, "usage": {"input_tokens": 2134, "output_tokens": 1136, "cache_read_input_tokens": 23549, "cache_creation_input_tokens": 1088}},
+        {"turn": 16, "request_chars": 74830, "usage": {"input_tokens": 35, "output_tokens": 947, "cache_read_input_tokens": 24637, "cache_creation_input_tokens": 2290}}
+      ]
+    },
+    {
+      "name": "textkit_cache_expiry",
+      "description": "Eleven requests. A slow test run let the 5 minute cache entry lapse before requests 5 and 9.",
+      "cache_layout": "static_prefix",
+      "samples": [
+        {"turn": 1, "request_chars": 19600, "usage": {"input_tokens": 259, "output_tokens": 1083, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 6419}},
+        {"turn": 2, "request_chars": 20290, "usage": {"input_tokens": 511, "output_tokens": 1054, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 3, "request_chars": 25250, "usage": {"input_tokens": 2237, "output_tokens": 445, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 4, "request_chars": 28540, "usage": {"input_tokens": 3337, "output_tokens": 685, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 5, "request_chars": 33870, "usage": {"input_tokens": 5526, "output_tokens": 888, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 6419}},
+        {"turn": 6, "request_chars": 34385, "usage": {"input_tokens": 5720, "output_tokens": 639, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 7, "request_chars": 39215, "usage": {"input_tokens": 7782, "output_tokens": 1156, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 8, "request_chars": 41585, "usage": {"input_tokens": 8635, "output_tokens": 1285, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 9, "request_chars": 42120, "usage": {"input_tokens": 8834, "output_tokens": 1315, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 6419}},
+        {"turn": 10, "request_chars": 45550, "usage": {"input_tokens": 10208, "output_tokens": 1039, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}},
+        {"turn": 11, "request_chars": 47210, "usage": {"input_tokens": 10768, "output_tokens": 905, "cache_read_input_tokens": 6419, "cache_creation_input_tokens": 0}}
+      ]
+    },
+    {
+      "name": "longlog_drift",
+      "description": "Fourteen requests that start with code reads and end with long test logs.",
+      "cache_layout": "incremental",
+      "samples": [
+        {"turn": 1, "request_chars": 25900, "usage": {"input_tokens": 689, "output_tokens": 942, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 8221}},
+        {"turn": 2, "request_chars": 27150, "usage": {"input_tokens": 400, "output_tokens": 986, "cache_read_input_tokens": 8221, "cache_creation_input_tokens": 744}},
+        {"turn": 3, "request_chars": 32730, "usage": {"input_tokens": 1917, "output_tokens": 1354, "cache_read_input_tokens": 8965, "cache_creation_input_tokens": 463}},
+        {"turn": 4, "request_chars": 37810, "usage": {"input_tokens": 1630, "output_tokens": 1058, "cache_read_input_tokens": 9428, "cache_creation_input_tokens": 1986}},
+        {"turn": 5, "request_chars": 44110, "usage": {"input_tokens": 2071, "output_tokens": 353, "cache_read_input_tokens": 11414, "cache_creation_input_tokens": 1706}},
+        {"turn": 6, "request_chars": 44640, "usage": {"input_tokens": 36, "output_tokens": 388, "cache_read_input_tokens": 13120, "cache_creation_input_tokens": 2222}},
+        {"turn": 7, "request_chars": 52570, "usage": {"input_tokens": 3230, "output_tokens": 1345, "cache_read_input_tokens": 15342, "cache_creation_input_tokens": 83}},
+        {"turn": 8, "request_chars": 56660, "usage": {"input_tokens": 1319, "output_tokens": 1366, "cache_read_input_tokens": 15425, "cache_creation_input_tokens": 3302}},
+        {"turn": 9, "request_chars": 57200, "usage": {"input_tokens": 36, "output_tokens": 905, "cache_read_input_tokens": 18727, "cache_creation_input_tokens": 1475}},
+        {"turn": 10, "request_chars": 66930, "usage": {"input_tokens": 3928, "output_tokens": 531, "cache_read_input_tokens": 20202, "cache_creation_input_tokens": 85}},
+        {"turn": 11, "request_chars": 78860, "usage": {"input_tokens": 5150, "output_tokens": 353, "cache_read_input_tokens": 20287, "cache_creation_input_tokens": 3975}},
+        {"turn": 12, "request_chars": 79380, "usage": {"input_tokens": 35, "output_tokens": 1156, "cache_read_input_tokens": 24262, "cache_creation_input_tokens": 5309}},
+        {"turn": 13, "request_chars": 89910, "usage": {"input_tokens": 4561, "output_tokens": 1212, "cache_read_input_tokens": 29571, "cache_creation_input_tokens": 85}},
+        {"turn": 14, "request_chars": 102050, "usage": {"input_tokens": 5184, "output_tokens": 556, "cache_read_input_tokens": 29656, "cache_creation_input_tokens": 4610}}
+      ]
+    }
+  ]
+}

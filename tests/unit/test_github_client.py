@@ -1055,3 +1055,110 @@ async def test_tokens_never_appear_in_reprs_errors_or_logs(
     for echoed in (failures[3], failures[7], failures[-1]):
         assert "[redacted]" in str(echoed)  # the echoed token was replaced, not dropped
     assert all(error.__cause__ is None for error in failures)
+
+
+# --- reads that side_effects.py uses to find an earlier attempt (LH-304) ----------------------
+
+
+async def test_list_comments_returns_every_comment_of_an_issue(
+    fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    number = fake.seed_issue(REPO, "a long thread")
+    other = fake.seed_issue(REPO, "another thread")
+    assert await gh.list_comments(REPO, number) == []
+    for n in range(130):
+        fake.seed_comment(REPO, number, f"comment {n}", user="maria", created_at=T0)
+    fake.seed_comment(REPO, other, "elsewhere")
+
+    comments = await gh.list_comments(REPO, number)
+
+    # No `since`, so the oldest comment is there too, on the second page as well as the first.
+    assert [c["body"] for c in comments] == [f"comment {n}" for n in range(130)]
+    assert comments[0]["user"]["login"] == "maria"
+    queries = [parse_qs(request.query) for request in fake.requests[1:]]
+    assert [q.get("page", ["1"])[0] for q in queries] == ["1", "2"]
+    assert all("since" not in q for q in queries)
+
+
+async def test_list_comments_of_a_missing_issue_is_fatal(gh: GitHubClient) -> None:
+    with pytest.raises(GitHubFatal) as info:
+        await gh.list_comments(REPO, 99)
+    assert info.value.status == 404
+
+
+async def test_list_open_pulls_by_head_names_the_owner(fake: FakeGitHub, gh: GitHubClient) -> None:
+    mine = fake.seed_pull(REPO, "longhaul-pr/42")
+    fake.seed_pull(REPO, "longhaul-pr/43")
+
+    pulls = await gh.list_open_pulls_by_head(REPO, "longhaul-pr/42")
+
+    assert [pull["number"] for pull in pulls] == [mine]
+    assert pulls[0]["html_url"] == f"https://github.com/{REPO}/pull/{mine}"
+    # GitHub matches the filter only as owner:branch, so a bare branch gets the repo's owner.
+    assert parse_qs(fake.requests[-1].query)["head"] == ["acme:longhaul-pr/42"]
+    assert parse_qs(fake.requests[-1].query)["state"] == ["open"]
+    qualified = await gh.list_open_pulls_by_head(REPO, "acme:longhaul-pr/42")
+    assert [pull["number"] for pull in qualified] == [mine]
+    assert parse_qs(fake.requests[-1].query)["head"] == ["acme:longhaul-pr/42"]
+
+
+async def test_list_open_pulls_by_head_leaves_out_closed_and_other_heads(
+    fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    merged = fake.seed_pull(REPO, "longhaul-pr/7")
+    fake.merge_pr(REPO, merged)
+    closed = fake.seed_pull(REPO, "longhaul-pr/7")
+    fake.close_pr(REPO, closed)
+    open_one = fake.seed_pull(REPO, "longhaul-pr/7")
+    fake.seed_pull(REPO, "longhaul-pr/8")
+    other_base = fake.seed_pull(REPO, "longhaul-pr/7", base="release")
+
+    pulls = await gh.list_open_pulls_by_head(REPO, "longhaul-pr/7")
+
+    assert sorted(pull["number"] for pull in pulls) == [open_one, other_base]
+    assert await gh.list_open_pulls_by_head(REPO, "longhaul-pr/9") == []
+    assert await gh.list_open_pulls_by_head(REPO, "other:longhaul-pr/7") == []
+
+
+async def test_list_open_pulls_by_head_keeps_only_pulls_from_that_head(clock: ManualClock) -> None:
+    # If GitHub ignores a filter it does not understand, it answers with every open pull
+    # request. Taking the first of those would name a pull request that has nothing to do
+    # with the branch, so the client checks each one.
+    def pull(number: int, owner: str, ref: str) -> dict[str, Any]:
+        return {"number": number, "head": {"ref": ref, "user": {"login": owner}}}
+
+    everything = [
+        pull(1, "acme", "docs"),
+        pull(2, "ACME", "longhaul-pr/42"),
+        pull(3, "fork", "x"),
+        # A head that was deleted with its fork has no user, and a broken answer has no head.
+        {"number": 4, "head": {"ref": "longhaul-pr/42", "user": None}},
+        {"number": 5, "head": None},
+        {"number": 6},
+    ]
+    broken = Script(answer(200, json=everything))
+    async with client_on(broken.transport(), clock) as client:
+        pulls = await client.list_open_pulls_by_head(REPO, "longhaul-pr/42")
+    assert [p["number"] for p in pulls] == [2]  # the owner's case does not matter
+
+
+@pytest.mark.parametrize("head", ["", ":", "acme:", "longhaul-pr/42:"])
+async def test_list_open_pulls_by_head_refuses_a_head_without_a_branch(
+    head: str, fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    # An empty branch makes GitHub drop the filter, which lists every open pull request.
+    with pytest.raises(GitHubFatal, match="branch"):
+        await gh.list_open_pulls_by_head(REPO, head)
+    assert fake.requests == []
+
+
+async def test_list_open_pulls_by_head_errors_use_the_same_mapping(
+    fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    with pytest.raises(GitHubFatal):
+        await gh.list_open_pulls_by_head("acme/missing", "longhaul-pr/1")
+    with pytest.raises(GitHubFatal, match="owner/name"):
+        await gh.list_open_pulls_by_head("not-a-repo", "longhaul-pr/1")
+    fake.fail_next(r"/pulls$", 502)
+    with pytest.raises(GitHubRetryable):
+        await gh.list_open_pulls_by_head(REPO, "longhaul-pr/1")

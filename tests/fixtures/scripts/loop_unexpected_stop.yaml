@@ -1,0 +1,6 @@
+# A stop reason the loop has no rule for. Longhaul sends no stop sequences, so this is a surprise.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "Stopped for a reason nobody planned for."
+      stop_reason: other

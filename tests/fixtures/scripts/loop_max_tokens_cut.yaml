@@ -1,0 +1,10 @@
+# A reply that hit max_tokens, with a tool call whose input may be cut off. The loop must
+# not store it or run the call. The scripted provider ignores max_tokens, so a retry of the
+# same request gets this answer again.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "Writing the whole module in one go."
+      tool_calls:
+        - {name: write_file, input: {path: big.py, content: "x = 1\n"}}
+      stop_reason: max_tokens

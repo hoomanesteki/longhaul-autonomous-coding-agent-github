@@ -1,0 +1,6 @@
+# Pauses every time. A turn may be continued only a few times before the loop gives up.
+steps:
+  - match: {role: coder}
+    respond:
+      text: "Still working."
+      stop_reason: pause_turn

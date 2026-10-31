@@ -1,0 +1,14 @@
+# Two finish calls with no usable summary, then a good one. The bare steps run by turn
+# (0 and 1). The last step also needs the error from the call before it, so a loop that ends
+# the task on a bad finish, or that never answers it, cannot reach a good finish.
+steps:
+  - respond:
+      tool_calls:
+        - {name: finish, input: {}}
+  - respond:
+      tool_calls:
+        - {name: finish, input: {summary: "   "}}
+  - match: {turn_index: 2, last_tool_result_contains: "needs a summary"}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Finished on the third try."}}

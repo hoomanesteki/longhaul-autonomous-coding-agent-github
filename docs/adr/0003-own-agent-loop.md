@@ -75,7 +75,7 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 ### D10. SDK and dependencies
 
 - Use `anthropic>=2.3,<3`. The 2.x line sends API version `2026-10-21` by default and is built on `httpx2`. The latest release when this was written is 2.3.0, published on 2026-10-23 (PyPI).
-- The SDK is not locked yet. LH-104 adds it to `pyproject.toml` and `uv.lock`, then records the pinned version in ADR-0002 and in the log at the end of the appendix.
+- LH-104 locked `anthropic` 2.3.0 (recorded in ADR-0002). It sends API version 2026-10-21, and a unit test fails if an SDK upgrade changes that.
 - Tests inject `httpx2.MockTransport` through `anthropic.DefaultAsyncHttpxClient(transport=...)`. Tools that patch `httpx` stop seeing SDK traffic.
 - No sampling parameters (`temperature`, `top_p`, `top_k`) are ever sent. On API version `2026-10-21` any of them is a 400 on every model.
 - Invariant I1 and CLAUDE.md rule 4 list `httpx2` and `httpcore2` among the imports that workflow code may not use.
@@ -85,7 +85,7 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 Drafted on 2026-10-30 from the bundled Claude API documentation (claude-api skill bundle 2.1.310). Every fact names its source file and section inside that bundle. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. Hooman runs them and replaces "pending" with the result and the date.
 
 - Model scope: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. A fact that names no model applies to both.
-- SDK: `anthropic` is not yet in `pyproject.toml` or `uv.lock`. LH-104 records the pinned version, and the `anthropic-version` header it sends, in the log below.
+- SDK: `anthropic` 2.3.0 is locked (LH-104, ADR-0002). It sends `anthropic-version` 2026-10-21, pinned by `test_the_sdk_sends_the_api_version_adr_0003_records`.
 - The bundle is a snapshot. The skill's model table is marked as cached on 2026-10-06, and the preserved-thinking notes quote the live page as of 2026-10-14. Check prices, model lists, beta names and enforcement rules against the live pages before code depends on them.
 
 ### Part 1. The five facts LH-102 asks for

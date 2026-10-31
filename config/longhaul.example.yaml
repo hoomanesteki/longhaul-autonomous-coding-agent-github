@@ -5,7 +5,8 @@ repos:
   - repo: hoomanesteki/lh-demo-calc
     allowlisted: true
     plan_approval_required: true
-    setup_command: "pip install -e '.[dev]'"
+    # The sandbox root filesystem is read-only, so packages go into a venv in the workspace.
+    setup_command: "python -m venv .venv && .venv/bin/pip install -e '.[dev]'"
     test_command: "pytest -q"
     budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
 models:                 # every id here needs an entry in the pricing file

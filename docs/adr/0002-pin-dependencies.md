@@ -23,6 +23,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | docker | 7.2.0 |
 | fastapi | not yet added; pinned when first added |
 | jsonschema | 4.26.0 |
+| typer | 0.27.3 (`typer>=0.27.3`, for the `longhaul` command; it bundles its own Click, so `click` is not installed) |
 | pydantic | 2.14.1 |
 | pydantic-settings | 2.16.1 |
 | pyyaml | 6.0.3 |

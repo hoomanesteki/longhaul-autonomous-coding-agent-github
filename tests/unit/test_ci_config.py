@@ -18,12 +18,13 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 WORKFLOW = WORKFLOWS / "ci.yml"
 PROTECT = ROOT / "scripts" / "protect_branches.sh"
 COMPOSE = ROOT / "docker-compose.yml"
+MAKEFILE = ROOT / "Makefile"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 RUNBOOK = ROOT / "docs" / "runbook.md"
 
-# A minimum. Later stories add jobs (e2e, console, chaos-lite), and the `ci` job has to wait
-# for each of them, which test_ci_waits_for_every_other_job checks against the real file.
-REQUIRED_JOBS = {"lint", "types", "unit", "integration", "security", "compose", "ci"}
+# A minimum. Later stories add jobs (console, chaos-lite), and the `ci` job has to wait for each
+# of them, which test_ci_has_required_jobs checks against the real file.
+REQUIRED_JOBS = {"lint", "types", "unit", "integration", "e2e", "security", "compose", "ci"}
 
 
 def load_workflow() -> dict[str, Any]:
@@ -157,6 +158,72 @@ def test_aggregate_check_notices_a_job_it_does_not_wait_for() -> None:
 
 def test_provider_is_scripted() -> None:
     assert load_workflow()["env"]["LONGHAUL_PROVIDER"] == "scripted"
+
+
+# --- the test jobs that need a sandbox ------------------------------------------------------
+
+
+def makefile_selection(makefile: str, target: str) -> str:
+    """The -m expression that `make <target>` gives pytest, with $(OPT_IN) filled in."""
+    opt_in = re.search(r"^OPT_IN\s*:=\s*(.+)$", makefile, re.M)
+    assert opt_in, "the Makefile has no OPT_IN"
+    recipe = re.search(rf"^{re.escape(target)}:\n\t(.+)$", makefile, re.M)
+    assert recipe, f"the Makefile has no {target} target"
+    found = re.search(r'-m "([^"]+)"', recipe.group(1))
+    assert found, f"make {target} gives pytest no -m expression"
+    return found.group(1).replace("$(OPT_IN)", opt_in.group(1).strip())
+
+
+def job_selection(job: dict[str, Any]) -> str | None:
+    """The -m expression of the job's pytest step, or None when it has none."""
+    for step in job.get("steps", []):
+        found = re.search(r'pytest\b.*?-m "([^"]+)"', " ".join(str(step.get("run", "")).split()))
+        if found:
+            return found.group(1)
+    return None
+
+
+def step_index(job: dict[str, Any], fragment: str) -> int | None:
+    runs = [" ".join(str(step.get("run", "")).split()) for step in job.get("steps", [])]
+    return next((i for i, run in enumerate(runs) if fragment in run), None)
+
+
+@pytest.mark.parametrize(("job", "target"), [("integration", "itest"), ("e2e", "e2e")])
+def test_ci_runs_the_tests_that_make_runs(job: str, target: str) -> None:
+    # The comment in ci.yml says "same selection as make". Without this check the two could
+    # drift: a marker added to OPT_IN would then apply on a laptop and not in CI.
+    from_make = makefile_selection(MAKEFILE.read_text(encoding="utf-8"), target)
+    assert job_selection(load_workflow()["jobs"][job]) == from_make
+
+
+def test_the_e2e_job_runs_the_e2e_tests_only() -> None:
+    selection = job_selection(load_workflow()["jobs"]["e2e"])
+    assert selection is not None and selection.startswith("e2e and ")
+
+
+@pytest.mark.parametrize("job", ["integration", "e2e"])
+def test_jobs_with_a_sandbox_build_the_image_before_the_tests(job: str) -> None:
+    # The sandbox tests fail with "image is missing" on a runner that has not built it.
+    definition = load_workflow()["jobs"][job]
+    build = step_index(definition, "make sandbox-image")
+    tests = step_index(definition, "pytest")
+    assert build is not None, f"{job} never builds the sandbox image"
+    assert tests is not None, f"{job} never runs pytest"
+    assert build < tests
+
+
+def test_the_selection_checks_read_the_makefile_and_a_job() -> None:
+    makefile = (
+        "OPT_IN := not live and not slow\n\n"
+        'itest:\n\tuv run pytest -m "integration and $(OPT_IN)"\n'
+    )
+    assert makefile_selection(makefile, "itest") == "integration and not live and not slow"
+    folded = {"steps": [{"run": 'uv run pytest -q -m "integration and not live"'}]}
+    assert job_selection(folded) == "integration and not live"
+    assert job_selection({"steps": [{"run": "make sandbox-image"}]}) is None
+    steps = {"steps": [{"run": "make sandbox-image"}, {"run": "uv run pytest"}]}
+    assert (step_index(steps, "make sandbox-image"), step_index(steps, "pytest")) == (0, 1)
+    assert step_index(steps, "cargo test") is None
 
 
 def test_triggers_and_permissions() -> None:

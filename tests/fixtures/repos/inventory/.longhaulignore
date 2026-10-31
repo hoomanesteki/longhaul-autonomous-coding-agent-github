@@ -1,0 +1,4 @@
+# Not copied into the sandbox, so a real model never sees the reference fix.
+# The issue text reaches the agent in the task, not as a file in the repo.
+REFERENCE.patch
+ISSUE.md

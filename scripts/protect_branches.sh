@@ -3,10 +3,10 @@
 # no force pushes, no deletions. Run once by the repo owner (needs admin rights).
 # Usage: scripts/protect_branches.sh [OWNER/REPO]
 #
-# enforce_admins is false on purpose. The owner merges the phase-gate pull requests and the
-# maintainer pushes dev as the admin, so GitHub has to let admins through. These rules bind
-# collaborators and bots, not admins: a direct push to dev is rejected for a token without
-# admin rights and accepted for an admin. See the CI section of docs/runbook.md.
+# enforce_admins is false on purpose. Admins merge the phase-gate pull requests and push dev,
+# so GitHub has to let admins through. These rules bind collaborators and bots, not admins:
+# a direct push to dev is rejected for a token without admin rights and accepted for an
+# admin. See the CI section of docs/runbook.md.
 set -euo pipefail
 
 REPO="${1:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"

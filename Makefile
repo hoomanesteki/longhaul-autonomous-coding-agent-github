@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e up down migrate sandbox-image gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image gate
 
 PHASE ?= 0
 
@@ -29,6 +29,10 @@ itest:
 
 e2e:
 	uv run pytest -m "e2e and $(OPT_IN)"
+
+# An empty FakeGitHub on port 8099, for end-to-end runs. Stop it with ctrl-c.
+fake-github:
+	uv run python tests/fakes/fake_github.py --port 8099
 
 up:
 	docker compose up -d --wait

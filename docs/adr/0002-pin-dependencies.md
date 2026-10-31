@@ -27,6 +27,8 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | pydantic | 2.14.1 |
 | pydantic-settings | 2.16.1 |
 | pyyaml | 6.0.3 |
+| pyjwt | 2.15.1 (see ADR-0012) |
+| cryptography | 50.0.2 (RS256 signing for pyjwt, see ADR-0012) |
 | sqlalchemy | 2.1.6 |
 | alembic | 1.20.1 |
 | asyncpg | 0.32.0 |

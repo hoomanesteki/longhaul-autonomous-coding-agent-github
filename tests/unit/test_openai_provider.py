@@ -16,6 +16,7 @@ from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from longhaul.contracts import (
+    CallOptions,
     LLMResponse,
     Message,
     ProviderError,
@@ -96,6 +97,7 @@ async def _ask(
     messages: list[Message] | None = None,
     tools: list[ToolSpec] | None = None,
     max_tokens: int = 10,
+    options: CallOptions | None = None,
 ) -> LLMResponse:
     return await provider.complete(
         model="gpt-test",
@@ -103,6 +105,7 @@ async def _ask(
         messages=messages or HI,
         tools=tools or [],
         max_tokens=max_tokens,
+        options=options,
     )
 
 
@@ -1016,6 +1019,139 @@ async def test_tool_use_block_in_a_user_message_is_invalid_request() -> None:
     assert info.value.kind == ProviderErrorKind.INVALID_REQUEST
     assert not info.value.retryable
     assert seen.requests == []
+
+
+# ---------- call options ----------
+async def test_effort_is_ignored() -> None:
+    # Chat completions has no matching knob, so the request is the same with or without it.
+    with_effort, plain = Recorder(_ok), Recorder(_ok)
+
+    await _ask(_provider(with_effort), tools=[READ_FILE], options=CallOptions(effort="max"))
+    await _ask(_provider(plain), tools=[READ_FILE])
+
+    assert with_effort.bodies == plain.bodies
+
+
+async def test_without_options_the_request_has_no_tool_choice_or_response_format() -> None:
+    for options in (None, CallOptions()):
+        seen = Recorder(_ok)
+
+        await _ask(_provider(seen), tools=[READ_FILE], options=options)
+
+        assert "tool_choice" not in seen.bodies[0]
+        assert "response_format" not in seen.bodies[0]
+
+
+async def test_force_tool_becomes_a_function_tool_choice() -> None:
+    seen = Recorder(_ok)
+
+    await _ask(_provider(seen), tools=[READ_FILE], options=CallOptions(force_tool="read_file"))
+
+    assert seen.bodies[0]["tool_choice"] == {"type": "function", "function": {"name": "read_file"}}
+
+
+async def test_force_tool_must_be_one_of_the_offered_tools() -> None:
+    # The server would answer 400 anyway. Saying so locally saves the call.
+    seen = Recorder(_ok)
+
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(seen), tools=[READ_FILE], options=CallOptions(force_tool="finish"))
+
+    assert info.value.kind == ProviderErrorKind.INVALID_REQUEST
+    assert "force_tool" in info.value.message
+    assert "finish" in info.value.message
+    assert "read_file" in info.value.message
+    assert seen.requests == []
+
+
+async def test_force_tool_without_any_tools_is_invalid() -> None:
+    seen = Recorder(_ok)
+
+    with pytest.raises(ProviderError) as info:
+        await _ask(_provider(seen), options=CallOptions(force_tool="read_file"))
+
+    assert info.value.kind == ProviderErrorKind.INVALID_REQUEST
+    assert seen.requests == []
+
+
+async def test_output_schema_becomes_a_json_schema_response_format() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"goal": {"type": "string"}},
+        "required": ["goal"],
+        "additionalProperties": False,
+    }
+    seen = Recorder(_ok)
+
+    await _ask(_provider(seen), options=CallOptions(output_schema=schema))
+
+    assert seen.bodies[0]["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "output", "schema": schema, "strict": True},
+    }
+    assert "tool_choice" not in seen.bodies[0]
+
+
+async def test_force_tool_and_output_schema_can_be_sent_together() -> None:
+    schema = {"type": "object", "additionalProperties": False}
+    seen = Recorder(_ok)
+
+    await _ask(
+        _provider(seen),
+        tools=[READ_FILE],
+        options=CallOptions(force_tool="read_file", output_schema=schema),
+    )
+
+    assert seen.bodies[0]["tool_choice"]["function"]["name"] == "read_file"
+    assert seen.bodies[0]["response_format"]["json_schema"]["schema"] == schema
+
+
+async def test_count_tokens_accepts_options() -> None:
+    provider = _provider(_ok)
+    plain = await provider.count_tokens(model="m", system="sys" * 40, messages=HI, tools=[])
+
+    counted = await provider.count_tokens(
+        model="m",
+        system="sys" * 40,
+        messages=HI,
+        tools=[],
+        options=CallOptions(effort="low", force_tool="read_file", output_schema={"type": "object"}),
+    )
+
+    assert counted == plain > 0
+
+
+# ---------- response metadata ----------
+@pytest.mark.parametrize(
+    "finish_reason", ["stop", "tool_calls", "length", "content_filter", "function_call", None]
+)
+async def test_raw_stop_reason_is_the_servers_finish_reason(finish_reason: str | None) -> None:
+    body = _completion(content="done", finish_reason=finish_reason)
+
+    resp = await _ask(_provider(_status(200, body)))
+
+    assert resp.raw_stop_reason == finish_reason
+
+
+async def test_a_refusal_keeps_its_stop_reason_and_the_finish_reason() -> None:
+    body = _completion(content=None, finish_reason="stop")
+    body["choices"][0]["message"]["refusal"] = "I can't help with that."
+
+    resp = await _ask(_provider(_status(200, body)))
+
+    assert resp.stop_reason == "other"
+    assert resp.raw_stop_reason == "stop"
+    assert resp.stop_details is None
+
+
+async def test_request_id_comes_from_the_response_header() -> None:
+    handler = _status(200, _completion(content="ok"), {"x-request-id": "req_abc123"})
+
+    assert (await _ask(_provider(handler))).request_id == "req_abc123"
+
+
+async def test_request_id_is_none_without_the_header() -> None:
+    assert (await _ask(_provider(_ok))).request_id is None
 
 
 def test_get_provider_openai(monkeypatch: pytest.MonkeyPatch) -> None:

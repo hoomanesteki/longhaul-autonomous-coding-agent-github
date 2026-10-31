@@ -2,6 +2,12 @@
 
 Kept out of contracts so that module stays free of vendor details. Blocks are
 plain dicts, so the anthropic SDK is not needed here.
+
+to_anthropic leaves out what the API answers with a 400: a text block with no
+text, and a message with no blocks. A transcript can hold both, for example
+after the documented empty response, and a 400 is not retried, so the task
+would end. Where a skipped message leaves two turns of one role side by side,
+the API reads them as one turn.
 """
 
 from typing import Any, Literal
@@ -9,9 +15,10 @@ from typing import Any, Literal
 from longhaul.contracts import Block, Message, TextBlock, ToolResultBlock, ToolUseBlock
 
 
-def _block_to_dict(block: Block) -> dict[str, Any]:
+def _block_to_dict(block: Block) -> dict[str, Any] | None:
     if isinstance(block, TextBlock):
-        return {"type": "text", "text": block.text}
+        # Only a block with nothing in it goes. Text with spaces around it is sent as written.
+        return {"type": "text", "text": block.text} if block.text.strip() else None
     if isinstance(block, ToolUseBlock):
         return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
     return {
@@ -38,7 +45,12 @@ def _block_from_dict(raw: dict[str, Any]) -> Block:
 
 
 def to_anthropic(messages: list[Message]) -> list[dict[str, Any]]:
-    return [{"role": m.role, "content": [_block_to_dict(b) for b in m.content]} for m in messages]
+    wire: list[dict[str, Any]] = []
+    for message in messages:
+        blocks = [d for d in map(_block_to_dict, message.content) if d is not None]
+        if blocks:
+            wire.append({"role": message.role, "content": blocks})
+    return wire
 
 
 def from_anthropic(blocks: list[dict[str, Any]], role: Literal["user", "assistant"]) -> Message:

@@ -6,13 +6,35 @@ every change in the "Contracts changelog" section of docs/architecture.md.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    GetJsonSchemaHandler,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
+from pydantic.json_schema import JsonSchemaValue
 
-contracts_version = "1"
+contracts_version = "2"
+
+EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
+StopReason = Literal[
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "refusal",
+    "pause_turn",
+    "model_context_window_exceeded",
+    "other",
+]
 
 
 # ---------- basic records ----------
@@ -33,6 +55,9 @@ class ToolSpec(BaseModel):
     name: str
     description: str
     input_schema: dict[str, Any]
+    # Asks the provider for arguments that are checked against input_schema. Providers
+    # that support it need additionalProperties: false on every object in the schema.
+    strict: bool = False
 
 
 class ToolCall(BaseModel):
@@ -52,19 +77,46 @@ class ToolResult(BaseModel):
     post_sha: str | None = None  # set when the call mutated the workspace
 
 
-class TextBlock(BaseModel):
+class _TaggedBlock(BaseModel):
+    """Base of the message blocks. It keeps the `type` tag in every dump.
+
+    The tag is a default, so exclude_unset and exclude_defaults would drop it, and a block
+    without it cannot be read back through the Block union.
+    """
+
+    type: str
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # The tag goes first, as in a plain dump, so the bytes of a stored transcript do
+        # not depend on the dump flags.
+        data: dict[str, Any] = handler(self)
+        return {"type": self.type, **{key: value for key, value in data.items() if key != "type"}}
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls, core_schema: Any, handler: GetJsonSchemaHandler
+    ) -> JsonSchemaValue:
+        # A serializer function hides the fields from the serialization-mode schema, which
+        # FastAPI uses for response models, and a client generated from it would see "an
+        # object with any keys". Describe the block by its fields in both modes.
+        plain: Any = {key: value for key, value in core_schema.items() if key != "serialization"}
+        return handler(plain)
+
+
+class TextBlock(_TaggedBlock):
     type: Literal["text"] = "text"
     text: str
 
 
-class ToolUseBlock(BaseModel):
+class ToolUseBlock(_TaggedBlock):
     type: Literal["tool_use"] = "tool_use"
     id: str
     name: str
     input: dict[str, Any]
 
 
-class ToolResultBlock(BaseModel):
+class ToolResultBlock(_TaggedBlock):
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: str
@@ -86,13 +138,44 @@ class Usage(BaseModel):
     cache_write_tokens: int = 0
 
 
+class StopDetails(BaseModel):
+    """Why the model stopped, when the provider says. Today only a refusal carries details."""
+
+    category: str | None = None
+    explanation: str | None = None
+
+
+class CallOptions(BaseModel):
+    """Settings for one call that a provider maps to its API or ignores.
+
+    effort: reasoning effort. It stays fixed for the life of a transcript.
+    force_tool: name of a tool the model must call. claude-sonnet-5-5 rejects a forced
+        tool choice, so the Anthropic provider raises INVALID_REQUEST instead of sending
+        it. For JSON that must parse, use output_schema, or a strict tool plus a prompt
+        instruction.
+    output_schema: JSON schema that the reply has to follow.
+    """
+
+    # A misspelled option would otherwise be dropped, and the call would run without it.
+    model_config = ConfigDict(extra="forbid")
+
+    effort: EffortLevel | None = None
+    force_tool: str | None = Field(default=None, min_length=1)
+    output_schema: dict[str, Any] | None = None
+
+
 class LLMResponse(BaseModel):
     content: list[Block]
     tool_calls: list[ToolCall]
-    stop_reason: Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "other"]
+    stop_reason: StopReason
+    raw_stop_reason: str | None = None  # the provider's own string, for reports
+    stop_details: StopDetails | None = None
     usage: Usage
     model: str
     latency_ms: int
+    request_id: str | None = None  # the provider's id for this call, for support and traces
+    # Thinking blocks are dropped before a response becomes an LLMResponse. This counts them.
+    dropped_thinking_blocks: int = Field(default=0, ge=0)
 
 
 class ProviderErrorKind(StrEnum):
@@ -117,16 +200,23 @@ _RETRYABLE = frozenset(
 
 class ProviderError(Exception):
     def __init__(
-        self, kind: ProviderErrorKind, message: str, retry_after_s: float | None = None
+        self,
+        kind: ProviderErrorKind,
+        message: str,
+        retry_after_s: float | None = None,
+        usage: Usage | None = None,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.retry_after_s = retry_after_s
+        # Set when the call was billed before it failed, for example on a body that does
+        # not parse, so the cost ledger can still record it.
+        self.usage = usage
 
     def __reduce__(self) -> tuple[Any, ...]:
-        # Exception pickling replays only self.args, which would drop kind and retry_after_s.
-        return (type(self), (self.kind, self.message, self.retry_after_s))
+        # Exception pickling replays only self.args, which would drop everything but the message.
+        return (type(self), (self.kind, self.message, self.retry_after_s, self.usage))
 
     @property
     def retryable(self) -> bool:
@@ -264,9 +354,17 @@ class CarryState(BaseModel):
     cost_usd: float = 0.0
     extra_budget_usd: float = 0.0
     extra_turns: int = 0
-    started_at: datetime
+    started_at: AwareDatetime
     hints: list[str] = Field(default_factory=list)
     stuck_count: int = 0
+
+    @field_validator("started_at")
+    @classmethod
+    def _started_at_in_utc(cls, value: datetime) -> datetime:
+        # Workflow code subtracts this from workflow.now(), which is aware UTC. A naive value
+        # would raise TypeError there. After a JSON round trip pydantic returns its own tzinfo
+        # class, so convert to the standard library UTC.
+        return value.astimezone(UTC)
 
 
 # ---------- protocols ----------
@@ -282,10 +380,17 @@ class LLMProvider(Protocol):
         tools: list[ToolSpec],
         max_tokens: int,
         cache_system: bool = True,
+        options: CallOptions | None = None,
     ) -> LLMResponse: ...
 
     async def count_tokens(
-        self, *, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        options: CallOptions | None = None,
     ) -> int: ...
 
 

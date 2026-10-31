@@ -8,11 +8,16 @@ repos:
     setup_command: "pip install -e '.[dev]'"
     test_command: "pytest -q"
     budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
-models:                 # set to current model ids at project start
-  planner: "<sonnet-class model id>"
-  coder: "<sonnet-class model id>"
-  verifier: "<sonnet-class model id>"
-  compactor: "<haiku-class model id>"
+models:                 # every id here needs an entry in the pricing file
+  planner: "claude-sonnet-5-5"
+  coder: "claude-sonnet-5-5"
+  verifier: "claude-sonnet-5-5"
+  compactor: "claude-haiku-5-5"
+effort:                 # reasoning effort per role: low, medium, high, xhigh or max
+  planner: medium       # sent with every call, and fixed for the life of a transcript
+  coder: medium
+  verifier: medium
+  compactor: low
 sandbox:
   image: "longhaul-sandbox:py312"
   limits: { cpus: 2, memory_mb: 4096, pids: 512 }
@@ -28,6 +33,7 @@ loop:
   max_verify_rounds: 3
   continue_as_new_every_turns: 40
   max_tokens_per_turn: 8192
+  max_tokens_retry: 64000   # cap for the one retry of a turn that stopped on max_tokens
 stuck:
   no_progress_turns: 15
   repeated_failure_count: 3

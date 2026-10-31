@@ -13,6 +13,14 @@ cache_system is accepted for protocol compatibility and ignored. Chat
 completions has no cache_control marker; caching, when the endpoint does it,
 happens on the server side.
 
+Call options. effort is ignored: chat completions has no setting that means the
+same. force_tool becomes a function tool_choice, and it must name one of the
+offered tools, or the call fails with INVALID_REQUEST before any request is sent.
+output_schema becomes a strict json_schema response_format. ToolSpec.strict is not
+sent. Stop reasons are unchanged: a refusal is still reported as "other", with the
+refusal text in the content. raw_stop_reason is the finish_reason the server sent,
+and request_id is the x-request-id header when there is one.
+
 The reply cap is sent as max_completion_tokens to OpenAI's own endpoint and as
 max_tokens to every other server. Pass max_tokens_param to override the choice.
 
@@ -40,12 +48,15 @@ from openai.types.chat import (
     ChatCompletionMessageFunctionToolCall,
     ChatCompletionMessageFunctionToolCallParam,
     ChatCompletionMessageParam,
+    ChatCompletionToolChoiceOptionParam,
     ChatCompletionToolUnionParam,
 )
 from openai.types.completion_usage import CompletionUsage
+from openai.types.shared_params import ResponseFormatJSONSchema
 
 from longhaul.contracts import (
     Block,
+    CallOptions,
     LLMResponse,
     Message,
     ProviderError,
@@ -65,6 +76,8 @@ _StopReason = Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "ot
 MaxTokensParam = Literal["max_tokens", "max_completion_tokens"]
 _MAX_TOKENS_PARAMS: tuple[MaxTokensParam, ...] = ("max_tokens", "max_completion_tokens")
 _OPENAI_HOST = "api.openai.com"
+# response_format needs a name for the schema. Callers pass a schema, not a name.
+_SCHEMA_NAME = "output"
 
 # Keys are the chat completions finish_reason values.
 _STOP_REASONS: dict[str, _StopReason] = {
@@ -137,17 +150,22 @@ class OpenAICompatProvider:
         tools: list[ToolSpec],
         max_tokens: int,
         cache_system: bool = True,
+        options: CallOptions | None = None,
     ) -> LLMResponse:
         chat_tools: list[ChatCompletionToolUnionParam] | Omit = (
             [_tool_param(t) for t in tools] if tools else omit
         )
         chat_messages = _chat_messages(system, messages)
+        tool_choice = _tool_choice(options, tools)
+        response_format = _response_format(options)
         started = time.monotonic()
         try:
             completion = await self._client.chat.completions.create(
                 model=model,
                 messages=chat_messages,
                 tools=chat_tools,
+                tool_choice=tool_choice,
+                response_format=response_format,
                 max_tokens=max_tokens if self._max_tokens_param == "max_tokens" else omit,
                 max_completion_tokens=(
                     max_tokens if self._max_tokens_param == "max_completion_tokens" else omit
@@ -164,7 +182,13 @@ class OpenAICompatProvider:
         return _to_response(completion, model=model, latency_ms=latency_ms)
 
     async def count_tokens(
-        self, *, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        options: CallOptions | None = None,
     ) -> int:
         return _estimate(system, messages)
 
@@ -187,6 +211,31 @@ def _tool_param(spec: ToolSpec) -> ChatCompletionToolUnionParam:
             "description": spec.description,
             "parameters": spec.input_schema,
         },
+    }
+
+
+def _tool_choice(
+    options: CallOptions | None, tools: list[ToolSpec]
+) -> ChatCompletionToolChoiceOptionParam | Omit:
+    if options is None or options.force_tool is None:
+        return omit
+    offered = [t.name for t in tools]
+    if options.force_tool not in offered:
+        # The server would answer 400. Saying so here saves the call and names the option.
+        raise ProviderError(
+            ProviderErrorKind.INVALID_REQUEST,
+            f"force_tool {options.force_tool!r} is not one of the offered tools: {offered}",
+        )
+    return {"type": "function", "function": {"name": options.force_tool}}
+
+
+def _response_format(options: CallOptions | None) -> ResponseFormatJSONSchema | Omit:
+    if options is None or options.output_schema is None:
+        return omit
+    # strict, because the point of an output schema is a reply that always parses.
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": _SCHEMA_NAME, "schema": options.output_schema, "strict": True},
     }
 
 
@@ -289,10 +338,19 @@ def _convert(completion: ChatCompletion, *, model: str, latency_ms: int) -> LLMR
         stop_reason=_stop_reason(
             choice.finish_reason, has_calls=bool(tool_calls), refused=bool(message.refusal)
         ),
+        # The SDK does not check types, so a server's odd finish_reason is dropped, not raised.
+        raw_stop_reason=choice.finish_reason if isinstance(choice.finish_reason, str) else None,
         usage=_usage(completion.usage),
         model=model,
         latency_ms=latency_ms,
+        request_id=_request_id(completion),
     )
+
+
+def _request_id(completion: ChatCompletion) -> str | None:
+    # The SDK copies the x-request-id header onto the parsed response.
+    value = completion._request_id
+    return value if isinstance(value, str) and value else None
 
 
 def _snippet(body: object) -> str:

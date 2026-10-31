@@ -7,13 +7,13 @@ looks like a credential, so a secret cannot end up in a checked-in file.
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from longhaul.contracts import Budgets, RepoSettings, SandboxLimits
+from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
 
 # A key is secret-looking when its name contains one of these after it is lower-cased and
 # stripped of separators. Matching inside the flattened name catches camelCase (githubToken),
@@ -22,7 +22,9 @@ _SECRET_FRAGMENTS = ("token", "key", "secret")
 
 # Count and size settings that contain "token" but are not credentials, in flattened form.
 # Add a name here only for a setting that holds a number, never a value that could be a secret.
-_COUNT_KEYS = frozenset({"maxtokensperturn", "tooloutputmaxtokens", "windowtokens"})
+_COUNT_KEYS = frozenset(
+    {"abovetokens", "maxtokensperturn", "maxtokensretry", "tooloutputmaxtokens", "windowtokens"}
+)
 
 
 class EnvSettings(BaseSettings):
@@ -89,6 +91,15 @@ class ModelIds(StrictModel):
     compactor: str
 
 
+class EffortLevels(StrictModel):
+    """Reasoning effort per role. It goes out as CallOptions.effort on every call."""
+
+    planner: EffortLevel
+    coder: EffortLevel
+    verifier: EffortLevel
+    compactor: EffortLevel
+
+
 class SandboxLimitsEntry(SandboxLimits):
     model_config = ConfigDict(extra="forbid")
 
@@ -112,6 +123,18 @@ class Loop(StrictModel):
     max_verify_rounds: int
     continue_as_new_every_turns: int
     max_tokens_per_turn: int
+    # The cap for the one retry of a turn that stopped on max_tokens.
+    max_tokens_retry: int
+
+    @model_validator(mode="after")
+    def _retry_cap_is_not_below_the_first_cap(self) -> Self:
+        if self.max_tokens_retry < self.max_tokens_per_turn:
+            raise ValueError(
+                f"max_tokens_retry ({self.max_tokens_retry}) must not be below "
+                f"max_tokens_per_turn ({self.max_tokens_per_turn}), or the retry could not "
+                "finish a reply that the first try cut off"
+            )
+        return self
 
 
 class Stuck(StrictModel):
@@ -126,6 +149,7 @@ class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
     models: ModelIds
+    effort: EffortLevels
     sandbox: Sandbox
     context: Context
     loop: Loop

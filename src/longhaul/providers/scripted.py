@@ -13,6 +13,7 @@ Script format::
           text: "optional text"
           tool_calls: [{name: edit_file, input: {path: a.py}}]
           stop_reason: tool_use      # default: tool_use with calls, else end_turn
+          stop_details: {category: cyber, explanation: "..."}   # only with stop_reason refusal
           raise: overloaded          # a ProviderErrorKind value; replaces the reply
           retry_after_s: 2.0
           times: 2                   # raise for the first 2 identical requests only
@@ -32,9 +33,21 @@ reason, a script with role-keyed steps cannot hold bare steps: a bare step answe
 every role, so give such a step an explicit ``match: {role: ...}``.
 
 A script is checked when it loads, and a bad one raises ValueError with the file
-path. A key may not appear twice in one mapping. A reply needs text or tool calls.
-A raise cannot come with a reply, and retry_after_s and times only go with a raise.
-stop_reason has to fit the calls: tool_use needs one, end_turn allows none.
+path. A key may not appear twice in one mapping. A reply needs text, tool calls or a
+stop_reason: a reply with none of them has to say why it is empty, as a refusal or an
+empty end_turn does. A raise cannot come with a reply, and retry_after_s and times
+only go with a raise. stop_reason has to fit the calls: tool_use needs one, end_turn
+allows none. The other reasons (max_tokens, stop_sequence, refusal, pause_turn,
+model_context_window_exceeded, other) take calls or none, so a test can offer a tool
+call that the loop must not run. stop_details only goes with a refusal.
+
+Stop reasons. Every reply sets raw_stop_reason to the stop reason, because there is
+no vendor string behind a script. A reply has no request_id.
+
+Options. complete() and count_tokens() accept CallOptions and ignore them: they are
+not part of the request that steps match on, and they do not change a reply or an id.
+complete() keeps a copy of each call's options in ``options_seen``, in call order and
+also for calls that raise, so a test can check what the caller asked for.
 
 Text matchers. ``last_tool_result_contains`` looks at the last tool_result block
 of the final message. ``user_text_contains`` looks at the text blocks of the last
@@ -80,18 +93,21 @@ import json
 from collections.abc import Hashable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from longhaul.contracts import (
     Block,
+    CallOptions,
     LLMResponse,
     Message,
     ProviderError,
     ProviderErrorKind,
     Role,
+    StopDetails,
+    StopReason,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -130,12 +146,16 @@ class _CallSpec(_Strict):
     input: dict[str, Any] = {}
 
 
+class _StopDetailsSpec(StopDetails):
+    # A misspelled key is an error here, not a field that is silently left empty.
+    model_config = ConfigDict(extra="forbid")
+
+
 class _Respond(_Strict):
     text: str | None = None
     tool_calls: list[_CallSpec] = []
-    stop_reason: Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "other"] | None = (
-        None
-    )
+    stop_reason: StopReason | None = None
+    stop_details: _StopDetailsSpec | None = None
     raise_: ProviderErrorKind | None = Field(default=None, alias="raise")
     retry_after_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     times: int | None = Field(default=None, ge=1)
@@ -155,6 +175,7 @@ class _Respond(_Strict):
                 ("text", self.text is not None),
                 ("tool_calls", bool(self.tool_calls)),
                 ("stop_reason", self.stop_reason is not None),
+                ("stop_details", self.stop_details is not None),
             )
             if present
         ]
@@ -165,12 +186,16 @@ class _Respond(_Strict):
         for name in ("retry_after_s", "times"):
             if getattr(self, name) is not None:
                 raise ValueError(f"{name} only applies to a raise step")
-        if self.text is None and not self.tool_calls:
-            raise ValueError("respond is empty: give text, tool_calls or raise")
+        # A reply with neither text nor calls is real (a refusal, or the empty end_turn that
+        # follows some tool results), but the script has to say which one it is.
+        if self.text is None and not self.tool_calls and self.stop_reason is None:
+            raise ValueError("respond is empty: give text, tool_calls, a stop_reason or raise")
         if self.stop_reason == "tool_use" and not self.tool_calls:
             raise ValueError("stop_reason tool_use needs a tool call")
         if self.stop_reason == "end_turn" and self.tool_calls:
             raise ValueError("stop_reason end_turn cannot come with tool calls")
+        if self.stop_details is not None and self.stop_reason != "refusal":
+            raise ValueError("stop_details only applies to stop_reason refusal")
 
 
 class _Step(_Strict):
@@ -327,6 +352,7 @@ class ScriptedProvider:
         )
         # How often each (step, request) pair has raised, for steps that set times.
         self._raised: dict[tuple[int, str], int] = {}
+        self.options_seen: list[CallOptions | None] = []
 
     def _request(
         self, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
@@ -411,7 +437,10 @@ class ScriptedProvider:
         tools: list[ToolSpec],
         max_tokens: int,
         cache_system: bool = True,
+        options: CallOptions | None = None,
     ) -> LLMResponse:
+        # Copied, so a test that edits its options later cannot change what was recorded.
+        self.options_seen.append(options.model_copy(deep=True) if options is not None else None)
         req = self._request(model, system, messages, tools)
         self._require_role_line(req)
         index, step = self._select(req)
@@ -441,16 +470,30 @@ class ScriptedProvider:
             input_tokens=_estimate(system, messages, tools),
             output_tokens=_OUTPUT_TOKENS_PER_CALL * len(calls) + len(resp.text or "") // 4,
         )
+        stop_reason: StopReason = resp.stop_reason or ("tool_use" if calls else "end_turn")
         return LLMResponse(
             content=content,
             tool_calls=calls,
-            stop_reason=resp.stop_reason or ("tool_use" if calls else "end_turn"),
+            stop_reason=stop_reason,
+            raw_stop_reason=stop_reason,
+            # Back to the contract class: a subclass instance would not equal a StopDetails.
+            stop_details=(
+                StopDetails(**resp.stop_details.model_dump())
+                if resp.stop_details is not None
+                else None
+            ),
             usage=usage,
             model=model,
             latency_ms=0,
         )
 
     async def count_tokens(
-        self, *, model: str, system: str, messages: list[Message], tools: list[ToolSpec]
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        options: CallOptions | None = None,
     ) -> int:
         return _estimate(system, messages, tools)

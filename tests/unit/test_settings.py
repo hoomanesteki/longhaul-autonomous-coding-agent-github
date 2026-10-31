@@ -2,23 +2,33 @@ import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from urllib.parse import urlsplit
 
 import pytest
 import yaml
-from pydantic import ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
-from longhaul.contracts import SandboxLimits
-from longhaul.settings import AppConfig, EnvSettings, get_settings, load_config
+from longhaul.contracts import EffortLevel, Role, SandboxLimits
+from longhaul.settings import (
+    AppConfig,
+    EffortLevels,
+    EnvSettings,
+    ModelIds,
+    get_settings,
+    load_config,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = ROOT / "config" / "longhaul.example.yaml"
+PRICING = ROOT / "config" / "pricing.yaml"
 ENV_EXAMPLE = ROOT / ".env.example"
 COMPOSE = ROOT / "docker-compose.yml"
 ENV_PREFIX = "LONGHAUL_"
+ROLES = [role.value for role in Role]
+RATES = ("input_per_mtok", "output_per_mtok", "cache_write_per_mtok", "cache_read_per_mtok")
 
 
 @pytest.fixture
@@ -79,6 +89,102 @@ def test_example_config_loads() -> None:
     assert config.loop.max_tokens_per_turn == 8192
 
 
+def test_example_config_has_the_models_effort_and_output_caps() -> None:
+    config = load_config(EXAMPLE)
+
+    assert config.models.model_dump() == {
+        "planner": "claude-sonnet-5-5",
+        "coder": "claude-sonnet-5-5",
+        "verifier": "claude-sonnet-5-5",
+        "compactor": "claude-haiku-5-5",
+    }
+    assert config.effort.model_dump() == {
+        "planner": "medium",
+        "coder": "medium",
+        "verifier": "medium",
+        "compactor": "low",
+    }
+    assert config.loop.max_tokens_per_turn == 8192
+    assert config.loop.max_tokens_retry == 64000
+
+
+@pytest.mark.parametrize("section", [ModelIds, EffortLevels], ids=["models", "effort"])
+def test_every_role_has_an_entry_in_models_and_effort(section: type[BaseModel]) -> None:
+    # A role added to the contracts has to get a model and an effort level, or the loader
+    # would accept a config that cannot serve it.
+    assert set(section.model_fields) == set(ROLES)
+
+
+@pytest.mark.parametrize("level", get_args(EffortLevel))
+def test_every_effort_level_loads(tmp_path: Path, level: str) -> None:
+    data = _example_data()
+    data["effort"]["coder"] = level
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path).effort.coder == level
+
+
+@pytest.mark.parametrize("role", ROLES)
+@pytest.mark.parametrize("level", ["extreme", "MEDIUM", "", 3, None])
+def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: Any) -> None:
+    data = _example_data()
+    data["effort"][role] = level
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("effort", role)]
+
+
+@pytest.mark.parametrize(
+    ("where", "name"),
+    [
+        pytest.param((), "effort", id="effort section"),
+        pytest.param(("effort",), "compactor", id="effort.compactor"),
+        pytest.param(("loop",), "max_tokens_retry", id="loop.max_tokens_retry"),
+    ],
+)
+def test_new_settings_have_no_silent_default(
+    tmp_path: Path, where: tuple[str, ...], name: str
+) -> None:
+    # Like every other section, a config that predates the key fails and names it.
+    data = _example_data()
+    section: Any = data
+    for step in where:
+        section = section[step]
+    del section[name]
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [(error["type"], error["loc"]) for error in excinfo.value.errors()] == [
+        ("missing", (*where, name))
+    ]
+
+
+@pytest.mark.parametrize("cap", [0, -1, 4096, 8191])
+def test_the_retry_cap_cannot_be_below_the_normal_cap(tmp_path: Path, cap: int) -> None:
+    # A retry that allows less than the first attempt cannot finish what the first cut off.
+    data = _example_data()
+    data["loop"]["max_tokens_retry"] = cap
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError, match="max_tokens_retry") as excinfo:
+        load_config(path)
+
+    assert "max_tokens_per_turn" in str(excinfo.value)
+
+
+def test_the_retry_cap_may_equal_the_normal_cap(tmp_path: Path) -> None:
+    data = _example_data()
+    data["loop"]["max_tokens_retry"] = data["loop"]["max_tokens_per_turn"]
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path).loop.max_tokens_retry == 8192
+
+
 # Each entry is the path to a section and a realistic typo for a key in it. Every section
 # repeats extra="forbid" on its own model, so each one needs its own case.
 UNKNOWN_KEY_CASES = [
@@ -87,6 +193,7 @@ UNKNOWN_KEY_CASES = [
     pytest.param(("repos", 0), "test_comand", id="repos[0]"),
     pytest.param(("repos", 0, "budgets"), "task_usdd", id="repos[0].budgets"),
     pytest.param(("models",), "plannr", id="models"),
+    pytest.param(("effort",), "plannr", id="effort"),
     pytest.param(("sandbox",), "imge", id="sandbox"),
     pytest.param(("sandbox", "limits"), "cpu", id="sandbox.limits"),
     pytest.param(("context",), "compact_att", id="context"),
@@ -169,7 +276,16 @@ SECRET_LOOKING_NAMES = [
 ]
 
 # Counts and sizes that contain the word "token" but are not credentials.
-COUNT_NAMES = ["max_tokens_per_turn", "tool_output_max_tokens", "window_tokens", "maxTokensPerTurn"]
+COUNT_NAMES = [
+    "max_tokens_per_turn",
+    "max_tokens_retry",
+    "tool_output_max_tokens",
+    "window_tokens",
+    "above_tokens",
+    "maxTokensPerTurn",
+    "maxTokensRetry",
+    "aboveTokens",
+]
 
 
 @pytest.mark.parametrize("name", SECRET_LOOKING_NAMES)
@@ -388,3 +504,84 @@ def test_env_example_lists_every_compose_variable() -> None:
 
     assert used
     assert used <= set(_env_example())
+
+
+# ---------- pricing ----------
+def _prices() -> dict[str, Any]:
+    data = yaml.safe_load(PRICING.read_text(encoding="utf-8"))
+    models = data["models"]
+    assert isinstance(models, dict)
+    return models
+
+
+def _rates(block: dict[str, Any]) -> dict[str, Any]:
+    return {name: block[name] for name in RATES}
+
+
+def test_every_configured_model_has_all_four_prices() -> None:
+    # The cost module refuses to run a paid model whose price is missing or null.
+    configured = set(load_config(EXAMPLE).models.model_dump().values())
+    prices = _prices()
+
+    assert configured <= set(prices)
+    for model_id in configured:
+        for name in RATES:
+            rate = prices[model_id][name]
+            assert isinstance(rate, int | float), f"{model_id}.{name} is {rate!r}"
+            assert rate > 0, f"{model_id}.{name} is {rate!r}"
+
+
+def test_prices_match_the_decided_rates() -> None:
+    # Per million tokens, from the provider's model table as cached on 2026-10-06.
+    prices = _prices()
+
+    assert _rates(prices["claude-sonnet-5-5"]) == {
+        "input_per_mtok": 2.0,
+        "output_per_mtok": 10.0,
+        "cache_write_per_mtok": 2.5,
+        "cache_read_per_mtok": 0.2,
+    }
+    assert _rates(prices["claude-haiku-5-5"]) == {
+        "input_per_mtok": 0.1,
+        "output_per_mtok": 0.5,
+        "cache_write_per_mtok": 0.125,
+        "cache_read_per_mtok": 0.01,
+    }
+
+
+def test_haiku_prompts_above_100k_tokens_cost_more() -> None:
+    long_prompt = _prices()["claude-haiku-5-5"]["long_prompt"]
+
+    assert long_prompt["above_tokens"] == 100_000
+    assert _rates(long_prompt) == {
+        "input_per_mtok": 0.5,
+        "output_per_mtok": 2.5,
+        "cache_write_per_mtok": 0.625,
+        "cache_read_per_mtok": 0.05,
+    }
+    assert "long_prompt" not in _prices()["claude-sonnet-5-5"]
+
+
+def test_the_pricing_file_passes_the_secret_key_scan(
+    tmp_path: Path, permissive_schema: None
+) -> None:
+    # No YAML file may hold a secret, and the scanner cannot tell a price tier's token
+    # threshold from a credential unless the key is on its list of counts.
+    data = _example_data()
+    data["pricing"] = yaml.safe_load(PRICING.read_text(encoding="utf-8"))
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path) is not None
+
+
+def test_cache_prices_sit_around_the_input_price() -> None:
+    # A swapped column or a slipped decimal shows up here: reading the cache is the cheap
+    # way to send input, writing it costs a little more, and output costs the most.
+    prices = _prices()
+    blocks = [prices["claude-sonnet-5-5"], prices["claude-haiku-5-5"]]
+    blocks.append(prices["claude-haiku-5-5"]["long_prompt"])
+
+    for block in blocks:
+        assert block["cache_read_per_mtok"] < block["input_per_mtok"]
+        assert block["input_per_mtok"] < block["cache_write_per_mtok"]
+        assert block["cache_write_per_mtok"] < block["output_per_mtok"]

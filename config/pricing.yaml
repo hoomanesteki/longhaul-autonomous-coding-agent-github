@@ -1,12 +1,22 @@
+# US dollars per million tokens. Copied from the provider's model table as cached on
+# 2026-10-06. Check these against the live pricing page before LH-701 builds the cost
+# ledger on them, and change them here, never in code.
 models:
-  # fill from provider pricing page
-  "<sonnet-class model id>":
-    input_per_mtok: null
-    output_per_mtok: null
-    cache_write_per_mtok: null
-    cache_read_per_mtok: null
-  "<haiku-class model id>":
-    input_per_mtok: null
-    output_per_mtok: null
-    cache_write_per_mtok: null
-    cache_read_per_mtok: null
+  claude-sonnet-5-5:
+    input_per_mtok: 2.00
+    output_per_mtok: 10.00
+    cache_write_per_mtok: 2.50
+    cache_read_per_mtok: 0.20
+  claude-haiku-5-5:
+    # These rates are for prompts up to 100,000 tokens. A longer prompt is billed at the
+    # long_prompt rates instead.
+    input_per_mtok: 0.10
+    output_per_mtok: 0.50
+    cache_write_per_mtok: 0.125
+    cache_read_per_mtok: 0.01
+    long_prompt:
+      above_tokens: 100000
+      input_per_mtok: 0.50
+      output_per_mtok: 2.50
+      cache_write_per_mtok: 0.625
+      cache_read_per_mtok: 0.05

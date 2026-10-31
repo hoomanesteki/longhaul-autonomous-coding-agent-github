@@ -7,11 +7,13 @@ import pytest
 from pydantic import BaseModel, SecretStr
 
 from longhaul.contracts import (
+    CallOptions,
     LLMResponse,
     Message,
     ProviderError,
     ProviderErrorKind,
     Role,
+    StopDetails,
     TextBlock,
     ToolResultBlock,
     ToolSpec,
@@ -854,6 +856,22 @@ async def test_returned_inputs_do_not_share_objects_with_the_script(tmp_path: Pa
         ("respond: {}", "respond is empty"),
         ("match: {turn_index: -1}\n    respond: {text: hi}", "greater than or equal to 0"),
         ("respond: {tool_calls: [{name: ''}]}", "at least 1 character"),
+        # An empty reply is allowed only with a stop reason that says why it is empty.
+        ("respond: {stop_reason: tool_use}", "stop_reason tool_use needs a tool call"),
+        ("respond: {stop_reason: nonsense}", "stop_reason"),
+        (
+            "respond: {text: hi, stop_details: {category: cyber}}",
+            "stop_details only applies to stop_reason refusal",
+        ),
+        (
+            "respond: {text: hi, stop_reason: end_turn, stop_details: {category: cyber}}",
+            "stop_details only applies to stop_reason refusal",
+        ),
+        (
+            "respond: {raise: overloaded, stop_details: {category: cyber}}",
+            "raise replaces the reply.*stop_details",
+        ),
+        ("respond: {stop_reason: refusal, stop_details: {kind: cyber}}", "kind"),
     ],
 )
 def test_impossible_responses_are_rejected(tmp_path: Path, body: str, fragment: str) -> None:
@@ -870,6 +888,13 @@ def test_impossible_responses_are_rejected(tmp_path: Path, body: str, fragment: 
         "respond: {tool_calls: [{name: x}], stop_reason: tool_use}",
         "respond: {raise: rate_limit, retry_after_s: 0}",
         "respond: {raise: timeout, times: 3}",
+        "respond: {text: hi, stop_reason: pause_turn}",
+        "respond: {text: hi, stop_reason: model_context_window_exceeded}",
+        "respond: {stop_reason: end_turn}",
+        "respond: {stop_reason: refusal}",
+        "respond: {stop_reason: refusal, stop_details: {category: cyber, explanation: declined}}",
+        # A refusal that still lists a tool call: the loop must run nothing.
+        "respond: {tool_calls: [{name: x}], stop_reason: refusal}",
     ],
 )
 def test_ordinary_responses_still_load(tmp_path: Path, body: str) -> None:
@@ -1042,6 +1067,128 @@ async def test_block_types_the_provider_does_not_know_are_ignored(tmp_path: Path
     assert (await _call(p, request("x" * 400), tools=tools)).tool_calls == first.tool_calls
     other = await _call(p, request("y" * 400), tools=tools)
     assert other.tool_calls[0].id != first.tool_calls[0].id
+
+
+# ---------- call options ----------
+OPTIONS = CallOptions(effort="high", force_tool="list_dir", output_schema={"type": "object"})
+
+
+async def test_call_options_are_accepted_and_change_nothing() -> None:
+    p = ScriptedProvider(SCRIPT)
+    tools = [_tool("list_dir")]
+    plain = await _call(p, _turn(0), tools=tools)
+
+    with_options = await p.complete(
+        model="m", system=SYSTEM, messages=_turn(0), tools=tools, max_tokens=100, options=OPTIONS
+    )
+
+    # Same reply, ids and usage: the options are not part of the request the script sees.
+    assert with_options == plain
+    counted = await p.count_tokens(
+        model="m", system=SYSTEM, messages=_turn(0), tools=tools, options=OPTIONS
+    )
+    assert counted == await p.count_tokens(model="m", system=SYSTEM, messages=_turn(0), tools=tools)
+
+
+async def test_call_options_are_recorded_for_tests(tmp_path: Path) -> None:
+    # A loop test can then check what the caller asked for on each attempt, also the ones
+    # that raised.
+    steps = "steps:\n  - match: {turn_index: 0}\n    respond: {raise: overloaded, times: 1}\n"
+    p = ScriptedProvider(_write(tmp_path, steps + "  - respond: {text: ok}\n"))
+    assert p.options_seen == []
+
+    async def ask(options: CallOptions | None) -> LLMResponse:
+        return await p.complete(
+            model="m", system=SYSTEM, messages=_turn(0), tools=[], max_tokens=1, options=options
+        )
+
+    with pytest.raises(ProviderError):
+        await ask(OPTIONS)
+    # The retry is the same request, so the spent raise step gives way to the reply.
+    await ask(None)
+
+    assert p.options_seen == [OPTIONS, None]
+
+
+async def test_options_do_not_reach_the_request_fingerprint() -> None:
+    p = ScriptedProvider(SCRIPT)
+    tools = [_tool("list_dir")]
+    low = CallOptions(effort="low")
+    first = await p.complete(
+        model="m", system=SYSTEM, messages=_turn(0), tools=tools, max_tokens=1, options=low
+    )
+    second = await p.complete(
+        model="m", system=SYSTEM, messages=_turn(0), tools=tools, max_tokens=1, options=OPTIONS
+    )
+    assert first.tool_calls == second.tool_calls
+
+
+# ---------- stop reasons ----------
+async def test_raw_stop_reason_repeats_the_stop_reason(tmp_path: Path) -> None:
+    # There is no vendor string behind a script, so the field repeats the stop reason.
+    called = await _call(ScriptedProvider(SCRIPT), _turn(0))
+    assert (called.stop_reason, called.raw_stop_reason) == ("tool_use", "tool_use")
+    text_only = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {text: hi}\n"))
+    reply = await _call(text_only, _turn(0))
+    assert (reply.stop_reason, reply.raw_stop_reason) == ("end_turn", "end_turn")
+
+
+@pytest.mark.parametrize("reason", ["refusal", "pause_turn", "model_context_window_exceeded"])
+async def test_new_stop_reasons_can_be_scripted(tmp_path: Path, reason: str) -> None:
+    p = ScriptedProvider(
+        _write(tmp_path, f"steps:\n  - respond: {{text: partial, stop_reason: {reason}}}\n")
+    )
+
+    resp = await _call(p, _turn(0))
+
+    assert resp.stop_reason == reason
+    assert resp.raw_stop_reason == reason
+    assert resp.content == [TextBlock(text="partial")]
+    assert resp.stop_details is None
+
+
+async def test_a_refusal_can_carry_details_and_have_no_text(tmp_path: Path) -> None:
+    body = (
+        "steps:\n"
+        "  - respond:\n"
+        "      stop_reason: refusal\n"
+        "      stop_details: {category: cyber, explanation: blocked by policy}\n"
+    )
+
+    resp = await _call(ScriptedProvider(_write(tmp_path, body)), _turn(0))
+
+    assert resp.stop_reason == "refusal"
+    assert resp.content == []
+    assert resp.tool_calls == []
+    assert resp.stop_details == StopDetails(category="cyber", explanation="blocked by policy")
+
+
+async def test_stop_details_may_leave_a_field_out(tmp_path: Path) -> None:
+    body = "steps:\n  - respond: {stop_reason: refusal, stop_details: {explanation: declined}}\n"
+
+    resp = await _call(ScriptedProvider(_write(tmp_path, body)), _turn(0))
+
+    assert resp.stop_details == StopDetails(category=None, explanation="declined")
+
+
+async def test_a_refusal_can_still_list_a_tool_call(tmp_path: Path) -> None:
+    # The loop must run no tool for a refusal, so a test needs a refusal that offers one.
+    body = "steps:\n  - respond: {tool_calls: [{name: x}], stop_reason: refusal}\n"
+
+    resp = await _call(ScriptedProvider(_write(tmp_path, body)), _turn(0))
+
+    assert resp.stop_reason == "refusal"
+    assert [c.name for c in resp.tool_calls] == ["x"]
+
+
+async def test_an_empty_end_turn_can_be_scripted(tmp_path: Path) -> None:
+    # The API sometimes ends a turn with no content, mostly right after a tool result.
+    p = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {stop_reason: end_turn}\n"))
+
+    resp = await _call(p, _turn(0))
+
+    assert (resp.content, resp.tool_calls, resp.stop_reason) == ([], [], "end_turn")
+    assert resp.usage.output_tokens == 0
 
 
 # ---------- get_provider ----------

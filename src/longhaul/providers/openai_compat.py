@@ -17,8 +17,9 @@ Call options. effort is ignored: chat completions has no setting that means the
 same. force_tool becomes a function tool_choice, and it must name one of the
 offered tools, or the call fails with INVALID_REQUEST before any request is sent.
 output_schema becomes a strict json_schema response_format. ToolSpec.strict is not
-sent. Stop reasons are unchanged: a refusal is still reported as "other", with the
-refusal text in the content. raw_stop_reason is the finish_reason the server sent,
+sent. A refusal, or a reply blocked by a content filter, is reported as "refusal" with
+the refusal text in the content and in stop_details, so the loop surfaces it the same
+way for every provider. raw_stop_reason is the finish_reason the server sent,
 and request_id is the x-request-id header when there is one.
 
 The reply cap is sent as max_completion_tokens to OpenAI's own endpoint and as
@@ -61,6 +62,8 @@ from longhaul.contracts import (
     Message,
     ProviderError,
     ProviderErrorKind,
+    StopDetails,
+    StopReason,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -68,8 +71,6 @@ from longhaul.contracts import (
     ToolUseBlock,
     Usage,
 )
-
-_StopReason = Literal["end_turn", "tool_use", "max_tokens", "stop_sequence", "other"]
 
 # Name of the request field that caps the reply. OpenAI's reasoning models reject
 # the deprecated max_tokens; most other servers know only that name.
@@ -80,10 +81,11 @@ _OPENAI_HOST = "api.openai.com"
 _SCHEMA_NAME = "output"
 
 # Keys are the chat completions finish_reason values.
-_STOP_REASONS: dict[str, _StopReason] = {
+_STOP_REASONS: dict[str, StopReason] = {
     "stop": "end_turn",
     "tool_calls": "tool_use",
     "length": "max_tokens",
+    "content_filter": "refusal",
 }
 # Lowercase fragments of the codes, types and messages that servers use when the
 # input does not fit. OpenAI sends the code. llama.cpp sends the type. vLLM,
@@ -338,6 +340,7 @@ def _convert(completion: ChatCompletion, *, model: str, latency_ms: int) -> LLMR
         stop_reason=_stop_reason(
             choice.finish_reason, has_calls=bool(tool_calls), refused=bool(message.refusal)
         ),
+        stop_details=_stop_details(choice.finish_reason, message.refusal),
         # The SDK does not check types, so a server's odd finish_reason is dropped, not raised.
         raw_stop_reason=choice.finish_reason if isinstance(choice.finish_reason, str) else None,
         usage=_usage(completion.usage),
@@ -358,9 +361,17 @@ def _snippet(body: object) -> str:
     return f"{type(body).__name__}: {text[:_SNIPPET_CHARS]}"
 
 
-def _stop_reason(finish_reason: str | None, *, has_calls: bool, refused: bool) -> _StopReason:
+def _stop_details(finish_reason: str | None, refusal: str | None) -> StopDetails | None:
+    if refusal:
+        return StopDetails(explanation=refusal)
+    if finish_reason == "content_filter":
+        return StopDetails(category="content_filter")
+    return None
+
+
+def _stop_reason(finish_reason: str | None, *, has_calls: bool, refused: bool) -> StopReason:
     if refused:
-        return "other"
+        return "refusal"
     mapped = _STOP_REASONS.get(finish_reason or "", "other")
     # Some servers send finish_reason "stop" with tool calls in place, and OpenAI
     # does when tool_choice forces a function. ScriptedProvider reports tool_use

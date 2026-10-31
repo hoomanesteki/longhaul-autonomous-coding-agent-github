@@ -21,6 +21,7 @@ from longhaul.contracts import (
     Message,
     ProviderError,
     ProviderErrorKind,
+    StopDetails,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -903,7 +904,7 @@ async def test_stop_reason_with_tool_calls(finish_reason: str | None, stop_reaso
     [
         pytest.param("stop", "end_turn", id="stop"),
         pytest.param("length", "max_tokens", id="length"),
-        pytest.param("content_filter", "other", id="content_filter"),
+        pytest.param("content_filter", "refusal", id="content_filter"),
         pytest.param(None, "other", id="no-finish-reason"),
     ],
 )
@@ -921,7 +922,8 @@ async def test_refusal_is_surfaced_as_text() -> None:
     resp = await _ask(_provider(_status(200, body)))
 
     assert resp.content == [TextBlock(text="I can't help with that.")]
-    assert resp.stop_reason == "other"
+    assert resp.stop_reason == "refusal"
+    assert resp.stop_details == StopDetails(explanation="I can't help with that.")
     assert resp.tool_calls == []
 
 
@@ -1139,9 +1141,19 @@ async def test_a_refusal_keeps_its_stop_reason_and_the_finish_reason() -> None:
 
     resp = await _ask(_provider(_status(200, body)))
 
-    assert resp.stop_reason == "other"
+    assert resp.stop_reason == "refusal"
     assert resp.raw_stop_reason == "stop"
-    assert resp.stop_details is None
+    assert resp.stop_details == StopDetails(explanation="I can't help with that.")
+
+
+async def test_a_content_filter_stop_is_a_refusal_with_its_category() -> None:
+    body = _completion(content=None, finish_reason="content_filter")
+
+    resp = await _ask(_provider(_status(200, body)))
+
+    assert resp.stop_reason == "refusal"
+    assert resp.raw_stop_reason == "content_filter"
+    assert resp.stop_details == StopDetails(category="content_filter")
 
 
 async def test_request_id_comes_from_the_response_header() -> None:

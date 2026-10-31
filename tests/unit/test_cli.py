@@ -610,9 +610,15 @@ def test_no_arguments_print_the_help_and_name_the_command() -> None:
     assert "run-local" in result.output
 
 
+# Rich styles help text when it detects CI (GITHUB_ACTIONS) or FORCE_COLOR, and the escape
+# codes split option names, so compare the help as plain text.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def test_run_local_help_lists_every_option() -> None:
     result = invoke(["run-local", "--help"])
     assert result.exit_code == 0
+    text = ANSI.sub("", result.output)
     for option in (
         "--path",
         "--issue-file",
@@ -622,7 +628,7 @@ def test_run_local_help_lists_every_option() -> None:
         "--test-command",
         "--max-turns",
     ):
-        assert option in result.output
+        assert option in text
     # Rich wraps the list of choices inside a narrow column, so read them from the enum.
     assert [p.value for p in cli.ProviderName] == ["scripted", "anthropic", "openai"]
 

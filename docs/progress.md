@@ -27,7 +27,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-108 | Tool registry and file tools | 5 | Done | merge | 2026-10-30 |
 | LH-109 | Exec and git tools | 3 | Done | merge | 2026-10-30 |
 | LH-110 | Turn functions and in-process loop | 5 | Done | merge | 2026-10-30 |
-| LH-111 | run-local CLI and first e2e | 3 | In progress | | |
+| LH-111 | run-local CLI and first e2e | 3 | Done | merge | 2026-10-31 |
 | LH-191 | Sandbox write and exec safety | 5 | Done | merge | 2026-10-30 |
 | LH-192 | Tool input and output hardening | 5 | Done | merge | 2026-10-30 |
 | LH-193 | OpenAI-compatible provider mapping fixes | 3 | Done | merge | 2026-10-30 |

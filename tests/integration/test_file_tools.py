@@ -180,16 +180,43 @@ async def test_search_finds_symbol(reg: ToolRegistry, sbx: Sandbox) -> None:
     assert none.ok and "no matches" in none.output
 
 
+# The four names the plan lists. They are written out here and not read from the tool.
+NOISE = (".git", "__pycache__", ".venv", "node_modules")
+
+
+def entries(output: str) -> set[str]:
+    """The names in a listing, without the indent and the slash of a directory."""
+    return {line.strip().rstrip("/") for line in output.splitlines()}
+
+
 async def test_list_dir_ignores_noise(reg: ToolRegistry, sbx: Sandbox) -> None:
-    await sbx.exec(
-        "mkdir -p node_modules/x .git/objects src/calc/__pycache__ && touch node_modules/x/a.js",
-        timeout_s=10,
+    # Noise at the top and further down, with files inside. A __pycache__ below the depth
+    # that is listed would pass whether or not the tool prunes it, so each call looks at
+    # a level that has noise in it.
+    await sh(
+        sbx,
+        "mkdir -p node_modules/x .git/objects .venv/lib/x __pycache__ src/calc/__pycache__ "
+        "&& touch node_modules/x/a.js .git/HEAD .venv/lib/x/site.py __pycache__/top.pyc "
+        "src/calc/__pycache__/m.pyc",
     )
-    r = await call(reg, sbx, "list_dir")
-    assert r.ok, r.output
-    for noise in ("node_modules", ".git", "__pycache__"):
-        assert noise not in r.output
-    assert "calc/" in r.output and "pyproject.toml" in r.output
+    hidden = {*NOISE, "x", "a.js", "objects", "HEAD", "lib", "site.py", "top.pyc", "m.pyc"}
+    for path, depth in ((".", 1), (".", 2), (".", 6), ("src", 3), ("src/calc", 1)):
+        r = await call(reg, sbx, "list_dir", path=path, depth=depth)
+        assert r.ok, r.output
+        assert not entries(r.output) & hidden, (path, depth, r.output)
+    top = await call(reg, sbx, "list_dir")
+    assert {"src", "tests", "pyproject.toml"} <= entries(top.output)
+
+
+async def test_list_dir_depth_and_the_entry_limit(reg: ToolRegistry, sbx: Sandbox) -> None:
+    await sh(sbx, "mkdir -p l1/l2/l3/l4/l5/l6/l7")
+    for depth in range(1, 7):
+        names = entries((await call(reg, sbx, "list_dir", depth=depth)).output)
+        assert f"l{depth}" in names and f"l{depth + 1}" not in names, depth
+    await sh(sbx, "mkdir many && cd many && seq -f 'f%03g.txt' 0 449 | xargs touch")
+    lines = (await call(reg, sbx, "list_dir", path="many")).output.splitlines()
+    assert len(lines) == 401
+    assert lines[-1] == "... 50 more entries not shown"
 
 
 def hits(output: str) -> list[tuple[str, int]]:

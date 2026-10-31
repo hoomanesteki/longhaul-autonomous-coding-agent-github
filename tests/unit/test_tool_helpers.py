@@ -197,9 +197,19 @@ def test_plan_edit_uses_the_line_endings_of_the_file() -> None:
 
 def test_render_tree_caps() -> None:
     paths = [f"d/f{i}" for i in range(500)]
-    out = render_tree(paths)
-    assert "more entries" in out
-    assert len(out.splitlines()) <= 402
+    lines = render_tree(paths).splitlines()
+    # 400 entries and the marker. A limit of 399 or 401 changes this count.
+    assert len(lines) == 401
+    assert lines[399] == "  f399"
+    assert lines[-1] == "... 100 more entries not shown"
+
+
+def test_render_tree_does_not_cut_at_the_limit() -> None:
+    paths = [f"f{i:03d}" for i in range(401)]
+    exactly = render_tree(paths[:400]).splitlines()
+    assert len(exactly) == 400 and exactly[-1] == "f399"
+    assert render_tree(paths).splitlines()[-1] == "... 1 more entries not shown"
+    assert render_tree([]) == "(empty)"
 
 
 def test_parse_rg_json() -> None:

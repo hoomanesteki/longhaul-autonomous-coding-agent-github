@@ -187,6 +187,22 @@ async def test_git_diff_after_edit(reg: ToolRegistry, box: Sandbox) -> None:
     assert "+    return a + b" in staged.output
 
 
+async def test_git_add_all_skips_what_a_test_run_leaves(reg: ToolRegistry, box: Sandbox) -> None:
+    # The checkpoint store runs `git add -A` after a step that changed files. The venv, the
+    # egg-info directory, bytecode and pytest's cache would otherwise end up in its commit,
+    # and their bytes differ between two runs of the same task.
+    await call(reg, box, "run_tests")
+    # The debris has to be there, or the check below would pass for nothing.
+    left = await box.exec("ls -d .venv .pytest_cache src/*.egg-info", timeout_s=30)
+    assert left.exit_code == 0, left.stderr
+    added = await box.exec("git add -A && git ls-files", timeout_s=60)
+    assert added.exit_code == 0, added.stderr
+    tracked = added.stdout.split()
+    debris = {"__pycache__", ".pytest_cache", ".venv"}
+    assert [p for p in tracked if debris & set(p.split("/")) or ".egg-info" in p] == []
+    assert {MODULE, "pyproject.toml", ".gitignore"} <= set(tracked)
+
+
 async def test_git_diff_shows_a_new_file(reg: ToolRegistry, box: Sandbox) -> None:
     made = await call(reg, box, "write_file", path="src/calc/extra.py", content="LIMIT = 10\n")
     assert made.ok, made.output

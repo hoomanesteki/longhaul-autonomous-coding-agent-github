@@ -29,4 +29,4 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - Comments explain why, not what.
 
 ## When unsure
-Stop and leave a short note in the PR description under "Questions". Do not guess at shared contracts.
+Leave a short note in the PR description under "Questions" instead of changing a shared contract on a guess.

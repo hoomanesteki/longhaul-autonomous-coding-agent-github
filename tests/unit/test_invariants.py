@@ -430,7 +430,9 @@ def test_workflow_modules_lists_the_package_and_its_workflows(tmp_path: Path) ->
 # call them. That module adds the idempotency key and the search for an earlier attempt. A
 # write from anywhere else would be posted twice when a retry follows a reply that never
 # arrived, so a scan of the source is the guard. The scan also looks at the client's own file:
-# nothing in it may call a write method either.
+# nothing in it may call a write method either. It names the three write methods and does not
+# follow a call down to the helper under them (`_write`). Nothing outside client.py uses that
+# helper, and the same name belongs to an unrelated method of the Docker sandbox manager.
 
 phase3 = pytest.mark.phase3
 

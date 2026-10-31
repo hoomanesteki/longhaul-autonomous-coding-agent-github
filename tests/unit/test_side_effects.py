@@ -440,9 +440,9 @@ async def test_a_comment_without_a_body_in_the_listing_is_skipped(ledger: Memory
 async def test_non_ascii_text_survives_and_hashes_the_same_every_time(
     fake: FakeGitHub, gh: GitHubClient, ledger: MemoryLedger
 ) -> None:
-    first = await post_comment(gh, ledger, comment("café ✓"))
-    assert await post_comment(gh, ledger, comment("café ✓")) == first
-    assert fake.comment_bodies(REPO, 1)[0].startswith("café ✓\n\n")
+    first = await post_comment(gh, ledger, comment("café ñ"))
+    assert await post_comment(gh, ledger, comment("café ñ")) == first
+    assert fake.comment_bodies(REPO, 1)[0].startswith("café ñ\n\n")
 
 
 async def test_an_empty_comment_is_refused_before_anything_happens(

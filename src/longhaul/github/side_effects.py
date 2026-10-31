@@ -24,6 +24,8 @@ worker dies or the attempt is cancelled.
 
 A key names one effect. Its row keeps a hash of the payload, and a second use of the key with
 other text raises KeyReuseError instead of returning the first effect's answer without a word.
+So a retry must send the same request: an activity that renders a body from a template has to
+render the same text on every attempt, with no clock reading in it.
 
 The plain async functions (`post_comment`, `add_label`, `remove_label`, `create_pr`) are for
 code that already runs in an activity, such as the poller and `deliver`. `SideEffectActivities`

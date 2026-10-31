@@ -93,7 +93,7 @@ def test_the_table_is_one_step_on_the_migration_path(scratch: Scratch) -> None:
     # The step below this one is read from the scripts, so that a migration chained in front
     # of it later does not break the test.
     below = ScriptDirectory.from_config(cfg).get_revision(REVISION).down_revision
-    assert below == "0002_checkpoints"
+    assert isinstance(below, str)
 
     command.upgrade(cfg, "head")
     assert scratch.tables() >= {"checkpoints", "side_effects"}

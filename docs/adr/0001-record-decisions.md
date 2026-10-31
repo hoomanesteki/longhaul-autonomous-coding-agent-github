@@ -5,7 +5,7 @@
 
 ## Context
 
-Choices in this project have effects that last longer than the code around them. Six months from now, the code will say what we did but not why. A later reader, human or agent, needs the reasoning to change a decision safely.
+Choices in this project have effects that last longer than the code around them. Six months from now, the code will say what we did but not why. A later reader needs the reasoning to change a decision safely.
 
 ## Decision
 

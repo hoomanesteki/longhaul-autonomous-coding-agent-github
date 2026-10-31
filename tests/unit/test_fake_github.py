@@ -22,6 +22,7 @@ from tests.fakes.fake_github import FakeGitHub, ManualClock, git, serve_in_threa
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
+ROOT = Path(__file__).resolve().parents[2]
 REPO = "acme/calc"
 T0 = datetime(2026, 3, 1, 12, 0, 0, tzinfo=UTC)
 TIMESTAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
@@ -1052,3 +1053,12 @@ def test_main_runs_on_8099_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     assert (calls[0]["host"], calls[0]["port"]) == ("127.0.0.1", 8099)
     assert fake_github.main(["--host", "0.0.0.0", "--port", "9000"]) == 0
     assert (calls[1]["host"], calls[1]["port"]) == ("0.0.0.0", 9000)
+
+
+def test_the_make_target_runs_it_on_port_8099() -> None:
+    makefile = (ROOT / "Makefile").read_text()
+    phony = " ".join(re.findall(r"^\.PHONY:(.*)$", makefile, flags=re.MULTILINE))
+    assert "fake-github" in phony.split()
+    recipe = re.search(r"^fake-github:\n((?:\t.*\n?)+)", makefile, flags=re.MULTILINE)
+    assert recipe and "tests/fakes/fake_github.py" in recipe.group(1)
+    assert "--port 8099" in recipe.group(1)

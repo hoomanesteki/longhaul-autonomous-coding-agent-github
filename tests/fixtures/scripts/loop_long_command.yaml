@@ -1,0 +1,12 @@
+# A command longer than the short summary the loop prints for a call.
+steps:
+  - match: {turn_index: 0}
+    respond:
+      tool_calls:
+        - name: run_command
+          input:
+            command: "echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  - match: {turn_index: 1}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Ran a long command."}}

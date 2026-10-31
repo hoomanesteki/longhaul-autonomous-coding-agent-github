@@ -1,0 +1,13 @@
+# An empty end_turn right after a tool result, which the API can return when it thinks the
+# result speaks for itself. The nudge then goes after the tool_result in the same user message.
+steps:
+  - match: {user_text_contains: "Use tools or call finish."}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Finished after an empty reply."}}
+  - match: {turn_index: 0}
+    respond:
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - match: {turn_index: 1}
+    respond: {stop_reason: end_turn}

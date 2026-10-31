@@ -290,9 +290,9 @@ def test_get_provider_scripted_and_unimplemented() -> None:
     assert scripted.name == "scripted"
     with pytest.raises(ValueError, match="script_path"):
         get_provider(EnvSettings(provider="scripted", _env_file=None))
-    for kind, story in (("anthropic", "LH-104"), ("replay", "LH-209")):
-        with pytest.raises(NotImplementedError, match=story):
-            get_provider(EnvSettings(provider=kind))  # type: ignore[arg-type]
+    # anthropic left this list with LH-104. Its factory tests are in test_anthropic_provider.py.
+    with pytest.raises(NotImplementedError, match="LH-209"):
+        get_provider(EnvSettings(provider="replay"))
 
 
 def test_get_provider_reads_the_script_from_settings(

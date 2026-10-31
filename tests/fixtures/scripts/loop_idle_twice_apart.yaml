@@ -1,0 +1,13 @@
+# Two turns without a tool call, but not in a row: a tool call comes between them. Each one
+# gets its own nudge, and the run goes on. The steps have no match, so they run by turn (0 to 3).
+steps:
+  - respond:
+      text: "Let me think about it."
+  - respond:
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - respond:
+      text: "Still thinking."
+  - respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Finished after two separate nudges."}}

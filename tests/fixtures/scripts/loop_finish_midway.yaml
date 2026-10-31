@@ -1,0 +1,9 @@
+# One reply with three calls, and finish in the middle. The call before it runs, finish
+# ends the task, and the call after it gets a "not run" result.
+steps:
+  - match: {role: coder}
+    respond:
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+        - {name: finish, input: {summary: "Nothing needed changing."}}
+        - {name: run_tests, input: {}}

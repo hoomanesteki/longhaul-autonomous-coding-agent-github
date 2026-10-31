@@ -1,0 +1,10 @@
+# A text-only reply on the first turn, then a finish once the loop has sent its nudge.
+# The nudge step comes first because the first step that matches wins.
+steps:
+  - match: {user_text_contains: "Use tools or call finish."}
+    respond:
+      tool_calls:
+        - {name: finish, input: {summary: "Nothing needed changing."}}
+  - match: {turn_index: 0}
+    respond:
+      text: "The code looks fine to me."

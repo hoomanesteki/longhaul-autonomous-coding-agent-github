@@ -77,7 +77,7 @@ If another project already uses a port, copy `.env.example` to `.env` and change
 
 ## Development
 
-One story per branch (`feat/lh-<id>-<slug>`), merged into `dev`. `main` only moves when a phase gate passes, and each gate is tagged. Working rules for contributors and coding agents are in [CLAUDE.md](CLAUDE.md). CI details are in [docs/runbook.md](docs/runbook.md).
+One story per branch (`feat/lh-<id>-<slug>`), merged into `dev`. `main` only moves when a phase gate passes, and each gate is tagged. Contribution rules are in [CONTRIBUTING.md](CONTRIBUTING.md). CI details are in [docs/runbook.md](docs/runbook.md).
 
 ## License
 

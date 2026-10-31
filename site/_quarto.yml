@@ -2,7 +2,7 @@ project:
   type: website
   output-dir: _site
   # Listed on purpose. Without a list Quarto finds no pages when the checkout sits under a dot
-  # folder such as .claude/worktrees, and it renders nothing without saying so.
+  # folder such as .worktrees, and it renders nothing without saying so.
   render:
     - "*.qmd"
     - "adr/*.qmd"

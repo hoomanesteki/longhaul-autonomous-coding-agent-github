@@ -17,7 +17,7 @@ The numbers show why this matters:
 
 ## Decision
 
-**Pass references, not data.** Transcripts, tool arguments and outputs, diffs and bundles are written to the blob store. Workflows and activities pass a `BlobRef` (key, sha256, size) and small summaries. Anything bigger than 16 KB that crosses an activity boundary becomes a `BlobRef` (rule 5 in `CLAUDE.md`).
+**Pass references, not data.** Transcripts, tool arguments and outputs, diffs and bundles are written to the blob store. Workflows and activities pass a `BlobRef` (key, sha256, size) and small summaries. Anything bigger than 16 KB that crosses an activity boundary becomes a `BlobRef` (rule 5 in `CONTRIBUTING.md`).
 
 **Cap every payload at 256 KB.** No activity input or output may serialize to more than 256,000 bytes of JSON (invariant I2). That is about eight times below the server's payload limit, which leaves room for summaries to grow. `assert_small` in `longhaul.durable.payload_guard` measures the JSON size of a pydantic model or plain value and raises `PayloadTooLargeError` with the size and the limit. Activity wrappers call it on inputs and outputs, so a mistake fails in the activity that made it, with a message that says what to do.
 

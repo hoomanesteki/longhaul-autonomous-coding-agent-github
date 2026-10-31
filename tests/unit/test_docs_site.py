@@ -79,7 +79,7 @@ def test_quarto_runs_the_script_and_renders_the_pages_it_writes() -> None:
     # Quarto runs the script from site/, so the path is relative to that folder.
     assert (SITE / command[1]).resolve() == ROOT / "scripts" / "site_pages.py"
     # Quarto finds no pages by itself when a checkout sits under a dot folder such as
-    # .claude/worktrees, and it renders none without saying so. The list avoids that.
+    # .worktrees, and it renders none without saying so. The list avoids that.
     assert project["render"] == ["*.qmd", "adr/*.qmd"]
 
 

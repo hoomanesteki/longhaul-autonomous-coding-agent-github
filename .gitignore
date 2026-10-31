@@ -223,9 +223,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Claude Code local worktrees
-.claude/worktrees/
-.claude/settings.local.json
 
 # Output of throwaway spikes (error bodies, usage samples, raw responses)
 spikes/out/

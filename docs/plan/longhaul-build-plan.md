@@ -18,10 +18,10 @@ This file is the single source of truth for the build. Copy it into the repo as 
 | Reader | What to read | What to do |
 |---|---|---|
 | Hooman (product owner) | Sections 1, 2, 8, 10, 11 and every "Defend it" block | Approve scope, review each phase gate report, merge `dev` into `main`, run the paid eval runs, record the demo. |
-| Executor model (Sonnet or Haiku in Claude Code) | Section 3 (contracts), Section 5 (operating model), then one story at a time from Section 7 | Implement exactly one story per branch, tests first, open a PR into `dev`, merge when CI is green. Do not start a story whose dependencies are not merged. |
-| Gatekeeper model (Opus) | Sections 3, 4, 5 and the phase being closed | Run `make gate PHASE=N`, check every acceptance criterion and invariant, write `docs/gates/phase-N.md`, open fix stories when something fails, then open the `dev` to `main` PR. |
+| Developer | Section 3 (contracts), Section 5 (operating model), then one story at a time from Section 7 | Implement exactly one story per branch, tests first, open a PR into `dev`, merge when CI is green. Do not start a story whose dependencies are not merged. |
+| Reviewer | Sections 3, 4, 5 and the phase being closed | Run `make gate PHASE=N`, check every acceptance criterion and invariant, write `docs/gates/phase-N.md`, open fix stories when something fails, then open the `dev` to `main` PR. |
 
-Rules of thumb for the executor:
+Rules of thumb for the developer:
 
 - One story, one branch, one PR. Never mix stories.
 - If a story says "Spike", the output is a short ADR plus a throwaway script, not production code.
@@ -323,7 +323,7 @@ Migrations use Alembic. Each story that adds a table adds exactly one migration.
 
 ### 3.6 Contracts (code every story builds against)
 
-File: `src/longhaul/contracts.py`. This module has no I/O and imports only pydantic, enum and typing. Changing it requires a note in the PR and a gatekeeper check.
+File: `src/longhaul/contracts.py`. This module has no I/O and imports only pydantic, enum and typing. Changing it requires a note in the PR and a reviewer check.
 
 ```python
 from __future__ import annotations
@@ -699,7 +699,7 @@ pricing_file: config/pricing.yaml   # fill from the provider's pricing page; nev
 
 ```
 longhaul-background-agent/
-  CLAUDE.md
+  CONTRIBUTING.md
   README.md
   Makefile
   pyproject.toml / uv.lock
@@ -835,8 +835,8 @@ longhaul-background-agent/
 | Role | Who | Responsibilities |
 |---|---|---|
 | Product owner | Hooman | Owns scope and priorities. Reviews gate reports, merges `dev` into `main`, tags releases, runs paid evals, keeps `.env` secrets. |
-| Executor | Claude Sonnet (5 to 8 point stories), Claude Haiku (1 to 3 point stories) in Claude Code | Implements one story at a time from this plan, tests first. |
-| Gatekeeper | Claude Opus in Claude Code | Runs phase gates, reviews the cumulative diff against acceptance criteria and invariants, writes gate reports, files fix stories. It also handles stories marked "Gatekeeper review" (shared contracts, workflow determinism). |
+| Developer | Contributor | Implements one story at a time from this plan, tests first. |
+| Reviewer | Maintainer | Runs phase gates, reviews the cumulative diff against acceptance criteria and invariants, writes gate reports, files fix stories. Also signs off stories marked "Reviewer sign-off" (shared contracts, workflow determinism). |
 
 ### 5.2 Branching and releases
 
@@ -858,7 +858,7 @@ feat/lh-101  ●     ●  feat/lh-102 ...                   (one story each, squ
 - Hotfix on `main`: branch `fix/` from `main`, PR to `main`, then merge `main` back into `dev` the same day.
 - GitHub settings (Phase 0 story LH-003): require PRs on `main` and `dev`, require the `ci` status check, and disallow force pushes.
 
-### 5.3 Story workflow (executor), exact steps
+### 5.3 Story workflow, exact steps
 
 ```bash
 # 0. pick the next story whose "Depends on" are all merged (see docs/progress.md)
@@ -892,7 +892,7 @@ If a story can't be finished:
 - Open the PR as draft with a short "Blocked:" note.
 - Move on to a story that does not depend on it.
 
-### 5.4 Phase gate protocol (gatekeeper)
+### 5.4 Phase gate protocol
 
 ```bash
 git switch dev && git pull --ff-only
@@ -902,7 +902,7 @@ git log --oneline v0.2.0..dev
 git diff --stat v0.2.0..dev
 ```
 
-Gatekeeper checklist:
+Reviewer checklist:
 
 1. Every story in the phase is merged and its acceptance criteria hold. Check each criterion against a test or a manual command.
 2. `make gate PHASE=N` is green. Paste the summary.
@@ -916,7 +916,7 @@ Write `docs/gates/phase-N.md` with these sections: Result (pass/fail), Test summ
 
 On fail:
 - Create fix stories `LH-N91`, `LH-N92` and so on, in the same story-block format, and append them to the phase in `docs/plan/longhaul-build-plan.md`.
-- Run them through the executor.
+- Work through them like any other story.
 - Re-run the gate.
 
 On pass:
@@ -979,10 +979,10 @@ Test doubles:
 
 Pytest markers: `unit`, `integration`, `e2e`, `chaos`, `chaos_lite`, `phase0` ... `phase9`. Each test carries the marker of the phase that introduced it. `make gate PHASE=N` runs `-m "phase0 or ... or phaseN"`.
 
-### 5.8 `CLAUDE.md` (put this in the repo root in Phase 0)
+### 5.8 `CONTRIBUTING.md` (put this in the repo root in Phase 0)
 
 ````markdown
-# Longhaul: notes for coding agents
+# Contributing to Longhaul
 
 ## What this is
 Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Progress: docs/progress.md.
@@ -999,7 +999,7 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge.
 2. Write the story's listed tests first. Make them fail. Then implement.
 3. Do not edit src/longhaul/contracts.py unless the story says so. If you must, explain why in the PR.
-4. Workflow code (src/longhaul/durable/workflows/) must stay deterministic: no I/O, no datetime.now(), no random, no imports of httpx/docker/sqlalchemy/boto3/anthropic/openai/subprocess. Use workflow.now() and activities.
+4. Workflow code (src/longhaul/durable/workflows/) must stay deterministic: no I/O, no datetime.now(), no random, no imports of httpx/httpx2/httpcore2/docker/sqlalchemy/boto3/anthropic/openai/subprocess. Use workflow.now() and activities.
 5. Anything bigger than 16 KB crossing an activity boundary goes to the blob store as a BlobRef.
 6. All GitHub writes go through src/longhaul/github/side_effects.py with an idempotency key.
 7. Never put secrets into the sandbox environment. Never push to a default branch.
@@ -1011,54 +1011,37 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - Plain English in docs, comments, commits and PRs. No hype words. No emoji.
 - Commit messages: conventional commits, lowercase, imperative, under 72 chars. Body only when the why is not obvious.
 - Comments explain why, not what.
-- No AI attribution trailers in commits or PRs.
 
 ## When unsure
 Stop and leave a short note in the PR description under "Questions". Do not guess at shared contracts.
 ````
 
-### 5.9 Prompt templates
+### 5.9 Checklists
 
-**Executor: implement a story**
+**Story checklist**
 
-```
-You are implementing story {LH-ID} in the longhaul-background-agent repo.
+1. Read `CONTRIBUTING.md`, sections 3.6 to 3.8 (contracts, activities, config), the story block in section 7, and any listed files that already exist.
+2. Create the story branch from an up-to-date `dev`.
+3. Write the tests listed under "Tests" first and confirm they fail.
+4. Implement until every listed test passes and every acceptance criterion holds.
+5. Run `make check`, and `make itest` when the story has integration tests.
+6. Update `docs/progress.md` (status Done, PR link) and any ADR the story asks for.
+7. Commit in small steps with conventional-commit messages.
+8. Push, open a PR into `dev` with what changed, why, how it was tested and "Closes #<issue>", and squash-merge when CI is green.
+9. Stay inside the story's files. If a dependency is missing or a contract is wrong, stop and write it under "Questions" in the PR.
 
-Read, in order:
-1. CLAUDE.md
-2. docs/plan/longhaul-build-plan.md, section 3.6 to 3.8 (contracts, activities, config)
-3. The story block for {LH-ID} in section 7 of the same file
-4. Any files listed under "Files" that already exist
+**Gate checklist**
 
-Then:
-- Create branch {branch} from an up-to-date dev.
-- Write the tests listed under "Tests" first and confirm they fail.
-- Implement until all listed tests pass and every acceptance criterion is met.
-- Run make check, and make itest if the story has integration tests.
-- Update docs/progress.md (status Done, PR link) and any ADR the story asks for.
-- Commit in small steps with natural conventional-commit messages. No attribution trailers.
-- Push, open a PR into dev with: what changed, why, how you tested it, "Closes #<issue>".
-- Wait for CI. If it is red, fix it. Merge with squash when green.
+1. Read `CONTRIBUTING.md`, section 4 (failure model, invariants), section 5.4 (gate protocol) and the section of the phase being closed.
+2. `git switch dev && git pull`, then `make up` and `make gate PHASE=N`.
+3. Check every acceptance criterion of every story in the phase against a test or a command, and record pass or fail with the evidence.
+4. Check invariants I1 to I9 and run the phase's integration checkpoint smoke script exactly as written.
+5. Review `git diff v<previous tag>..dev` for shared contract changes, determinism problems in workflows, secrets, dead code, missing tests and the style rules in `CONTRIBUTING.md`.
+6. Write `docs/gates/phase-N.md` (Result, Test summary, AC table, Invariants, Smoke output, Issues, Fix stories).
+7. If anything fails, add fix stories LH-N91, LH-N92 and so on in the standard story format, commit them with the report on a `chore/` branch, open a PR into `dev`, and stop.
+8. If everything passes, open the `dev` to `main` PR titled "Phase N gate: <phase name>" with the report as the body, merge it with a merge commit, then tag the release and push the tag.
 
-Do not touch files unrelated to this story. If a dependency is missing or a contract is wrong, stop and write it under "Questions" in the PR.
-Report at the end: tests added, files changed, anything you were unsure about.
-```
-
-**Gatekeeper: run phase gate N**
-
-```
-You are the gatekeeper for Phase {N} of longhaul-background-agent.
-
-1. Read CLAUDE.md, section 4 (failure model, invariants), section 5.4 (gate protocol) and the Phase {N} section of docs/plan/longhaul-build-plan.md.
-2. git switch dev && git pull. Run make up, then make gate PHASE={N}.
-3. For every story in Phase {N}: check each acceptance criterion against a test or a command you run. Mark pass or fail with evidence.
-4. Check invariants I1 to I9. Run the "Integration checkpoint {N}" smoke script exactly as written.
-5. Review git diff v{previous tag}..dev for: shared contract changes, determinism problems in workflows, secrets, dead code, missing tests, style rules in CLAUDE.md.
-6. Write docs/gates/phase-{N}.md (Result, Test summary, AC table, Invariants, Smoke output, Issues, Fix stories).
-7. If anything fails: add fix stories LH-{N}91, LH-{N}92 ... to the plan in the standard story format, commit the report and stories to a chore/ branch, PR into dev, and stop.
-8. If everything passes: open a PR dev -> main titled "Phase {N} gate: {phase name}" with the report as the body, merge with a merge commit, tag {tag} and push the tag.
 Be strict. A gate that passes broken work costs more later than a gate that fails today.
-```
 
 ### 5.10 Voice and style guide (README, docs, comments, commits, PRs)
 
@@ -1082,7 +1065,6 @@ The repo should read like one careful engineer wrote it.
   - game-changer, unlock, empower, elevate, harness the power, supercharge, in today's fast-paced, it's worth noting
   - furthermore, moreover, plethora, a testament to, navigate the complexities, best-in-class
   - em dashes, emoji
-- **Attribution:** turn off Claude Code's commit and PR co-author/attribution trailers in the project's `.claude/settings.json`. The key has changed between versions, so check the current Claude Code settings docs for the attribution or co-authored-by option before Phase 0 and record it in `docs/runbook.md`.
 - **Ownership:** Hooman reads every phase gate report and every "Defend it" block. If he can't explain a decision in an interview, it isn't done.
 
 ### 5.11 Progress tracking
@@ -1172,7 +1154,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 | LH-001 | Repo scaffold and tooling | 3 | E0 |
 | LH-002 | Local stack with docker compose | 3 | E0 |
 | LH-003 | CI pipeline and branch protection | 3 | E0 |
-| LH-004 | CLAUDE.md, ADRs and contribution docs | 3 | E0 |
+| LH-004 | CONTRIBUTING.md, ADRs and contribution docs | 3 | E0 |
 | LH-005 | Settings and config loading | 2 | E0 |
 | LH-006 | Backlog import into GitHub issues | 3 | E0 |
 | LH-007 | Toy repo fixtures | 2 | E0 |
@@ -1180,7 +1162,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 
 #### LH-001 · Repo scaffold and tooling
 - **Epic:** E0 · **Points:** 3 · **Branch:** bootstrap commit on `main`, then create `dev` from `main` · **Depends on:** none
-- **Story:** As the executor, I want a working Python project skeleton, so that every later story uses the same commands and layout.
+- **Story:** As a developer, I want a working Python project skeleton, so that every later story uses the same commands and layout.
 - **Build:**
   - `uv init --package longhaul`. Python 3.12. Use the `src/longhaul/` layout from section 3.9 with empty `__init__.py` files for each package.
   - Dev dependencies: pytest, pytest-asyncio, pytest-cov, ruff, mypy, pre-commit.
@@ -1235,22 +1217,21 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 - **Tests:** `tests/unit/test_ci_config.py::test_no_secrets_in_ci`, `::test_ci_has_required_jobs` (parse YAML)
 - **Files:** `.github/workflows/ci.yml`, `scripts/protect_branches.sh`, `tests/unit/test_ci_config.py`
 
-#### LH-004 · CLAUDE.md, ADRs and contribution docs
-- **Epic:** E0 · **Points:** 3 · **Branch:** `feat/lh-004-agent-docs` · **Depends on:** LH-001
-- **Story:** As the executor and gatekeeper, I want the working rules in the repo, so that every session follows the same process.
+#### LH-004 · CONTRIBUTING.md, ADRs and contribution docs
+- **Epic:** E0 · **Points:** 3 · **Branch:** `feat/lh-004-contribution-docs` · **Depends on:** LH-001
+- **Story:** As a contributor or reviewer, I want the working rules in the repo, so that every change follows the same process.
 - **Build:**
   - Copy this plan to `docs/plan/longhaul-build-plan.md`.
-  - `CLAUDE.md` exactly as in section 5.8.
+  - `CONTRIBUTING.md` exactly as in section 5.8.
   - `docs/adr/0000-template.md`, `0001-record-decisions.md` and `0002-pin-dependencies.md`. ADR-0002 lists the pinned versions from `uv.lock` for temporalio, anthropic, docker, fastapi, sqlalchemy, alembic, pgvector, opentelemetry-sdk and boto3.
   - `.github/pull_request_template.md` with What / Why / How I tested it / Closes #.
   - `docs/style.md` with the voice guide from section 5.10.
-  - `.claude/settings.json` with commit/PR attribution turned off. Check the Claude Code settings docs for the current key and write the key name in `docs/runbook.md`.
   - `docs/progress.md` with every phase table pre-filled as Todo.
 - **Acceptance criteria:**
   - [ ] Every file above exists. `docs/progress.md` lists 80 stories.
   - [ ] A scan of `docs/` and `README.md` finds no banned phrases and no em or en dashes. `docs/style.md` and `docs/plan/` are excluded from the banned-phrase check only, because they list the phrases.
 - **Tests:** `tests/unit/test_docs_style.py::test_no_banned_phrases`, `::test_no_long_dashes`, `tests/unit/test_progress.py::test_progress_lists_all_stories` (parses the plan headings and compares them with the progress rows)
-- **Files:** `CLAUDE.md`, `docs/plan/longhaul-build-plan.md`, `docs/adr/*`, `docs/style.md`, `docs/progress.md`, `docs/runbook.md`, `.github/pull_request_template.md`, `.claude/settings.json`, tests
+- **Files:** `CONTRIBUTING.md`, `docs/plan/longhaul-build-plan.md`, `docs/adr/*`, `docs/style.md`, `docs/progress.md`, `docs/runbook.md`, `.github/pull_request_template.md`, tests
 
 #### LH-005 · Settings and config loading
 - **Epic:** E0 · **Points:** 2 · **Branch:** `feat/lh-005-settings` · **Depends on:** LH-001
@@ -1363,7 +1344,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 | LH-111 | run-local CLI and first e2e | 3 | E2 |
 
 #### LH-101 · Shared contracts module
-- **Epic:** E2 · **Points:** 3 · **Branch:** `feat/lh-101-contracts` · **Depends on:** LH-005 · **Gatekeeper review**
+- **Epic:** E2 · **Points:** 3 · **Branch:** `feat/lh-101-contracts` · **Depends on:** LH-005 · **Reviewer sign-off**
 - **Story:** As every later story, I want one module of shared types, so that pieces built by different sessions fit together.
 - **Build:**
   - Create `src/longhaul/contracts.py` exactly as in section 3.6. Move `RepoSettings` and `Budgets` out of `settings.py` if LH-005 put them there.
@@ -1378,7 +1359,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 
 #### LH-102 · Spike: Messages API tool use, caching and token counting
 - **Epic:** E1 · **Points:** 2 · **Branch:** `spike/lh-102-messages-api` · **Depends on:** LH-101
-- **Story:** As the executor of LH-104, I want verified facts about the current Anthropic SDK, so that the provider is built on what the API does today.
+- **Story:** As the developer of LH-104, I want verified facts about the current Anthropic SDK, so that the provider is built on what the API does today.
 - **Build:** this is a timeboxed throwaway script (2 hours max), `spikes/messages_api.py`, run by Hooman with a real key. Verify and record in `docs/adr/0003-own-agent-loop.md` (appendix "API facts"):
   1. Tool definitions and `tool_use` / `tool_result` block shapes.
   2. Which error classes and status codes map to rate limit (429), overloaded (529) and context too long. Write down the exact exception class names.
@@ -1389,7 +1370,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 - **Acceptance criteria:**
   - [ ] The ADR-0003 appendix lists all five facts with the SDK version.
   - [ ] The script is under `spikes/` and is excluded from mypy and the package.
-- **Tests:** none (spike). A gatekeeper reads the ADR.
+- **Tests:** none (spike). A reviewer reads the ADR.
 - **Files:** `spikes/messages_api.py`, `docs/adr/0003-own-agent-loop.md`
 
 #### LH-103 · Provider protocol and ScriptedProvider
@@ -1571,7 +1552,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 
 ### Phase 1 fix stories (from the pre-gate review)
 
-The gatekeeper ran an adversarial review of everything merged during Phase 0 and Phase 1 before the Phase 1 gate. Each finding below was reproduced with a failing test before it was fixed. Findings that did not reproduce are recorded in the gate report.
+The reviewer ran an adversarial review of everything merged during Phase 0 and Phase 1 before the Phase 1 gate. Each finding below was reproduced with a failing test before it was fixed. Findings that did not reproduce are recorded in the gate report.
 
 #### LH-191 · Sandbox write and exec safety
 - **Epic:** E3 · **Points:** 5 · **Branch:** `fix/lh-191-sandbox-safety` · **Depends on:** LH-107, LH-108
@@ -1636,7 +1617,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 
 #### LH-195 · CI, gate and test collection integrity
 - **Epic:** E0 · **Points:** 3 · **Branch:** `fix/lh-195-ci-gate-integrity` · **Depends on:** LH-001, LH-003
-- **Story:** As the gatekeeper, I want every test to run where it should and every gate to fail loudly, so that green means what it says.
+- **Story:** As the reviewer, I want every test to run where it should and every gate to fail loudly, so that green means what it says.
 - **Build:**
   - Test files with the same name in different layers collect; a collection hook requires a phase marker on every test and derives the layer marker from the directory.
   - `make gate` fails when the marker script fails and excludes opt-in layers; the mypy strict override applies only to the strict modules.
@@ -1672,7 +1653,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 - **Files:** `src/longhaul/providers/scripted.py`, `src/longhaul/providers/base.py`, `tests/fixtures/scripts/*`, tests
 
 #### LH-198 · Contracts v2 from the API research
-- **Epic:** E2 · **Points:** 5 · **Branch:** `feat/lh-198-contracts-v2` · **Depends on:** LH-102, LH-101 · **Gatekeeper review**
+- **Epic:** E2 · **Points:** 5 · **Branch:** `feat/lh-198-contracts-v2` · **Depends on:** LH-102, LH-101 · **Reviewer sign-off**
 - **Story:** As every provider and the loop, I want the shared contracts to carry what the current Messages API returns and accepts, so that refusals, effort, forced output and billed failures are handled without guessing.
 - **Build:**
   - `LLMResponse.stop_reason` adds `refusal`, `pause_turn` and `model_context_window_exceeded`, plus `raw_stop_reason`, `stop_details`, `request_id` and `dropped_thinking_blocks`.
@@ -1740,7 +1721,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 
 #### LH-201 · Spike: Temporal Python SDK patterns
 - **Epic:** E4 · **Points:** 2 · **Branch:** `spike/lh-201-temporal-patterns` · **Depends on:** LH-002
-- **Story:** As the executor of Phase 2, I want the exact SDK patterns verified, so that the workflow code is right the first time.
+- **Story:** As the developer of Phase 2, I want the exact SDK patterns verified, so that the workflow code is right the first time.
 - **Build:** a timeboxed (2 h) throwaway workflow in `spikes/temporal_patterns.py`. Verify and record in `docs/adr/0004-temporal.md` (appendix "SDK facts"):
   1. Workflow sandbox import rules and `workflow.unsafe.imports_passed_through()` for pydantic models.
   2. The pydantic data converter (`temporalio.contrib.pydantic`), if available in the pinned version. Otherwise write a custom converter.
@@ -1774,7 +1755,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 - **Files:** `src/longhaul/blobs/s3.py`, `src/longhaul/durable/payload_guard.py`, `docs/adr/0005-payloads-by-reference.md`, tests
 
 #### LH-203 · Task workflow skeleton
-- **Epic:** E4 · **Points:** 5 · **Branch:** `feat/lh-203-task-workflow-skeleton` · **Depends on:** LH-201, LH-202 · **Gatekeeper review**
+- **Epic:** E4 · **Points:** 5 · **Branch:** `feat/lh-203-task-workflow-skeleton` · **Depends on:** LH-201, LH-202 · **Reviewer sign-off**
 - **Story:** As the system, I want a TaskWorkflow with state, signals and a status query, so that each task has one durable owner.
 - **Build:**
   - `src/longhaul/durable/workflows/task.py`:
@@ -1928,7 +1909,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
   - `scripts/chaos_kill.sh` for the manual demo.
 - **Acceptance criteria:**
   - [ ] `pytest -m chaos_lite` passes 5/5 locally and in CI.
-  - [ ] The test fails if `restore(pre_sha)` is removed from `tool_exec` (mutation check: the gatekeeper temporarily comments it out and confirms the failure, then restores it).
+  - [ ] The test fails if `restore(pre_sha)` is removed from `tool_exec` (mutation check: the reviewer temporarily comments it out and confirms the failure, then restores it).
   - [ ] Kills during `llm_turn`, during `tool_exec` and between activities are each hit at least once across the seeds (the test logs the kill point from the worker's last log line).
 - **Tests:** `tests/chaos/test_kill_worker.py::test_kill_during_tool_exec_resumes`, `::test_kill_during_llm_turn_resumes`, `::test_kill_between_activities`
 - **Files:** `src/longhaul/providers/replay.py`, `tests/chaos/*`, `eval/chaos/recordings/**`, `scripts/chaos_kill.sh`, `.github/workflows/ci.yml` (nightly)
@@ -2049,7 +2030,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 - **Files:** `src/longhaul/github/intake.py`, tests
 
 #### LH-304 · Idempotent side-effect activities
-- **Epic:** E6 · **Points:** 5 · **Branch:** `feat/lh-304-side-effects` · **Depends on:** LH-302 · **Gatekeeper review**
+- **Epic:** E6 · **Points:** 5 · **Branch:** `feat/lh-304-side-effects` · **Depends on:** LH-302 · **Reviewer sign-off**
 - **Story:** As the workflow, I want every GitHub write to happen exactly once no matter how many retries, so that issue threads stay clean.
 - **Build:**
   - Migration: the `side_effects` table.
@@ -2307,7 +2288,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 
 #### LH-407 · Long-task test
 - **Epic:** E7 · **Points:** 3 · **Branch:** `feat/lh-407-long-task` · **Depends on:** LH-404, LH-405
-- **Story:** As the gatekeeper, I want one test that forces many compactions, so that the context system is proven under pressure.
+- **Story:** As the reviewer, I want one test that forces many compactions, so that the context system is proven under pressure.
 - **Build:**
   - Fixture repo `tests/fixtures/repos/longlog`:
     - 12 small modules, each with a planted bug.
@@ -2373,7 +2354,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 | LH-507 | Final outcomes and stuck report | 3 | E8 |
 
 #### LH-501 · Planner role and plan schema
-- **Epic:** E8 · **Points:** 5 · **Branch:** `feat/lh-501-planner` · **Depends on:** LH-404 · **Gatekeeper review**
+- **Epic:** E8 · **Points:** 5 · **Branch:** `feat/lh-501-planner` · **Depends on:** LH-404 · **Reviewer sign-off**
 - **Story:** As a reviewer, I want the agent to write a plan with steps and checks before touching code, so that I can catch a wrong approach early.
 - **Build:**
   - `src/longhaul/roles/planner.py`:
@@ -2987,7 +2968,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
 
 #### LH-808 · Console e2e with Playwright
 - **Epic:** E13 · **Points:** 3 · **Branch:** `feat/lh-808-console-e2e` · **Depends on:** LH-805, LH-806, LH-807
-- **Story:** As the gatekeeper, I want one browser test of the main path, so that the console keeps working as the backend changes.
+- **Story:** As the reviewer, I want one browser test of the main path, so that the console keeps working as the backend changes.
 - **Build:**
   - `scripts/seed_demo.sh` runs:
     - one scripted task to `pr_opened`
@@ -3189,7 +3170,7 @@ The gatekeeper ran an adversarial review of everything merged during Phase 0 and
   - Hooman records the video.
   - The repo is made public at the v1.0.0 gate.
 - **Acceptance criteria:**
-  - [ ] A fresh clone plus the README quickstart reaches a finished scripted task in under 10 minutes on a clean machine (tested by the gatekeeper in a fresh VM or container).
+  - [ ] A fresh clone plus the README quickstart reaches a finished scripted task in under 10 minutes on a clean machine (tested by the reviewer in a fresh VM or container).
   - [ ] The docs style tests pass (no banned phrases, no long dashes).
 - **Tests:** `tests/unit/test_docs_style.py` (extended to all docs), manual fresh-clone check in the gate report
 - **Files:** `README.md`, `docs/*`
@@ -3435,13 +3416,13 @@ Cost controls:
 | R5 | Risk | Low absolute resolve rate | Weaker headline | Lead with durability and cost numbers, which are what this project claims. Publish the failure list. |
 | R6 | Risk | Replay mismatch after code changes (request hashes differ) | Chaos tests break | Fall back to turn-index matching with a warning. Re-record at Phase 9 start. |
 | R7 | Risk | API cost overrun | Budget | Caps, cheaper model for ablations, stop rule |
-| R8 | Risk | Cheaper executor model drifts from contracts | Integration bugs | Contracts module, gatekeeper review flags, cumulative gate tests |
+| R8 | Risk | Stories drift from the shared contracts | Integration bugs | Contracts module, reviewer sign-off flags, cumulative gate tests |
 | R9 | Risk | Docker socket access on the worker is powerful | Host compromise if the worker is compromised | Worker runs on a dedicated host/VM, the sandbox is hardened, gVisor is optional. Documented in `docs/security.md`. |
 | A1 | Assumption | Target repos are Python with a runnable test suite | Scope | Non-Python is post-v1 |
 | A2 | Assumption | A 60 s pickup delay is fine | UX | Webhooks post-v1 |
 | A3 | Assumption | One worker host is enough for v1 | Scale | Bundles allow cross-host resume. Multi-host is tested only in chaos. |
-| D1 | Open decision | `aioboto3` vs `boto3` in threads for blobs | Minor | Executor decides in LH-202, ADR-0005 |
-| D2 | Open decision | `fastembed` vs `sentence-transformers` | Image size | Executor decides in LH-601, ADR-0010 |
+| D1 | Open decision | `aioboto3` vs `boto3` in threads for blobs | Minor | Developer decides in LH-202, ADR-0005 |
+| D2 | Open decision | `fastembed` vs `sentence-transformers` | Image size | Developer decides in LH-601, ADR-0010 |
 | D3 | Open decision | GitHub App in v1 or PAT only | Security story | Hooman, before Phase 3. Default: PAT for demos, App as Should. |
 | D4 | Open decision | Draft PR on stuck (`open_draft_on_stuck`) default | Noise vs visibility | Hooman, Phase 5. Default: off. |
 | D5 | Open decision | Make the repo public before v1.0.0? | Visibility | Hooman. Default: public at v1.0.0. |
@@ -3456,7 +3437,7 @@ The total is about $420 to $575 (section 8.8). Spending is front-loaded only at 
 
 ### 10.2 Calendar
 
-Assuming about 12 to 15 story points per working day with the executor model and evening reviews by Hooman. Full-time focus compresses this to about 4 weeks.
+Assuming about 12 to 15 story points per working day, with reviews in the evening. Full-time focus compresses this to about 4 weeks.
 
 | Week | Phases | Points | Milestone |
 |---|---|---|---|
@@ -3551,7 +3532,6 @@ Fill these only with real numbers from `docs/results.md`.
 - Anthropic Messages API: https://docs.claude.com/en/api/messages
 - Tool use with Claude: https://docs.claude.com/en/docs/agents-and-tools/tool-use/overview
 - Prompt caching: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
-- Claude Code settings (attribution options): https://docs.claude.com/en/docs/claude-code/settings
 - Anthropic, Building effective agents: https://www.anthropic.com/engineering/building-effective-agents
 - Anthropic, Effective context engineering for AI agents: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents
 - SWE-bench: https://www.swebench.com/ and https://github.com/SWE-bench/SWE-bench

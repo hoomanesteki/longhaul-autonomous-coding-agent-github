@@ -3,7 +3,7 @@ title: Gate reports
 toc-depth: 2
 ---
 
-Each phase ends with a gate. The gatekeeper runs `make gate PHASE=N`, checks every acceptance criterion and invariant, and writes a report. The reports below are the evidence that a phase is done, including what failed and what was fixed.
+Each phase ends with a gate. The reviewer runs `make gate PHASE=N`, checks every acceptance criterion and invariant, and writes a report. The reports below are the evidence that a phase is done, including what failed and what was fixed.
 
 ::: {.source-note}
 The reports are the files in [`docs/gates/`]({{< meta source-repo >}}/tree/main/docs/gates). A new report appears here when it is added to that folder.

@@ -1,7 +1,7 @@
 # Phase 0 gate: Foundation and backlog import
 
 - Date: 2026-10-25
-- Result: **Pass on code, pending two owner actions** (branch protection and the GitHub issue import need an authenticated `gh`). `main` and the `v0.0.1` tag move once both are done.
+- Result: **Pass on code, pending two manual steps** (branch protection and the GitHub issue import need an authenticated `gh`). `main` and the `v0.0.1` tag move once both are done.
 
 ## Test summary
 
@@ -24,8 +24,8 @@
 | LH-002 | `make up` returns only after healthchecks pass | Manual run: 8 services healthy | Pass |
 | LH-002 | Temporal UI, MinIO bucket, `vector` extension | `test_services_reachable`, curl 8233 returned 200 | Pass |
 | LH-002 | `make down` removes volumes | `docker volume ls` empty after down | Pass |
-| LH-003 | PR into `dev` runs all jobs, `ci` is the required check | Jobs run on push; required check needs `scripts/protect_branches.sh` | Pending owner |
-| LH-003 | Direct push to `dev` rejected | Needs `scripts/protect_branches.sh` | Pending owner |
+| LH-003 | PR into `dev` runs all jobs, `ci` is the required check | Jobs run on push; required check needs `scripts/protect_branches.sh` | Pending |
+| LH-003 | Direct push to `dev` rejected | Needs `scripts/protect_branches.sh` | Pending |
 | LH-003 | No secrets in the workflow | `test_no_secrets_in_ci` | Pass |
 | LH-004 | Files exist, progress lists 80 stories | `test_progress_lists_all_stories` | Pass |
 | LH-004 | No banned phrases or long dashes in docs | `test_no_banned_phrases`, `test_no_long_dashes` | Pass |
@@ -33,7 +33,7 @@
 | LH-006 | Dry run prints 80 stories and 10 milestones, no API calls | `test_dry_run_makes_no_calls`, manual dry run | Pass |
 | LH-006 | Second import creates nothing | `test_idempotent_plan` (fake gh) | Pass |
 | LH-006 | Malformed heading fails loudly | `test_malformed_heading_raises` | Pass |
-| LH-006 | 80 issues and 10 milestones on GitHub | Needs authenticated `gh` | Pending owner |
+| LH-006 | 80 issues and 10 milestones on GitHub | Needs authenticated `gh` | Pending |
 | LH-007 | Fixtures fail at base, reference patches pass | `test_fixtures.py` | Pass |
 | LH-008 | `make migrate` creates tables, rerun is a no-op, roundtrip works | `test_upgrade_downgrade_roundtrip`, manual migrate | Pass |
 
@@ -63,7 +63,7 @@ $ python scripts/import_backlog.py docs/plan/longhaul-build-plan.md --dry-run | 
 
 None open. The coverage fix above was done on `fix/lh-091-unit-coverage`.
 
-## Owner actions to close the gate
+## Steps to close the gate
 
 1. `gh auth login`
 2. `scripts/protect_branches.sh`

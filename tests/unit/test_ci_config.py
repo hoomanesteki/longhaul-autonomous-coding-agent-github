@@ -383,9 +383,9 @@ def test_protect_script_targets_main_and_dev() -> None:
 
 
 def test_admins_are_deliberately_not_enforced() -> None:
-    # The owner merges gate pull requests and the maintainer pushes dev as the admin, so the
-    # rules bind collaborators and bots but not admins. The value stays false only while the
-    # script and the runbook both say so, because LH-003 reads as if every push is rejected.
+    # Admins merge gate pull requests and push dev, so the rules bind collaborators and bots
+    # but not admins. The value stays false only while the script and the runbook both say
+    # so, because LH-003 reads as if every push is rejected.
     script = PROTECT.read_text(encoding="utf-8")
     assert protection_payload(script)["enforce_admins"] is False
     comments = "\n".join(line for line in script.splitlines() if line.lstrip().startswith("#"))

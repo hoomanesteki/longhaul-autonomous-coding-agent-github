@@ -13,11 +13,11 @@
 
 ## 0. How to use this document
 
-This file is the single source of truth for the build. Copy it into the repo as `docs/plan/longhaul-build-plan.md` in Phase 0. Every story, test name and contract below is meant to be followed literally unless an ADR changes it.
+This file is the single source of truth for the build. Every story, test name and contract below holds as written unless an ADR changes it.
 
 | Reader | What to read | What to do |
 |---|---|---|
-| Hooman (product owner) | Sections 1, 2, 8, 10, 11 and every "Defend it" block | Approve scope, review each phase gate report, merge `dev` into `main`, run the paid eval runs, record the demo. |
+| Product owner | Sections 1, 2, 8, 10, 11 and every "Defend it" block | Approve scope, review each phase gate report, merge `dev` into `main`, run the paid eval runs, record the demo. |
 | Developer | Section 3 (contracts), Section 5 (operating model), then one story at a time from Section 7 | Implement exactly one story per branch, tests first, open a PR into `dev`, merge when CI is green. Do not start a story whose dependencies are not merged. |
 | Reviewer | Sections 3, 4, 5 and the phase being closed | Run `make gate PHASE=N`, check every acceptance criterion and invariant, write `docs/gates/phase-N.md`, open fix stories when something fails, then open the `dev` to `main` PR. |
 
@@ -290,7 +290,7 @@ Each ADR becomes a file in `docs/adr/NNNN-title.md` (template: Context, Decision
 
 - **ADR-0001 Record decisions as ADRs.** Every non-obvious choice gets a short ADR in the same PR as the code.
 - **ADR-0002 Pin dependencies.** Pin the latest stable versions at project start with `uv lock`. Record the key versions (temporalio, anthropic, docker, fastapi, sqlalchemy, pgvector, opentelemetry) in the ADR. Upgrades get their own `chore/` PR.
-- **ADR-0003 Own agent loop on the Messages API.** We write our own loop instead of running Claude Agent SDK's loop or a LangGraph graph as the core. Hooman has shipped with both; they are good tools for interactive and graph-shaped agents. Here the unit of durability is one model turn and one tool call: each must be a separate Temporal activity with its own retry policy, timeout, heartbeat and checkpoint. The Agent SDK owns its loop and session transcript, so we can't checkpoint or retry between its internal steps. LangGraph with a Postgres checkpointer could checkpoint per node, but we would still need a job runner, durable timers (24 h hint waits), schedules, signals and a history UI, and Temporal gives us all of those. A thin `LLMProvider` protocol keeps the loop vendor-neutral.
+- **ADR-0003 Own agent loop on the Messages API.** We write our own loop instead of running Claude Agent SDK's loop or a LangGraph graph as the core. We have shipped with both; they are good tools for interactive and graph-shaped agents. Here the unit of durability is one model turn and one tool call: each must be a separate Temporal activity with its own retry policy, timeout, heartbeat and checkpoint. The Agent SDK owns its loop and session transcript, so we can't checkpoint or retry between its internal steps. LangGraph with a Postgres checkpointer could checkpoint per node, but we would still need a job runner, durable timers (24 h hint waits), schedules, signals and a history UI, and Temporal gives us all of those. A thin `LLMProvider` protocol keeps the loop vendor-neutral.
 - **ADR-0004 Temporal for durable execution.** Alternatives considered: Celery/RQ (no durable workflow state), a DIY Postgres state machine (we would rebuild retries, timers and signals), and LangGraph checkpointer (see ADR-0003). Temporal provides deterministic replay, activity retries, heartbeats, signals, queries, schedules and Continue-As-New. Cost: determinism rules in workflow code, which invariant I1 enforces.
 - **ADR-0005 Payloads by reference.** Transcripts, tool args, tool outputs and diffs go to the blob store. Workflows and activities pass `BlobRef`s and small summaries only, with a hard cap of 256 KB per payload (invariant I2). Continue-As-New runs every 40 turns, or earlier when Temporal suggests it.
 - **ADR-0006 Git checkpoints.** Each task has a bare repo in a Docker volume. Every mutating tool call is followed by a micro-commit on scratch branch `longhaul/<issue>`, so each tool call has a `pre_sha` and `post_sha`. Before any retry, the workspace is hard-reset to `pre_sha`. At PR time we build a separate branch `longhaul-pr/<issue>` with one squashed commit per completed plan step. A git bundle is uploaded to blob storage at each Continue-As-New, so a different host can resume (Should).
@@ -298,7 +298,7 @@ Each ADR becomes a file in `docs/adr/NNNN-title.md` (template: Context, Decision
 - **ADR-0008 Poll, don't webhook (v1).** A Temporal Schedule runs `PollerWorkflow` every 60 s. No public endpoint, no tunnel, no webhook secrets. A latency of up to 60 s is acceptable for background work.
 - **ADR-0009 Sandbox model.** One Docker container per task, non-root user, `--cap-drop ALL`, `no-new-privileges`, pids/memory/cpu limits, read-only root filesystem except `/workspace` and `/tmp`. The network is enabled only for the setup command, then disconnected. No GitHub token or LLM key ever enters the container: the worker clones into the bare repo on the host and pushes from the host side.
 - **ADR-0010 Memory write policy.** Memory items used in prompts must be `approved`. Approval comes only from the default branch (repo map, verified commands), a merged Longhaul PR (lessons), or an explicit human approval. Unmerged work can only create `candidate` items, which prevents memory poisoning.
-- **ADR-0011 Console stack.** React + Vite + TypeScript, with API types generated from FastAPI's OpenAPI schema. The timeline view is interactive enough to justify React, Hooman already knows it, and TypeScript is asked for in 15.5% of our sampled posts (19% in SF).
+- **ADR-0011 Console stack.** React + Vite + TypeScript, with API types generated from FastAPI's OpenAPI schema. The timeline view is interactive enough to justify React, we already know it, and TypeScript is asked for in 15.5% of our sampled posts (19% in SF).
 - **ADR-0012 GitHub auth.** A fine-grained PAT for local development (Must). A GitHub App with short-lived installation tokens for any shared deployment (Should). Tokens live in the worker environment only.
 - **ADR-0013 Two-tier context strategy.** Tier 1: tool outputs older than K turns are elided to a one-line stub with their handle. Tier 2: past the threshold, older turns become structured `ProgressNotes`. The cut point is always a turn boundary where every `tool_use` has its `tool_result`.
 
@@ -757,7 +757,7 @@ longhaul-background-agent/
 
 | Tech | Why |
 |---|---|
-| Python 3.12, uv | Fast, reproducible installs. Hooman's main language. |
+| Python 3.12, uv | Fast, reproducible installs. Our main language. |
 | Temporal (Python SDK) | Durable workflows, retries, timers, signals, schedules, and a UI for free (ADR-0004). |
 | Anthropic Messages API | Primary model provider with tool use and prompt caching. |
 | OpenAI-compatible client | Second provider. Also works with local or self-hosted endpoints. |
@@ -959,7 +959,7 @@ git switch dev && git merge --ff-only main || true
 | `security` | PR, push | `gitleaks detect`, `pip-audit` |
 | `chaos-lite` | nightly, gate | `pytest tests/chaos -m chaos_lite` (replay provider, 5 kills) |
 
-There are no secrets in CI (I8). Paid evals run only on Hooman's machine or a VM.
+There are no secrets in CI (I8). Paid evals run only on the product owner's machine or a VM.
 
 ### 5.7 Testing strategy
 
@@ -996,7 +996,7 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - make gate PHASE=N # everything for phases 0..N
 
 ## Working rules
-1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge.
+1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge. Delete the branch once it is merged.
 2. Write the story's listed tests first. Make them fail. Then implement.
 3. Do not edit src/longhaul/contracts.py unless the story says so. If you must, explain why in the PR.
 4. Workflow code (src/longhaul/durable/workflows/) must stay deterministic: no I/O, no datetime.now(), no random, no imports of httpx/httpx2/httpcore2/docker/sqlalchemy/boto3/anthropic/openai/subprocess. Use workflow.now() and activities.
@@ -1013,14 +1013,14 @@ Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Pro
 - Comments explain why, not what.
 
 ## When unsure
-Stop and leave a short note in the PR description under "Questions". Do not guess at shared contracts.
+Leave a short note in the PR description under "Questions" instead of changing a shared contract on a guess.
 ````
 
 ### 5.9 Checklists
 
 **Story checklist**
 
-1. Read `CONTRIBUTING.md`, sections 3.6 to 3.8 (contracts, activities, config), the story block in section 7, and any listed files that already exist.
+1. Read the story block in section 7, the contracts, activities and config in sections 3.6 to 3.8, and any listed files that already exist.
 2. Create the story branch from an up-to-date `dev`.
 3. Write the tests listed under "Tests" first and confirm they fail.
 4. Implement until every listed test passes and every acceptance criterion holds.
@@ -1032,7 +1032,7 @@ Stop and leave a short note in the PR description under "Questions". Do not gues
 
 **Gate checklist**
 
-1. Read `CONTRIBUTING.md`, section 4 (failure model, invariants), section 5.4 (gate protocol) and the section of the phase being closed.
+1. Read section 4 (failure model, invariants), section 5.4 (gate protocol) and the section of the phase being closed.
 2. `git switch dev && git pull`, then `make up` and `make gate PHASE=N`.
 3. Check every acceptance criterion of every story in the phase against a test or a command, and record pass or fail with the evidence.
 4. Check invariants I1 to I9 and run the phase's integration checkpoint smoke script exactly as written.
@@ -1041,11 +1041,9 @@ Stop and leave a short note in the PR description under "Questions". Do not gues
 7. If anything fails, add fix stories LH-N91, LH-N92 and so on in the standard story format, commit them with the report on a `chore/` branch, open a PR into `dev`, and stop.
 8. If everything passes, open the `dev` to `main` PR titled "Phase N gate: <phase name>" with the report as the body, merge it with a merge commit, then tag the release and push the tag.
 
-Be strict. A gate that passes broken work costs more later than a gate that fails today.
+A gate that passes broken work costs more later than a gate that fails today.
 
 ### 5.10 Voice and style guide (README, docs, comments, commits, PRs)
-
-The repo should read like one careful engineer wrote it.
 
 - **README:** lead with the problem in one sentence and one real number. Then the architecture diagram, quickstart (three commands), results table, and design decisions with links to ADRs. Keep the top screen short.
 - **Docs:** short paragraphs. Active voice. Say what the thing does and why. Prefer tables for facts and code blocks for commands.
@@ -1061,11 +1059,10 @@ The repo should read like one careful engineer wrote it.
     - `WIP`
 - **PR descriptions:** three short sections (What, Why, How I tested it), plus `Closes #N`. Three to ten lines is normal.
 - **Banned phrases:**
-  - robust, seamless, seamlessly, leverage, delve, comprehensive, cutting-edge, state-of-the-art (unless citing a paper)
-  - game-changer, unlock, empower, elevate, harness the power, supercharge, in today's fast-paced, it's worth noting
-  - furthermore, moreover, plethora, a testament to, navigate the complexities, best-in-class
+  - robust, seamless, seamlessly, leverage, comprehensive, cutting-edge, state-of-the-art (unless citing a paper)
+  - game-changer, unlock, empower, elevate, supercharge, best-in-class
   - em dashes, emoji
-- **Ownership:** Hooman reads every phase gate report and every "Defend it" block. If he can't explain a decision in an interview, it isn't done.
+  - `tests/unit/test_docs_style.py` checks the docs for these and for a few filler phrases.
 
 ### 5.11 Progress tracking
 
@@ -1208,7 +1205,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
   - `.github/workflows/ci.yml` with jobs `lint`, `types`, `unit`, `integration` and `security`, as in section 5.6. `e2e`, `console` and `chaos-lite` are added later by their stories.
   - Integration job: Postgres (pgvector image) and MinIO as service containers. Install the Temporal CLI and start the dev server in the background, then wait on port 7233.
   - Cache uv and Docker layers.
-  - `scripts/protect_branches.sh` uses `gh api` to require PRs and the `ci` check on `main` and `dev`, and to block force pushes. It is run once by Hooman (it needs admin rights).
+  - `scripts/protect_branches.sh` uses `gh api` to require PRs and the `ci` check on `main` and `dev`, and to block force pushes. It is run once by the repo owner (it needs admin rights).
   - Add a `ci` aggregate job that needs all other jobs, so branch protection points at one name.
 - **Acceptance criteria:**
   - [ ] A PR into `dev` runs all jobs, and `ci` is the required check.
@@ -1316,7 +1313,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 
 ### Defend it
 
-1. **Why a written plan with story IDs instead of just prompting an agent?** Small stories with tests keep each change reviewable and let a cheaper model do most of the work. The gate catches integration problems every phase, not at the end.
+1. **Why a written plan with story IDs?** Small stories with tests keep each change reviewable. The gate catches integration problems every phase, not at the end.
 2. **Why `dev` and `main`?** `dev` is where stories integrate. `main` only moves after a gate passes, so every tag is a known-good, demoable state.
 3. **Why reject secrets in YAML?** Config files get committed. Secrets come only from the environment, which keeps them out of git and out of the sandbox.
 4. **Why fixture repos instead of real repos for tests?** Determinism. Real repos change, and network calls make CI flaky. Real repos are used in evals, not tests.
@@ -1345,7 +1342,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 
 #### LH-101 · Shared contracts module
 - **Epic:** E2 · **Points:** 3 · **Branch:** `feat/lh-101-contracts` · **Depends on:** LH-005 · **Reviewer sign-off**
-- **Story:** As every later story, I want one module of shared types, so that pieces built by different sessions fit together.
+- **Story:** As every later story, I want one module of shared types, so that pieces built in different stories fit together.
 - **Build:**
   - Create `src/longhaul/contracts.py` exactly as in section 3.6. Move `RepoSettings` and `Budgets` out of `settings.py` if LH-005 put them there.
   - Add `to_anthropic()` / `from_anthropic()` helpers for `Message` in `src/longhaul/agent/render.py`, not in contracts, so contracts stay vendor-free.
@@ -1360,7 +1357,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
 #### LH-102 · Spike: Messages API tool use, caching and token counting
 - **Epic:** E1 · **Points:** 2 · **Branch:** `spike/lh-102-messages-api` · **Depends on:** LH-101
 - **Story:** As the developer of LH-104, I want verified facts about the current Anthropic SDK, so that the provider is built on what the API does today.
-- **Build:** this is a timeboxed throwaway script (2 hours max), `spikes/messages_api.py`, run by Hooman with a real key. Verify and record in `docs/adr/0003-own-agent-loop.md` (appendix "API facts"):
+- **Build:** this is a timeboxed throwaway script (2 hours max), `spikes/messages_api.py`, run once with a real key. Verify and record in `docs/adr/0003-own-agent-loop.md` (appendix "API facts"):
   1. Tool definitions and `tool_use` / `tool_result` block shapes.
   2. Which error classes and status codes map to rate limit (429), overloaded (529) and context too long. Write down the exact exception class names.
   3. Prompt caching: `cache_control` placement on system and tools, and the usage fields for cache read and write tokens.
@@ -1546,7 +1543,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
   - Add an `e2e` job to CI: `make sandbox-image` then `pytest -m e2e`.
 - **Acceptance criteria:**
   - [ ] The e2e test runs `run-local` on `calc` with the scripted provider. Exit code is 0, and the printed diff matches `REFERENCE.patch` semantically (tests pass).
-  - [ ] Manually, with a real key, `run-local` fixes `calc` and `textkit` (Hooman runs this once and pastes the output into the PR).
+  - [ ] Manually, with a real key, `run-local` fixes `calc` and `textkit` (run this once and paste the output into the PR).
 - **Tests:** `tests/e2e/test_run_local.py::test_calc_scripted` (marker `e2e, phase1`)
 - **Files:** `src/longhaul/cli.py`, `.github/workflows/ci.yml`, tests
 
@@ -1899,7 +1896,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 - **Story:** As the product owner, I want an automated test that kills the worker at random points, so that "survives crashes" is proven, not claimed.
 - **Build:**
   - `src/longhaul/providers/replay.py`: `ReplayProvider(recording_dir)`. Responses are keyed by `(turn_index, sha256(canonical request))`. `--record` mode wraps another provider and saves pairs. If no matching request is found, it falls back to the turn index only and logs a warning.
-  - Record one real run of `inventory` (Hooman, with a key) into `eval/chaos/recordings/inventory/`. Also produce a scripted equivalent for CI: `tests/fixtures/scripts/inventory_fix.yaml`.
+  - Record one real run of `inventory` (with a key) into `eval/chaos/recordings/inventory/`. Also produce a scripted equivalent for CI: `tests/fixtures/scripts/inventory_fix.yaml`.
   - `tests/chaos/test_kill_worker.py`:
     1. Start the worker as a subprocess and start the task.
     2. Pick a random delay (seeded) in `[0.5 s, expected duration]` and send `SIGKILL`.
@@ -2320,7 +2317,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 
 - [ ] All 7 stories Done. ADR-0013 merged.
 - [ ] The long-task e2e passes, and Phase 3 e2e still passes.
-- [ ] The live cache test was run once by Hooman, with `cache_ratio` noted in the gate report.
+- [ ] The live cache test was run once, with `cache_ratio` noted in the gate report.
 - [ ] Tag `v0.4.0`.
 
 ### Defend it
@@ -2337,7 +2334,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 **Goal:** the agent plans before coding, checks its own work before delivering, notices when it is stuck, and asks a specific question. Every task ends in a verified PR, a stuck report or a budget pause, never silence.
 **Demo at the end:**
 1. On `lh-demo-inventory` (plan approval on), the agent posts a plan.
-2. Hooman replies `/longhaul approve`, and the agent codes.
+2. A maintainer replies `/longhaul approve`, and the agent codes.
 3. The Verifier runs the tests and sends the work back once.
 4. The agent fixes it, and the PR opens as ready for review.
 
@@ -2683,7 +2680,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 3. Grafana shows cost per repo, and Jaeger shows the turn spans.
 4. The PR body includes a collapsible run report.
 
-**Entry criteria:** Phase 6 gate passed. `config/pricing.yaml` filled in from the provider's current pricing page by Hooman.
+**Entry criteria:** Phase 6 gate passed. `config/pricing.yaml` filled in from the provider's current pricing page.
 
 | ID | Title | Pts | Epic |
 |---|---|---|---|
@@ -3005,7 +3002,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 ### Defend it
 
 1. **Why a console at all if GitHub comments work?** Comments are good for steering one task. The console is for seeing many tasks, reading long timelines and reviewing memory, which GitHub threads are bad at.
-2. **Why generated API types?** The backend and frontend are built by different sessions. Generated types turn an API drift into a build error instead of a runtime bug.
+2. **Why generated API types?** The backend and frontend are built in different stories. Generated types turn an API drift into a build error instead of a runtime bug.
 3. **Why mirror console actions to the issue?** One audit trail. Anyone reading the issue sees every human intervention, wherever it came from.
 
 ---
@@ -3017,7 +3014,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 **Entry criteria:**
 - Phase 8 gate passed.
 - An x86_64 VM with Docker and about 250 GB of disk for SWE-bench images.
-- An eval budget approved by Hooman (section 10).
+- An eval budget approved by the product owner (section 10).
 
 | ID | Title | Pts | Epic |
 |---|---|---|---|
@@ -3035,7 +3032,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 - **Epic:** E14 · **Points:** 5 · **Branch:** `feat/lh-901-eval-runner` · **Depends on:** LH-706
 - **Story:** As the evaluator, I want one runner for every task set and config, so that every number in the README comes from the same code path.
 - **Build:**
-  - `eval/custom/tasks.yaml` lists 15 tasks on 3 small repos Hooman owns, 5 per repo. Fields: `id`, `repo`, `base_sha`, `issue_title`, `issue_body`, `category` (`bugfix`, `feature`, `refactor`, `dependency`, `flaky`) and `hidden_tests` (a path in `eval/custom/hidden_tests/`, never visible to the agent).
+  - `eval/custom/tasks.yaml` lists 15 tasks on 3 small repos we own, 5 per repo. Fields: `id`, `repo`, `base_sha`, `issue_title`, `issue_body`, `category` (`bugfix`, `feature`, `refactor`, `dependency`, `flaky`) and `hidden_tests` (a path in `eval/custom/hidden_tests/`, never visible to the agent).
   - `eval/run.py --set custom|swebench --config full|naive|single_shot [--model ID] [--limit N] [--concurrency K] [--memory on|off] [--context-mode ...] --run-id NAME`. It:
     1. Runs tasks in local mode, with no GitHub writes, plan gate off and hints off. A pause counts as `intervention_needed` and ends the task after a 1-minute timeout.
     2. Writes `eval/results/<run_id>/<task_id>.json` with: outcome, `resolved` (filled by the grader), cost, tokens, cache ratio, wall time, turns, compactions, verify rounds, stuck reasons and `intervention_needed`.
@@ -3069,7 +3066,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
   - [ ] On 2 instances with the gold patch as the "agent output" (a sanity mode), the grader reports 2/2 resolved.
   - [ ] On the same 2 with an empty patch, it reports 0/2.
   - [ ] `subset.txt` has 40 ids with the stated difficulty split, generated from the seed.
-  - [ ] A real 3-instance smoke run with the agent completes end to end (Hooman runs it, and its output goes in the PR).
+  - [ ] A real 3-instance smoke run with the agent completes end to end (run by hand, and its output goes in the PR).
 - **Tests:** `tests/integration/test_swebench_adapter.py::test_gold_patch_sanity` (marker `slow`, needs Docker and images, run on the eval VM), `tests/unit/test_subset.py::test_stratified_counts`, `tests/unit/test_patch_filter.py::test_excludes_test_patch_files`
 - **Files:** `eval/swebench/*`, tests
 
@@ -3167,7 +3164,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
   - `docs/runbook.md`: start/stop, rotate tokens, drain a worker, cancel stuck tasks, replay test, upgrade with workflow versioning.
   - `docs/case-study.md` per section 11.2.
   - `docs/demo-script.md` per section 11.3.
-  - Hooman records the video.
+  - The demo video is recorded.
   - The repo is made public at the v1.0.0 gate.
 - **Acceptance criteria:**
   - [ ] A fresh clone plus the README quickstart reaches a finished scripted task in under 10 minutes on a clean machine (tested by the reviewer in a fresh VM or container).
@@ -3254,14 +3251,14 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 | Q3 | What does compaction buy? | Paired tokens and resolve rate, full vs `no_compaction`, on the long-task set |
 | Q4 | Does memory help? | Paired turns-to-first-green, cost and resolve rate, memory on vs off, on the custom set |
 | Q5 | Does it survive crashes? | Chaos suite: completion, diff equality, duplicate side effects, resume latency |
-| Q6 | How often does it need a person, and does the stuck protocol fire for the right reasons? | Intervention-needed rate, stuck reasons, and an assisted run where Hooman answers stuck questions |
+| Q6 | How often does it need a person, and does the stuck protocol fire for the right reasons? | Intervention-needed rate, stuck reasons, and an assisted run where a person answers stuck questions |
 
 ### 8.2 Task sets
 
 | Set | Size | Source | Notes |
 |---|---|---|---|
 | SWE-bench Verified subset | 40 | `princeton-nlp/SWE-bench_Verified`, stratified by difficulty: 15 easy, 20 medium, 5 hard, seed 42 | `eval/swebench/subset.txt` is frozen after the first headline run. Graded by the official harness. |
-| Custom set | 15 | 3 small repos Hooman owns, 5 tasks each | Categories: bugfix (5), feature (3), refactor (3), dependency (2), flaky (2). Hidden tests are written before any agent run and never shown to the agent. |
+| Custom set | 15 | 3 small repos we own, 5 tasks each | Categories: bugfix (5), feature (3), refactor (3), dependency (2), flaky (2). Hidden tests are written before any agent run and never shown to the agent. |
 | Long-task set | 14 | The custom refactor, dependency and flaky tasks (7), plus the SWE-bench "1-4 hours" tasks (5), plus 2 synthetic long tasks (`longlog`-style, at real scale) | Defined before any run, so it isn't cherry-picked. |
 
 ### 8.3 Configurations
@@ -3284,7 +3281,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 | Variance | Sonnet-class | Custom-15 | full (second run) | 15 |
 | Ablation Q3 | Haiku-class | Long-14 | full, full_no_compaction | 28 |
 | Ablation Q4 | Haiku-class | Custom-15 | full, full_no_memory (memory warmed by a prior pass whose PRs were "merged" by the eval harness) | 30 |
-| Assisted | Sonnet-class | Custom tasks that ended stuck in the headline run | full with Hooman answering hints | ≤ 15 |
+| Assisted | Sonnet-class | Custom tasks that ended stuck in the headline run | full with a person answering hints | ≤ 15 |
 | Chaos | Replay of 4 recorded custom tasks | n/a | full | 20 |
 
 Fairness rules:

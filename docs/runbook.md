@@ -141,7 +141,7 @@ scripts/protect_branches.sh OWNER/REPO # or name it
 
 It requires a pull request and an up-to-date `ci` check, and blocks force pushes and deletions.
 
-`enforce_admins` is false on purpose. The owner merges the phase-gate pull requests and the maintainer pushes `dev` as the admin, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
+`enforce_admins` is false on purpose. Admins merge the phase-gate pull requests and push `dev`, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
 
 ## Docs site
 

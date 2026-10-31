@@ -8,8 +8,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 ROOT = Path(__file__).resolve().parents[2]
 
-# Banned phrases from the voice guide (plan section 5.10). "em dashes" and "emoji"
-# are checked separately: dashes by test_no_long_dashes, emoji by character.
+# Hype words from the voice guide (docs/style.md), plus a few filler phrases. Dashes
+# and emoji are checked separately: dashes by test_no_long_dashes, emoji by character.
 BANNED_PHRASES = [
     "robust",
     "seamless",

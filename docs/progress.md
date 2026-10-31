@@ -18,7 +18,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-101 | Shared contracts module | 3 | Done | merge | 2026-10-30 |
-| LH-102 | Spike: Messages API tool use, caching and token counting | 2 | Todo | | |
+| LH-102 | Spike: Messages API tool use, caching and token counting | 2 | In progress | | |
 | LH-103 | Provider protocol and ScriptedProvider | 3 | Done | merge | 2026-10-30 |
 | LH-104 | AnthropicProvider | 5 | Todo | | |
 | LH-105 | OpenAI-compatible provider (Should) | 3 | Done | merge | 2026-10-30 |
@@ -28,6 +28,14 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-109 | Exec and git tools | 3 | Done | merge | 2026-10-30 |
 | LH-110 | Turn functions and in-process loop | 5 | Todo | | |
 | LH-111 | run-local CLI and first e2e | 3 | Todo | | |
+| LH-191 | Sandbox write and exec safety | 5 | Done | merge | 2026-10-30 |
+| LH-192 | Tool input and output hardening | 5 | Done | merge | 2026-10-30 |
+| LH-193 | OpenAI-compatible provider mapping fixes | 3 | Done | merge | 2026-10-30 |
+| LH-194 | Settings, env and database safety | 3 | Done | merge | 2026-10-30 |
+| LH-195 | CI, gate and test collection integrity | 3 | Done | merge | 2026-10-30 |
+| LH-196 | Backlog import safety | 2 | Done | merge | 2026-10-30 |
+| LH-197 | Scripted provider determinism | 3 | Done | merge | 2026-10-30 |
+| LH-198 | Contracts v2 from the API research | 5 | In progress |  |  |
 
 ## Phase 2: Temporal durability and checkpoints (tag v0.2.0)
 | ID | Title | Pts | Status | PR | Merged |

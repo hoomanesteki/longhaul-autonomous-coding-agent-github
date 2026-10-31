@@ -294,7 +294,9 @@ def test_the_model_sees_the_issue_the_repo_and_the_test_command(
     system = seen.systems[0]
     assert "Issue: add() returns the difference" in system
     assert "`calc.add` subtracts its arguments" in system
-    assert f"Repository: local:{CALC}" in system
+    # Only the folder name reaches the model: the absolute path carries the user name.
+    assert f"Repository: local:{CALC.name}" in system
+    assert str(CALC.parent) not in system
     assert f"Test command: {TEST_COMMAND}" in system
     # The reference fix is not in the prompt: the issue file does not carry it.
     assert "return a + b" not in system
@@ -662,11 +664,19 @@ def test_make_manager_gives_the_docker_manager(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_the_module_runs_as_a_script() -> None:
+    # A child interpreter does not get pytest's pythonpath, and on macOS Python skips an
+    # editable-install .pth file that carries the hidden flag, so name src explicitly.
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])),
+    }
     done = subprocess.run(
         [sys.executable, "-m", "longhaul.cli", "--help"],
         capture_output=True,
         text=True,
         check=False,
+        env=env,
     )
     assert done.returncode == 0, done.stderr
     assert "run-local" in done.stdout

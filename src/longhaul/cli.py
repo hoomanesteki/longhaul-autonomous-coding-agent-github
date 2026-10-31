@@ -313,7 +313,9 @@ def loop_config(cfg: AppConfig, options: RunOptions) -> LoopConfig:
 
 
 def build_spec(run: Run, base_sha: str) -> TaskSpec:
-    repo = f"local:{run.options.path}"
+    # The spec reaches the model in the system prompt. Name the folder only: the absolute
+    # path would send the local user name and directory layout to the provider.
+    repo = f"local:{run.options.path.name}"
     settings = RepoSettings(
         repo=repo,
         test_command=run.options.test_command,

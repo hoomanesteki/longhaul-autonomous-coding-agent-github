@@ -1659,7 +1659,7 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
   - `LLMResponse.stop_reason` adds `refusal`, `pause_turn` and `model_context_window_exceeded`, plus `raw_stop_reason`, `stop_details`, `request_id` and `dropped_thinking_blocks`.
   - `LLMProvider.complete()` and `count_tokens()` take `options: CallOptions | None` with `effort`, `force_tool` and `output_schema`. `ToolSpec` gains `strict`. `ProviderError` can carry the `usage` of a billed response.
   - `CarryState.started_at` is timezone aware; block type tags always serialize; render never sends empty blocks or messages.
-  - Config: model ids `claude-sonnet-5-5` and `claude-haiku-5-5`, an `effort` section per role, `loop.max_tokens_retry`, and prices in `config/pricing.yaml` taken from the bundled docs.
+  - Config: model ids `claude-sonnet-5-5` and `claude-haiku-5-5`, an `effort` section per role, `loop.max_tokens_retry`, and prices in `config/pricing.yaml` taken from the API docs.
   - `contracts_version = "2"` with a changelog entry.
 - **Acceptance criteria:**
   - [ ] Every contract model round-trips with non-default values for every field.

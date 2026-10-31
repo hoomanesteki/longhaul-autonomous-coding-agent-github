@@ -43,7 +43,7 @@ What to watch:
 
 ## Decisions from the API research
 
-These decisions came out of the LH-102 research on the bundled Claude API docs. The live calls are still pending, so each decision names the check that could change it. Models: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. Both think by default (adaptive thinking) and have a 1M token window. The labels D1, D3, D7, D8 and D10 are the ones used in the research notes, so they are not renumbered here.
+These decisions came out of the LH-102 research on the Claude API docs. The live calls are still pending, so each decision names the check that could change it. Models: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. Both think by default (adaptive thinking) and have a 1M token window. The labels D1, D3, D7, D8 and D10 are the ones used in the research notes, so they are not renumbered here.
 
 ### D1. Thinking blocks are stripped at ingestion (v1)
 
@@ -82,11 +82,11 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 
 ## Appendix: API facts (LH-102)
 
-Drafted on 2026-10-30 from the bundled Claude API documentation (claude-api skill bundle 2.1.310). Every fact names its source file and section inside that bundle. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. Hooman runs them and replaces "pending" with the result and the date.
+Drafted on 2026-10-30 from a local snapshot of the Claude API documentation. Every fact names its source file and section in that snapshot. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. Hooman runs them and replaces "pending" with the result and the date.
 
 - Model scope: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. A fact that names no model applies to both.
 - SDK: `anthropic` 2.3.0 is locked (LH-104, ADR-0002). It sends `anthropic-version` 2026-10-21, pinned by `test_the_sdk_sends_the_api_version_adr_0003_records`.
-- The bundle is a snapshot. The skill's model table is marked as cached on 2026-10-06, and the preserved-thinking notes quote the live page as of 2026-10-14. Check prices, model lists, beta names and enforcement rules against the live pages before code depends on them.
+- The snapshot can be out of date. Its model table is marked as cached on 2026-10-06, and the preserved-thinking notes quote the live page as of 2026-10-14. Check prices, model lists, beta names and enforcement rules against the live pages before code depends on them.
 
 ### Part 1. The five facts LH-102 asks for
 

@@ -9,30 +9,46 @@ The agent's behavior depends on the exact versions of its SDKs, the Temporal ser
 
 ## Decision
 
-Pin the latest stable versions at project start with `uv lock` and commit `uv.lock`. The key runtime versions are recorded below so a reader can see them without opening the lock file. Upgrades go in their own `chore/` PR.
+Pin the latest stable versions at project start with `uv lock` and commit `uv.lock`. The key versions are recorded below so a reader can see them without opening the lock file. Upgrades go in their own `chore/` PR.
 
-Key runtime packages:
+Key packages, as locked in `uv.lock` on 2026-10-30:
 
 | Package | Pinned version |
 |---|---|
-| temporalio | not yet added; pinned when first added |
-| anthropic | not yet added; pinned when first added |
-| docker | not yet added; pinned when first added |
+| temporalio | 1.34.0 |
+| anthropic | not yet added; LH-104 pins it (`anthropic>=2.3,<3`, see ADR-0003) |
+| openai | 3.41.0 |
+| httpx2 | 2.16.0 |
+| httpcore2 | 2.16.0 |
+| docker | 7.2.0 |
 | fastapi | not yet added; pinned when first added |
+| jsonschema | 4.26.0 |
+| pydantic | 2.14.1 |
+| pydantic-settings | 2.16.1 |
+| pyyaml | 6.0.3 |
 | sqlalchemy | 2.1.6 |
 | alembic | 1.20.1 |
 | asyncpg | 0.32.0 |
 | pgvector | 0.5.1 |
+| psycopg | 3.3.6 |
 | opentelemetry-sdk | not yet added; pinned when first added |
-| boto3 | not yet added; pinned when first added |
+| boto3 | 1.43.118 |
 
-Development tools, as locked in `uv.lock` on the date above:
+`temporalio`, `boto3` and `psycopg` sit in the `dev` dependency group of `pyproject.toml` today. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.3.0 requires `httpx2>=2.0.0,<3` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`.
+
+Development tools, as locked in `uv.lock` on 2026-10-30:
 
 | Package | Pinned version |
 |---|---|
 | mypy | 2.4.0 |
 | pytest | 9.1.1 |
+| pytest-asyncio | 1.4.1 |
+| pytest-cov | 7.1.0 |
 | ruff | 0.17.2 |
+| pre-commit | 4.7.0 |
+| types-docker | 7.2.0.20261006 |
+| types-jsonschema | 4.26.0.20261006 |
+| types-pyyaml | 6.0.12.20260906 |
 
 ### Container images (docker-compose.yml)
 

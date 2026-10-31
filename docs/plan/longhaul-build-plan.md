@@ -816,7 +816,7 @@ longhaul-background-agent/
 
 | ID | Invariant | Enforced by |
 |---|---|---|
-| I1 | Workflow modules import no I/O libraries (httpx, docker, sqlalchemy, boto3, anthropic, openai, subprocess) | `tests/unit/test_invariants.py::test_workflows_have_no_io_imports` (AST scan) plus Temporal's sandbox |
+| I1 | Workflow modules import no I/O libraries (httpx, httpx2, httpcore2, docker, sqlalchemy, boto3, anthropic, openai, subprocess) | `tests/unit/test_invariants.py::test_workflows_have_no_io_imports` (AST scan) plus Temporal's sandbox |
 | I2 | No activity input or output serializes above 256 KB | `tests/unit/test_invariants.py::test_payload_size_guard` plus a runtime guard in the payload converter |
 | I3 | The sandbox environment contains no secrets | `tests/integration/test_sandbox.py::test_no_secrets_in_container_env` |
 | I4 | Every GitHub write goes through `github/side_effects.py` | `tests/unit/test_invariants.py::test_github_writes_only_in_side_effects` (AST scan for write methods) |

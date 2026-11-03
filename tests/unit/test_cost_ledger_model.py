@@ -17,7 +17,7 @@ def test_columns_match_the_data_model() -> None:
     columns = {c.name: c for c in CostLedgerRow.__table__.columns}
     assert set(columns) == {
         "id", "task_id", "repo", "model", "turn_index", "attempt", "input_tokens",
-        "output_tokens", "cache_read_tokens", "cache_write_tokens", "usd", "ts",
+        "output_tokens", "cache_read_tokens", "cache_write_tokens", "usd", "ts", "created_at",
     }  # fmt: skip
     assert [c.name for c in CostLedgerRow.__table__.primary_key.columns] == ["id"]
     # A row is written after the call, when every number is known.

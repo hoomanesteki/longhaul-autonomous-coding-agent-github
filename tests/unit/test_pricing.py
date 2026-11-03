@@ -282,6 +282,13 @@ def test_a_file_that_is_not_yaml_is_refused_with_its_path(tmp_path: Path) -> Non
     assert str(path) in str(caught.value)
 
 
+def test_a_missing_file_is_refused_with_its_path(tmp_path: Path) -> None:
+    path = tmp_path / "absent.yaml"
+    with pytest.raises(PricingError, match="cannot be read") as caught:
+        Pricing.load(path)
+    assert str(path) in str(caught.value)
+
+
 def test_an_empty_file_is_refused(tmp_path: Path) -> None:
     path = tmp_path / "pricing.yaml"
     path.write_text("", encoding="utf-8")

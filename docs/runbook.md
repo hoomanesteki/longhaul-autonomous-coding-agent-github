@@ -38,6 +38,17 @@ Loopback binding does not keep out containers. On Docker Desktop a container on 
 
 A pooled database connection belongs to the event loop that opened it. Code that runs more than one loop in a process, such as a CLI that calls `asyncio.run` twice or tests that each get their own loop, must `await dispose_engine()` before each loop ends. Code that builds its own engine can pass `pooled=False` to `make_engine` instead.
 
+### The memory embedder
+
+Memory finds notes by vector search. Tests and CI use `HashEmbedder`, which needs nothing installed. Real use needs the `memory` extra, which adds fastembed and onnxruntime. This installs it and runs the opt-in test against the real model:
+
+```bash
+uv sync --extra memory
+uv run pytest -m slow tests/slow/test_local_embedder.py -rs
+```
+
+The first run downloads the model (66 MB). fastembed keeps it in `FASTEMBED_CACHE_PATH`, or under the system temp directory when that is unset, where a reboot may clear it. Set the variable to a folder that stays for any worker that embeds. Without the extra the test is skipped, and `-rs` shows how to install it. A plain `uv sync` takes the extra's packages out again. ADR-0010 has the reasons.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.

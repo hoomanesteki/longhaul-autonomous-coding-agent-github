@@ -21,7 +21,7 @@ Spike LH-201 checked the SDK patterns that Phase 2 depends on. The results are i
 
 ## Decision
 
-Use Temporal, with the Python SDK `temporalio`, locked at 1.34.0 in `uv.lock`.
+Use Temporal, with the Python SDK `temporalio`, locked at 1.35.0 in `uv.lock`. The appendix facts were checked on 1.34.0, and the integration tests that rely on them pass on 1.35.0.
 
 - One task is one workflow, `TaskWorkflow`. The workflow id is the task id.
 - Workflow code is deterministic. It schedules activities and does no I/O (invariant I1). All I/O lives in activities.

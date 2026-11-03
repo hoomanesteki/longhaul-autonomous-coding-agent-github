@@ -15,7 +15,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 
 | Package | Pinned version |
 |---|---|
-| temporalio | 1.34.0 (runtime since LH-203, see ADR-0004) |
+| temporalio | 1.35.0 (runtime since LH-203, see ADR-0004) |
 | anthropic | 2.3.0 (`anthropic>=2.3,<3`, see ADR-0003) |
 | openai | 3.41.0 |
 | httpx2 | 2.16.0 |
@@ -43,7 +43,7 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 
 | Package | Pinned version |
 |---|---|
-| mypy | 2.4.0 |
+| mypy | 2.4.1 |
 | pytest | 9.2.0 |
 | pytest-asyncio | 1.4.1 |
 | pytest-cov | 7.1.0 |

@@ -47,6 +47,7 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 | pytest | 9.2.0 |
 | pytest-asyncio | 1.4.1 |
 | pytest-cov | 7.1.0 |
+| hypothesis | 6.170.14 (property tests, since LH-403) |
 | ruff | 0.17.3 |
 | pre-commit | 4.7.0 |
 | types-boto3 | 1.43.123 |

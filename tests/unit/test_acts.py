@@ -70,6 +70,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "compact",
         "ensure_sandbox",
         "llm_turn",
+        "load_memory",
         "poll_once",
         "prepare_workspace",
         "record_event",
@@ -91,6 +92,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
+        (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -128,6 +130,8 @@ def test_each_activity_names_its_payload_types(
         # Section 3.7 gives compact 10 minutes and 5 attempts. The heartbeat is added for the
         # reason llm_turn has one: it is a model call, and a cancel has to reach it.
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
+        # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
+        pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -856,3 +860,54 @@ def test_github_payloads_survive_the_pydantic_data_converter(sample: BaseModel) 
 
 def test_nothing_to_deliver_is_named_after_the_error_class() -> None:
     assert NothingToDeliverError.__name__ == acts.NOTHING_TO_DELIVER
+
+
+# ---------- memory in the payloads (LH-604) ----------
+@pytest.mark.phase6
+def test_a_workspace_output_from_before_memory_still_parses_and_loads_no_memory() -> None:
+    # A history that was recorded before LH-604 holds this JSON. The workflow decides whether to
+    # call load_memory from it, so what it lacks must read as "no memory" and the old command
+    # sequence must not change.
+    old = '{"sandbox_id": "sbx-1", "base_sha": "' + SHA + '", "head_sha": "' + SHA + '"}'
+
+    out = acts.PrepareWorkspaceOutput.model_validate_json(old)
+
+    assert (out.memory_enabled, out.test_command, out.repo_map_ref) == (False, None, None)
+
+
+@pytest.mark.phase6
+def test_the_workspace_output_says_whether_the_worker_keeps_memory_and_the_test_command() -> None:
+    out = acts.PrepareWorkspaceOutput(
+        sandbox_id="sbx-1",
+        base_sha=SHA,
+        head_sha=SHA,
+        repo_map_ref=REF,
+        memory_enabled=True,
+        test_command="pytest -q",
+    )
+
+    back = acts.PrepareWorkspaceOutput.model_validate_json(out.model_dump_json())
+
+    assert back == out
+    assert (back.memory_enabled, back.test_command) == (True, "pytest -q")
+
+
+@pytest.mark.phase6
+def test_load_memory_takes_the_spec_and_the_map_of_the_workspace() -> None:
+    inp = acts.LoadMemoryInput(spec=SPEC, repo_map_ref=REF)
+    assert acts.LoadMemoryInput.model_validate_json(inp.model_dump_json()) == inp
+    assert acts.LoadMemoryInput(spec=SPEC).repo_map_ref is None
+
+
+@pytest.mark.phase6
+def test_the_model_turn_and_the_compaction_see_the_same_memory_block() -> None:
+    # The compactor counts the tokens of the request it would be part of, system prompt included.
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    assert turn.memory_ref is None
+    compact = acts.CompactInput(
+        task_id="lh-x", turn_index=3, role=Role.CODER, spec=SPEC, transcript_ref=REF
+    )
+    assert compact.memory_ref is None
+    assert acts.CompactInput(**{**compact.model_dump(), "memory_ref": REF}).memory_ref == REF

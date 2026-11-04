@@ -141,6 +141,10 @@ async def prepare(rig: Rig) -> acts.PrepareWorkspaceOutput:
 async def test_calc_commands(rig: Rig, memory: PgMemoryStore) -> None:
     out = await prepare(rig)
 
+    # The workflow is told to load the memory of the task, and which command runs its tests when
+    # the repo settings name none (LH-604).
+    assert (out.memory_enabled, out.test_command) == (True, "pytest -q")
+
     # pytest -q is found in pyproject.toml, runs at the base commit and is kept as approved.
     [stored] = await memory.list_items(rig.repo)
     assert stored.content == "pytest -q"

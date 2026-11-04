@@ -51,6 +51,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "cleanup",
         "ensure_sandbox",
         "llm_turn",
+        "poll_once",
         "prepare_workspace",
         "record_event",
         "tool_exec",
@@ -69,6 +70,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.CLEANUP, acts.CleanupInput, NoneType),
         (acts.BUNDLE_CHECKPOINT, acts.BundleCheckpointInput, BlobRef),
         (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
+        (acts.POLL_ONCE, NoneType, acts.PollResult),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -99,6 +101,10 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.BUNDLE_CHECKPOINT, 5 * 60, 60, 3, id="bundle_checkpoint"),
         # A local activity: 10 seconds, and no heartbeat to set.
         pytest.param(acts.RECORD_EVENT, 10, None, 3, id="record_event"),
+        # Not in the table either. A poll reads a page or two of issues for each repo and starts
+        # the tasks that are new, so three minutes is far more than it needs. The heartbeat is
+        # what ends a poll on a killed worker: the schedule skips a tick while a poll is open.
+        pytest.param(acts.POLL_ONCE, 3 * 60, 30, 3, id="poll_once"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -492,3 +498,58 @@ def test_a_script_ref_survives_the_pydantic_data_converter() -> None:
 def test_the_script_and_the_tuning_have_memo_keys_of_their_own() -> None:
     assert acts.SCRIPT_MEMO_KEY == "script"
     assert acts.SCRIPT_MEMO_KEY != acts.TUNING_MEMO_KEY
+
+
+# ---------- LH-307: the poller ----------
+def test_poll_once_backs_off_briefly_because_the_next_tick_is_a_retry_too() -> None:
+    retry = acts.POLL_ONCE.retry
+    assert retry.initial_interval == timedelta(seconds=5)
+    assert retry.maximum_interval == timedelta(seconds=30)
+    assert retry.backoff_coefficient == 2.0
+
+
+def test_poll_once_does_not_retry_what_a_retry_cannot_fix() -> None:
+    never = set(acts.POLL_ONCE.retry.non_retryable_error_types or [])
+    assert {acts.GITHUB_FATAL, acts.POLLER_CONFIG} <= never
+    assert acts.GITHUB_RETRYABLE not in never
+
+
+def test_the_error_types_poll_once_raises_have_fixed_names() -> None:
+    # The activity raises these as ApplicationError types and the policy matches on the names.
+    # side_effects.py uses the same two GitHub names.
+    assert (acts.GITHUB_FATAL, acts.GITHUB_RETRYABLE) == ("GitHubFatal", "GitHubRetryable")
+    assert acts.POLLER_CONFIG == "PollerConfigError"
+
+
+def test_a_poll_run_may_last_as_long_as_all_attempts_of_poll_once() -> None:
+    # If the run timeout were shorter, the server would cut a poll that is still retrying.
+    act = acts.POLL_ONCE
+    attempts = act.retry.maximum_attempts
+    waits = sum(
+        min(
+            act.retry.initial_interval.total_seconds() * act.retry.backoff_coefficient**n,
+            act.retry.maximum_interval.total_seconds(),
+        )
+        for n in range(attempts - 1)
+    )
+    worst = attempts * act.start_to_close.total_seconds() + waits
+    assert acts.POLLER_RUN_TIMEOUT.total_seconds() >= worst
+
+
+def test_the_poller_schedule_has_the_id_of_the_plan_and_a_short_catch_up_window() -> None:
+    assert acts.POLLER_SCHEDULE_ID == "longhaul-poller"
+    assert acts.POLLER_CATCHUP_WINDOW.total_seconds() == 120
+
+
+def test_a_poll_result_counts_and_is_small() -> None:
+    result = acts.PollResult(repos=2, issues=5, started=3, known=2)
+    converter = pydantic_data_converter.payload_converter
+    payloads = converter.to_payloads([result])
+    assert converter.from_payloads(payloads, [acts.PollResult]) == [result]
+    assert acts.PollResult() == acts.PollResult(repos=0, issues=0, started=0, known=0)
+    assert_small(result)
+
+
+def test_a_poll_result_cannot_count_below_zero() -> None:
+    with pytest.raises(ValidationError):
+        acts.PollResult(started=-1)

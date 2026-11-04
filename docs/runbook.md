@@ -198,6 +198,35 @@ The folder that `--path` names has to exist inside the worker container to be re
 
 The same image runs on AWS. `docs/deploy-aws.md` describes the Terraform that puts workers on ECS with EC2 capacity, because a Fargate task cannot run the Docker daemon that the sandboxes need.
 
+## Start tasks from GitHub issues
+
+The poller finds open issues that carry the label in `poller.label` (`longhaul` in the example config) on the repos with `allowlisted: true`, and starts one task for each. It is a Temporal Schedule that runs once every `poller.interval_seconds`. The design is in ADR-0008.
+
+```bash
+export LONGHAUL_GITHUB_TOKEN=github_pat_...   # the fine-grained token of ADR-0012
+uv run longhaul worker                       # shell 1: the worker runs the polls
+uv run longhaul poller install               # shell 2: create the Schedule, once
+```
+
+The worker needs `LONGHAUL_GITHUB_TOKEN` to poll. Without it the worker still starts, and each poll fails with a message that names the setting. The compose worker takes the token from your shell or from `.env`. `install` needs the config and Temporal, but not the worker, and it can be run before the worker starts: the first poll waits for a worker.
+
+| Command | What it does |
+|---|---|
+| `longhaul poller install` | Creates the Schedule `longhaul-poller`, or updates it to `poller.interval_seconds` and the task queue of `LONGHAUL_TASK_QUEUE`. It prints `created`, `updated` or `unchanged`. A second run with the same config changes nothing, and a paused Schedule stays paused. |
+| `longhaul poller pause [--note TEXT]` | Stops the polls. A poll that is running finishes. |
+| `longhaul poller resume` | Starts them again. |
+| `longhaul poller trigger` | Polls now. It works on a paused Schedule, and it does nothing while a poll is running. |
+
+Each poll is a workflow named `longhaul-poller-run-<time>` in the Temporal UI (http://localhost:8233). It returns four counts: the repos it looked at, the labeled issues it saw, the tasks it started and the issues that already had a task. A poll fails when a repo cannot be read, for example a typo in the config or a token without access to it. The other repos are still polled first, and the failure names the repo.
+
+What the poller does and does not do:
+
+- A task id is `lh-<owner>-<repo>-<issue number>`, in lowercase. The task is started once. A row in `tasks` keeps a finished task from starting again while the label stays on the issue.
+- Only the allowlist counts. A labeled issue on a repo that is not in the config, or is there with `allowlisted: false`, is never read.
+- The poller only reads from GitHub. It posts no comment and sets no label. The task does that itself (LH-306).
+- A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. Nothing pushes the branch or opens a pull request until LH-306 adds the delivery, so a finished task leaves no change on GitHub yet.
+- To change the label or the interval, edit the config, restart the worker, and run `longhaul poller install` again for the interval.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.

@@ -21,6 +21,7 @@ from longhaul.contracts import RepoSettings, TaskSpec
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.worker import serve
+from longhaul.durable.workflows.poller import PollerWorkflow
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
@@ -128,3 +129,28 @@ async def test_serve_returns_at_once_when_nothing_is_running(env: WorkflowEnviro
     stop.set()
     async with asyncio.timeout(WAIT_S):
         await serving
+
+
+async def test_serve_runs_the_poller_workflow_beside_the_task_workflow(
+    env: WorkflowEnvironment,
+) -> None:
+    # LH-307. The Schedule starts PollerWorkflow on the queue of the worker, so serve has to
+    # register it. The activity is a stub that answers with a count.
+    class Poll:
+        @activity.defn(name=acts.POLL_ONCE.name)
+        async def poll_once(self) -> acts.PollResult:
+            return acts.PollResult(repos=1, issues=2, started=2)
+
+    stop = asyncio.Event()
+    queue = f"lh-test-{uuid.uuid4().hex[:8]}"
+    serving = asyncio.create_task(serve(env.client, queue, [Poll().poll_once], stop))
+    try:
+        result = await env.client.execute_workflow(
+            PollerWorkflow.run, id=f"lh-poller-{uuid.uuid4().hex[:8]}", task_queue=queue
+        )
+    finally:
+        stop.set()
+        async with asyncio.timeout(WAIT_S):
+            await serving
+
+    assert result == acts.PollResult(repos=1, issues=2, started=2)

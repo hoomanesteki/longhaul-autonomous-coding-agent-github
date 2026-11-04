@@ -213,6 +213,38 @@ The body comes from `templates/pr_body.md.j2`: the summary, the changes per file
 
 Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
 
+### The plan
+
+A task can plan before it codes (LH-501, ADR-0007). The planner is a role of the same workflow. It has the tools that read and run (`list_dir`, `read_file`, `search`, `run_tests`, `run_command`, `read_output`) and the tool `submit_plan`, and it has no tool that writes a file. Any file that one of its commands writes is deleted again when the command ends, so the coder starts from the tree the task began with.
+
+Planning is a choice of the task. The poller turns it on for every task it starts from an issue. For `longhaul run` add `--plan`, and give the script steps for the `planner` role as well as for the coder:
+
+```bash
+uv run longhaul run --plan --path DIR --issue-file FILE --provider scripted --script FILE
+```
+
+A task started without `--plan` goes straight to coding, as it did before the planner.
+
+| Where | What shows the plan |
+|---|---|
+| `longhaul run`, `longhaul status` | The status line has `plan v1` once the plan is stored and posted, and the phase moves from `planning` to `coding`. |
+| Postgres | One row for each version in `plans`, with the plan as JSON and the status `proposed`. |
+| The issue | A task of an issue posts the plan as a checklist, once. The comment ends with the hidden marker for the key `<task id>:plan_comment:1`, so a retry finds it and posts nothing new. A task on a local folder posts nothing. |
+
+```sql
+SELECT version, status, plan->>'summary' FROM plans WHERE task_id = 'lh-acme-calc-42';
+```
+
+The planner has `loop.planner_max_turns` turns (20) to submit. A plan has 2 to 8 steps, each with a `done_when`, and at least one acceptance check. A plan that does not fit gets one repair turn: the answer to `submit_plan` lists what is wrong, and the planner may call it again. These ends are an `error` outcome with a fixed summary:
+
+| Summary | Meaning |
+|---|---|
+| `planner submitted an invalid plan twice: <problems>` | The repair turn did not fix the plan. |
+| `planner submitted no plan in 20 turns` | The planner used all its turns reading and running commands. |
+| `no tool calls` | Two replies in a row had no tool call. The first one gets a nudge to call `submit_plan`. |
+
+The turns of the planner count against `task_turns` like any other. The coder does not read the plan yet (LH-503).
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

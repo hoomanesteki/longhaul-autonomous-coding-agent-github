@@ -150,5 +150,6 @@ def _new_model(cache_dir: str | None) -> TextEmbedding:
             "Install it with: uv sync --extra memory",
             name="fastembed",
         ) from exc
-    options = {} if cache_dir is None else {"cache_dir": cache_dir}
-    return TextEmbedding(LOCAL_MODEL, **options)
+    if cache_dir is None:
+        return TextEmbedding(LOCAL_MODEL)  # fastembed picks its own cache folder
+    return TextEmbedding(LOCAL_MODEL, cache_dir=cache_dir)

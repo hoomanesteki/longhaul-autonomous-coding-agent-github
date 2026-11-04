@@ -218,6 +218,16 @@ def test_the_guide_tells_the_model_how_to_read_a_cut_output() -> None:
     assert "`handle`" in static and "`pattern`" in static
 
 
+def test_the_guide_explains_the_stub_that_replaces_an_old_result() -> None:
+    # Tier 1 of the context strategy (LH-404) leaves a stub where an old result was. The model
+    # has to know what it is, and that its handle still works.
+    from longhaul.context.evict import ELIDED_PREFIX
+
+    prompt = build_system_prompt(Role.CODER, make_spec())
+    static = prompt[: prompt.index(TASK)]
+    assert f"starts with {ELIDED_PREFIX.strip()}" in static
+
+
 def test_first_user_message_points_at_the_system_prompt() -> None:
     assert FIRST_USER_MESSAGE.strip()
     assert "finish" in FIRST_USER_MESSAGE

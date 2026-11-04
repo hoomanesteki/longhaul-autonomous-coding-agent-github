@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.context.log import read_log
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -33,6 +32,7 @@ from longhaul.agent.turns import CONTROL_RESULT, validate_pairs
 from longhaul.blobs.base import blob_key, handle_key, make_ref
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.context.log import read_log
 from longhaul.context.tokens import estimate_tokens
 from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
@@ -1198,11 +1198,18 @@ async def test_a_call_id_used_in_two_turns_never_reaches_the_model_twice(
 
 
 # ---------- the log (LH-404) ----------
+def log_input(transcript_ref: BlobRef, *results: acts.ToolResultSummary, **fields: Any) -> Any:
+    """An append_results input for turn 0, because the log is read from the first turn."""
+    return acts.AppendResultsInput(
+        task_id=TASK, turn_index=0, transcript_ref=transcript_ref, results=list(results), **fields
+    )
+
+
 async def test_the_results_go_to_the_log_as_the_model_read_them() -> None:
     rig = Rig(None)
     ref = await rig.put_json("t.json", calls_transcript(call_block("a"), call_block("b")))
     await rig.append(
-        append_input(
+        log_input(
             ref,
             acts.ToolResultSummary(call_id="a", ok=True, output="first"),
             acts.ToolResultSummary(call_id="b", ok=False, output="second"),
@@ -1225,7 +1232,7 @@ async def test_a_nudge_that_joins_the_last_user_message_is_logged_on_its_own() -
     rig = Rig(None)
     ref = await rig.put_json("t.json", [FIRST])
 
-    await rig.append(append_input(ref, user_text="Use tools or call finish."))
+    await rig.append(log_input(ref, user_text="Use tools or call finish."))
 
     assert await read_log(rig.blobs, TASK) == [
         Message(role="user", content=[TextBlock(text="Use tools or call finish.")])
@@ -1235,7 +1242,7 @@ async def test_a_nudge_that_joins_the_last_user_message_is_logged_on_its_own() -
 async def test_results_that_are_answered_again_are_logged_once() -> None:
     rig = Rig(None)
     ref = await rig.put_json("t.json", calls_transcript(call_block("a")))
-    inp = append_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output="fine"))
+    inp = log_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output="fine"))
 
     await rig.append(inp)
     await rig.append(inp)
@@ -1249,7 +1256,7 @@ async def test_the_log_keeps_the_text_that_the_model_was_given_for_a_long_output
     stored = await rig.put_text("tool-a-output.txt", "line\n" * 5000)
 
     await rig.append(
-        append_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output_ref=stored))
+        log_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output_ref=stored))
     )
 
     (logged,) = result_blocks((await read_log(rig.blobs, TASK))[0])

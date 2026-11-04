@@ -31,13 +31,41 @@ The cost on the ledger is the cost in `LlmTurnOutput` and in the `turns` row.
 Who answers. A task that carries a script (`script_ref`, from `longhaul run --script`) is answered
 by a scripted provider built from it, and any other task by the provider of the worker. A worker
 whose provider is the scripted one but that was given no script has none of its own, and refuses
-a task without a script for good, since asking again changes nothing.
+a task without a script for good, since asking again changes nothing (support.provider_for_task).
+
+The two views of a transcript (LH-404). The transcript the workflow carries (`transcript_ref`) is
+the view: what the model sees. Before each call this activity applies tier 1 of the context
+strategy to it, so that tool results older than `context.elide_tool_outputs_after_turns` turns
+are stubs with a handle (context/evict.py). The reply is appended to the elided view, and that is
+what is stored. The log is the other record, the whole transcript with nothing elided, and the
+activity adds to it as well (context/log.py): the hints it showed and the reply, as the `reply`
+part of the turn. `append_results` writes the `results` part. The log keeps every turn and the
+view keeps what fits.
+
+Tier 2 is decided here, because only here can the tokens be counted (the workflow cannot, and the
+transcript is a blob). A meter that learns from the replies of the task (support.Meters) projects
+the request before it is sent. A request over `hard_limit` of the window is not sent: the
+activity fails with CONTEXT_TOO_LONG, as the provider would, and the workflow compacts down to the
+last two turns and asks once more (F6). Close to the thresholds the provider is asked for an exact
+count. After the reply the activity projects the request after this one, with one more result
+elided and room for the results of the calls it just made (each up to `tool_output_max_tokens`),
+and returns what to do before then in `context_decision`: go on, compact, or force. The workflow
+runs the compaction when this turn is over.
+
+The notes. After a compaction the notes are in the first message of the view, right after the task
+text, where context/compact.py `apply` put them. The system prompt does not change (D7), so the
+cached prefix survives a compaction as far as its first message. `LlmTurnInput.notes` is the
+workflow's own copy and is not used to build the request.
+
+Without a `context` policy the activity elides nothing, projects nothing and always says "ok".
+The log is written either way.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -56,7 +84,10 @@ from longhaul.agent.turns import (
     show_hints,
     validate_pairs,
 )
-from longhaul.blobs.base import BlobError, BlobStoreBase, blob_key
+from longhaul.blobs.base import BlobStoreBase, blob_key
+from longhaul.context.evict import elide_old_outputs
+from longhaul.context.log import added_messages, append_to_log
+from longhaul.context.tokens import ContextBudget, Decision, TokenMeter, count_request_chars
 from longhaul.contracts import (
     BlobRef,
     Block,
@@ -65,6 +96,7 @@ from longhaul.contracts import (
     LLMResponse,
     Message,
     ProviderError,
+    ProviderErrorKind,
     Role,
     TextBlock,
     ToolCall,
@@ -76,21 +108,48 @@ from longhaul.cost.pricing import PricingError
 from longhaul.db.records import Recorder, TurnRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import (
+    Meters,
     call_slug,
     heartbeating,
     not_retried,
     provider_failure,
+    provider_for_task,
     small,
 )
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
+from longhaul.settings import Context
 from longhaul.telemetry.otel import chat_span
+from longhaul.tools.control import is_control_tool
 
-NO_PROVIDER = (
-    "this worker has no model provider of its own: LONGHAUL_PROVIDER is scripted and no script "
-    "is set. Start the task with a script (longhaul run --script FILE) or give the worker "
-    "LONGHAUL_SCRIPT"
-)
+
+@dataclass(frozen=True)
+class _View:
+    """The transcript of one call at the points where llm_turn looks at it.
+
+    `before` is the stored view, or nothing for the first turn. `shown` adds the hints that the
+    call shows. `sent` is `shown` after tier 1, which is the request apart from the paused text.
+    """
+
+    before: list[Message]
+    shown: list[Message]
+    sent: list[Message]
+    paused: list[Block]
+
+
+def _budget(context: Context | None) -> ContextBudget | None:
+    if context is None:
+        return None
+    if context.elide_tool_outputs_after_turns < 1:
+        raise ValueError(
+            "context.elide_tool_outputs_after_turns has to be at least 1, got "
+            f"{context.elide_tool_outputs_after_turns}"
+        )
+    return ContextBudget(context.window_tokens, context.compact_at, context.hard_limit)
+
+
+def _options(cfg: LoopConfig) -> CallOptions | None:
+    return CallOptions(effort=cfg.effort) if cfg.effort is not None else None
 
 
 class LlmActivities:
@@ -105,6 +164,11 @@ class LlmActivities:
     `ledger` writes the cost ledger row of every call. A worker passes a `SqlLedger` built on
     the prices of `load_pricing`. Without one no row is written and every call costs 0, which
     suits a run with no database and no paid provider, and nothing else.
+
+    `context` is the policy of the two context tiers (config section `context`). Without it the
+    activity runs as it did before LH-404: nothing is elided and no request is projected.
+    `meters` holds the token meter of each task, and the compact activity of the same worker
+    shares it, so both count with the ratio the replies taught.
     """
 
     def __init__(
@@ -116,6 +180,8 @@ class LlmActivities:
         config_for: Callable[[Role], LoopConfig],
         *,
         ledger: Ledger | None = None,
+        context: Context | None = None,
+        meters: Meters | None = None,
     ) -> None:
         self._provider = provider
         self._scripts = TaskProviders(blobs)
@@ -124,6 +190,9 @@ class LlmActivities:
         self._tools = list(tools)
         self._config_for = config_for
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
+        self._context = context
+        self._budget = _budget(context)
+        self._meters = meters if meters is not None else Meters()
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -136,20 +205,32 @@ class LlmActivities:
         cfg = self._config_for(inp.role)
         try:
             system = build_system_prompt(inp.role, inp.spec)
-            transcript = show_hints(await self._transcript(inp), inp.hints)
+            stored = await self._transcript(inp)
+            shown = show_hints(stored, inp.hints)
+            transcript = self._evict(shown)  # tier 1
             validate_pairs(transcript)  # a transcript the API would reject is not sent
         except ValueError as exc:  # also TranscriptError and a damaged blob
             raise not_retried(exc) from exc
         paused = await self._paused(inp.paused_ref)
         provider = await self._provider_for(inp)
+        # The text of a paused reply goes back as the last message, which the API continues.
+        request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
+        meter = self._meters.for_task(inp.task_id)
+        projected = await self._preflight(provider, cfg, system, request, meter)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
         began = time.monotonic()
-        resp, cost = await self._ask(
-            provider, inp, cfg, system, transcript, paused, attempt, started
-        )
+        resp, cost = await self._ask(provider, inp, cfg, system, request, attempt, started)
+        if self._context is not None:
+            meter.observe(resp.usage, count_request_chars(system, request, self._tools))
         latency_ms = resp.latency_ms or int((time.monotonic() - began) * 1000)
-        out = await self._store(inp, resp, transcript, paused, attempt, cost)
+        view = _View(
+            before=stored if inp.transcript_ref is not None else [],
+            shown=shown,
+            sent=transcript,
+            paused=paused,
+        )
+        out = await self._store(inp, resp, view, attempt, cost, system, meter, projected)
         await self._recorder.record_turn(
             TurnRecord(
                 task_id=inp.task_id,
@@ -181,16 +262,89 @@ class LlmActivities:
 
     async def _provider_for(self, inp: acts.LlmTurnInput) -> LLMProvider:
         """The script of the task if it has one, else the provider of the worker."""
-        if inp.script_ref is not None:
-            try:
-                return await self._scripts.provider_for(inp.task_id, inp.script_ref)
-            except (ValueError, BlobError) as exc:
-                # A script that does not load, or that the store no longer has, stays that way.
-                # A store that cannot be reached raises something else, and Temporal retries it.
-                raise not_retried(exc) from exc
-        if self._provider is None:
-            raise not_retried(ValueError(NO_PROVIDER))
-        return self._provider
+        return await provider_for_task(self._scripts, self._provider, inp.task_id, inp.script_ref)
+
+    def _evict(self, transcript: list[Message]) -> list[Message]:
+        """Tier 1: the results older than the configured number of turns become stubs."""
+        if self._context is None:
+            return transcript
+        return elide_old_outputs(transcript, self._context.elide_tool_outputs_after_turns)
+
+    # ----- tier 2: the size of the request -----
+    async def _preflight(
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        request: list[Message],
+        meter: TokenMeter,
+    ) -> int:
+        """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
+
+        A request at or over `hard_limit` of the window is not sent. The workflow handles this
+        as it does the provider's own answer (F6), by compacting and asking once more. Close to
+        the thresholds the estimate is replaced by the provider's exact count, if it gives one.
+        """
+        budget = self._budget
+        if budget is None:
+            return 0
+        tokens = meter.projected(system, request, self._tools)
+        if budget.needs_exact_count(tokens):
+            tokens = await self._exact_count(provider, cfg, system, request) or tokens
+        if budget.decide(tokens) == "force":
+            limit = int(budget.window * budget.hard_limit)
+            raise provider_failure(
+                ProviderError(
+                    ProviderErrorKind.CONTEXT_TOO_LONG,
+                    f"the request is about {tokens} tokens, over the hard limit of {limit} tokens "
+                    f"({budget.hard_limit} of a window of {budget.window})",
+                )
+            )
+        return tokens
+
+    async def _exact_count(
+        self, provider: LLMProvider, cfg: LoopConfig, system: str, request: list[Message]
+    ) -> int | None:
+        """The provider's count of the request, or None to keep the estimate.
+
+        The count is asked for the request that is sent, with the same options, because counts
+        depend on the model and on the request rules. A failed or empty count leaves the
+        estimate, and a request that really is too long fails on the call and is compacted then.
+        """
+        try:
+            async with heartbeating():
+                count = await provider.count_tokens(
+                    model=cfg.model,
+                    system=system,
+                    messages=request,
+                    tools=self._tools,
+                    options=_options(cfg),
+                )
+        except ProviderError:
+            return None
+        return count if count > 0 else None
+
+    def _decide(
+        self,
+        meter: TokenMeter,
+        system: str,
+        view: list[Message],
+        calls: list[ToolCall],
+    ) -> Decision:
+        """What to do before the next turn, from the projection of the request after this one.
+
+        That request has one more result elided than this one (eviction runs at the start of a
+        turn, and the reply just made ages the others), and it holds the results of the calls
+        just made. Those are not known yet, and each is at most tool_output_max_tokens, so that
+        is what is reserved. A `finish` call has no result to reserve for.
+        """
+        policy, budget = self._context, self._budget
+        if policy is None or budget is None:
+            return "ok"
+        upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
+        pending = sum(1 for call in calls if not is_control_tool(call.name))
+        tokens = meter.projected(system, upcoming, self._tools)
+        return budget.decide(tokens + pending * policy.tool_output_max_tokens)
 
     # ----- the call -----
     async def _ask(
@@ -199,8 +353,7 @@ class LlmActivities:
         inp: acts.LlmTurnInput,
         cfg: LoopConfig,
         system: str,
-        transcript: list[Message],
-        paused: list[Block],
+        request: list[Message],
         attempt: int,
         started: datetime,
     ) -> tuple[LLMResponse, Decimal]:
@@ -209,10 +362,8 @@ class LlmActivities:
         The ledger row is written inside the chat span, as soon as the call returns, so the span
         carries the same price as the row.
         """
-        # The text of a paused reply goes back as the last message, which the API continues.
-        request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         cap = cfg.max_tokens_retry if inp.high_output_cap else cfg.max_tokens_per_turn
-        options = CallOptions(effort=cfg.effort) if cfg.effort is not None else None
+        options = _options(cfg)
         try:
             with chat_span(
                 model=cfg.model,
@@ -273,25 +424,34 @@ class LlmActivities:
         self,
         inp: acts.LlmTurnInput,
         resp: LLMResponse,
-        transcript: list[Message],
-        paused: list[Block],
+        view: _View,
         attempt: int,
         cost: Decimal,
+        system: str,
+        meter: TokenMeter,
+        projected: int,
     ) -> acts.LlmTurnOutput:
+        paused = view.paused
         complete = rules.is_complete(resp)
-        grown = self._grow(transcript, rules.join_pauses(resp, paused)) if complete else transcript
+        reply = rules.join_pauses(resp, paused)
+        grown = self._grow(view.sent, reply) if complete else view.sent
         calls = rules.runnable_calls(resp, resp.tool_calls)
 
         def key(name: str) -> str:
             return blob_key(inp.task_id, "turns", inp.turn_index, name)
 
         response_ref = await self._blobs.put_json(resp, key(f"response-{attempt}.json"))
-        if len(grown) == len(transcript) and inp.transcript_ref is not None:
+        if len(grown) == len(view.sent) and inp.transcript_ref is not None:
             # The reply added nothing, so there is nothing to store. A hint that joined the last
             # message stays out as well, and the next call adds it again.
             transcript_ref = inp.transcript_ref
         else:
             transcript_ref = await self._blobs.put_json(grown, key(f"transcript-{attempt}.json"))
+        if len(grown) > len(view.sent):
+            # The log gets the same step without the elision: the hints shown, then the reply.
+            # Only the stored view was elided, so the reply is the last message of both.
+            added = [*added_messages(view.before, view.shown), grown[-1]]
+            await append_to_log(self._blobs, inp.task_id, inp.turn_index, "reply", added)
         tool_calls_ref = None
         if calls:
             tool_calls_ref = await self._blobs.put_json(calls, key(f"tool_calls-{attempt}.json"))
@@ -314,6 +474,8 @@ class LlmActivities:
             raw_stop_reason=resp.raw_stop_reason,
             response_ref=response_ref,
             paused_ref=paused_ref,
+            context_decision=self._decide(meter, system, grown, calls),
+            request_tokens=projected,
         )
 
     @staticmethod

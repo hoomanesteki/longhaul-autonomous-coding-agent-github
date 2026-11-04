@@ -20,6 +20,10 @@ Lines are counted the way read_output pages them (split_lines): only "\\n" ends 
 ending loses its carriage return and a final newline does not start another line. The number in
 the marker and the line numbers of read_output therefore agree.
 
+Eviction (context/evict.py) replaces an old result with a stub that names the lines of the whole
+output. Once the middle is cut, the marker is the one place that still knows that number, so
+marker_line_count() reads it back.
+
 This module is pure: it does no I/O and imports only the standard library and
 longhaul.context.tokens, so the activities, the in-process loop and the tools can all use it.
 """
@@ -27,10 +31,18 @@ longhaul.context.tokens, so the activities, the in-process loop and the tools ca
 from __future__ import annotations
 
 import math
+import re
 
 from longhaul.context.tokens import DEFAULT_CHARS_PER_TOKEN, estimate_tokens
 
-__all__ = ["HEAD_LINES", "TAIL_LINES", "format_size", "shape_output", "split_lines"]
+__all__ = [
+    "HEAD_LINES",
+    "TAIL_LINES",
+    "format_size",
+    "marker_line_count",
+    "shape_output",
+    "split_lines",
+]
 
 # What the model keeps of a long output (plan section 7, LH-402).
 HEAD_LINES = 60
@@ -64,6 +76,20 @@ def format_size(size: int) -> str:
     if round(kilobytes, 1) < _KB:
         return f"{kilobytes:.1f} KB"
     return f"{size / _MB:.1f} MB"
+
+
+# The start of a marker line. It has to open a line: output that only mentions a marker in the
+# middle of a line is not one.
+_MARKER_LINE = re.compile(r"^\[output truncated: (\d+) lines?, ", re.MULTILINE)
+
+
+def marker_line_count(text: str) -> int | None:
+    """The lines of the whole output, from the marker that shape_output() put in `text`.
+
+    It is None for text that has no marker, which is output that was not cut.
+    """
+    found = _MARKER_LINE.search(text)
+    return int(found.group(1)) if found else None
 
 
 def _marker(lines: int, size: int, handle: str) -> str:

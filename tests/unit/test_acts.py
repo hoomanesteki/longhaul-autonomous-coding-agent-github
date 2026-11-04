@@ -7,12 +7,14 @@ these tests pin what each side may rely on.
 from datetime import timedelta
 from pathlib import Path
 from types import NoneType
+from typing import get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.workflow import ActivityCancellationType
 
+from longhaul.context import compact
 from longhaul.contracts import (
     BlobRef,
     ProgressNotes,
@@ -605,3 +607,9 @@ def test_compaction_has_four_outcomes() -> None:
             tokens_after=10,
             folded_turns=0,
         )
+
+
+def test_the_compaction_outcomes_of_the_activity_include_those_of_compact() -> None:
+    # acts.py cannot import compact.py, which reaches the tool registry, so the words are
+    # written twice and this keeps them equal.
+    assert set(get_args(compact.CompactStatus)) | {"unchanged"} == set(get_args(acts.CompactStatus))

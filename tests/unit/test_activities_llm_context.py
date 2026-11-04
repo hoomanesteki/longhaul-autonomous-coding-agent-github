@@ -13,8 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
-from longhaul.context.log import read_log
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -22,6 +20,8 @@ from longhaul.agent.loop import LoopConfig
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
+from longhaul.context.log import read_log
 from longhaul.context.tokens import count_request_chars
 from longhaul.contracts import (
     BlobRef,
@@ -257,10 +257,12 @@ async def test_a_hint_is_shown_after_the_elided_results() -> None:
 
 # ---------- the log ----------
 async def test_the_log_gets_the_reply_of_the_turn() -> None:
+    # The log is read from turn 0, so the turn that is logged here is turn 0 with a view that
+    # already holds earlier rounds.
     rig = Rig(reply("tool_use", use("call-9")), policy=context())
     ref = await rig.put(rounds(8))
 
-    await rig.run(turn_input(turn_index=8, transcript_ref=ref))
+    await rig.run(turn_input(turn_index=0, transcript_ref=ref))
 
     log = await read_log(rig.blobs, SPEC.task_id)
     assert log == [Message(role="assistant", content=[use("call-9")])]
@@ -279,7 +281,7 @@ async def test_a_hint_is_in_the_log_with_the_reply_it_came_with() -> None:
     rig = Rig(reply("tool_use", use("call-9")), policy=context())
     ref = await rig.put(rounds(2))
 
-    await rig.run(turn_input(turn_index=2, transcript_ref=ref, hints=["alice: use pytest -x"]))
+    await rig.run(turn_input(turn_index=0, transcript_ref=ref, hints=["alice: use pytest -x"]))
 
     log = await read_log(rig.blobs, SPEC.task_id)
     assert log == [
@@ -553,3 +555,14 @@ async def test_the_notes_do_not_change_the_system_prompt() -> None:
 
     first, second = rig.provider.calls
     assert first["system"] == second["system"] == SYSTEM
+
+
+# ---------- a policy that cannot work stops the worker, not the first turn ----------
+def test_a_policy_that_never_keeps_a_result_is_refused() -> None:
+    with pytest.raises(ValueError, match="elide_tool_outputs_after_turns"):
+        Rig(policy=context(elide_tool_outputs_after_turns=0))
+
+
+def test_thresholds_that_cross_are_refused() -> None:
+    with pytest.raises(ValueError, match="compact_at"):
+        Rig(policy=context(compact_at=0.9, hard_limit=0.8))

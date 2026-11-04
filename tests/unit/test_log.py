@@ -6,11 +6,11 @@ activity) replaces it and adds nothing.
 """
 
 import pytest
-from longhaul.context.log import added_messages, append_to_log, log_key, read_log
 
 from longhaul.agent.turns import validate_pairs
 from longhaul.blobs.base import BlobNotFoundError
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.context.log import added_messages, append_to_log, log_key, read_log
 from longhaul.contracts import Message, TextBlock, ToolResultBlock, ToolUseBlock
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase4]
@@ -170,3 +170,11 @@ def test_added_messages_of_no_change_are_empty() -> None:
 def test_added_messages_reject_an_after_that_does_not_extend_before() -> None:
     with pytest.raises(ValueError, match="extend"):
         added_messages([user("a"), assistant("c0")], [user("b")])
+
+
+def test_added_messages_reject_a_last_message_that_was_rewritten() -> None:
+    before = [user("start"), assistant("c0"), answer("c0", "first")]
+    after = [*before[:-1], answer("c0", "rewritten"), assistant("c1")]
+
+    with pytest.raises(ValueError, match="last message"):
+        added_messages(before, after)

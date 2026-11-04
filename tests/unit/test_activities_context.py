@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.durable.activities.context import ContextActivities
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -41,6 +40,7 @@ from longhaul.contracts import (
 from longhaul.cost.ledger import MemoryLedger
 from longhaul.cost.pricing import Pricing
 from longhaul.durable import acts
+from longhaul.durable.activities.context import ContextActivities
 from longhaul.providers.base import read_turn_offset, turn_index
 from longhaul.settings import Context
 from longhaul.tools.registry import default_registry
@@ -350,6 +350,23 @@ async def test_a_fallback_keeps_the_old_notes_and_cuts_half_as_much() -> None:
     validate_pairs(view)
 
 
+async def test_a_fallback_that_halves_the_cut_to_nothing_leaves_the_view_as_it_is() -> None:
+    # Four turns with three to keep fold one turn. Half of that cut is no cut at all. The two
+    # calls were made, so they are on the ledger, and the workflow is not failed.
+    rig = Rig(chatter(LONG_PROMPT), chatter(SHORT_PROMPT))
+    ref = await rig.put(rounds(4))
+
+    out = await rig.run(compact_input(ref, notes=NOTES))
+
+    assert out.status == "fallback"
+    assert out.transcript_ref == ref
+    assert out.notes == NOTES
+    assert out.folded_turns == 0
+    assert out.tokens_before == out.tokens_after
+    assert [r.usage for r in rig.ledger.entries] == [LONG_PROMPT, SHORT_PROMPT]
+    assert out.cost_usd == pytest.approx(float(sum(r.usd for r in rig.ledger.entries)))
+
+
 async def test_a_fallback_on_the_first_round_says_that_no_notes_were_kept() -> None:
     rig = Rig(chatter(), chatter())
 
@@ -510,3 +527,29 @@ async def test_a_hint_survives_a_second_compaction() -> None:
     second = await rig.run(compact_input(await rig.put(view), notes=first.notes))
 
     assert hint in (await rig.view(second.transcript_ref))[0].content
+
+
+async def test_a_second_round_counts_the_turns_it_folded_and_not_those_of_the_first() -> None:
+    rig = Rig(notes_reply(), notes_reply())
+    first = await rig.run(compact_input(await rig.put(rounds(8))))
+    view = [*await rig.view(first.transcript_ref), *rounds(12)[17:]]  # four more turns
+
+    second = await rig.run(compact_input(await rig.put(view), notes=first.notes))
+
+    assert first.folded_turns == 5
+    assert second.folded_turns == 4  # seven turns were left, and three stay
+    assert second.notes is not None
+    assert second.notes.covers_turns_up_to == 9  # and the notes cover all nine that are folded
+
+
+def test_a_policy_that_keeps_no_turn_is_refused() -> None:
+    policy = POLICY.model_copy(update={"keep_recent_turns": 0})
+
+    with pytest.raises(ValueError, match="keep_recent_turns"):
+        ContextActivities(FakeProvider(), MemoryBlobStore(), TOOLS, config_for, policy)
+
+
+def test_the_activity_list_is_the_compact_activity() -> None:
+    activities = ContextActivities(FakeProvider(), MemoryBlobStore(), TOOLS, config_for, POLICY)
+
+    assert [fn.__name__ for fn in activities.activities] == ["compact"]

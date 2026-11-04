@@ -13,7 +13,9 @@ has a heartbeat timeout like `prepare_workspace`: it builds a container and runs
 command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
 `bundle_checkpoint` has the table's 5 minutes and 3 attempts and the same kind of heartbeat
 timeout, because it uploads the whole history of a repository. `record_event` is a local
-activity: it is one row insert, and it runs inside the worker that holds the workflow.
+activity: it is one row insert, and it runs inside the worker that holds the workflow. `compact`
+has the table's 10 minutes and 5 attempts, and it is a model call, so it gets the backoff, the
+non-retryable error kinds and the heartbeat timeout of `llm_turn`.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -38,13 +40,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 from types import NoneType
-from typing import Any, Self
+from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 from longhaul.agent import rules
+from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
     Plan,
@@ -86,6 +89,11 @@ TOOL_TIMEOUT_S = 600
 # under the 4,096 at which the server suggests a hand-over (ADR-0004, appendix section 4). That
 # suggestion is the safety net for a turn with many calls.
 CONTINUE_AS_NEW_EVERY_TURNS = 40
+
+# F6: when the window is too full to wait, or the provider says the prompt is too long, the view
+# is compacted down to this many recent turns and the notes. A proactive compaction keeps
+# `context.keep_recent_turns`, which the workflow cannot read, so the activity reads it.
+FORCED_KEEP_RECENT_TURNS = 2
 
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
@@ -154,7 +162,10 @@ class LlmTurnInput(BaseModel):
     # The system prompt is built from it, in the same bytes on every call of a transcript (D7).
     spec: TaskSpec
     transcript_ref: BlobRef | None  # None before the first turn
-    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6.
+    # The notes reach the model in the first message of the view, where compaction put them
+    # (context/compact.py apply), so the system prompt does not change with them (D7). This field
+    # is the workflow's copy, which it hands back to the compact activity. The plan and the memory
+    # block reach the model in Phases 5 and 6.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
     memory_ref: BlobRef | None = None
@@ -179,6 +190,11 @@ class LlmTurnOutput(BaseModel):
     tool_use) is appended to it. Any other reply is not stored, so the ref is the input's, or the
     first message alone when the turn had no transcript yet. The workflow decides what to do
     next from `stop_reason`, with the rules in longhaul.agent.rules.
+
+    The workflow cannot count tokens, so the activity does it (LH-404). `request_tokens` is the
+    projection of the request this call sent, and `context_decision` says what the next turn
+    should begin with, from the projection of the request after it: "ok" to go on, "compact" to
+    compact the view first, "force" to compact down to FORCED_KEEP_RECENT_TURNS turns.
     """
 
     transcript_ref: BlobRef
@@ -194,6 +210,8 @@ class LlmTurnOutput(BaseModel):
     raw_stop_reason: str | None = None
     response_ref: BlobRef | None = None  # the provider's reply, whole
     paused_ref: BlobRef | None = None  # the text so far of a turn that stopped on pause_turn
+    context_decision: Decision = "ok"
+    request_tokens: int = Field(default=0, ge=0)  # 0 when the activity has no context policy
 
 
 class ToolExecInput(BaseModel):
@@ -231,6 +249,47 @@ class AppendResultsInput(BaseModel):
     results: list[ToolResultSummary]
     # Text from the harness, such as the nudge. It goes after the results, as the API requires.
     user_text: str | None = None
+
+
+# What a compaction came to. The first three are context.compact.CompactStatus, and a test keeps
+# them equal. "unchanged" is the activity's own: there was no turn old enough to fold.
+CompactStatus = Literal["ok", "repaired", "fallback", "unchanged"]
+
+
+class CompactInput(BaseModel):
+    """What the compact activity needs to fold the older turns of a view into notes.
+
+    `turn_index` is the turn that asked for it, for the blob key and the ledger rows. The spec
+    and the role build the system prompt, so the activity can say how many tokens the request
+    took before and after. `forced` picks FORCED_KEEP_RECENT_TURNS and not the configured number.
+    """
+
+    task_id: str
+    turn_index: int
+    role: Role
+    spec: TaskSpec
+    transcript_ref: BlobRef
+    notes: ProgressNotes | None = None
+    forced: bool = False
+    # The script of the task, as in LlmTurnInput. The compactor is scripted in a scripted run.
+    script_ref: BlobRef | None = None
+
+
+class CompactOutput(BaseModel):
+    """The new view and the notes that belong to it.
+
+    `notes` are the notes to carry from now on. For a fallback they are the previous ones, and
+    for "unchanged" the input's. The tokens are those of the whole request (system prompt, view
+    and tools) before and after. `cost_usd` is what the compactor's calls cost on the ledger.
+    """
+
+    transcript_ref: BlobRef
+    notes: ProgressNotes | None
+    status: CompactStatus
+    tokens_before: int = Field(ge=0)
+    tokens_after: int = Field(ge=0)
+    folded_turns: int = Field(ge=0)  # the turns that this compaction removed from the view
+    cost_usd: float = Field(default=0.0, ge=0)
 
 
 class CleanupInput(BaseModel):
@@ -363,6 +422,28 @@ RECORD_EVENT = Act(
     local=True,
 )
 
+COMPACT = Act(
+    "compact",
+    CompactInput,
+    CompactOutput,
+    start_to_close=timedelta(minutes=10),
+    # Section 3.7 gives no heartbeat. It is a model call like llm_turn, so a cancel has to reach
+    # it and a killed worker has to be noticed in half a minute.
+    heartbeat=timedelta(seconds=30),
+    retry=RetryPolicy(
+        initial_interval=timedelta(seconds=2),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=120),
+        maximum_attempts=5,
+        non_retryable_error_types=[
+            ProviderErrorKind.INVALID_REQUEST.value,
+            ProviderErrorKind.AUTH.value,
+            ProviderErrorKind.CONTEXT_TOO_LONG.value,
+            _OVERSIZED,
+        ],
+    ),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -372,6 +453,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     CLEANUP,
     BUNDLE_CHECKPOINT,
     RECORD_EVENT,
+    COMPACT,
 )
 
 

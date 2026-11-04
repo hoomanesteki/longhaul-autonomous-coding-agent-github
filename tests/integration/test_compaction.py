@@ -20,9 +20,6 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.context.evict import ELIDED_PREFIX
-from longhaul.context.log import read_log
-from longhaul.durable.activities.context import ContextActivities
 from temporalio import activity
 from temporalio.client import WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -36,6 +33,8 @@ from longhaul.agent.turns import validate_pairs
 from longhaul.blobs.base import BlobStoreBase
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.context.compact import NOTES_HEADING, NOTES_TOOL_NAME
+from longhaul.context.evict import ELIDED_PREFIX
+from longhaul.context.log import read_log
 from longhaul.context.tokens import count_request_chars
 from longhaul.contracts import (
     BlobRef,
@@ -58,6 +57,7 @@ from longhaul.cost.ledger import MemoryLedger
 from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
+from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
@@ -239,6 +239,17 @@ class Boxes:
     async def cleanup(self, inp: acts.CleanupInput) -> None:
         return None
 
+    # A run of 40 turns hands over to a new run, which ensures its sandbox first. The fake
+    # sandbox is still there, and the bundle is only named in an event.
+    @activity.defn(name=acts.ENSURE_SANDBOX.name)
+    async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
+        return inp.sandbox_id or f"sbx-{inp.task_id}"
+
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        key = f"tasks/{inp.task_id}/ckpt/{inp.turn_index}.bundle"
+        return BlobRef(key=key, sha256="0" * 64, size=1)
+
     async def destroy_all(self) -> None:
         for box in self.boxes.values():
             await box.destroy()
@@ -321,6 +332,8 @@ async def running(
                 *events.activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
+                boxes.ensure_sandbox,
+                boxes.bundle_checkpoint,
             ],
             workflow_runner=workflow_runner(),
         ):
@@ -343,18 +356,18 @@ async def play(env: WorkflowEnvironment, script: Path, spec: TaskSpec) -> tuple[
 
 # ---------- LH-404 acceptance criteria ----------
 async def test_never_exceeds_hard_limit(env: WorkflowEnvironment, tmp_path: Path) -> None:
-    """Fifty turns in a window of 8,000 tokens, and no request goes over 85 percent of it.
+    """Sixty turns in a window of 8,000 tokens, and no request goes over 85 percent of it.
 
     The assertion is on the projections the activity recorded for each request it sent. Without
     the two tiers the same task would have filled the window many times over, which the log
     shows.
     """
     spec = make_spec()
-    run, outcome = await play(env, write_script(tmp_path, long_task(50)), spec)
+    run, outcome = await play(env, write_script(tmp_path, long_task(60)), spec)
 
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Fixed them all.")
     projections = [out.request_tokens for out in run.llm.outputs]
-    assert len(projections) == 50
+    assert len(projections) == 60
     assert all(tokens > 0 for tokens in projections)
     assert max(projections) <= HARD_LIMIT_TOKENS
 
@@ -404,7 +417,7 @@ async def test_forced_compaction_on_overflow(env: WorkflowEnvironment, tmp_path:
     refused, retried = asked[6], asked[7]
     assert sum(m.role == "assistant" for m in refused["messages"]) == 6
     assert sum(m.role == "assistant" for m in retried["messages"]) == acts.FORCED_KEEP_RECENT_TURNS
-    assert NOTES_HEADING in text_of(retried["messages"][0])
+    assert NOTES_HEADING in text_of(retried["messages"][:1])
 
     # The compactor was paid for, and the view of the end of the run still pairs up.
     assert [(e.model, e.turn_index) for e in run.ledger.entries if e.model == HAIKU] == [(HAIKU, 6)]

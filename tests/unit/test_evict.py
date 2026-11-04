@@ -5,9 +5,9 @@ the request, and a stub that changed from one call to the next would throw the p
 """
 
 import pytest
-from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs, elision_stub
 
 from longhaul.agent.turns import validate_pairs
+from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs, elision_stub
 from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     Message,

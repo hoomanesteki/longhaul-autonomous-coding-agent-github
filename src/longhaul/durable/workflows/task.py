@@ -51,8 +51,24 @@ can tell them apart without reading prose:
 Not here yet, each in its own story: the planner and verifier phases (Phase 5), budget
 enforcement and pauses (Phase 7), clean-up and a final outcome for runs that end any way but a
 cancel (LH-507). An activity that fails for good, after its retries, fails the workflow with that
-error, except a prompt over the context window, which ends the run with "context limit" as it
-does in-process.
+error. A prompt over the context window is the exception, and it is handled as described next.
+
+The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
+a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
+When the turn is over and its results are in the transcript, the workflow acts on it, in
+`_relieve`. "compact" and "force" call the `compact` activity, which replaces the older turns of
+the view with progress notes. The workflow stores the new view in `state.transcript_ref` and the
+notes in `state.notes`, adds the cost of the compactor, and records a `compaction` event with the
+tokens before and after. Doing it at the end of the turn means a hand-over that follows carries
+the compacted view and its notes. A compaction that fails for good fails the workflow, like any
+other activity, and one that finds nothing to fold changes nothing and records nothing.
+
+F6, a prompt over the window. `llm_turn` refuses a request that its projection puts over the hard
+limit, and the provider can reject one too. Both arrive as a provider error of kind
+context_too_long. The workflow then compacts with `forced=True`, which keeps the last two turns
+and the notes, and asks the turn again, once. It does not ask again when the compaction folded
+nothing, because the view would be the same. A second overflow in the same turn, or one with
+nothing to fold (the first turn has no view at all), ends the run with "context limit" as before.
 
 Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
 the same workflow id. After a turn that did not end the run, the workflow hands over when the
@@ -113,6 +129,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 # model that came from outside still works (ADR-0004, appendix section 1).
 with workflow.unsafe.imports_passed_through():
     from longhaul.agent import rules
+    from longhaul.context.tokens import Decision
     from longhaul.contracts import (
         BlobRef,
         CarryState,
@@ -148,6 +165,9 @@ def cancel_summary(by: str, reason: str) -> str:
 # The summary of the outcome when one tool call keeps finding its sandbox gone.
 SANDBOX_LOST = "sandbox lost"
 
+# The event a compaction records (plan section 3.5).
+COMPACTION_EVENT = "compaction"
+
 # The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
 CONTINUE_AS_NEW_EVENT = "continue_as_new"
 HAND_OVER_TURNS = "turns"  # the turn count reached the interval
@@ -181,8 +201,8 @@ def _is_sandbox_gone(err: ActivityError) -> bool:
     return isinstance(cause, ApplicationError) and cause.type == acts.SANDBOX_GONE
 
 
-def _ended_by(err: ActivityError) -> Outcome | None:
-    """The outcome a failed model turn ends the run with, or None when the failure is not one.
+def _provider_error_kind(err: ActivityError) -> ProviderErrorKind | None:
+    """The kind of the provider error that failed a model turn, or None when it is not one.
 
     The activity raises a provider error as an ApplicationError whose type is the error kind
     (support.provider_failure), so the cause tells a prompt over the window from the rest.
@@ -191,10 +211,15 @@ def _ended_by(err: ActivityError) -> Outcome | None:
     if not isinstance(cause, ApplicationError) or cause.type is None:
         return None
     try:
-        kind = ProviderErrorKind(cause.type)
+        return ProviderErrorKind(cause.type)
     except ValueError:
         return None
-    return rules.provider_error_outcome(kind)
+
+
+def _ended_by(err: ActivityError) -> Outcome | None:
+    """The outcome a failed model turn ends the run with, or None when the failure is not one."""
+    kind = _provider_error_kind(err)
+    return None if kind is None else rules.provider_error_outcome(kind)
 
 
 @workflow.defn(name="TaskWorkflow")
@@ -383,7 +408,7 @@ class TaskWorkflow:
             return self._end(sampled, Phase.FAILED)
         calls = rules.runnable_calls(sampled, sampled.tool_call_summaries)
         if not calls:
-            return await self._idle_turn(index, sampled.transcript_ref)
+            return await self._idle_turn(index, sampled)
 
         self.idle = 0
         finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
@@ -412,6 +437,7 @@ class TaskWorkflow:
         state.turn_index = index + 1
         if ran.finish is not None:
             return self._end(rules.finished(ran.finish), Phase.DONE)
+        await self._relieve(index, sampled.context_decision)
         return None
 
     async def _end_lost(
@@ -452,10 +478,16 @@ class TaskWorkflow:
         return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
 
     async def _sample(self, index: int) -> acts.LlmTurnOutput | Outcome:
-        """Call the model until one reply can be used, or the run has to end (D8, D9)."""
+        """Call the model until one reply can be used, or the run has to end (D8, D9).
+
+        A prompt that is over the window is compacted down to the last two turns, and the turn
+        is asked once more (F6). It is asked again only if the compaction changed the view. A
+        second overflow, or one with nothing to fold, ends the run with "context limit".
+        """
         state = self.state
         sampling = rules.Sampling()
         paused_ref: BlobRef | None = None
+        compacted = False
         while True:
             try:
                 reply = await self._call(
@@ -475,6 +507,13 @@ class TaskWorkflow:
                     ),
                 )
             except ActivityError as err:
+                if (
+                    _provider_error_kind(err) is ProviderErrorKind.CONTEXT_TOO_LONG
+                    and not compacted
+                ):
+                    compacted = True
+                    if await self._compact(index, forced=True):
+                        continue
                 outcome = _ended_by(err)
                 if outcome is None:
                     raise
@@ -492,7 +531,59 @@ class TaskWorkflow:
             elif verdict.move is rules.Move.USE:
                 return reply
 
-    async def _idle_turn(self, index: int, transcript_ref: BlobRef) -> Outcome | None:
+    # ---------- the context tiers ----------
+    async def _relieve(self, index: int, decision: Decision) -> None:
+        """Compact the view when the model turn that just ended said the next request needs it.
+
+        This runs when the turn is over and its results are in the view, so a hand-over that
+        follows carries the compacted view and its notes.
+        """
+        if decision != "ok":
+            await self._compact(index, forced=decision == "force")
+
+    async def _compact(self, index: int, *, forced: bool) -> bool:
+        """Fold the older turns of the view into notes. True when the view changed.
+
+        The compactor is paid for either way, so its cost is added before anything else. A view
+        with nothing to fold, or one that a failed compactor left as it was, changes nothing and
+        records no event. The failure of the activity, after its retries, fails the workflow
+        like any other activity does.
+        """
+        state = self.state
+        if state.transcript_ref is None:
+            return False  # nothing has been said yet, so there is nothing to fold
+        done = await self._call(
+            acts.COMPACT,
+            acts.CompactInput(
+                task_id=state.spec.task_id,
+                turn_index=index,
+                role=Role.CODER,
+                spec=state.spec,
+                transcript_ref=state.transcript_ref,
+                notes=state.notes,
+                forced=forced,
+                script_ref=self._script(),
+            ),
+        )
+        state.cost_usd += done.cost_usd
+        if done.folded_turns == 0:
+            return False
+        state.transcript_ref = done.transcript_ref
+        state.notes = done.notes
+        await self._note(
+            COMPACTION_EVENT,
+            {
+                "turn_index": index,
+                "forced": forced,
+                "status": done.status,
+                "tokens_before": done.tokens_before,
+                "tokens_after": done.tokens_after,
+                "folded_turns": done.folded_turns,
+            },
+        )
+        return True
+
+    async def _idle_turn(self, index: int, reply: acts.LlmTurnOutput) -> Outcome | None:
         """A reply with no tool calls. The first gets a nudge, and a second ends the run."""
         state = self.state
         idle = rules.idle_turn(self.idle)
@@ -505,12 +596,13 @@ class TaskWorkflow:
             acts.AppendResultsInput(
                 task_id=state.spec.task_id,
                 turn_index=index,
-                transcript_ref=transcript_ref,
+                transcript_ref=reply.transcript_ref,
                 results=[],
                 user_text=rules.NUDGE,
             ),
         )
         state.turn_index = index + 1
+        await self._relieve(index, reply.context_decision)
         return None
 
     async def _run_tool(self, index: int, call: acts.ToolCallSummary) -> ToolResult:

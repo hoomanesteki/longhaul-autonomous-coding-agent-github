@@ -53,8 +53,15 @@ caller.
 
 Errors. A ProviderError other than a refused force goes up, because retries belong to the
 activity. Its `usage` is the total of every call of this compact() that was billed, the failed
-one included, so the activity can ledger it in one row whatever the retry policy then does
-(invariant I6). It stays None when nothing was billed.
+one included. It stays None when nothing was billed.
+
+The ledger needs the calls one by one (invariant I6). Haiku's rate depends on the size of one
+prompt, so two calls that are each under the line can add up to a total that is over it, and a
+row priced from the total would charge both at the dearer rate. So compact() also reports each
+billed call to `on_billed`, as soon as the call is known: a reply that came back, a forced call
+that was refused after it was billed, and a call that failed with a usage. The activity ledgers
+each one there. That also covers a compact() that fails or is cut off later, which a list on
+the success result or on the error could not.
 
 Using it. A caller does this when the budget says to compact (LH-404):
 
@@ -67,6 +74,7 @@ Using it. A caller does this when the budget says to compact (LH-404):
             render_for_compaction(messages[:cut]),
             effort=effort,
             covers_turns_up_to=turn_index(messages[:cut]),
+            on_billed=ledger_row,
         )
         if result.status == "fallback":
             cut = halve_cut(messages, cut)
@@ -76,13 +84,14 @@ Using it. A caller does this when the budget says to compact (LH-404):
 
 find_cut() and halve_cut() give 0 when there is nothing to cut, and then nothing is compacted.
 What to do when even that is too long is the caller's call (F6 keeps the last two turns and the
-notes). result.usages has one Usage for each billed model call, for the cost ledger (invariant
-I6). That includes a forced call that was refused after it was billed.
+notes). result.usages has one Usage for each billed model call. That includes a forced call that
+was refused after it was billed.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -134,6 +143,7 @@ __all__ = [
     "REPAIR_PREFIX",
     "CompactStatus",
     "Compaction",
+    "OnBilled",
     "apply",
     "compact",
     "find_cut",
@@ -175,6 +185,8 @@ REPAIR_TURNS = 1
 MAX_PROBLEM_LINES = 8
 
 CompactStatus = Literal["ok", "repaired", "fallback"]
+# Called once for each model call that was billed, as soon as the call is known.
+OnBilled = Callable[[Usage], Awaitable[None]]
 
 
 # ---------- the tool ----------
@@ -626,24 +638,37 @@ class _Compactor:
     """
 
     def __init__(
-        self, provider: LLMProvider, model: str, effort: EffortLevel | None, max_tokens: int
+        self,
+        provider: LLMProvider,
+        model: str,
+        effort: EffortLevel | None,
+        max_tokens: int,
+        on_billed: OnBilled | None,
     ) -> None:
         self._provider, self._model = provider, model
         self._effort, self._max_tokens = effort, max_tokens
+        self._on_billed = on_billed
         self._force = True
         self.usages: list[Usage] = []
+
+    async def _bill(self, usage: Usage) -> None:
+        self.usages.append(usage)
+        if self._on_billed is not None:
+            await self._on_billed(usage)
 
     async def ask(self, messages: list[Message]) -> LLMResponse:
         try:
             reply = await self._ask(messages)
         except ProviderError as error:
-            # The activity that catches this ledgers error.usage. The calls before this one were
-            # billed too, and nothing else would tell it about them (I6).
-            billed = [*self.usages, *([error.usage] if error.usage is not None else [])]
-            if billed:
-                error.usage = _total(billed)
+            # A call that failed after it was billed carries its usage. The error then holds
+            # the total of every billed call, as it always did, and each call has gone to
+            # on_billed on its own (I6).
+            if error.usage is not None:
+                await self._bill(error.usage)
+            if self.usages:
+                error.usage = _total(self.usages)
             raise
-        self.usages.append(reply.usage)
+        await self._bill(reply.usage)
         return reply
 
     async def _ask(self, messages: list[Message]) -> LLMResponse:
@@ -660,7 +685,7 @@ class _Compactor:
                 # A reply that was billed and then refused, such as one with a block type the
                 # provider does not know, carries its usage.
                 if error.usage is not None:
-                    self.usages.append(error.usage)
+                    await self._bill(error.usage)
         return await self._call(messages, force=False)
 
     async def _call(self, messages: list[Message], *, force: bool) -> LLMResponse:
@@ -686,18 +711,21 @@ async def compact(
     effort: EffortLevel | None = None,
     covers_turns_up_to: int | None = None,
     max_tokens: int = MAX_TOKENS,
+    on_billed: OnBilled | None = None,
 ) -> Compaction:
     """Ask the compactor for the notes that replace `rendered`, merged with `notes_prev`.
 
     `rendered` is render_for_compaction() of the part to remove. `task` is the task statement,
     for a first round that has no earlier goal to carry. `covers_turns_up_to` replaces the
     number the model wrote, because the caller counts the turns and the model does not: it is
-    turn_index(messages[:cut]). `effort` goes out as CallOptions.effort.
+    turn_index(messages[:cut]). `effort` goes out as CallOptions.effort. `on_billed` is awaited
+    with the usage of each billed call, in order, before compact() goes on; an error it raises
+    stops compact() (see the module docstring).
 
     A reply with no valid call to record_progress_notes gets one repair turn. If that fails
     too, or the model refuses, the result is the previous notes with status "fallback".
     """
-    compactor = _Compactor(provider, model, effort, max_tokens)
+    compactor = _Compactor(provider, model, effort, max_tokens, on_billed)
     prompt = Message(role="user", content=[TextBlock(text=_prompt(notes_prev, rendered, task))])
     request = [prompt]
     problems: list[str] = []

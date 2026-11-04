@@ -42,7 +42,7 @@ The review of `contracts.py` raised more than version 2 holds. Each of these wai
 
 ## Tracing
 
-Each task is one OpenTelemetry trace. `src/longhaul/telemetry/otel.py` holds all of it, and the rest of the code calls four things: `setup_tracing(settings, telemetry)`, `interceptors()`, `chat_span(...)` and `tool_span(...)`.
+Each task is one OpenTelemetry trace. `src/longhaul/telemetry/otel.py` holds all of it, and the rest of the code calls five things: `setup_tracing(settings, telemetry)`, `interceptors()`, `detached()`, `chat_span(...)` and `tool_span(...)`.
 
 The trace has the shape that Temporal's interceptor gives it, with the model and tool spans inside the activity spans.
 
@@ -64,6 +64,8 @@ Temporal's workflow spans have no duration, because a workflow span that stayed 
 - `setup_tracing` builds a tracer provider with the resource `service.name=longhaul-worker` and an OTLP gRPC exporter to `OTEL_EXPORTER_OTLP_ENDPOINT`. Without that variable nothing is set up and every span is a no-op. A bare `host:port` counts as plain gRPC, like the collector in compose. The caller calls `shutdown()` on the returned provider when the process stops, which sends the spans still queued.
 - `durable.client.connect` puts `interceptors()` on the client when tracing is set up. A worker takes the interceptors of its client, so the worker needs no list of its own. Passing the interceptor to both would trace every call twice.
 - The worker module (LH-208) calls `setup_tracing(settings, config.telemetry)` before it calls `connect`, and `provider.shutdown()` when it exits.
+- `durable.client.start_task` starts the workflow inside `detached()`, a block with no current span, so each task opens a trace of its own. The poller (LH-307) calls `start_task` from the activity `poll_once`. Without this, every task of one poll would become a child of `RunActivity:poll_once` and share its trace id. Code that starts a task, the poller and the merge step included, goes through `start_task` for this reason.
+- A workflow started outside `start_task`, from the `temporal` CLI or a Schedule, carries no trace header. Temporal's interceptor then creates no workflow spans, and each `RunActivity` span becomes its own root trace.
 - `llm_turn` wraps the provider call in `chat_span`, and `tool_exec` wraps the tool run in `tool_span`.
 
 ### Attribute names
@@ -98,6 +100,8 @@ The names come from `opentelemetry-semantic-conventions` 0.66b2 (module `opentel
 ### Content
 
 Prompts hold code and may hold secrets, so content capture is off. `telemetry.capture_content` in the config turns it on. While it is off, no prompt, tool argument or tool output text goes into an attribute or an event, and a failed span keeps only an error type, never the text of the exception, because a provider error can echo the request. Token counts, timings, names and ids stay.
+
+The spans of Temporal's interceptor (`RunActivity`, `CompleteWorkflow` and the rest) record the message and stacktrace of a failed activity or workflow by themselves, and set "Type: message" as the status description. While capture is off, `interceptors()` hands the interceptor a tracer that keeps `error.type` and drops the rest: no status description and no `exception` event. With capture on, those spans keep Temporal's own detail.
 
 With `capture_content: true`, these attributes are added, each cut at 16,000 characters:
 

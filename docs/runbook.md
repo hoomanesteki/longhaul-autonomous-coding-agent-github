@@ -187,6 +187,7 @@ A task that runs for many turns keeps two records of its transcript (ADR-0013). 
 | `compact_at` | 0.60 | At this share of the window the older turns are folded into progress notes by the compactor model. |
 | `hard_limit` | 0.85 | A request projected above this share is not sent. The view is compacted down to the last two turns and the turn is asked once more. |
 | `keep_recent_turns` | 6 | The turns a compaction leaves as they are. |
+| `mode` | full | Which tiers run: `full`, `no_compaction` or `none`. See the next section. |
 
 Each compaction writes a `compaction` event with the tokens before and after, and each call of the compactor model has its own row in `cost_ledger`:
 
@@ -195,6 +196,46 @@ SELECT ts, payload FROM events WHERE task_id = 'lh-local-calc-1a2b3c4d' AND type
 ```
 
 The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` and a `results.json` for each turn. `longhaul.context.log.read_log(blobs, task_id)` joins them into one transcript. It is never elided or compacted, so a report can say what the agent did in turn 3 of 150. The view of a task is the `transcript_ref` of the workflow state, under `tasks/<task id>/turns/`.
+
+### Switching the tiers off, and what a task records about its context
+
+The evaluation compares runs with the tiers on and off (plan section 8), so `context.mode` turns them off one at a time:
+
+| Mode | Tier 1: elide old tool outputs | Tier 2: compact into notes | A full window |
+|---|---|---|---|
+| `full` | on | on | one forced compaction, then the turn is asked again |
+| `no_compaction` | on | off | the run ends with `error` and the summary `context limit` |
+| `none` | off | off | the run ends with `error` and the summary `context limit` |
+
+The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In the two modes without compaction nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+
+`context.mode` in the config is the default of a worker. A single run can ask for its own, and that wins:
+
+```bash
+uv run longhaul run --path tests/fixtures/repos/calc --issue-file tests/fixtures/repos/calc/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/calc_fix.yaml --context-mode none
+```
+
+The run puts the mode in the workflow memo, next to the script. The workflow hands it to every model turn and every compaction, and the header line of `run` says `context mode none`. A run that names no mode uses the config of the worker that picks up each turn, so all workers of a queue should share one `context.mode`.
+
+Each task row keeps five totals for the report (`tasks`, migration `0010_task_context_totals`). Activities write them, and none of them is added to a counter, so a retried activity cannot count a call twice:
+
+| Column | What it holds | Where it comes from |
+|---|---|---|
+| `input_tokens_total` | Tokens the model read that were not in the prompt cache: input plus cache writes | the sum of the `cost_ledger` rows of the task |
+| `output_tokens_total` | Tokens the model wrote | the same rows |
+| `cache_read_total` | Tokens served from the prompt cache | the same rows |
+| `compactions` | Compactions that changed the view | the number of different `compaction` events |
+| `max_fraction` | The largest share of `window_tokens` that one request took, as `llm_turn` projected it before sending | the maximum over the requests |
+
+The three token totals do not overlap, and the compactor's own calls are in them, so they add up to what the task cost to run. Tokens per task is their sum, and the cache ratio is `cache_read_total / (input_tokens_total + cache_read_total)`:
+
+```sql
+SELECT id, input_tokens_total, output_tokens_total, cache_read_total, compactions, max_fraction
+FROM tasks WHERE id = 'lh-acme-calc-42';
+```
+
+A task has these columns only when it has a row in `tasks`. The poller makes the row when it starts a task. `longhaul run` does not, so a task started with it has its calls in `cost_ledger` and its compactions in `events`, and the totals stay at 0. The cost ledger works the same way.
 
 ### Stopping a worker
 

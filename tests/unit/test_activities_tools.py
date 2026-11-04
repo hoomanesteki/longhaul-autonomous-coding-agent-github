@@ -29,15 +29,19 @@ from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.rules import BAD_FINISH, SKIPPED_AFTER_FINISH
 from longhaul.agent.turns import CONTROL_RESULT, validate_pairs
-from longhaul.blobs.base import blob_key, make_ref
+from longhaul.blobs.base import blob_key, handle_key, make_ref
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.context.tokens import estimate_tokens
+from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
     ExecResult,
     Message,
     Sandbox,
     TextBlock,
+    ToolCall,
+    ToolContext,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -50,6 +54,7 @@ from longhaul.durable.activities.tools import (
     WorkspaceCheckpoints,
 )
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.tools.output import ReadOutput, output_handle
 from longhaul.tools.registry import ToolRegistry, default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -102,16 +107,18 @@ class Rig:
         checkpoints: WorkspaceCheckpoints | None = None,
         registry: ToolRegistry | None = None,
         recorder: MemoryRecorder | None = None,
+        tool_output_max_tokens: int = 4000,
     ) -> None:
         self.blobs = MemoryBlobStore()
         self.recorder = recorder or MemoryRecorder()
         self.lookup = Lookup(sandbox)
         self.activities = ToolActivities(
-            registry or default_registry(test_command="pytest -q"),
+            registry or default_registry(test_command="pytest -q", blobs=self.blobs),
             self.lookup,
             self.blobs,
             self.recorder,
             checkpoints=checkpoints or NoCheckpoints(),
+            tool_output_max_tokens=tool_output_max_tokens,
         )
         self.beats: list[Any] = []
 
@@ -893,7 +900,9 @@ async def test_results_answer_the_calls_in_call_order() -> None:
 
 
 async def test_a_text_held_by_reference_is_read_from_the_blob() -> None:
-    rig = Rig(None)
+    # This test is about reading the blob, so the cap is above its text. The cap has tests of its
+    # own under "output handles" below.
+    rig = Rig(None, tool_output_max_tokens=10_000)
     ref = await rig.put_json("t.json", calls_transcript(call_block("a")))
     text = "line\n" * 5000
     stored = await rig.put_text("tool-a-output.txt", text)
@@ -992,7 +1001,8 @@ async def test_results_for_a_transcript_that_has_no_calls_fail_without_a_retry()
 
 
 async def test_hundreds_of_results_by_reference_fit_in_one_payload() -> None:
-    rig = Rig(None)
+    # About the size of the payload, not the cap: the texts stay whole.
+    rig = Rig(None, tool_output_max_tokens=10_000)
     blocks = [call_block(f"toolu_{n:03d}", path=f"f{n}.py") for n in range(300)]
     ref = await rig.put_json("t.json", calls_transcript(*blocks))
     stored = await rig.put_text("tool-out.txt", "x" * 15_000)
@@ -1017,3 +1027,116 @@ async def test_activities_list_what_a_worker_registers() -> None:
     names = sorted(a.__name__ for a in rig.activities.activities)
     assert names == ["append_results", "tool_exec"]
     assert asyncio.iscoroutinefunction(rig.activities.tool_exec)
+
+
+# ---------- output handles (LH-402) ----------
+def noisy_command(lines: int) -> str:
+    code = f"for n in range(1, {lines} + 1): print('line', n, 'x' * 40)"
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+async def index_of(rig: Rig, call_id: str = "toolu_1") -> BlobRef:
+    return BlobRef.model_validate_json(await rig.blobs.get_by_key(handle_key(TASK, call_id)))
+
+
+def tool_context() -> ToolContext:
+    return ToolContext(task_id=TASK, turn_index=5, blob_prefix=f"tasks/{TASK}")
+
+
+async def test_every_output_has_a_handle_that_finds_its_blob_without_the_database(
+    sandbox: FakeSandbox,
+) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(exec_input("read_file", path="src/calc/__init__.py"))
+
+    assert output_handle("toolu_1") == "out_toolu_1"
+    # The turn is part of the blob's key and not of the handle, so a small index at a key that
+    # needs only the task and the call says where the text is.
+    assert result.output_ref is not None
+    assert await index_of(rig) == result.output_ref
+    # Reading by handle uses the blob store and nothing else: the recorder is not involved.
+    rig.recorder.tool_calls.clear()
+    page = await ReadOutput(rig.blobs).run(sandbox, {"handle": "out_toolu_1"}, tool_context())
+    assert page.ok and "return a - b" in page.output
+
+
+async def test_a_call_that_is_retried_stores_the_same_blobs_again(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    inp = exec_input("read_file", path="src/calc/__init__.py")
+    first = await rig.exec(inp)
+    keys = set(rig.blobs.objects)
+    again = await rig.exec(inp, attempt=2)
+    assert set(rig.blobs.objects) == keys
+    assert again.output_ref == first.output_ref
+    assert await index_of(rig) == first.output_ref
+
+
+async def test_a_long_output_reaches_the_model_as_a_head_a_tail_and_a_handle(
+    sandbox: FakeSandbox,
+) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(exec_input("run_command", command=noisy_command(3000)))
+    assert result.ok and result.output_ref is not None
+    stored = (await rig.blobs.get(result.output_ref)).decode()
+    assert estimate_tokens(stored) > 4000
+    # The history keeps a preview and the ref, whatever the size.
+    assert len(result.output) < acts.OUTPUT_PREVIEW_CHARS + 300
+
+    ref = await rig.put_json(
+        "t.json", calls_transcript(call_block("toolu_1", "run_command", command="noisy"))
+    )
+    out_ref = await rig.append(append_input(ref, acts.summarize_result(result)))
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+
+    assert answer.content == shape_output(stored, 4000, "out_toolu_1")
+    assert estimate_tokens(answer.content) <= 4000
+    assert "Full text: handle out_toolu_1." in answer.content
+    assert not answer.is_error
+    # The whole text is still in the store, and the handle pages through it.
+    assert (await rig.blobs.get(result.output_ref)).decode() == stored
+    registry = default_registry(blobs=rig.blobs)
+    call = ToolCall(
+        id="r1",
+        name="read_output",
+        input={"handle": "out_toolu_1", "start_line": 1500, "end_line": 1502},
+    )
+    page = await registry.run(call, sandbox, tool_context())
+    rows = stored.split("\n")
+    assert page.output.split("\n") == [f"{n:>6}\t{rows[n - 1]}" for n in (1500, 1501, 1502)]
+
+
+async def test_an_output_under_the_cap_reaches_the_model_whole(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(exec_input("run_command", command=noisy_command(100)))
+    assert result.output_ref is not None
+    stored = (await rig.blobs.get(result.output_ref)).decode()
+    assert estimate_tokens(stored) <= 4000
+    ref = await rig.put_json(
+        "t.json", calls_transcript(call_block("toolu_1", "run_command", command="noisy"))
+    )
+    out_ref = await rig.append(append_input(ref, acts.summarize_result(result)))
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+    assert answer.content == stored
+
+
+async def test_the_cap_is_the_one_the_activities_were_built_with(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox, tool_output_max_tokens=100)
+    result = await rig.exec(exec_input("run_command", command=noisy_command(40)))
+    ref = await rig.put_json(
+        "t.json", calls_transcript(call_block("toolu_1", "run_command", command="noisy"))
+    )
+    out_ref = await rig.append(append_input(ref, acts.summarize_result(result)))
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+    assert estimate_tokens(answer.content) <= 100
+    assert "Full text: handle out_toolu_1." in answer.content
+
+
+async def test_a_result_that_no_tool_made_is_not_shaped() -> None:
+    # The answer to a finish without a summary is short and travels inline.
+    rig = Rig(None, tool_output_max_tokens=1)
+    ref = await rig.put_json("t.json", calls_transcript(call_block("f", "finish")))
+    out_ref = await rig.append(
+        append_input(ref, acts.ToolResultSummary(call_id="f", ok=False, output=BAD_FINISH))
+    )
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+    assert answer.content == BAD_FINISH

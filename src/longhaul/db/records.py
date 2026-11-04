@@ -40,7 +40,7 @@ class TurnRecord:
     request_ref: str | None = None  # blob key of the transcript that was sent
     response_ref: str | None = None  # blob key of the reply; None when the call failed
     usage: Usage = field(default_factory=Usage)
-    cost_usd: float = 0.0  # 0.0 until the pricing table arrives (LH-701)
+    cost_usd: float = 0.0  # the price of the call, as the cost ledger has it
     stop_reason: str | None = None
     latency_ms: int | None = None
     ended_at: datetime | None = None

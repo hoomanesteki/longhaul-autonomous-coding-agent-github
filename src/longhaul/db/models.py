@@ -100,7 +100,7 @@ class Turn(Base):
     `attempt` counts the calls of one turn: a turn is asked again after a reply that was cut
     off at max_tokens, after a pause_turn, and after a retry. A call that failed before the
     provider billed it leaves no row. A billed call that failed leaves one with its usage and
-    no reply, so the cost ledger of Phase 7 can still account for it.
+    no reply. The cost ledger has a row of its own for each of these calls.
     """
 
     __tablename__ = "turns"
@@ -180,6 +180,47 @@ class Event(Base):
     type: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class CostLedgerRow(Base):
+    """One model call and what it cost (LH-701), added up by task and by repo and day.
+
+    The ledger is append only. Every call that was billed is a row, so a retried call is another
+    row, with the Temporal attempt that made it. One turn can have several rows with the same
+    attempt: a reply cut off at max_tokens is asked again, and a paused reply is continued, each
+    by a new run of the activity that starts at attempt 1. Nothing but `id` can be the key.
+
+    `ts` is the time of the call, and `created_at` the time of the insert, as on every table.
+    """
+
+    __tablename__ = "cost_ledger"
+    __table_args__ = (
+        Index("ix_cost_ledger_task_id", "task_id"),
+        # The daily limit of a repo sums the rows since midnight UTC.
+        Index("ix_cost_ledger_repo_ts", "repo", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(Text, nullable=False)
+    repo: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    cache_read_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    cache_write_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    usd: Mapped[Decimal] = mapped_column(Numeric(10, 6), nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

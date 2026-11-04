@@ -38,4 +38,4 @@ The review of `contracts.py` raised more than version 2 holds. Each of these wai
 | `MemoryItem.source_ref`, and a lookup by it | LH-606 | Promotion on a merged PR is the first code that reads it. |
 | A size limit on `TaskSpec.body` and `comments`, with a blob ref for the full text | LH-303 | Issue intake is the first code that writes long text. |
 | `Message.role == "system"` | LH-405 | Decided together with the prompt layout. |
-| `Usage.thinking_tokens` and 1 hour cache writes | LH-701 | Optional. The cost ledger decides whether it needs them. |
+| `Usage.thinking_tokens` and 1 hour cache writes | LH-701 | Settled in LH-701 without a contracts change. Thinking is billed as output (ADR-0003, section 5), so the ledger prices `output_tokens` at the output rate and needs no separate count. Longhaul sends no `ttl` on its cache markers, so every write is a 5 minute write and one write price covers it. A change to 1 hour entries would need a second write price and a usage field for them. |

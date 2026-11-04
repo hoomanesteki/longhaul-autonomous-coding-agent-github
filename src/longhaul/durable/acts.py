@@ -163,7 +163,8 @@ class LlmTurnOutput(BaseModel):
     tool_call_summaries: list[ToolCallSummary] = Field(default_factory=list)
     stop_reason: StopReason
     usage: Usage
-    cost_usd: float = Field(default=0.0, ge=0)  # 0.0 until the pricing table arrives (LH-701)
+    # What the call cost, as the cost ledger priced it. 0.0 when the activity has no ledger.
+    cost_usd: float = Field(default=0.0, ge=0)
     input_tokens_total: int = Field(default=0, ge=0)  # input, cache read and cache write
     # The next four are what the rules read, or what the next call needs.
     stop_details: StopDetails | None = None

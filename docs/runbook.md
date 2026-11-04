@@ -93,6 +93,27 @@ docs/private/**
 
 The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
 
+## Prices and the cost ledger
+
+`config/pricing.yaml` holds what each model costs in US dollars per million tokens: `input_per_mtok`, `output_per_mtok`, `cache_write_per_mtok` and `cache_read_per_mtok`. Prices live there and never in code. The comment at the top of the file says when the numbers were last checked against the provider's published model table. Check them again, and change the date, when the provider changes a price or the config names a new model.
+
+A call costs `(input * pi + output * po + cache_write * pcw + cache_read * pcr) / 1,000,000`. The four token counts do not overlap. A model can also have a `long_prompt` block, as Haiku 5.5 has. A call whose prompt is longer than `above_tokens` is billed at the rates in that block, output tokens included. The prompt of a call is its input, cache read and cache write tokens added together, and a prompt of exactly `above_tokens` tokens is not long.
+
+The scripted and replay providers cost nothing, so a scripted run can name any model. For every other provider, `load_pricing(provider, config)` in `longhaul.cost.pricing` reads the pricing file and raises `PricingError` when a model in the config has no price or the file is malformed. The worker calls it before it takes a task (LH-208), so a missing price stops it at startup and not after the first billed call.
+
+Every model call that the provider billed writes one row to the `cost_ledger` table as soon as the call returns. The row holds the task, the repo, the model, the turn, the token counts and the cost in dollars. `attempt` is the Temporal attempt of the activity, so a retry after a failure shows as a second row with attempt 2. A call that failed before the provider billed it has no row. The table is only ever added to, and a turn can have several rows with the same attempt, for example the second call of a reply that was cut off.
+
+```sql
+-- what a task cost
+SELECT sum(usd) FROM cost_ledger WHERE task_id = 'lh-acme-calc-42';
+
+-- what a repo spent since midnight UTC
+SELECT sum(usd) FROM cost_ledger
+WHERE repo = 'acme/calc' AND ts >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC';
+```
+
+`tasks.cost_usd` holds the same total for a task, rounded to ten thousandths of a dollar. It is set from the sum of the rows, so it does not drift. A task with no row in `tasks`, as in a local run, still has its calls on the ledger.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.

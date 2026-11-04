@@ -532,7 +532,7 @@ def test_every_configured_model_has_all_four_prices() -> None:
 
 
 def test_prices_match_the_decided_rates() -> None:
-    # Per million tokens, from the provider's model table as cached on 2026-10-06.
+    # Per million tokens, from the provider's model table as checked on 2026-11-03.
     prices = _prices()
 
     assert _rates(prices["claude-sonnet-5-5"]) == {

@@ -10,8 +10,14 @@ off at max_tokens, a refusal, a full window or a pause is not stored, and none o
 are returned. For a turn that was paused, the text so far is stored under `paused_ref` and the
 workflow hands it back with the next call.
 
-Every call that was billed has a row in `turns`, also when it failed, so the cost ledger of
-Phase 7 can account for it. A call that failed before it was billed leaves no row.
+Every call that was billed has a row in `turns`, also when it failed. A call that failed before
+it was billed leaves no row.
+
+Every call that was billed is also on the cost ledger (invariant I6), with the Temporal attempt
+number. It is written as soon as the call returns, before the blobs and the `turns` row, so a
+call that is billed and then lost to a failure of this activity is still on the ledger. Temporal
+runs the activity again and the model is called again, which makes a second row with attempt 2.
+The cost on the ledger is the cost in `LlmTurnOutput` and in the `turns` row.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from pydantic_core import to_json
@@ -47,7 +54,10 @@ from longhaul.contracts import (
     TextBlock,
     ToolCall,
     ToolSpec,
+    Usage,
 )
+from longhaul.cost.ledger import Ledger, NoLedger
+from longhaul.cost.pricing import PricingError
 from longhaul.db.records import Recorder, TurnRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import (
@@ -66,6 +76,10 @@ class LlmActivities:
     `config_for` gives the model, the effort and the output caps of a role, which the workflow
     cannot read. `tools` is the tool list sent with every call: it stays as it is for the life
     of a transcript, because a change drops the prompt cache (D7, D8).
+
+    `ledger` writes the cost ledger row of every call. A worker passes a `SqlLedger` built on
+    the prices of `load_pricing`. Without one no row is written and every call costs 0, which
+    suits a run with no database and no paid provider, and nothing else.
     """
 
     def __init__(
@@ -75,12 +89,15 @@ class LlmActivities:
         recorder: Recorder,
         tools: Sequence[ToolSpec],
         config_for: Callable[[Role], LoopConfig],
+        *,
+        ledger: Ledger | None = None,
     ) -> None:
         self._provider = provider
         self._blobs = blobs
         self._recorder = recorder
         self._tools = list(tools)
         self._config_for = config_for
+        self._ledger: Ledger = NoLedger() if ledger is None else ledger
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -103,7 +120,8 @@ class LlmActivities:
         began = time.monotonic()
         resp = await self._ask(inp, cfg, system, transcript, paused, attempt, started)
         latency_ms = resp.latency_ms or int((time.monotonic() - began) * 1000)
-        out = await self._store(inp, resp, transcript, paused, attempt)
+        cost = await self._charge(inp, cfg.model, resp.usage)
+        out = await self._store(inp, resp, transcript, paused, attempt, cost)
         await self._recorder.record_turn(
             TurnRecord(
                 task_id=inp.task_id,
@@ -155,7 +173,9 @@ class LlmActivities:
                 )
         except ProviderError as exc:
             if exc.usage is not None:
-                # Billed, then failed: the usage is recorded before the error goes up.
+                # Billed, then failed: the call is on the ledger and in `turns` before the error
+                # goes up.
+                cost = await self._charge(inp, cfg.model, exc.usage)
                 await self._recorder.record_turn(
                     TurnRecord(
                         task_id=inp.task_id,
@@ -165,10 +185,29 @@ class LlmActivities:
                         started_at=started,
                         request_ref=inp.transcript_ref.key if inp.transcript_ref else None,
                         usage=exc.usage,
+                        cost_usd=float(cost),
                         ended_at=datetime.now(UTC),
                     )
                 )
             raise provider_failure(exc) from exc
+
+    async def _charge(self, inp: acts.LlmTurnInput, model: str, usage: Usage) -> Decimal:
+        """Put a call on the ledger and return what it cost.
+
+        This is the first thing done with a reply, so that the call is on the ledger even when
+        the activity fails after it. The row carries the Temporal attempt, so a retry shows as
+        attempt 2 (plan section 4.1, F1). `turns` counts the calls of a turn instead. The model
+        is the one that was asked for, because that is the name the pricing file knows.
+
+        A model without a price fails for good. Each retry would call the model again, and none
+        of those calls could be priced.
+        """
+        try:
+            return await self._ledger.record(
+                inp.task_id, inp.spec.repo, model, inp.turn_index, activity.info().attempt, usage
+            )
+        except PricingError as exc:
+            raise not_retried(exc) from exc
 
     # ----- what came back -----
     async def _store(
@@ -178,6 +217,7 @@ class LlmActivities:
         transcript: list[Message],
         paused: list[Block],
         attempt: int,
+        cost: Decimal,
     ) -> acts.LlmTurnOutput:
         complete = rules.is_complete(resp)
         grown = self._grow(transcript, rules.join_pauses(resp, paused)) if complete else transcript
@@ -205,6 +245,7 @@ class LlmActivities:
             tool_call_summaries=await self._summaries(inp, calls),
             stop_reason=resp.stop_reason,
             usage=usage,
+            cost_usd=float(cost),
             input_tokens_total=usage.input_tokens
             + usage.cache_read_tokens
             + usage.cache_write_tokens,

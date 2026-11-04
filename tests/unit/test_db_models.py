@@ -55,6 +55,7 @@ def test_turn_columns_match_data_model() -> None:
         "task_id", "turn_index", "attempt", "role", "request_ref", "response_ref",
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "cost_usd", "stop_reason", "latency_ms", "started_at", "ended_at", "created_at",
+        "cache_ratio",
     }  # fmt: skip
     keys = [c.name for c in Turn.__table__.primary_key.columns]
     assert keys == ["task_id", "turn_index", "attempt"]
@@ -76,6 +77,7 @@ def test_turn_ddl() -> None:
     assert "input_tokens INTEGER DEFAULT 0 NOT NULL" in ddl
     assert "cache_write_tokens INTEGER DEFAULT 0 NOT NULL" in ddl
     assert "cost_usd NUMERIC(10, 6) DEFAULT 0 NOT NULL" in ddl
+    assert "cache_ratio FLOAT DEFAULT 0 NOT NULL" in ddl
     assert "started_at TIMESTAMP WITH TIME ZONE NOT NULL" in ddl
     assert "created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL" in ddl
 

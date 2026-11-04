@@ -18,6 +18,7 @@ from longhaul.context.tokens import (
     DEFAULT_CHARS_PER_TOKEN,
     ContextBudget,
     TokenMeter,
+    cache_ratio,
     count_request_chars,
     estimate_tokens,
     prompt_tokens,
@@ -226,6 +227,30 @@ def test_the_whole_prompt_is_calibrated_not_input_tokens() -> None:
     meter = TokenMeter()
     meter.observe(usage, request_chars=10_836)
     assert meter.chars_per_token == pytest.approx(3.0)
+
+
+# ---------- cache ratio (LH-405) ----------
+def test_cache_ratio_is_cache_read_over_input_plus_cache_read() -> None:
+    assert cache_ratio(Usage(input_tokens=100, cache_read_tokens=900)) == pytest.approx(0.9)
+    assert cache_ratio(Usage(input_tokens=300, cache_read_tokens=100)) == pytest.approx(0.25)
+
+
+def test_cache_ratio_is_zero_without_a_read_and_one_when_everything_was_read() -> None:
+    assert cache_ratio(Usage(input_tokens=500)) == 0.0
+    assert cache_ratio(Usage(input_tokens=0, cache_read_tokens=500)) == 1.0
+
+
+def test_cache_ratio_of_a_call_with_no_prompt_is_zero_and_not_an_error() -> None:
+    # A failed call can be billed with output only. Dividing by its empty prompt would raise.
+    assert cache_ratio(Usage()) == 0.0
+    assert cache_ratio(Usage(output_tokens=40)) == 0.0
+
+
+def test_cache_ratio_leaves_cache_writes_out_of_the_denominator() -> None:
+    # The plan defines the ratio as cache_read / (input + cache_read). Written tokens were
+    # neither read nor sent plain, so a turn that writes a lot still shows how much it read.
+    usage = Usage(input_tokens=12, cache_read_tokens=3_000, cache_write_tokens=600)
+    assert cache_ratio(usage) == pytest.approx(3_000 / 3_012)
 
 
 def test_output_tokens_do_not_change_the_ratio() -> None:

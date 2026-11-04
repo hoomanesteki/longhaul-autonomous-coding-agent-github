@@ -52,7 +52,7 @@ from longhaul.contracts import (
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.tools import ToolActivities
+from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -284,7 +284,7 @@ async def through_the_workflow(
     llm = SpyLlm(
         provider_for(scenario), blobs, recorder, registry.specs(), lambda role: CFG, refs=refs
     )
-    tools = SpyTools(registry, OneBox(box), blobs, recorder, refs=refs)
+    tools = SpyTools(registry, OneBox(box), blobs, recorder, checkpoints=NoCheckpoints(), refs=refs)
     workspace = Workspace(box)
     queue = f"lh-parity-{uuid.uuid4().hex[:8]}"
     try:

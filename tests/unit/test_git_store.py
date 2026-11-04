@@ -832,6 +832,111 @@ async def test_a_timeout_in_the_sandbox_is_a_checkpoint_error(
         await sandbox.destroy()
 
 
+# ---------- is_at ----------
+#
+# tool_exec asks before every call whether the workspace already is where the call has to start.
+# A yes skips the restore, which also deletes ignored files, so a build that the agent made
+# survives a run of calls that change nothing.
+
+
+async def test_a_fresh_workspace_is_at_its_commit(env: Env, box: FakeSandbox) -> None:
+    assert await env.store.is_at(box, env.base_sha)
+
+
+async def test_the_workspace_is_at_the_commit_it_saved(env: Env, box: FakeSandbox) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    sha = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert sha is not None
+
+    assert await env.store.is_at(box, sha)
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "echo drift >> pyproject.toml",  # a tracked file changed
+        "rm tests/test_calc.py",  # a tracked file deleted
+        "echo new > notes.txt",  # an untracked file
+        "mkdir -p deep/dir && echo x > deep/dir/f",  # an untracked folder
+        "chmod +x pyproject.toml",  # a mode change
+        "echo staged > s.txt && git add s.txt",  # staged only
+        "git checkout -q -b feature",  # another branch at the same commit
+        "git checkout -q --detach",  # no branch at all
+        "rm -rf .git",  # no repository
+        "git init -q nested && echo n > nested/n.txt",  # a nested repository
+    ],
+)
+async def test_a_workspace_that_differs_is_not_at_the_commit(
+    env: Env, box: FakeSandbox, script: str
+) -> None:
+    await sh(box, script)
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+async def test_files_that_git_ignores_are_not_a_difference(env: Env, box: FakeSandbox) -> None:
+    # The venv and the caches are not part of a checkpoint, and a restore would delete the caches.
+    await sh(
+        box,
+        "mkdir -p .venv/bin src/calc/__pycache__ build.egg-info"
+        " && echo x > .venv/bin/python && echo y > src/calc/__pycache__/m.pyc"
+        " && echo z > build.egg-info/PKG-INFO",
+    )
+    assert await env.store.is_at(box, env.base_sha)
+
+
+async def test_a_config_the_agent_changed_cannot_hide_a_new_file(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, "git config status.showUntrackedFiles no && echo new > notes.txt")
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+async def test_the_question_changes_nothing(env: Env, box: FakeSandbox) -> None:
+    await sh(box, "echo drift >> pyproject.toml && echo new > notes.txt")
+    before = snapshot(box.root)
+    head = env.head()
+
+    assert not await env.store.is_at(box, env.base_sha)
+
+    assert snapshot(box.root) == before
+    assert env.head() == head
+    assert (await sh(box, "git rev-parse HEAD")).strip() == env.base_sha
+
+
+async def test_a_stale_lock_does_not_stop_the_question_or_get_removed(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, "touch .git/index.lock")
+    assert await env.store.is_at(box, env.base_sha)
+    assert (box.root / ".git" / "index.lock").exists()
+
+
+async def test_a_commit_the_workspace_never_had_is_not_the_commit_it_is_at(
+    env: Env, box: FakeSandbox
+) -> None:
+    assert not await env.store.is_at(box, "1" * 40)
+
+
+@pytest.mark.parametrize("sha", ["main", "HEAD", "abc", "a" * 40 + "; touch pwned", "$(id)"])
+async def test_is_at_only_takes_full_shas(
+    plain_store: GitCheckpointStore, empty_box: FakeSandbox, sha: str
+) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await plain_store.is_at(empty_box, sha)
+    assert list(empty_box.root.iterdir()) == [], "nothing ran in the sandbox"
+
+
+async def test_is_at_without_a_checkpoint_repo_says_so(env: Env) -> None:
+    sandbox = FakeSandbox()
+    env.store.mount_point = str(env.tmp_path / "nothing-here")
+    try:
+        with pytest.raises(CheckpointError, match="checkpoint repository"):
+            await env.store.is_at(sandbox, env.base_sha)
+    finally:
+        await sandbox.destroy()
+
+
 # ---------- bundles ----------
 
 

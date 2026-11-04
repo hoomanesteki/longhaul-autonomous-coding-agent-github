@@ -1,14 +1,22 @@
 """The tool_exec and append_results activities.
 
-tool_exec runs one call in a sandbox, stores what came out and writes the tool_calls row.
+tool_exec runs one call in a sandbox, stores what came out and writes the tool_calls row. It
+starts every call from `pre_sha` and saves the changes a call made as a checkpoint (LH-206).
 append_results answers the tool_use blocks of the last assistant message with the results.
 Both run inside temporalio's ActivityEnvironment, with a fake sandbox, the memory blob store and
 the memory recorder.
+
+Most tests here are about the tools and use NoCheckpoints, which stores nothing, in a folder with
+no repository. The tests under "checkpoints" use a real GitCheckpointStore and a real bare repo,
+with the fake sandbox standing in for the container.
 """
 
 import asyncio
 import dataclasses
+import importlib.util
+import os
 import shlex
+import subprocess
 import sys
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -23,27 +31,44 @@ from longhaul.agent.rules import BAD_FINISH, SKIPPED_AFTER_FINISH
 from longhaul.agent.turns import CONTROL_RESULT, validate_pairs
 from longhaul.blobs.base import blob_key, make_ref
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.contracts import (
     BlobRef,
+    ExecResult,
     Message,
     Sandbox,
     TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
-from longhaul.db.records import MemoryRecorder
+from longhaul.db.records import CheckpointRecord, MemoryRecorder
 from longhaul.durable import acts
-from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
+from longhaul.durable.activities.tools import (
+    SHELL_TOOLS,
+    NoCheckpoints,
+    ToolActivities,
+    WorkspaceCheckpoints,
+)
 from longhaul.sandbox.local_manager import FakeSandbox
-from longhaul.tools.registry import default_registry
+from longhaul.tools.registry import ToolRegistry, default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
 ROOT = Path(__file__).parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
 TASK = "lh-acme-calc-42"
+BRANCH = "longhaul/42"
 SHA = "a" * 40
+MODULE = "src/calc/__init__.py"
 FIRST = Message(role="user", content=[TextBlock(text="go")])
+
+_spec = importlib.util.spec_from_file_location(
+    "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
+)
+assert _spec and _spec.loader
+_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+make_fixture_git = _module.make_fixture_git
 
 
 class Lookup:
@@ -70,14 +95,22 @@ async def sandbox() -> AsyncIterator[FakeSandbox]:
 
 
 class Rig:
-    def __init__(self, sandbox: Sandbox | None) -> None:
+    def __init__(
+        self,
+        sandbox: Sandbox | None,
+        *,
+        checkpoints: WorkspaceCheckpoints | None = None,
+        registry: ToolRegistry | None = None,
+    ) -> None:
         self.blobs = MemoryBlobStore()
         self.recorder = MemoryRecorder()
+        self.lookup = Lookup(sandbox)
         self.activities = ToolActivities(
-            default_registry(test_command="pytest -q"),
-            Lookup(sandbox),
+            registry or default_registry(test_command="pytest -q"),
+            self.lookup,
             self.blobs,
             self.recorder,
+            checkpoints=checkpoints or NoCheckpoints(),
         )
         self.beats: list[Any] = []
 
@@ -101,12 +134,19 @@ class Rig:
         return await self.blobs.put_json(model, blob_key(TASK, "turns", turn, name))
 
 
-def exec_input(name: str, call_id: str = "toolu_1", turn: int = 2, **arguments: Any) -> Any:
+def exec_input(
+    name: str,
+    call_id: str = "toolu_1",
+    turn: int = 2,
+    *,
+    pre_sha: str | None = SHA,
+    **arguments: Any,
+) -> Any:
     return acts.ToolExecInput(
         task_id=TASK,
         turn_index=turn,
         call=acts.ToolCallSummary(id=call_id, name=name, input=arguments),
-        pre_sha=SHA,
+        pre_sha=pre_sha,
         sandbox_id="sbx-1",
     )
 
@@ -148,7 +188,8 @@ async def test_a_long_text_is_cut_in_the_result_and_whole_in_the_blob(
 async def test_the_result_carries_the_checkpoint_it_started_from_and_no_new_one(
     sandbox: FakeSandbox,
 ) -> None:
-    # LH-206 adds the restore and the commit. Until then a call neither moves nor leaves one.
+    # With NoCheckpoints a call neither moves the head nor leaves a checkpoint. The tests under
+    # "checkpoints" below show what the real store does.
     rig = Rig(sandbox)
     result = await rig.exec(
         exec_input("edit_file", path="src/calc/__init__.py", old_str="a - b", new_str="a + b")
@@ -237,10 +278,414 @@ async def test_an_input_over_the_payload_limit_fails_without_a_retry(
     assert caught.value.type == "PayloadTooLargeError"
 
 
-async def test_the_checkpoint_store_is_a_no_op_until_lh_206(sandbox: FakeSandbox) -> None:
+async def test_the_null_checkpoint_store_stores_nothing(sandbox: FakeSandbox) -> None:
+    # For tests that exercise a tool and do not care about checkpoints. A worker passes the
+    # real store.
     store = NoCheckpoints()
     assert await store.commit(sandbox, "lh: edit_file turn 0 call toolu_1") is None
     assert await store.restore(sandbox, SHA) is None
+    assert await store.is_at(sandbox, SHA)  # nothing to restore, so it never asks for a restore
+
+
+# ---------- checkpoints (LH-206) ----------
+def host_git(*args: str) -> str:
+    """Git on the host, as the tests read a repo: no inherited GIT_* variables."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    result = subprocess.run(
+        ["git", *args], check=True, capture_output=True, text=True, env=env, timeout=60
+    )
+    return result.stdout.strip()
+
+
+class Spy:
+    """A checkpoint store that passes every call to a real one, keeps count, and can die.
+
+    `dies` makes the next commit fail the way a killed worker does: "before" the commit is made,
+    or "after" it was made and pushed, before the result goes back.
+    """
+
+    def __init__(self, store: GitCheckpointStore) -> None:
+        self.store = store
+        self.restores: list[str] = []
+        self.commits: list[str] = []
+        self.dies: str | None = None
+
+    async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
+        return await self.store.init_task(task_id, clone_url, base_sha)
+
+    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+        self.commits.append(message)
+        if self.dies == "before":
+            self.dies = None
+            raise RuntimeError("the worker was killed")
+        sha = await self.store.commit(sandbox, message)
+        if self.dies == "after":
+            self.dies = None
+            raise RuntimeError("the worker was killed")
+        return sha
+
+    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+        self.restores.append(sha)
+        await self.store.restore(sandbox, sha)
+
+    async def bundle(self, task_id: str) -> BlobRef:
+        return await self.store.bundle(task_id)
+
+    async def is_at(self, sandbox: Sandbox, sha: str) -> bool:
+        return await self.store.is_at(sandbox, sha)
+
+
+@dataclasses.dataclass
+class Repo:
+    """The bare repo of a task, and a fake sandbox that is a clone of it at the base commit."""
+
+    store: GitCheckpointStore
+    box: FakeSandbox
+    base_sha: str
+
+    def bare(self, *args: str) -> str:
+        return host_git(f"--git-dir={self.store.repo_path(TASK)}", *args)
+
+    def branch_head(self) -> str:
+        return self.bare("rev-parse", f"refs/heads/{BRANCH}")
+
+    def rig(self, *, registry: ToolRegistry | None = None, spy: Spy | None = None) -> Rig:
+        return Rig(self.box, checkpoints=spy or self.store, registry=registry)
+
+    async def text(self, path: str = MODULE) -> str:
+        return (await self.box.read_file(path)).decode()
+
+
+@pytest.fixture
+async def repo(tmp_path: Path) -> AsyncIterator[Repo]:
+    source = make_fixture_git(CALC, tmp_path / "source")
+    base_sha = host_git("-C", str(source), "rev-parse", "HEAD")
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+    await store.init_task(TASK, str(source), base_sha)
+    # The fake sandbox cannot mount anything, so it reads the repo from its host path.
+    store.mount_point = str(store.repo_path(TASK))
+    box = FakeSandbox("sbx-1")
+    await store.attach(box, TASK)
+    try:
+        yield Repo(store, box, base_sha)
+    finally:
+        await box.destroy()
+
+
+def edit(pre_sha: str | None, **fields: Any) -> Any:
+    """An edit that is not idempotent: run twice on the same file it adds the suffix twice."""
+    arguments = {"path": MODULE, "old_str": "return a - b", "new_str": "return a - b + 1"}
+    return exec_input("edit_file", pre_sha=pre_sha, **{**arguments, **fields})
+
+
+async def test_a_call_that_changes_files_is_saved_as_a_checkpoint(repo: Repo) -> None:
+    rig = repo.rig()
+    result = await rig.exec(edit(repo.base_sha))
+
+    assert result.ok
+    assert result.pre_sha == repo.base_sha
+    assert result.post_sha is not None and result.post_sha != repo.base_sha
+    # The commit is the edit on top of pre_sha, and it is the head of the checkpoint branch.
+    assert repo.branch_head() == result.post_sha
+    assert repo.bare("rev-parse", f"{result.post_sha}^") == repo.base_sha
+    assert repo.bare("log", "-1", "--format=%s", result.post_sha) == (
+        "lh: edit_file turn 2 call toolu_1"
+    )
+    assert "return a - b + 1" in repo.bare("show", f"{result.post_sha}:{MODULE}")
+    # The row of the call and the row of the checkpoint name the same commit.
+    (row,) = rig.recorder.tool_calls.values()
+    assert (row.pre_sha, row.post_sha) == (repo.base_sha, result.post_sha)
+    assert rig.recorder.checkpoints == [CheckpointRecord(TASK, result.post_sha, "tool", 2)]
+
+
+async def test_a_call_that_only_reads_leaves_no_checkpoint(repo: Repo) -> None:
+    rig = repo.rig()
+    result = await rig.exec(exec_input("read_file", pre_sha=repo.base_sha, path=MODULE))
+
+    assert result.ok
+    assert (result.pre_sha, result.post_sha) == (repo.base_sha, None)
+    assert repo.branch_head() == repo.base_sha
+    assert rig.recorder.checkpoints == []
+
+
+async def test_a_call_that_fails_to_change_a_file_leaves_no_checkpoint(repo: Repo) -> None:
+    rig = repo.rig()
+    result = await rig.exec(edit(repo.base_sha, old_str="no such text"))
+
+    assert not result.ok
+    assert result.post_sha is None
+    assert repo.branch_head() == repo.base_sha
+    assert rig.recorder.checkpoints == []
+
+
+async def test_each_call_starts_from_the_checkpoint_the_one_before_left(repo: Repo) -> None:
+    rig = repo.rig()
+    first = await rig.exec(edit(repo.base_sha))
+    second = await rig.exec(
+        exec_input(
+            "write_file", "toolu_2", 3, pre_sha=first.post_sha, path="NOTES.md", content="hi\n"
+        )
+    )
+
+    assert first.post_sha is not None and second.post_sha is not None
+    assert repo.bare("rev-parse", f"{second.post_sha}^") == first.post_sha
+    assert repo.branch_head() == second.post_sha
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "3"
+    assert [(c.sha, c.turn_index) for c in rig.recorder.checkpoints] == [
+        (first.post_sha, 2),
+        (second.post_sha, 3),
+    ]
+
+
+async def test_a_command_that_changes_files_is_saved_and_one_that_does_not_is_not(
+    repo: Repo,
+) -> None:
+    # The tool cannot say in advance whether a command writes, so the tree is looked at after it.
+    rig = repo.rig()
+    wrote = await rig.exec(
+        exec_input("run_command", pre_sha=repo.base_sha, command="echo built > out.txt")
+    )
+    read = await rig.exec(
+        exec_input("run_command", "toolu_2", pre_sha=wrote.post_sha, command="cat out.txt")
+    )
+
+    assert wrote.post_sha is not None
+    assert repo.bare("show", f"{wrote.post_sha}:out.txt") == "built"
+    assert repo.bare("log", "-1", "--format=%s", wrote.post_sha) == (
+        "lh: run_command turn 2 call toolu_1"
+    )
+    assert read.post_sha is None
+    assert repo.branch_head() == wrote.post_sha
+
+
+async def test_a_test_run_that_writes_files_is_saved_and_a_clean_one_is_not(repo: Repo) -> None:
+    dirty = repo.rig(registry=default_registry(test_command="echo report > report.txt"))
+    wrote = await dirty.exec(exec_input("run_tests", pre_sha=repo.base_sha))
+    clean = repo.rig(registry=default_registry(test_command="true"))
+    quiet = await clean.exec(exec_input("run_tests", "toolu_2", pre_sha=wrote.post_sha))
+
+    assert wrote.post_sha is not None
+    assert repo.bare("show", f"{wrote.post_sha}:report.txt") == "report"
+    assert quiet.post_sha is None
+    assert clean.recorder.checkpoints == []
+
+
+async def test_files_that_git_ignores_do_not_make_a_checkpoint(repo: Repo) -> None:
+    command = "mkdir -p .venv/bin src/calc/__pycache__ && echo x > src/calc/__pycache__/m.pyc"
+    result = await repo.rig().exec(
+        exec_input("run_command", pre_sha=repo.base_sha, command=command)
+    )
+    assert result.ok and result.post_sha is None
+
+
+async def test_a_call_starts_from_pre_sha_so_a_half_applied_edit_is_gone(repo: Repo) -> None:
+    # What an attempt that died after its tool ran leaves behind: a changed file and a new one.
+    await repo.box.write_file(MODULE, b"half applied\n")
+    await repo.box.write_file("leftover.txt", b"x\n")
+
+    result = await repo.rig().exec(
+        exec_input("read_file", pre_sha=repo.base_sha, path=MODULE), attempt=2
+    )
+
+    assert "half applied" not in result.output
+    assert "return a - b" in result.output
+    assert not (repo.box.root / "leftover.txt").exists()
+
+
+async def test_a_call_starts_from_pre_sha_when_the_workspace_is_on_another_commit(
+    repo: Repo,
+) -> None:
+    rig = repo.rig()
+    moved = await rig.exec(edit(repo.base_sha))
+    assert moved.post_sha is not None
+
+    # The workflow goes back to an earlier head: the workspace is clean, but on a later commit.
+    result = await rig.exec(exec_input("read_file", "toolu_2", pre_sha=repo.base_sha, path=MODULE))
+
+    assert "return a - b + 1" not in result.output
+    assert host_git("-C", str(repo.box.root), "rev-parse", "HEAD") == repo.base_sha
+
+
+async def test_a_workspace_that_is_already_at_pre_sha_is_not_restored(repo: Repo) -> None:
+    # A restore deletes ignored files, so it is kept for the calls that need it.
+    spy = Spy(repo.store)
+    rig = repo.rig(spy=spy)
+    # The cache folder is in the fixture's .gitignore, like the output of a build would be.
+    await repo.box.write_file(".pytest_cache/lastfailed", b"{}\n")
+    first = await rig.exec(edit(repo.base_sha))
+    assert first.post_sha is not None
+    spy.restores.clear()
+
+    await rig.exec(exec_input("read_file", "toolu_2", pre_sha=first.post_sha, path=MODULE))
+    await rig.exec(exec_input("list_dir", "toolu_3", pre_sha=first.post_sha, path="."))
+
+    assert spy.restores == []
+    assert (repo.box.root / ".pytest_cache" / "lastfailed").exists()
+
+
+async def test_pre_sha_is_restored_when_the_workspace_is_dirty_or_elsewhere(repo: Repo) -> None:
+    spy = Spy(repo.store)
+    rig = repo.rig(spy=spy)
+    await repo.box.write_file("stray.txt", b"x\n")
+    await rig.exec(exec_input("read_file", pre_sha=repo.base_sha, path=MODULE))
+    assert spy.restores == [repo.base_sha]
+
+    moved = await rig.exec(edit(repo.base_sha))
+    spy.restores.clear()
+    await rig.exec(exec_input("read_file", "toolu_2", pre_sha=repo.base_sha, path=MODULE))
+    assert moved.post_sha is not None
+    assert spy.restores == [repo.base_sha]
+
+
+async def test_a_call_without_a_pre_sha_runs_where_it_is_and_is_still_saved(repo: Repo) -> None:
+    spy = Spy(repo.store)
+    result = await repo.rig(spy=spy).exec(edit(None))
+
+    assert spy.restores == []
+    assert result.pre_sha is None
+    assert result.post_sha is not None and repo.branch_head() == result.post_sha
+
+
+async def test_a_retry_after_the_worker_died_before_the_commit_applies_the_edit_once(
+    repo: Repo,
+) -> None:
+    spy = Spy(repo.store)
+    spy.dies = "before"
+    rig = repo.rig(spy=spy)
+
+    with pytest.raises(RuntimeError, match="killed"):
+        await rig.exec(edit(repo.base_sha))
+    # The edit is in the workspace and nowhere else: the first attempt died with it half done.
+    assert (await repo.text()).count("+ 1") == 1
+    assert repo.branch_head() == repo.base_sha
+    assert rig.recorder.tool_calls == {} and rig.recorder.checkpoints == []
+
+    result = await rig.exec(edit(repo.base_sha), attempt=2)
+
+    assert result.ok and result.post_sha is not None
+    assert (await repo.text()).count("+ 1") == 1
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+    assert repo.bare("rev-parse", f"{result.post_sha}^") == repo.base_sha
+    assert [c.sha for c in rig.recorder.checkpoints] == [result.post_sha]
+    assert [row.attempt for row in rig.recorder.tool_calls.values()] == [2]
+
+
+async def test_a_retry_after_the_worker_died_after_the_commit_replaces_the_branch_head(
+    repo: Repo,
+) -> None:
+    spy = Spy(repo.store)
+    spy.dies = "after"
+    rig = repo.rig(spy=spy)
+
+    with pytest.raises(RuntimeError, match="killed"):
+        await rig.exec(edit(repo.base_sha))
+    lost = repo.branch_head()
+    assert lost != repo.base_sha  # the first attempt got as far as pushing its commit
+
+    result = await rig.exec(edit(repo.base_sha), attempt=2)
+
+    assert result.post_sha is not None
+    assert (await repo.text()).count("+ 1") == 1
+    # The chain stays a line: the branch has the base and one commit for the call, and the commit
+    # that was replaced can still be restored by its sha.
+    assert repo.branch_head() == result.post_sha
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+    assert repo.bare("rev-parse", f"{result.post_sha}^") == repo.base_sha
+    assert repo.bare("cat-file", "-t", lost) == "commit"
+
+
+async def test_an_odd_call_id_makes_a_safe_commit_message(repo: Repo) -> None:
+    result = await repo.rig().exec(
+        exec_input(
+            "write_file", "call:1/odd id", pre_sha=repo.base_sha, path="a.txt", content="a\n"
+        )
+    )
+
+    assert result.post_sha is not None
+    message = repo.bare("log", "-1", "--format=%s", result.post_sha)
+    assert message.startswith("lh: write_file turn 2 call ")
+    assert message.rsplit(" ", 1)[1].replace("-", "").replace("_", "").isalnum()
+
+
+# ---------- a sandbox that goes away during a call ----------
+class Dying(FakeSandbox):
+    """A sandbox whose container disappears during the first command, as `docker rm -f` does."""
+
+    def __init__(self, sandbox_id: str, lookup: Lookup, error: Exception) -> None:
+        super().__init__(sandbox_id)
+        self.lookup, self.error = lookup, error
+
+    async def exec(
+        self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        self.lookup.sandbox = None
+        raise self.error
+
+
+async def test_a_sandbox_that_vanishes_during_a_call_is_reported_as_gone(repo: Repo) -> None:
+    rig = Rig(None, checkpoints=repo.store)
+    dying = Dying("sbx-1", rig.lookup, RuntimeError("No such container: sbx-1"))
+    rig.lookup.sandbox = dying
+    try:
+        with pytest.raises(ApplicationError) as caught:
+            await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command="make"))
+    finally:
+        await dying.destroy()
+
+    assert caught.value.type == acts.SANDBOX_GONE
+    assert caught.value.non_retryable
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert rig.recorder.tool_calls == {}
+
+
+async def test_a_failure_with_the_sandbox_still_there_is_left_to_the_retry_policy(
+    repo: Repo,
+) -> None:
+    class Broken(FakeSandbox):
+        async def exec(
+            self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
+        ) -> ExecResult:
+            raise RuntimeError("the daemon hiccuped")
+
+    broken = Broken("sbx-1")
+    rig = Rig(broken, checkpoints=repo.store)
+    try:
+        with pytest.raises(RuntimeError, match="hiccuped"):
+            await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command="make"))
+    finally:
+        await broken.destroy()
+
+
+async def test_an_error_stays_the_error_when_the_lookup_cannot_say_if_the_sandbox_is_there(
+    repo: Repo,
+) -> None:
+    class BrokenLookup(Lookup):
+        async def get(self, sandbox_id: str) -> Sandbox | None:
+            if self.sandbox is None:
+                raise ConnectionError("the daemon is not answering")
+            sandbox, self.sandbox = self.sandbox, None  # present at the start, then it fails
+            return sandbox
+
+    dying = Dying("sbx-1", Lookup(None), RuntimeError("boom"))
+    rig = Rig(None, checkpoints=repo.store)
+    rig.activities._sandboxes = BrokenLookup(dying)  # type: ignore[attr-defined]
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command="make"))
+    finally:
+        await dying.destroy()
+
+
+def test_the_mutating_flags_decide_which_calls_are_saved() -> None:
+    # tool_exec saves a checkpoint after a tool that says it mutates, and after the two tools
+    # that run shell commands, whose effect on the tree is not known in advance.
+    registry = default_registry()
+    flags = {spec.name: registry.get(spec.name) for spec in registry.specs()}
+    mutating = {name for name, tool in flags.items() if tool is not None and tool.mutates}
+    assert mutating == {"edit_file", "write_file"}
+    shell = set(SHELL_TOOLS)
+    assert shell == {"run_command", "run_tests"}
+    assert shell <= set(flags)
 
 
 # ---------- append_results ----------

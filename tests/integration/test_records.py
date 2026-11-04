@@ -1,4 +1,4 @@
-"""The turns and tool_calls tables, their migration and the SQL recorder, against Postgres.
+"""The turns, tool_calls, checkpoints and events tables and the SQL recorder, against Postgres.
 
 Every test works on a throwaway database that the test creates and drops, like the migration
 tests do. The migration test in test_migrations.py already checks that the migrated schema
@@ -23,10 +23,11 @@ from alembic.script import ScriptDirectory
 from psycopg import errors as pg_errors
 from psycopg import sql
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from longhaul.contracts import Usage
-from longhaul.db.records import SqlRecorder, ToolCallRecord, TurnRecord
+from longhaul.contracts import BlobRef, Usage
+from longhaul.db.records import CheckpointRecord, SqlRecorder, ToolCallRecord, TurnRecord
 from longhaul.db.session import make_engine
 from longhaul.settings import EnvSettings, get_settings
 
@@ -281,3 +282,83 @@ async def test_a_retried_tool_call_replaces_its_row(
         )
     )
     assert scratch.query("SELECT ok, attempt FROM tool_calls") == [(True, 2)]
+
+
+# ---------- checkpoints and events (LH-206) ----------
+SHA = "a" * 40
+
+
+async def test_a_checkpoint_round_trips(scratch: Scratch, recorder: SqlRecorder) -> None:
+    await recorder.record_checkpoint(
+        CheckpointRecord(
+            task_id="lh-acme-calc-42", sha=SHA, kind="step", turn_index=7, step_id="s2"
+        )
+    )
+    (row,) = scratch.query(
+        "SELECT task_id, sha, kind, step_id, turn_index, bundle_ref, created_at FROM checkpoints"
+    )
+    assert row[:6] == ("lh-acme-calc-42", SHA, "step", "s2", 7, None)
+    assert row[6] is not None  # created_at comes from the server
+
+
+async def test_a_bundle_checkpoint_keeps_the_whole_ref(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    ref = BlobRef(key=f"tasks/lh-acme-calc-42/ckpt/{SHA}.bundle", sha256="b" * 64, size=1234)
+    await recorder.record_checkpoint(
+        CheckpointRecord(
+            task_id="lh-acme-calc-42", sha=SHA, kind="bundle", turn_index=40, bundle_ref=ref
+        )
+    )
+    ((stored,),) = scratch.query("SELECT bundle_ref FROM checkpoints")
+    assert BlobRef.model_validate(stored) == ref
+
+
+async def test_saving_a_checkpoint_again_keeps_one_row(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    # A retried tool call can make the same commit as its first try.
+    record = CheckpointRecord(task_id="lh-acme-calc-42", sha=SHA, kind="tool", turn_index=3)
+    await recorder.record_checkpoint(record)
+    await recorder.record_checkpoint(record)
+    assert scratch.query("SELECT count(*) FROM checkpoints") == [(1,)]
+
+
+async def test_checkpoints_of_other_shas_kinds_and_tasks_are_all_kept(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    for task, sha, kind in [
+        ("lh-a-1", SHA, "tool"),
+        ("lh-a-1", SHA, "step"),
+        ("lh-a-1", "b" * 40, "tool"),
+        ("lh-b-2", SHA, "tool"),
+    ]:
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id=task, sha=sha, kind=kind, turn_index=1)
+        )
+    assert scratch.query("SELECT count(*) FROM checkpoints") == [(4,)]
+
+
+async def test_a_kind_outside_the_plan_is_refused(recorder: SqlRecorder) -> None:
+    with pytest.raises(IntegrityError, match="ck_checkpoints_kind"):
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id="lh-a-1", sha=SHA, kind="snapshot", turn_index=1)
+        )
+
+
+async def test_an_event_round_trips(scratch: Scratch, recorder: SqlRecorder) -> None:
+    payload = {"head_sha": SHA, "sandbox_id": "abc", "previous": None}
+    await recorder.record_event("lh-acme-calc-42", "sandbox_recreated", payload)
+    (row,) = scratch.query("SELECT task_id, type, payload, ts, created_at FROM events")
+    assert row[:3] == ("lh-acme-calc-42", "sandbox_recreated", payload)
+    assert row[3] is not None and row[4] is not None  # both times come from the server
+
+
+async def test_events_keep_their_order_and_the_same_event_is_not_merged(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    await recorder.record_event("lh-a-1", "sandbox_recreated", {"n": 1})
+    await recorder.record_event("lh-a-1", "hint", {})
+    await recorder.record_event("lh-a-1", "sandbox_recreated", {"n": 1})
+    rows = scratch.query("SELECT type, payload FROM events ORDER BY id")
+    assert rows == [("sandbox_recreated", {"n": 1}), ("hint", {}), ("sandbox_recreated", {"n": 1})]

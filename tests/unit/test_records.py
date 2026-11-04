@@ -8,8 +8,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from longhaul.contracts import Usage
-from longhaul.db.records import MemoryRecorder, Recorder, ToolCallRecord, TurnRecord
+from longhaul.contracts import BlobRef, Usage
+from longhaul.db.records import (
+    CheckpointRecord,
+    EventRecord,
+    MemoryRecorder,
+    Recorder,
+    ToolCallRecord,
+    TurnRecord,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -105,3 +112,78 @@ def test_a_tool_call_row_defaults() -> None:
     assert (row.attempt, row.duration_ms) == (1, 0)
     assert (row.args_ref, row.output_ref, row.exit_code) == (None, None, None)
     assert (row.pre_sha, row.post_sha) == (None, None)
+
+
+# ---------- checkpoints and events (LH-206) ----------
+SHA = "a" * 40
+
+
+def checkpoint(sha: str = SHA, **fields: object) -> CheckpointRecord:
+    values: dict[str, object] = {"task_id": "lh-x", "sha": sha, "kind": "tool", "turn_index": 3}
+    return CheckpointRecord(**{**values, **fields})  # type: ignore[arg-type]
+
+
+async def test_checkpoints_are_kept_in_the_order_they_were_saved() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint("a" * 40, turn_index=1))
+    await recorder.record_checkpoint(checkpoint("b" * 40, turn_index=2))
+    assert [(c.sha, c.turn_index) for c in recorder.checkpoints] == [("a" * 40, 1), ("b" * 40, 2)]
+
+
+async def test_saving_the_same_checkpoint_again_keeps_one_row() -> None:
+    # A retried tool call that commits in the same second as its first try makes the same
+    # commit, and so the same sha.
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint())
+    await recorder.record_checkpoint(checkpoint())
+    assert len(recorder.checkpoints) == 1
+
+
+async def test_a_sha_can_be_a_checkpoint_of_two_kinds() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint(kind="tool"))
+    await recorder.record_checkpoint(checkpoint(kind="step", step_id="s1"))
+    await recorder.record_checkpoint(checkpoint("b" * 40, kind="tool"))
+    assert [(c.kind, c.sha[0]) for c in recorder.checkpoints] == [
+        ("tool", "a"),
+        ("step", "a"),
+        ("tool", "b"),
+    ]
+
+
+async def test_a_bundle_checkpoint_keeps_its_ref() -> None:
+    ref = BlobRef(key=f"tasks/lh-x/ckpt/{SHA}.bundle", sha256="b" * 64, size=9)
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint(kind="bundle", bundle_ref=ref))
+    assert recorder.checkpoints[0].bundle_ref == ref
+
+
+def test_a_checkpoint_row_defaults() -> None:
+    row = checkpoint()
+    assert (row.step_id, row.bundle_ref) == (None, None)
+
+
+async def test_events_are_kept_in_order_with_their_payload() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "sandbox_recreated", {"head_sha": SHA})
+    await recorder.record_event("lh-y", "hint", {"by": "alice"})
+    assert recorder.events == [
+        EventRecord("lh-x", "sandbox_recreated", {"head_sha": SHA}),
+        EventRecord("lh-y", "hint", {"by": "alice"}),
+    ]
+
+
+async def test_an_event_keeps_a_copy_of_its_payload() -> None:
+    recorder = MemoryRecorder()
+    payload = {"head_sha": SHA}
+    await recorder.record_event("lh-x", "sandbox_recreated", payload)
+    payload["head_sha"] = "changed afterwards"
+    assert recorder.events[0].payload == {"head_sha": SHA}
+
+
+async def test_the_same_event_twice_is_two_events() -> None:
+    # An event is a log line. An activity that ran twice did the thing twice.
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "sandbox_recreated", {})
+    await recorder.record_event("lh-x", "sandbox_recreated", {})
+    assert len(recorder.events) == 2

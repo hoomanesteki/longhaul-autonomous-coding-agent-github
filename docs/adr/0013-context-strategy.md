@@ -37,7 +37,20 @@ The workflow acts on the decision when the turn is over and its results are in t
 
 **Every compactor call has its own ledger row (I6).** `compact()` reports each billed call to an `on_billed` callback as soon as it is known, and the activity writes a row for it. That covers a reply that came back, a forced call that was refused after it was billed, and a call that failed with a usage, whether `compact()` then succeeds or not. The error that `compact()` raises still carries the summed usage, but a sum is not what the ledger needs. Haiku bills a call at a higher rate when its prompt is over 100,000 tokens, so two calls that are each under the line can add up to a sum that is over it, and a row priced from the sum would charge both at the dearer rate.
 
-**The notes reach the model in the first message.** `compact.apply` writes them after the task text of the first user message, and the system prompt does not change (D7). `LlmTurnInput.notes` is the workflow's own copy and is handed back to the compact activity. LH-405 lays out the cache breakpoints around this.
+**The notes reach the model in the first message.** `compact.apply` writes them after the task text of the first user message, and the system prompt does not change (D7). `LlmTurnInput.notes` is the workflow's own copy and is handed back to the compact activity.
+
+**The prompt is six blocks, and the plan and the notes are in the first message (LH-405).** The blocks, in order, are the role and rules, the tool guide, the task statement, the memory block, the plan and the progress notes. The first four are the system prompt, and they are the same bytes in every request of a task. The plan (changes on a step update) and the notes (change on a compaction) are text blocks of the first user message, in that order, after the line that starts the work. Putting them at the tail of the system prompt would cost the same when they change, because the system prompt renders before every message and a change in it gives up the cached conversation. The first message is better for three reasons. A compaction rewrites that message anyway. The provider contract has the system prompt as one string with one breakpoint at its end, and a tail would need a separator or a contract change. And `build_system_prompt` takes no plan and no notes, so a prompt that changes in the middle of a task cannot be built by mistake. A step update edits the plan block in place.
+
+**Four breakpoints, and the fourth is tied to tier 1 (LH-405).** `providers/anthropic.py` sets up to four cache breakpoints on a request, the API limit, and `cache_system=False` turns all of them off:
+
+1. the last tool definition, which caches the tools;
+2. the system prompt, which is blocks 1 to 4, so the marker is the one after block 4 and caches tools and system together;
+3. the last block of the previous assistant turn (the last assistant message that another message follows), so each request reads what the one before it wrote;
+4. the last message that holds an elided result.
+
+The fourth exists because of tier 1. A stub replaces one more old result on every turn, so the request changes after the newest stub and nowhere before it. The entry that breakpoint 3 wrote on the last turn holds a whole result where this request has a stub, so no later request can read it. The prefix up to the newest stub is the longest one that two turns share, and the marker there is the one the next turn reads. With it, the turns older than `elide_tool_outputs_after_turns` are read from the cache and only the last K turns are written again. Without it a long task reads the tools and the system prompt and writes the whole conversation on every turn. When nothing is elided there is no fourth, so a request never has more than four.
+
+**Every turn row has its cache ratio.** `turns.cache_ratio` is `cache_read / (input + cache_read)` for the call (migration `0009_turn_cache_ratio`, which fills it for earlier rows from their counts). Cache writes are not in the denominator, as the plan defines the ratio. The same number is on the trace span as `longhaul.cache_ratio`. LH-406 adds the per-task totals.
 
 **Hints survive a compaction.** `show_hints` shows a hint again when its text is not in the transcript. The compact activity moves the hint texts of the folded turns into the first message, where they stay through later compactions, so a compaction does not make every hint come back.
 
@@ -52,7 +65,8 @@ The workflow acts on the decision when the turn is over and its results are in t
 
 **Harder**
 
-- Each turn changes the request at one place, K turns back, so the cache re-writes the last K turns every turn. A compaction re-writes everything after the first message. Both are the price of a bounded window, and LH-406 and LH-405 measure them.
+- Each turn changes the request at one place, K turns back, so the cache re-writes the last K turns every turn. A compaction re-writes everything after the first message, and so does a step update, which edits the plan in the first message. All three are the price of a bounded window. `cache_ratio` on every turn row measures them, and LH-406 totals it per task.
+- The fourth breakpoint is placed by looking for the stub text (`ELIDED_PREFIX`), so the provider knows about tier 1. A result that is long enough to be a stub keeps the marker where it should be, and a short one that tier 1 leaves alone does not move it. The marker can then sit a few turns earlier than the real edge, and those turns are written again.
 - Tier 1 shows the model a stub where it had the text. It has to call `read_output` to get the text back, and the prompt tells it how.
 - The log is read by probing keys, one `get` for each part, and has no hash to check the bytes against, since nothing keeps the refs. Each part is parsed as messages, so damage is an error, and a report is the only reader.
 - The reserve for the results to come makes the proactive decision conservative. A turn with several calls compacts a little early. The guard in front of the call stays the limit either way.
@@ -61,6 +75,9 @@ The workflow acts on the decision when the turn is over and its results are in t
 
 **To watch**
 
+- Once a transcript has a stub, breakpoint 3 is never read, because the stub changes the request before it on the next turn. It still makes the last K turns a cache write at 1.25 times the price of plain input, instead of 1 times. If `cache_write_tokens` shows that to be a real share of the cost, drop breakpoint 3 for a request that has a stub. It is needed again only while nothing is elided, in the first K turns and in a run with tier 1 off.
+- The layout follows the documented rules of the cache and is not yet measured on a live run. `tests/live/test_cache_live.py` checks it with a key (`ANTHROPIC_API_KEY`), and its first run is the check that the fourth breakpoint reads what it should.
+- A prefix under the model's minimum is not cached and no error says so. The tools and the coder's system prompt are about 1,800 tokens, over the minimum of 512 on the 5.5 models and under the 4,096 of Opus 4.6 and Haiku 4.5. On such a model the conversation breakpoints start to work only after the transcript passes the minimum.
 - `tool_output_max_tokens` as the reserve is a cap, and most results are shorter. If compactions come too early in a real run, the reserve is the number to look at.
 - A compactor that fails after its retries fails the workflow, like any activity. Phase 7 decides how a provider outage pauses a task (F5), and compaction follows.
 - If the API starts to require thinking blocks to be replayed, tier 1 and keep-tail compaction need the follow-up in ADR-0003.
@@ -74,4 +91,7 @@ The workflow acts on the decision when the turn is over and its results are in t
 - **Elide at request time only.** The stored view would keep the full text, so the next request would elide it again, and the view would grow without bound. Storing the elided view keeps it bounded and makes the stub a fact of the transcript.
 - **Summarize in free text (simple compaction).** Free text drifts and drops specifics. Fields keep file paths, failing tests and what was tried, and make the merge with an earlier round mechanical (LH-403).
 - **Sum the compactor calls into one ledger row.** Simple, and wrong whenever the calls are on different sides of a price line.
+- **The plan and the notes at the tail of the system prompt.** The same cost when they change, but the provider would have to cut the string between block 4 and block 5, or the contract would change, and a compaction would then change both the prompt and the view.
+- **One moving breakpoint on the last block of the newest message**, or the provider's automatic caching, which does the same. It is the layout the caching guide gives for a conversation. With tier 1 it reads nothing past the system prompt, because the entry from the last turn has a whole result where this turn has a stub, and it writes the whole conversation on every turn.
+- **Append the new plan as a message at the tail.** It keeps the cache on a step update, but leaves the old plan in the first message, with two plans in the conversation and the order of the blocks broken. A task has a handful of steps, and one rewrite each is cheap.
 - **Drop the exact count and trust the estimate.** The estimate is within about 10 percent after a few replies, which is enough for the proactive decision, but the guard at the hard limit is where the invariant is enforced, so near it the provider is asked.

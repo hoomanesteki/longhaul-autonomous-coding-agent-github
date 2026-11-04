@@ -63,7 +63,7 @@ These decisions came out of the LH-102 research on the Claude API docs. The live
 
 ### D7. The system prompt stays a string
 
-The top-level system prompt holds only the static blocks 1 to 4 and is frozen for the life of a transcript. Changes to the plan and to the notes are appended as messages (the Phase 4 and 5 design). So `system: str` stays in the contract, and the system cache breakpoint sits at the end of that string.
+The top-level system prompt holds only the static blocks 1 to 4 and is frozen for the life of a transcript. The plan and the progress notes are text blocks of the first user message, after the task statement, and are edited in place when they change (ADR-0013). So `system: str` stays in the contract, and the system cache breakpoint sits at the end of that string.
 
 ### D8. Effort and output limits per role
 

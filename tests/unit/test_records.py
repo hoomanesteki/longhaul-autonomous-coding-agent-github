@@ -85,6 +85,14 @@ async def test_turn_rows_keep_their_usage() -> None:
     assert (row.cost_usd, row.stop_reason) == (0.5, "end_turn")
 
 
+def test_a_turn_row_has_the_cache_ratio_of_its_usage() -> None:
+    # LH-405: cache_read / (input + cache_read), worked out from the usage, so a caller cannot
+    # record a ratio that disagrees with the counts next to it.
+    row = turn(usage=Usage(input_tokens=100, cache_read_tokens=300, cache_write_tokens=50))
+    assert row.cache_ratio == pytest.approx(0.75)
+    assert turn().cache_ratio == 0.0
+
+
 async def test_a_turn_row_needs_nothing_but_the_call_and_its_start() -> None:
     row = turn()
     assert (row.request_ref, row.response_ref, row.stop_reason) == (None, None, None)

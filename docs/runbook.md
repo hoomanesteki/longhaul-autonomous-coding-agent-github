@@ -229,6 +229,19 @@ The body comes from `templates/pr_body.md.j2`: the summary, the changes per file
 
 Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
 
+### The prompt cache
+
+Every request of a task starts with the same bytes: the tool list, then the system prompt (the role and rules, the tool guide, the task statement and the memory block). The plan and the progress notes are in the first user message, behind that prefix, so a plan update or a compaction does not touch it (ADR-0013). The Anthropic provider marks up to four places in the request for the cache: the last tool, the end of the system prompt, the last assistant turn that has a message after it, and the newest message that holds an elided result.
+
+The `turns` table has the result for every model call. `cache_ratio` is `cache_read_tokens / (input_tokens + cache_read_tokens)`, so 0.9 means that nine tenths of the input tokens, not counting the ones just written to the cache, were read from it:
+
+```sql
+SELECT turn_index, input_tokens, cache_read_tokens, cache_write_tokens, round(cache_ratio::numeric, 2)
+FROM turns WHERE task_id = 'lh-local-calc-1a2b3c4d' ORDER BY turn_index, attempt;
+```
+
+The first turn writes the prefix and reads nothing. On the second turn only the tools and the system prompt are read (about 1,900 tokens for the coder), and the first tool result is new input, so the ratio is low. It climbs as the conversation grows, because each turn reads the turns before it from the cache. A ratio of 0 on every turn means the prefix changes between requests, or that it is shorter than the model's minimum for caching: 512 tokens on the 5.5 models, up to 4,096 on older ones. A model that is under its minimum is not told, and `cache_write_tokens` stays 0. A drop on one turn is normal after a compaction or a plan update, which write the conversation again. To check the cache against the real API, run `uv run pytest -m live tests/live/test_cache_live.py` with `ANTHROPIC_API_KEY` set. It makes four small requests.
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

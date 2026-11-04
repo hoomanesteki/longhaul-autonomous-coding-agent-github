@@ -242,6 +242,15 @@ async def test_a_turn_row_is_written_for_the_call() -> None:
     assert row.ended_at is not None and row.ended_at >= row.started_at
 
 
+async def test_the_turn_row_carries_the_cache_ratio_of_the_call() -> None:
+    # LH-405: 5 tokens read from the cache and 100 sent plain. The 7 written are not in the ratio.
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    await rig.run(turn_input())
+
+    (row,) = rig.recorder.turns
+    assert row.cache_ratio == pytest.approx(5 / 105)
+
+
 async def test_a_later_turn_continues_from_the_stored_transcript() -> None:
     rig = Rig(reply("end_turn", TextBlock(text="Done.")))
     ref = await rig.put("transcript-1.json", answered())

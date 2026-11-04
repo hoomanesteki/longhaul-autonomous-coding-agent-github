@@ -26,6 +26,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from longhaul.context.tokens import cache_ratio
 from longhaul.contracts import BlobRef, Usage
 from longhaul.db.models import Checkpoint, Event, ToolCallRow, Turn
 
@@ -46,6 +47,15 @@ class TurnRecord:
     stop_reason: str | None = None
     latency_ms: int | None = None
     ended_at: datetime | None = None
+
+    @property
+    def cache_ratio(self) -> float:
+        """cache_read / (input + cache_read) for the call (LH-405).
+
+        Worked out from `usage`, not stored beside it, so the ratio cannot disagree with the
+        counts it comes from.
+        """
+        return cache_ratio(self.usage)
 
 
 @dataclass(frozen=True)
@@ -239,6 +249,7 @@ def _turn_values(r: TurnRecord) -> dict[str, Any]:
         "output_tokens": r.usage.output_tokens,
         "cache_read_tokens": r.usage.cache_read_tokens,
         "cache_write_tokens": r.usage.cache_write_tokens,
+        "cache_ratio": r.cache_ratio,
         # str() first: Decimal(0.1) would carry the binary rounding error of the float.
         "cost_usd": Decimal(str(r.cost_usd)),
         "stop_reason": r.stop_reason,

@@ -41,6 +41,7 @@ SCRATCH_PREFIX = "longhaul_rectest_"
 UNREACHABLE_DSN = "postgresql://nobody:nopass@127.0.0.1:1/never"
 BASELINE = "0001_baseline"
 REVISION = "0003_turns_tool_calls"
+CACHE_RATIO_REVISION = "0009_turn_cache_ratio"
 T0 = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
 T1 = datetime(2026, 10, 30, 12, 0, 3, tzinfo=UTC)
 
@@ -152,6 +153,51 @@ def test_the_migration_downgrades_to_the_baseline_and_upgrades_again(scratch: Sc
     assert {"turns", "tool_calls"} <= scratch.tables()
 
 
+def test_the_cache_ratio_comes_in_its_own_migration(scratch: Scratch) -> None:
+    script = ScriptDirectory.from_config(scratch.config())
+    revision = script.get_revision(CACHE_RATIO_REVISION)
+    assert revision is not None
+    assert len(script.get_heads()) == 1
+    assert scratch.query(
+        "SELECT data_type, is_nullable, column_default FROM information_schema.columns "
+        "WHERE table_name = 'turns' AND column_name = 'cache_ratio'"
+    ) == [("double precision", "NO", "0")]
+
+    cfg = scratch.config()
+    command.downgrade(cfg, str(revision.down_revision))
+    assert not scratch.query(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'turns' AND column_name = 'cache_ratio'"
+    )
+    command.upgrade(cfg, "head")
+    assert scratch.query(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'turns' AND column_name = 'cache_ratio'"
+    )
+
+
+def test_turns_that_were_recorded_before_get_their_ratio_from_their_counts(
+    scratch: Scratch,
+) -> None:
+    cfg = scratch.config()
+    script = ScriptDirectory.from_config(cfg)
+    revision = script.get_revision(CACHE_RATIO_REVISION)
+    assert revision is not None
+    command.downgrade(cfg, str(revision.down_revision))
+    with psycopg.connect(scratch.url) as conn:
+        for index, (plain, cached) in enumerate([(10, 30), (50, 0), (0, 0), (0, 20)]):
+            conn.execute(
+                "INSERT INTO turns (task_id, turn_index, attempt, role, started_at, "
+                "input_tokens, cache_read_tokens) VALUES ('t', %s, 1, 'coder', now(), %s, %s)",
+                (index, plain, cached),
+            )
+
+    command.upgrade(cfg, CACHE_RATIO_REVISION)
+
+    ratios = scratch.query("SELECT cache_ratio FROM turns ORDER BY turn_index")
+    assert [row[0] for row in ratios] == [0.75, 0.0, 0.0, 1.0]
+
+
 def test_the_primary_keys_and_the_task_index_exist(scratch: Scratch) -> None:
     constraints = scratch.query("SELECT conname FROM pg_constraint WHERE contype = 'p'")
     assert {("pk_turns",), ("pk_tool_calls",)} <= set(constraints)
@@ -188,7 +234,7 @@ async def test_a_turn_round_trips(scratch: Scratch, recorder: SqlRecorder) -> No
     (row,) = scratch.query(
         "SELECT task_id, turn_index, attempt, role, request_ref, response_ref, input_tokens, "
         "output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, stop_reason, "
-        "latency_ms, started_at, ended_at, created_at FROM turns"
+        "latency_ms, started_at, ended_at, created_at, cache_ratio FROM turns"
     )
     assert row[:5] == (
         "lh-acme-calc-42",
@@ -203,6 +249,7 @@ async def test_a_turn_round_trips(scratch: Scratch, recorder: SqlRecorder) -> No
     assert row[11:13] == ("tool_use", 1234)
     assert (row[13], row[14]) == (T0, T1)
     assert row[15] is not None  # created_at comes from the server
+    assert row[16] == pytest.approx(3 / 13)  # cache_read / (input + cache_read), LH-405
 
 
 async def test_a_billed_call_that_failed_has_usage_and_no_reply(

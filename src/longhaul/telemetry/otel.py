@@ -46,6 +46,7 @@ from opentelemetry.util.types import Attributes, AttributeValue
 from pydantic_core import to_json
 from temporalio.contrib.opentelemetry import TracingInterceptor
 
+from longhaul.context.tokens import cache_ratio
 from longhaul.contracts import LLMResponse, Message, ProviderError, Role, ToolResult, Usage
 from longhaul.settings import EnvSettings, Telemetry
 
@@ -333,12 +334,6 @@ def chat_span(
         attributes[gen_ai.GEN_AI_INPUT_MESSAGES] = _cut(_json(messages))
     with _open(f"chat {model}", SpanKind.CLIENT, attributes) as span:
         yield ChatSpan(span)
-
-
-def cache_ratio(usage: Usage) -> float:
-    """The share of the prompt that came from the cache: cache_read / (input + cache_read)."""
-    denominator = usage.input_tokens + usage.cache_read_tokens
-    return usage.cache_read_tokens / denominator if denominator else 0.0
 
 
 def _set_usage(span: Span, usage: Usage) -> None:

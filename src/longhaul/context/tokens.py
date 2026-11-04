@@ -89,6 +89,7 @@ __all__ = [
     "ContextBudget",
     "Decision",
     "TokenMeter",
+    "cache_ratio",
     "count_request_chars",
     "estimate_tokens",
     "prompt_tokens",
@@ -131,6 +132,20 @@ def estimate_tokens(text: str) -> int:
 def prompt_tokens(usage: Usage) -> int:
     """The size of the prompt a usage record describes: all three input counters."""
     return usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
+
+
+def cache_ratio(usage: Usage) -> float:
+    """The share of a prompt that was read from the cache: cache_read / (input + cache_read).
+
+    It is the number to watch for LH-405: close to 1.0 means the prefix of the request stayed
+    the same and the cache served it. Cache writes are left out of the denominator on purpose,
+    as the plan defines it: tokens written on this call were neither read nor sent plain, and a
+    turn that writes a lot should still show how much of the rest it read. A call with no prompt
+    has no ratio, and 0.0 is returned so that a failed call billed for output alone is not an
+    error.
+    """
+    denominator = usage.input_tokens + usage.cache_read_tokens
+    return usage.cache_read_tokens / denominator if denominator > 0 else 0.0
 
 
 # ---------- request size ----------

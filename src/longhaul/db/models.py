@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     Index,
     Integer,
     MetaData,
@@ -133,6 +134,9 @@ class Turn(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # cache_read / (input + cache_read), from the counts above (LH-405). It is kept as a column
+    # so a report or a dashboard can average it by task without redoing the sum for every row.
+    cache_ratio: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
 
 
 class ToolCallRow(Base):

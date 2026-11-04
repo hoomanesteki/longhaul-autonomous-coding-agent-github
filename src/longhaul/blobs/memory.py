@@ -23,3 +23,10 @@ class MemoryBlobStore(BlobStoreBase):
         except KeyError:
             raise BlobNotFoundError(f"no blob at {ref.key}") from None
         return verify(ref, data)
+
+    async def get_by_key(self, key: str) -> bytes:
+        check_key(key)
+        try:
+            return self.objects[key]
+        except KeyError:
+            raise BlobNotFoundError(f"no blob at {key}") from None

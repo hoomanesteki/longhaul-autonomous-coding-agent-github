@@ -1,4 +1,4 @@
-"""The agent loop with nothing around it: no Temporal, no blob store, no retries.
+"""The agent loop with nothing around it: no Temporal, no blob service, no retries.
 
 `run_in_process` calls the turn functions in order, so the durable workflow of Phase 2 can run
 the same steps as activities. It stays afterwards as the test harness and as the baseline for
@@ -9,6 +9,11 @@ reason leads to (D8, D9), the nudge, the finish rule and the fixed summaries of 
 is not a finish. This module only drives them: it makes the model calls and the tool calls
 directly, keeps the transcript in memory and reports each turn to `on_event`. The docstring of
 rules.py lists how a run ends.
+
+A tool result over `tool_output_max_tokens` reaches the model as its first and last lines and
+an output handle, as it does in the durable path (LH-402). The full text goes to the registry's
+blob store, which is a MemoryBlobStore unless the caller gave the registry another, so that
+read_output resolves the handle in the same process.
 
 A reply that stopped on max_tokens, a refusal or a full window is never stored and none of its
 tool calls run. A paused turn is continued: the text so far goes back as the last message of
@@ -60,6 +65,8 @@ from longhaul.agent.turns import (
     tool_step,
     validate_pairs,
 )
+from longhaul.context.tokens import estimate_tokens
+from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     Block,
     Budgets,
@@ -79,6 +86,7 @@ from longhaul.contracts import (
     ToolResultBlock,
 )
 from longhaul.settings import AppConfig
+from longhaul.tools.output import output_handle, store_output
 from longhaul.tools.registry import ToolRegistry
 
 # The constants moved to rules.py. They stay importable from here, where callers and tests
@@ -329,12 +337,29 @@ class _Loop:
         )
 
         async def run(call: ToolCall) -> ToolResult:
-            return await tool_step(self.registry, self.sandbox, call, ctx)
+            result = await tool_step(self.registry, self.sandbox, call, ctx)
+            return await self._shaped(turn, call, result)
 
         ran = await run_calls(calls, run)
         self.transcript = answer_tool_calls(self.transcript, calls, ran.results)
         self._emit(turn, calls, notes)
         return finished(ran.finish) if ran.finish is not None else None
+
+    async def _shaped(self, turn: int, call: ToolCall, result: ToolResult) -> ToolResult:
+        """The result as the model reads it: whole, or a head, a tail and a handle.
+
+        Over the cap the full text is stored first, under the keys the durable activities use,
+        so that the handle in the marker resolves. `output_ref` then names the full text, as the
+        contract says it does for a result that was cut.
+        """
+        cap = self.cfg.tool_output_max_tokens
+        if estimate_tokens(result.output) <= cap:
+            return result
+        ref = await store_output(
+            self.registry.blobs, self.spec.task_id, turn, call.id, result.output
+        )
+        shaped = shape_output(result.output, cap, output_handle(call.id))
+        return result.model_copy(update={"output": shaped, "output_ref": ref})
 
     def _emit(self, turn: int, calls: list[ToolCall], notes: list[str]) -> None:
         if self.on_event is None:

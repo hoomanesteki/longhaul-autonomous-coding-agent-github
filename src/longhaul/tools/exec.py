@@ -1,7 +1,9 @@
 """Exec tools: run_command and run_tests.
 
-Output handling is simple on purpose. Each stream is cut to a head and a tail
-with a marker between them. Phase 4 (LH-402) replaces this with output handles.
+The tools return the whole text of a command. They do not cut it: the tool activity and the
+in-process loop shape every result, whatever tool made it, into a head, a tail and an output
+handle (context/truncate.py, tools/output.py). A cut here would also hide the middle from
+read_output, which reads the text that came out of the tool.
 
 Only a timeout is a tool error (ok=False). A command that exits non-zero still
 ran, so a failing test run does not count towards the consecutive tool-error
@@ -22,10 +24,6 @@ DEFAULT_TIMEOUT_S = 300
 # Same value as sandbox.command_timeout_s in config/longhaul.example.yaml. Code
 # that has loaded the config passes its own value to default_registry.
 DEFAULT_MAX_TIMEOUT_S = 600
-
-HEAD_CHARS = 8_000
-TAIL_CHARS = 12_000
-MAX_STREAM_CHARS = HEAD_CHARS + TAIL_CHARS
 
 COMMAND_TIMEOUT_HINT = "Run something narrower, or raise timeout_s (max {max_s})."
 TESTS_TIMEOUT_HINT = "Run one file or test id with target, or look for a hanging test."
@@ -49,18 +47,6 @@ _SUMMARY = re.compile(
     rf"^[= ]*(?P<body>no tests ran|{_COUNT}(?:, {_COUNT})*)"
     r" in \d+(?:\.\d+)?s(?: \([^)]*\))?[= ]*$"
 )
-
-
-def cap_text(text: str) -> str:
-    """Keep the first HEAD_CHARS and the last TAIL_CHARS of long text.
-
-    The marker between them says how many characters were cut. It is extra: the
-    kept text is exactly MAX_STREAM_CHARS.
-    """
-    if len(text) <= MAX_STREAM_CHARS:
-        return text
-    cut = len(text) - MAX_STREAM_CHARS
-    return f"{text[:HEAD_CHARS]}\n[output truncated: {cut} characters cut]\n{text[-TAIL_CHARS:]}"
 
 
 def clamp_timeout(requested: float | None, maximum: int) -> int:
@@ -104,7 +90,7 @@ def _stream_sections(res: ExecResult) -> list[str]:
     for label, text in (("stdout", res.stdout), ("stderr", res.stderr)):
         body = text.rstrip("\n")
         if body:
-            sections += [f"{label}:", cap_text(body)]
+            sections += [f"{label}:", body]
     return sections
 
 

@@ -11,7 +11,6 @@ import shlex
 from typing import Any
 
 from longhaul.contracts import ExecResult, Sandbox, ToolContext, ToolResult, ToolSpec
-from longhaul.tools.exec import cap_text
 from longhaul.tools.files import IGNORED_DIRS, fail, ok
 
 # Spelled out so a branch or a file that is also called "base" cannot be picked up instead.
@@ -87,7 +86,7 @@ class GitDiff:
         if not staged:
             text += await self._new_files(sandbox)
         text = text.rstrip("\n")
-        return ok(cap_text(text) if text else NO_CHANGES)
+        return ok(text if text else NO_CHANGES)
 
     async def _new_files(self, sandbox: Sandbox) -> str:
         listing = await sandbox.exec(untracked_command(), timeout_s=GIT_TIMEOUT_S)

@@ -113,8 +113,13 @@ def noisy_command() -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
 
 
-def context(task_id: str) -> ToolContext:
-    return ToolContext(task_id=task_id, turn_index=1, blob_prefix=f"tasks/{task_id}")
+def context(task_id: str, output_max_tokens: int = CAP) -> ToolContext:
+    return ToolContext(
+        task_id=task_id,
+        turn_index=1,
+        blob_prefix=f"tasks/{task_id}",
+        output_max_tokens=output_max_tokens,
+    )
 
 
 async def run_noisy_command(
@@ -169,8 +174,9 @@ async def test_page_and_filter(store: S3BlobStore, task_id: str, sandbox: FakeSa
     result, registry, tools = await run_noisy_command(store, task_id, sandbox)
     assert result.ok and result.output_ref is not None
     full = (await store.get(result.output_ref)).decode()
-    source = full.split("\n")  # the stored text ends with a newline, so the last item is ""
-    total = len(source) - 1
+    # run_command drops the final newline, so each item of the split is a line of the text.
+    source = full.split("\n")
+    total = len(source)
     assert total > LINES
 
     # A 10,000-line output becomes a shaped result under the cap, with a valid handle.
@@ -182,21 +188,34 @@ async def test_page_and_filter(store: S3BlobStore, task_id: str, sandbox: FakeSa
     assert rows[60].startswith(f"[output truncated: {total} lines, ")
     assert f"Full text: handle {HANDLE}. Use read_output to page or filter.]" in rows[60]
 
-    async def read_output(**arguments: Any) -> ToolResult:
+    async def read_output(output_max_tokens: int = CAP, **arguments: Any) -> ToolResult:
         # The registry is the model's way in. It is given no sandbox that it could use.
         call = ToolCall(id="r1", name="read_output", input={"handle": HANDLE, **arguments})
-        return await registry.run(call, sandbox, context(task_id))
+        return await registry.run(call, sandbox, context(task_id, output_max_tokens))
 
-    # Paging: a range, the default page, and a page that runs to the end of the text.
+    # Paging: a range, then the default page, which stops at the token cap, and then a page
+    # that is cut by the 400 line limit because the cap is raised above it.
     middle = await read_output(start_line=5_001, end_line=5_003)
     assert middle.ok
     assert middle.output.split("\n") == [row(n, source[n - 1]) for n in (5_001, 5_002, 5_003)]
 
     first_page = await read_output()
-    assert first_page.output.split("\n")[:MAX_LINES] == [
+    rows = first_page.output.split("\n")
+    shown = len(rows) - 1
+    assert 0 < shown <= MAX_LINES
+    assert len(first_page.output) <= int(CAP * 3.5)
+    assert rows[:shown] == [row(n, source[n - 1]) for n in range(1, shown + 1)]
+    assert rows[shown] == (
+        f"[showing lines 1-{shown} of {total}; call again with start_line={shown + 1} to continue]"
+    )
+    following = await read_output(start_line=shown + 1)
+    assert following.output.split("\n")[0] == row(shown + 1, source[shown])
+
+    long_page = await read_output(output_max_tokens=20_000)
+    assert long_page.output.split("\n")[:MAX_LINES] == [
         row(n, source[n - 1]) for n in range(1, MAX_LINES + 1)
     ]
-    assert first_page.output.endswith(f"call again with start_line={MAX_LINES + 1} to continue]")
+    assert long_page.output.endswith(f"call again with start_line={MAX_LINES + 1} to continue]")
 
     last_page = await read_output(start_line=total - 4)
     assert last_page.output.split("\n") == [
@@ -206,7 +225,7 @@ async def test_page_and_filter(store: S3BlobStore, task_id: str, sandbox: FakeSa
     # Filtering: exactly the failing lines, with their numbers.
     failed = await read_output(pattern="FAILED")
     assert failed.ok
-    wanted = [row(n, line) for n, line in enumerate(source[:total], 1) if "FAILED" in line]
+    wanted = [row(n, line) for n, line in enumerate(source, 1) if "FAILED" in line]
     assert len(wanted) == len(FAILING)
     assert failed.output.split("\n") == wanted
 

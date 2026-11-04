@@ -69,7 +69,10 @@ _TOOL_GUIDE = (
     "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. Use "
     "`run_command` for any other shell command. It runs in /workspace.",
     "- Look at `git_diff` before you finish, to check that the change is what you meant.",
-    "- Long output can be cut. Narrow the request instead of repeating it.",
+    "- A long result is cut to its first and last lines and ends with a handle. Read the "
+    "rest with `read_output`: give it that `handle`, a range with `start_line` and "
+    "`end_line`, or a `pattern` to get only the lines that contain some text. Do not run "
+    "the command again to see more of its output.",
     "- Independent tool calls can go in one reply. Send `finish` on its own.",
     "- When a tool reports an error, read it and change your next call.",
 )

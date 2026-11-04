@@ -80,7 +80,7 @@ What it does, in order:
 3. Runs the agent and prints one line per turn, such as `turn 3 coder: edit_file src/calc/__init__.py`, then how the run ended, then the final diff. Progress notes, warnings and errors go to stderr.
 4. Removes the container and the volume, also after an error, Ctrl-C, SIGTERM or SIGHUP. After SIGKILL or a crash they stay. The first output line holds the task id, so `docker rm -f $(docker ps -aq --filter label=longhaul.task_id=<id>)` and `docker volume rm lh-ws-<id>` clean up by hand.
 
-Exit codes: 0 when the agent called `finish`, 2 when the run failed (turn limit, no tool calls, a refusal, a failing setup, a provider error, no Docker or image) or was interrupted, and 1 for a bug in longhaul, which prints a traceback. The diff is cut like any tool output, to its first 8,000 and last 12,000 characters.
+Exit codes: 0 when the agent called `finish`, 2 when the run failed (turn limit, no tool calls, a refusal, a failing setup, a provider error, no Docker or image) or was interrupted, and 1 for a bug in longhaul, which prints a traceback. The final diff is printed whole. During the run, a tool result over `context.tool_output_max_tokens` reaches the model as its first and last 60 lines and a handle such as `out_toolu_01`, and the model reads the rest with `read_output`. The full text is kept in memory for the length of the run.
 
 ### What is not copied
 

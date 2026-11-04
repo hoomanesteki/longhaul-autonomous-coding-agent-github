@@ -184,6 +184,17 @@ async def test_a_missing_object_is_reported_as_not_found(
         await store.get(ref)
 
 
+async def test_an_object_is_read_by_its_key_when_no_ref_is_at_hand(
+    store: S3BlobStore, scratch: Scratch
+) -> None:
+    # What an output handle needs: the index blob has a known key and no ref.
+    key = scratch.key("outputs/toolu_1.json")
+    await store.put(b'{"index": true}', key=key)
+    assert await store.get_by_key(key) == b'{"index": true}'
+    with pytest.raises(BlobNotFoundError, match="never-written"):
+        await store.get_by_key(scratch.key("never-written.json"))
+
+
 async def test_putting_a_key_again_replaces_the_object(
     store: S3BlobStore, scratch: Scratch
 ) -> None:

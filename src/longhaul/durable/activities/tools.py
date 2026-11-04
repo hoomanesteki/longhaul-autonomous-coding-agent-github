@@ -1,12 +1,23 @@
 """The tool_exec and append_results activities.
 
-`tool_exec` runs one tool call in the task's sandbox, stores the text that came out, and writes
-the `tool_calls` row. Its `ToolResult` keeps a short preview of the text in `output` and names
-the whole text in `output_ref`, so a long test log never sits in the workflow history.
+`tool_exec` runs one tool call in the task's sandbox, stores the full text that came out, and
+writes the `tool_calls` row. Its `ToolResult` keeps a short preview of the text in `output` and
+names the whole text in `output_ref`, so a long test log never sits in the workflow history. It
+also writes the small index that lets the handle `out_<call id>` find the text again without the
+database (tools/output.py), which is how read_output pages through a cut output (LH-402).
 
-`append_results` answers the tool_use blocks of the last assistant message. It reads each
-result's text from its blob, applies the pairing rules of turns.py (D9) and stores the new
-transcript. It also adds the harness text, such as the nudge, which goes after the results.
+`append_results` answers the tool_use blocks of the last assistant message. It reads the full
+text of each result from its blob and gives the model that text when it is within
+`tool_output_max_tokens`, or else its first and last lines and the handle (context/truncate.py).
+Then it applies the pairing rules of turns.py (D9) and stores the new transcript. It also adds
+the harness text, such as the nudge, which goes after the results.
+
+The cut is made in append_results and not in tool_exec, for three reasons. It is a plain
+function of the stored text and the cap, so a retried append_results builds the same transcript
+and no second blob has to be kept in step with the first. What the model reads can be as long as
+the cap allows, about 14,000 characters at the default, while the result of tool_exec goes into
+the workflow history, which keeps previews and refs only (ADR-0005). And one place sees every
+result of a turn, so the cap holds for all of them.
 
 Every `tool_exec` call starts from a known commit and saves what it changed as a new one
 (ADR-0006, failure mode F1), so Temporal can run an attempt again after the worker died in the
@@ -56,7 +67,8 @@ from longhaul.agent.turns import (
     tool_step,
     validate_pairs,
 )
-from longhaul.blobs.base import BlobStoreBase, blob_key
+from longhaul.blobs.base import BlobStoreBase, blob_key, call_slug
+from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
     CheckpointStore,
@@ -69,8 +81,9 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import CheckpointRecord, Recorder, ToolCallRecord
 from longhaul.durable import acts
-from longhaul.durable.activities.support import call_slug, heartbeating, not_retried, small
+from longhaul.durable.activities.support import heartbeating, not_retried, small
 from longhaul.telemetry.otel import tool_span
+from longhaul.tools.output import output_handle, store_output
 from longhaul.tools.registry import ToolRegistry
 
 # The two tools that run a shell command. Whether a command changes files is not known in
@@ -138,6 +151,13 @@ class ToolActivities:
 
     `checkpoints` has no default on purpose: a worker that forgot it would run every call on
     whatever the last attempt left, and nothing would say so.
+
+    `registry` has to be built on the same blob store as `blobs` (default_registry(blobs=...)).
+    The activities write the full text of every output there, and read_output, which belongs to
+    the registry, reads it from its own store. With two different stores no handle resolves, and
+    the model, which is told not to run the command again, could never read the middle of a long
+    output. A registry that is on another store is refused here, when the worker starts, and not
+    left to fail on every handle.
     """
 
     def __init__(
@@ -150,6 +170,11 @@ class ToolActivities:
         checkpoints: WorkspaceCheckpoints,
         tool_output_max_tokens: int = 4000,
     ) -> None:
+        if registry.blobs is not blobs:
+            raise ValueError(
+                "the tool registry reads output handles from a different blob store than the "
+                "tool activities write to; build it with default_registry(blobs=<that store>)"
+            )
         self._registry = registry
         self._sandboxes = sandboxes
         self._blobs = blobs
@@ -191,11 +216,11 @@ class ToolActivities:
             if await self._is_gone(inp.sandbox_id):
                 raise _gone(inp.sandbox_id) from exc
             raise
-        slug = call_slug(call.id)
-        output_ref = await self._blobs.put(
-            result.output.encode("utf-8", errors="replace"),
-            key=blob_key(inp.task_id, "turns", inp.turn_index, f"tool-{slug}-output.txt"),
+        # The text and its handle index. A retry writes the same bytes under the same keys.
+        output_ref = await store_output(
+            self._blobs, inp.task_id, inp.turn_index, call.id, result.output
         )
+        slug = call_slug(call.id)
         if args_ref is None:
             args_ref = await self._blobs.put(
                 to_json(call.input),
@@ -296,9 +321,10 @@ class ToolActivities:
 
     async def _result(self, summary: acts.ToolResultSummary) -> ToolResult:
         if summary.output_ref is not None:
-            text = (await self._blobs.get(summary.output_ref)).decode("utf-8", errors="replace")
+            full = (await self._blobs.get(summary.output_ref)).decode("utf-8", errors="replace")
+            text = shape_output(full, self._output_max_tokens, output_handle(summary.call_id))
         else:
-            text = summary.output or ""
+            text = summary.output or ""  # a short text that no tool made, such as a bad finish
         return ToolResult(call_id=summary.call_id, ok=summary.ok, output=text)
 
     @staticmethod

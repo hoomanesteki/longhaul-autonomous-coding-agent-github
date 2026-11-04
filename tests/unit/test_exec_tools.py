@@ -8,13 +8,9 @@ from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.exec import (
     DEFAULT_MAX_TIMEOUT_S,
     DEFAULT_TIMEOUT_S,
-    HEAD_CHARS,
-    MAX_STREAM_CHARS,
-    TAIL_CHARS,
     RunCommand,
     RunTests,
     build_test_command,
-    cap_text,
     clamp_timeout,
 )
 from longhaul.tools.registry import default_registry
@@ -63,35 +59,6 @@ async def sbx() -> AsyncIterator[FakeSandbox]:
     s = FakeSandbox()
     yield s
     await s.destroy()
-
-
-# ---------- output cap ----------
-
-
-def test_cap_constants_match_the_story() -> None:
-    assert (HEAD_CHARS, TAIL_CHARS, MAX_STREAM_CHARS) == (8_000, 12_000, 20_000)
-
-
-def test_cap_text_leaves_text_at_the_limit_alone() -> None:
-    assert cap_text("") == ""
-    assert cap_text("x" * MAX_STREAM_CHARS) == "x" * MAX_STREAM_CHARS
-
-
-def test_cap_text_says_how_many_characters_were_cut() -> None:
-    one_over = cap_text("x" * (MAX_STREAM_CHARS + 1))
-    assert "[output truncated: 1 characters cut]" in one_over
-    long = cap_text("x" * 50_000)
-    assert "[output truncated: 30000 characters cut]" in long
-
-
-def test_cap_text_keeps_the_head_and_the_tail() -> None:
-    text = "H" * HEAD_CHARS + "M" * 30_000 + "T" * TAIL_CHARS
-    out = cap_text(text)
-    head, marker, tail = out.partition("\n[output truncated: 30000 characters cut]\n")
-    assert head == "H" * HEAD_CHARS
-    assert tail == "T" * TAIL_CHARS
-    assert marker
-    assert "M" not in out
 
 
 # ---------- timeout clamp and command building ----------
@@ -163,16 +130,15 @@ async def test_a_failing_command_is_not_a_tool_error(sbx: FakeSandbox) -> None:
     assert r.ok and r.exit_code == 1
 
 
-async def test_run_command_caps_each_stream_on_its_own() -> None:
-    big = "H" * HEAD_CHARS + "M" * 30_000 + "T" * TAIL_CHARS
+async def test_run_command_returns_a_long_output_whole() -> None:
+    # Cutting long output is not the tool's job. The tool activity and the loop shape every
+    # result into a head, a tail and a handle (LH-402), and they need the whole text for it.
+    big = "H" * 8_000 + "M" * 30_000 + "T" * 12_000
     sandbox = StubSandbox(exec_result(stdout=big + "\n", stderr="E" * 25_000, code=1))
     r = await RunCommand().run(sandbox, {"command": "noisy"}, CTX)
     assert r.ok
-    assert "[output truncated: 30000 characters cut]" in r.output
-    assert "[output truncated: 5000 characters cut]" in r.output
-    assert "M" not in r.output
-    assert "H" * HEAD_CHARS in r.output and "T" * TAIL_CHARS in r.output
-    assert "E" * HEAD_CHARS in r.output and "E" * (TAIL_CHARS + 1) not in r.output
+    assert r.output == f"exit code: 1\nstdout:\n{big}\nstderr:\n{'E' * 25_000}"
+    assert "truncated" not in r.output
 
 
 async def test_run_command_leaves_short_output_untouched() -> None:

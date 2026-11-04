@@ -226,7 +226,7 @@ async def running(
     """A worker with the real llm_turn, tool_exec and append_results. Yields its task queue."""
     store = blobs or MemoryBlobStore()
     recorder = SqlRecorder(sessions)
-    registry = default_registry()
+    registry = default_registry(blobs=store)
     boxes = Boxes()
     llm = LlmActivities(
         provider, store, recorder, registry.specs(), lambda role: CFG, ledger=ledger

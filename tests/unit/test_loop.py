@@ -25,6 +25,8 @@ from longhaul.agent.loop import (
 )
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
 from longhaul.agent.turns import validate_pairs
+from longhaul.blobs.base import handle_key
+from longhaul.context.tokens import estimate_tokens
 from longhaul.contracts import (
     Budgets,
     CallOptions,
@@ -806,3 +808,88 @@ def test_the_retry_cap_cannot_be_lower_than_the_first_cap() -> None:
 def test_loop_config_does_not_change_under_a_running_loop() -> None:
     with pytest.raises(ValidationError):
         CFG.max_turns = 99  # type: ignore[misc]
+
+
+# ---------- long tool output (LH-402) ----------
+def noisy_command(lines: int, failing: tuple[int, ...]) -> str:
+    code = (
+        f"for n in range(1, {lines} + 1): print('line', n, 'FAILED' if n in {failing!r} else 'ok')"
+    )
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+async def test_a_long_output_is_shaped_and_read_output_pages_it(sbx: FakeSandbox) -> None:
+    # The loop has no blob store of its own: the registry brings a memory store, and the
+    # handle in the marker resolves there.
+    failing = (1000, 2000, 3000)
+    registry = default_registry()
+    provider = Canned(
+        llm_reply(
+            "tool_use",
+            ToolUseBlock(
+                id="call_1", name="run_command", input={"command": noisy_command(3000, failing)}
+            ),
+        ),
+        llm_reply(
+            "tool_use",
+            ToolUseBlock(
+                id="call_2",
+                name="read_output",
+                input={"handle": "out_call_1", "pattern": "FAILED"},
+            ),
+        ),
+        llm_reply(
+            "tool_use", ToolUseBlock(id="call_3", name="finish", input={"summary": FINISH_SUMMARY})
+        ),
+    )
+
+    result = await run_loop(make_spec(), provider, registry, sbx, CFG)
+
+    assert result.outcome == finished(FINISH_SUMMARY)
+    validate_pairs(result.transcript)
+    answers = [
+        tool_results(m)[0] for m in result.transcript if m.role == "user" and tool_results(m)
+    ]
+    shaped, filtered, _ = answers
+    assert estimate_tokens(shaped.content) <= CFG.tool_output_max_tokens
+    assert "Full text: handle out_call_1. Use read_output to page or filter.]" in shaped.content
+    assert shaped.content.startswith("exit code: 0\nstdout:\nline 1 ok")
+    assert not shaped.is_error
+    # The stored text starts with two lines of header, so line n of the output is line n + 2.
+    assert filtered.content.split("\n") == [f"{n + 2:>6}\tline {n} FAILED" for n in failing]
+    # The index that resolves the handle is in the registry's store, with no database.
+    assert handle_key("lh-local-calc-1", "call_1") in registry.blobs.objects  # type: ignore[attr-defined]
+
+
+async def test_a_short_output_is_left_alone_in_the_loop(sbx: FakeSandbox) -> None:
+    provider = Canned(
+        llm_reply(
+            "tool_use",
+            ToolUseBlock(id="call_1", name="run_command", input={"command": "echo hello"}),
+        ),
+        llm_reply(
+            "tool_use", ToolUseBlock(id="call_2", name="finish", input={"summary": FINISH_SUMMARY})
+        ),
+    )
+    result = await run_loop(make_spec(), provider, default_registry(), sbx, CFG)
+    first = tool_results(result.transcript[2])[0]
+    assert first.content == "exit code: 0\nstdout:\nhello"
+
+
+async def test_the_loop_cap_comes_from_its_config(sbx: FakeSandbox) -> None:
+    cfg = CFG.model_copy(update={"tool_output_max_tokens": 100})
+    provider = Canned(
+        llm_reply(
+            "tool_use",
+            ToolUseBlock(
+                id="call_1", name="run_command", input={"command": noisy_command(200, ())}
+            ),
+        ),
+        llm_reply(
+            "tool_use", ToolUseBlock(id="call_2", name="finish", input={"summary": FINISH_SUMMARY})
+        ),
+    )
+    result = await run_loop(make_spec(), provider, default_registry(), sbx, cfg)
+    first = tool_results(result.transcript[2])[0]
+    assert estimate_tokens(first.content) <= 100
+    assert "handle out_call_1." in first.content

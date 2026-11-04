@@ -1,5 +1,4 @@
-"""What the LLM and tool activities share: heartbeats, the payload guard, error mapping and
-safe blob names.
+"""What the LLM and tool activities share: heartbeats, the payload guard and error mapping.
 
 Activities run on a worker and may do I/O. Nothing here is imported by workflow code.
 """
@@ -8,14 +7,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
-import re
 from collections.abc import AsyncIterator
 from datetime import timedelta
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+# call_slug lives with the other blob naming rules now (blobs/base.py), because output handles
+# need it outside the activities. It is re-exported so that code that asks the activities'
+# helper module for it keeps working.
+from longhaul.blobs.base import call_slug as call_slug
 from longhaul.contracts import ProviderError
 from longhaul.durable import acts
 from longhaul.durable.payload_guard import PayloadTooLargeError, assert_small
@@ -26,10 +27,6 @@ HEARTBEAT_INTERVAL_S = 10.0
 
 # The error type that retry policies match on (acts._OVERSIZED names the same class).
 PAYLOAD_ERROR_TYPE = PayloadTooLargeError.__name__
-
-# A blob name part is at most this long. The key as a whole may be 1,024 bytes.
-_SLUG_MAX = 80
-_SAFE_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 # ---------- heartbeats ----------
@@ -99,19 +96,3 @@ def provider_failure(exc: ProviderError) -> ApplicationError:
 def not_retried(exc: Exception) -> ApplicationError:
     """A failure that the same input would repeat: a transcript the API rejects, a bad role."""
     return ApplicationError(str(exc), type=type(exc).__name__, non_retryable=True)
-
-
-# ---------- blob names ----------
-def call_slug(call_id: str) -> str:
-    """A tool id as a part of a blob name.
-
-    Anthropic and OpenAI ids are letters, digits and underscores and stay as they are. A
-    provider behind an OpenAI-compatible server can send other characters, such as a colon or a
-    slash, and blob_key refuses those. They become underscores, and a short hash of the original
-    keeps two such ids from sharing a name.
-    """
-    if _SAFE_SLUG.fullmatch(call_id) and ".." not in call_id and len(call_id) <= _SLUG_MAX:
-        return call_id
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", call_id).replace("..", "__")
-    cleaned = cleaned.lstrip("._-")[: _SLUG_MAX - 11] or "call"
-    return f"{cleaned}-{hashlib.sha256(call_id.encode()).hexdigest()[:10]}"

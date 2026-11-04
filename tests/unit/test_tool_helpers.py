@@ -132,6 +132,23 @@ def test_number_lines_cuts_a_line_that_alone_exceeds_the_budget() -> None:
     assert out.splitlines()[-1].endswith("start_line=2 to continue]")
 
 
+def test_number_lines_takes_its_own_line_limit() -> None:
+    text = "".join(f"l{i}\n" for i in range(1, 11))
+    out = number_lines(text, 1, None, max_lines=3)
+    assert out.splitlines()[:3] == ["     1\tl1", "     2\tl2", "     3\tl3"]
+    assert out.splitlines()[-1] == (
+        "[showing lines 1-3 of 10; call again with start_line=4 to continue]"
+    )
+
+
+def test_number_lines_names_the_text_it_was_given_in_its_messages() -> None:
+    with pytest.raises(ToolError, match=r"beyond the end of the output \(1 line\)"):
+        number_lines("a\n", 5, None, what="output")
+    assert number_lines("", 1, None, what="output") == "(empty output)"
+    with pytest.raises(ToolError, match="beyond the end of the output .it is empty."):
+        number_lines("", 2, None, what="output")
+
+
 def test_split_lines_breaks_on_newlines_only() -> None:
     assert split_lines("") == []
     assert split_lines("a") == ["a"]
@@ -261,5 +278,6 @@ def test_default_registry_names() -> None:
         "run_command",
         "run_tests",
         "git_diff",
+        "read_output",
         "finish",
     ]

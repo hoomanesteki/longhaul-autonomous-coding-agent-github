@@ -25,8 +25,9 @@ What crosses an activity boundary stays small (ADR-0005, invariants I2):
   the arguments inline up to INLINE_LIMIT_BYTES for one call and INLINE_ARGS_TOTAL_BYTES for
   the whole reply, and by `args_ref` beyond that.
 - A tool call returns a `ToolResult` whose `output` is a preview of at most
-  OUTPUT_PREVIEW_CHARS and whose `output_ref` holds the whole text. The text the model reads is
-  the one in the blob.
+  OUTPUT_PREVIEW_CHARS and whose `output_ref` holds the whole text. The model reads that text
+  when it is within `tool_output_max_tokens`, and its first and last lines with a handle when it
+  is longer (LH-402). `append_results` makes that cut from the blob.
 - `append_results` takes one `ToolResultSummary` for each result, which names that blob. A turn
   of fifty calls with 15 KB of output each therefore adds a few KB to the history, and not
   750 KB.

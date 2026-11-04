@@ -279,7 +279,7 @@ async def through_the_workflow(
     box = await seeded(scenario.seed)
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
-    registry = default_registry(test_command=TEST_COMMAND)
+    registry = default_registry(test_command=TEST_COMMAND, blobs=blobs)
     refs: list[BlobRef] = []
     llm = SpyLlm(
         provider_for(scenario), blobs, recorder, registry.specs(), lambda role: CFG, refs=refs

@@ -4,7 +4,6 @@ import pytest
 
 from longhaul.contracts import ExecResult, ToolCall, ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
-from longhaul.tools.exec import HEAD_CHARS, TAIL_CHARS
 from longhaul.tools.git import BASE_REF, NO_CHANGES, GitDiff
 from longhaul.tools.registry import default_registry
 
@@ -157,11 +156,12 @@ async def test_many_new_files_are_listed_up_to_a_limit(repo: FakeSandbox) -> Non
     assert "... 2 more untracked files not shown" in r.output
 
 
-async def test_a_huge_diff_is_capped_with_a_marker(repo: FakeSandbox) -> None:
+async def test_a_huge_diff_is_returned_whole(repo: FakeSandbox) -> None:
+    # The cut is made later, for every tool alike, and keeps a handle to the whole diff.
     await repo.write_file("big.txt", ("x" * 99 + "\n").encode() * 600)
     out = await diff(repo)
-    assert "characters cut]" in out
-    assert len(out) < HEAD_CHARS + TAIL_CHARS + 200
+    assert "truncated" not in out
+    assert out.count("+" + "x" * 99) == 600
 
 
 async def test_missing_base_tag_is_a_clear_error(repo: FakeSandbox) -> None:

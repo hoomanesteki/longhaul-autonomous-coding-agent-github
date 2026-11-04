@@ -117,8 +117,11 @@ def build_parts(
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
     recorder = SqlRecorder(sessions)
     ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
+    # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
     registry = default_registry(
-        test_command=DEFAULT_TEST_COMMAND, max_timeout_s=cfg.sandbox.command_timeout_s
+        test_command=DEFAULT_TEST_COMMAND,
+        max_timeout_s=cfg.sandbox.command_timeout_s,
+        blobs=blobs,
     )
 
     def config_for(role: Role) -> LoopConfig:

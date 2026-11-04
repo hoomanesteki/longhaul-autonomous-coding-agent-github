@@ -200,6 +200,13 @@ def test_tool_guide_names_only_tools_that_exist() -> None:
         assert tool in named
 
 
+def test_the_guide_tells_the_model_how_to_read_a_cut_output() -> None:
+    prompt = build_system_prompt(Role.CODER, make_spec(), MEMORY)
+    static = prompt[: prompt.index(TASK)]
+    assert "`read_output`" in static
+    assert "`handle`" in static and "`pattern`" in static
+
+
 def test_first_user_message_points_at_the_system_prompt() -> None:
     assert FIRST_USER_MESSAGE.strip()
     assert "finish" in FIRST_USER_MESSAGE

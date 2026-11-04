@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from typing import TYPE_CHECKING
 
 import boto3
 from botocore.config import Config
@@ -25,6 +26,9 @@ from longhaul.blobs.base import (
 )
 from longhaul.contracts import BlobRef
 from longhaul.settings import EnvSettings
+
+if TYPE_CHECKING:
+    from types_boto3_s3.type_defs import GetObjectOutputTypeDef
 
 # The errors and blob_key are defined in base.py so that the memory store can share them
 # without importing boto3. They are listed here because the plan places them with the S3 store.
@@ -101,6 +105,9 @@ class S3BlobStore(BlobStoreBase):
     async def get(self, ref: BlobRef) -> bytes:
         return await asyncio.to_thread(self._get, ref)
 
+    async def get_by_key(self, key: str) -> bytes:
+        return await asyncio.to_thread(self._get_by_key, key)
+
     # Hashing and the transfer both block, so the whole of each runs on a worker thread.
     def _put(self, data: bytes, key: str) -> BlobRef:
         ref = make_ref(data, key)
@@ -113,12 +120,7 @@ class S3BlobStore(BlobStoreBase):
 
     def _get(self, ref: BlobRef) -> bytes:
         check_key(ref.key)
-        try:
-            response = self._client.get_object(Bucket=self._bucket, Key=ref.key)
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") in _MISSING:
-                raise BlobNotFoundError(f"no blob at {ref.key}") from exc
-            raise
+        response = self._fetch(ref.key)
         body = response["Body"]
         try:
             # An object that was replaced can be far larger than the ref says. Compare the
@@ -129,3 +131,19 @@ class S3BlobStore(BlobStoreBase):
             return verify(ref, body.read())
         finally:
             body.close()
+
+    def _get_by_key(self, key: str) -> bytes:
+        check_key(key)
+        body = self._fetch(key)["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
+
+    def _fetch(self, key: str) -> GetObjectOutputTypeDef:
+        try:
+            return self._client.get_object(Bucket=self._bucket, Key=key)
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in _MISSING:
+                raise BlobNotFoundError(f"no blob at {key}") from exc
+            raise

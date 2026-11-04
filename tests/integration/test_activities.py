@@ -299,12 +299,14 @@ async def running(
     workspace: Workspace,
     registry: ToolRegistry | None = None,
     extra: Sequence[Callable[..., Any]] = (),
+    test_command: str | None = None,
 ) -> AsyncIterator[Run]:
     """A worker with the real activities. Yields the task queue it polls.
 
     `extra` are more activities to register, such as the ones a hand-over calls.
     """
-    toolbox = registry or default_registry()
+    # The tools read their output handles from the store the activities write to.
+    toolbox = registry or default_registry(test_command=test_command, blobs=blobs)
     llm = LlmActivities(provider, blobs, recorder, toolbox.specs(), lambda role: CFG)
     tools = SpyTools(toolbox, sandboxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
@@ -395,7 +397,7 @@ async def test_workflow_fixes_calc_via_activities(
             recorder=recorder,
             sandboxes=manager,
             workspace=workspace,
-            registry=default_registry(test_command=PYTEST),
+            test_command=PYTEST,
         ) as run:
             handle = await start_task(
                 env.client, spec, task_queue=run.queue, tuning=SHORT_HEARTBEAT

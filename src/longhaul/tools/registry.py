@@ -7,6 +7,8 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from longhaul.blobs.base import BlobStoreBase
+from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import Sandbox, Tool, ToolCall, ToolContext, ToolResult, ToolSpec
 from longhaul.tools import ToolError
 
@@ -34,7 +36,16 @@ RAW_ARGUMENTS = "_raw"
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    """The tools a run can call, with the blob store its output handles live in.
+
+    `blobs` is where the full text of long tool outputs is kept, and read_output reads it from
+    there (tools/output.py). The durable worker passes the store its activities write to. A
+    registry built without one gets a MemoryBlobStore, which is what the in-process loop
+    needs: its handles resolve in the same process that made them.
+    """
+
+    def __init__(self, blobs: BlobStoreBase | None = None) -> None:
+        self.blobs: BlobStoreBase = blobs if blobs is not None else MemoryBlobStore()
         self._tools: dict[str, Tool] = {}
         self._validators: dict[str, Draft202012Validator] = {}
 
@@ -99,22 +110,29 @@ def _fail(message: str) -> ToolResult:
 
 
 def default_registry(
-    *, test_command: str | None = None, max_timeout_s: int | None = None
+    *,
+    test_command: str | None = None,
+    max_timeout_s: int | None = None,
+    blobs: BlobStoreBase | None = None,
 ) -> ToolRegistry:
     """The tools every role starts from.
 
     `test_command` is RepoSettings.test_command. Without it run_tests answers
     that no test command is set. `max_timeout_s` is sandbox.command_timeout_s
-    and falls back to 600 seconds. Callers that pass no arguments keep working.
+    and falls back to 600 seconds. `blobs` is the store that read_output reads the full
+    text of cut outputs from. It has to be the store the tool activities write to, or no
+    handle resolves. Without it the registry keeps a store in memory. Callers that pass
+    no arguments keep working.
     """
     from longhaul.tools.control import Finish
     from longhaul.tools.exec import DEFAULT_MAX_TIMEOUT_S, RunCommand, RunTests
     from longhaul.tools.files import EditFile, ListDir, ReadFile, WriteFile
     from longhaul.tools.git import GitDiff
+    from longhaul.tools.output import ReadOutput
     from longhaul.tools.search import Search
 
     limit = DEFAULT_MAX_TIMEOUT_S if max_timeout_s is None else max_timeout_s
-    reg = ToolRegistry()
+    reg = ToolRegistry(blobs)
     for tool in (
         ListDir(),
         ReadFile(),
@@ -124,6 +142,7 @@ def default_registry(
         RunCommand(limit),
         RunTests(test_command, limit),
         GitDiff(),
+        ReadOutput(reg.blobs),
         Finish(),
     ):
         reg.register(tool)

@@ -250,6 +250,7 @@ REQUIRED = {
     "run_command": ["command"],
     "run_tests": [],
     "git_diff": [],
+    "read_output": ["handle"],
     "finish": ["summary"],
 }
 
@@ -286,6 +287,8 @@ async def test_every_required_input_is_checked_on_the_real_specs(
         ("write_file", {"path": "a", "content": 3}, "at content: 3 is not of type 'string'"),
         ("run_command", {"command": "ls", "timeout_s": 0}, "at timeout_s"),
         ("git_diff", {"staged": "yes"}, "at staged: 'yes' is not of type 'boolean'"),
+        ("read_output", {"handle": "out_x", "start_line": 0}, "at start_line"),
+        ("read_output", {"handle": ""}, "at handle"),
         ("finish", {"summary": ""}, "at summary"),
     ],
 )
@@ -327,6 +330,7 @@ EXPECTED_MUTATES = {
     "run_command": False,
     "run_tests": False,
     "git_diff": False,
+    "read_output": False,
     "finish": False,
 }
 

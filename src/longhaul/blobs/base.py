@@ -23,6 +23,10 @@ MAX_KEY_BYTES = 1024
 # "." or "..", or look like a command line flag when someone pastes a key into a shell.
 _PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
+# A name made from a tool call id is at most this long. The key as a whole may be 1,024 bytes.
+_SLUG_MAX = 80
+_SAFE_SLUG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
 
 class BlobError(Exception):
     """A stored blob could not be used."""
@@ -74,12 +78,44 @@ def blob_key(task_id: str, kind: str, turn_index: int, name: str) -> str:
     if turn_index < 0:
         raise ValueError(f"invalid blob key: turn_index must not be negative, got {turn_index}")
     for label, part in (("task_id", task_id), ("kind", kind), ("name", name)):
-        if not _PART.fullmatch(part) or ".." in part:
-            raise ValueError(
-                f"invalid blob key {label} {part[:80]!r}: use letters, digits, '.', '_' and '-', "
-                "start with a letter or digit, and never use '..'"
-            )
+        _require_part(label, part)
     return check_key(f"tasks/{task_id}/{kind}/{turn_index:04d}/{name}")
+
+
+def _require_part(label: str, part: str) -> None:
+    if not _PART.fullmatch(part) or ".." in part:
+        raise ValueError(
+            f"invalid blob key {label} {part[:80]!r}: use letters, digits, '.', '_' and '-', "
+            "start with a letter or digit, and never use '..'"
+        )
+
+
+def call_slug(call_id: str) -> str:
+    """A tool id as a part of a blob name.
+
+    Anthropic and OpenAI ids are letters, digits and underscores and stay as they are. A
+    provider behind an OpenAI-compatible server can send other characters, such as a colon or a
+    slash, and blob_key refuses those. They become underscores, and a short hash of the original
+    keeps two such ids from sharing a name.
+    """
+    if _SAFE_SLUG.fullmatch(call_id) and ".." not in call_id and len(call_id) <= _SLUG_MAX:
+        return call_id
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", call_id).replace("..", "__")
+    cleaned = cleaned.lstrip("._-")[: _SLUG_MAX - 11] or "call"
+    return f"{cleaned}-{hashlib.sha256(call_id.encode()).hexdigest()[:10]}"
+
+
+def handle_key(task_id: str, call_id: str) -> str:
+    """The key of the index blob that says where the full output of one tool call is stored.
+
+    An output handle is `out_<call id>`. The blob that holds the text sits under the turn that
+    made the call (blob_key), and the handle does not say which turn that was. So the text is
+    found in two steps, both from the task and the call alone and neither from the database:
+    this key holds a small JSON BlobRef, and the ref names the text. A call id with characters
+    that a key refuses is cleaned by call_slug, so no handle can reach outside its task.
+    """
+    _require_part("task_id", task_id)
+    return check_key(f"tasks/{task_id}/outputs/{call_slug(call_id)}.json")
 
 
 def make_ref(data: bytes, key: str) -> BlobRef:
@@ -114,6 +150,15 @@ class BlobStoreBase(BlobStore):
     @abstractmethod
     async def get(self, ref: BlobRef) -> bytes:
         """Return the bytes ref describes, or raise BlobNotFoundError or BlobIntegrityError."""
+
+    @abstractmethod
+    async def get_by_key(self, key: str) -> bytes:
+        """Return the bytes stored under key, or raise BlobNotFoundError.
+
+        There is no ref, so nothing checks the bytes. It is for a blob whose key is worked out
+        from known names and whose content is a pointer that get() then verifies, such as the
+        index of an output handle (handle_key). Use get() whenever a ref exists.
+        """
 
     async def put_json(self, model: BaseModel | Sequence[BaseModel], key: str) -> BlobRef:
         """Store a pydantic model, or a list of them such as a transcript, as JSON."""

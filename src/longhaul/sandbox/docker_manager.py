@@ -542,11 +542,25 @@ class DockerSandboxManager:
 
         await asyncio.to_thread(run)
 
+    async def remove_containers(self, task_id: str) -> None:
+        """Remove every container of the task, running or not, and keep its workspace volume.
+
+        Recovery uses it before it starts a new container: whatever is left of the old one, and
+        whatever an earlier attempt of the recovery made, must not run beside the new one.
+        The volume stays, because a new container over it starts with the old venv. Safe to call
+        twice, and for a task that has no container.
+        """
+        await asyncio.to_thread(self._remove_containers, task_id)
+
+    def _remove_containers(self, task_id: str) -> None:
+        label = f"{TASK_LABEL}={task_id}"
+        for c in self._client.containers.list(all=True, filters={"label": label}):
+            with contextlib.suppress(NotFound):  # removed by someone else since the listing
+                c.remove(force=True)
+
     async def cleanup_task(self, task_id: str) -> None:
         def run() -> None:
-            label = f"{TASK_LABEL}={task_id}"
-            for c in self._client.containers.list(all=True, filters={"label": label}):
-                c.remove(force=True)
+            self._remove_containers(task_id)
             with contextlib.suppress(NotFound):
                 self._client.volumes.get(volume_name(task_id)).remove(force=True)
 

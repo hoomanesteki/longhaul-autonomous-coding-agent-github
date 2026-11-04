@@ -134,7 +134,7 @@ def to_result(
 
 class RunCommand:
     # The tool cannot tell in advance whether a command changes files. The tool
-    # activity checks for a dirty tree after exec tools instead (LH-206).
+    # activity commits after exec tools instead, and a clean tree gives no commit.
     mutates = False
 
     def __init__(self, max_timeout_s: int = DEFAULT_MAX_TIMEOUT_S) -> None:

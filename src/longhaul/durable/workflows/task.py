@@ -19,6 +19,18 @@ reply with tool calls has them run one after another by `tool_exec`, and `append
 answers them all in one message. A used reply with none gets a nudge, and a second one in a row
 ends the run.
 
+The workflow keeps `state.head_sha` equal to the latest `post_sha` and passes it as `pre_sha` to
+every `tool_exec`, so each call starts from the checkpoint the one before it left (ADR-0006).
+
+A sandbox that goes away (failure mode F3). A `tool_exec` that finds its container gone fails
+with SandboxGoneError, which the activity does not retry. The workflow calls `ensure_sandbox`
+with the latest `head_sha`, stores the id it returns and runs the same call again from the same
+`pre_sha`. One call may do that MAX_SANDBOX_RECREATIONS times. A sandbox that is gone again after
+that ends the run with ERROR "sandbox lost", instead of looping on a host that cannot keep a
+container alive. A run that starts with a sandbox id, because an earlier run prepared it
+(LH-207 hands one over), calls `ensure_sandbox` before its first turn, since the container may
+be gone by then.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -26,6 +38,7 @@ can tell them apart without reading prose:
   opening the pull request is Phase 3 work. This is the same outcome the in-process loop returns;
 - a `cancel` signal: CANCELLED, after a `cleanup` activity;
 - `task_turns` plus the turns added by `add_budget` pass: ERROR "turn limit";
+- a tool call finds its sandbox gone more often than it may: ERROR "sandbox lost";
 - the other ends of agent/rules.py: "no tool calls", "output limit", "model declined (...)",
   "context limit", "pause limit" and "unexpected stop reason: ...".
 
@@ -86,8 +99,25 @@ def cancel_summary(by: str, reason: str) -> str:
     return f"cancelled by {by}: {reason}" if reason else f"cancelled by {by}"
 
 
+# The summary of the outcome when one tool call keeps finding its sandbox gone.
+SANDBOX_LOST = "sandbox lost"
+
+
 class _CancelRequested(Exception):
     """Unwinds run() to the cancel path. It never leaves the workflow."""
+
+
+class _SandboxLost(Exception):
+    """A tool call found its sandbox gone more often than it may. It unwinds to _turn()."""
+
+
+def _is_sandbox_gone(err: ActivityError) -> bool:
+    """True when a tool call failed because its container was not there.
+
+    The activity raises that as an ApplicationError of type SANDBOX_GONE, so the cause says it.
+    """
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == acts.SANDBOX_GONE
 
 
 def _ended_by(err: ActivityError) -> Outcome | None:
@@ -173,12 +203,33 @@ class TaskWorkflow:
 
     async def _prepare(self) -> None:
         state = self.state
-        if state.sandbox_id is not None:
-            return  # an earlier run of this workflow already prepared it
         state.phase = Phase.PREPARING
+        if state.sandbox_id is not None:
+            # An earlier run of this workflow prepared the workspace, and its container may be
+            # gone by now. ensure_sandbox answers with the same id when it is still running.
+            await self._ensure_sandbox()
+            return
         prepared = await self._call(acts.PREPARE_WORKSPACE, state.spec)
         state.sandbox_id = prepared.sandbox_id
         state.head_sha = prepared.head_sha
+
+    async def _ensure_sandbox(self) -> None:
+        """Have a running sandbox at the latest checkpoint, and keep its id."""
+        state = self.state
+        if state.head_sha is None:
+            # Without a checkpoint there is nothing to return to. Asking again changes nothing.
+            raise ApplicationError(
+                "the sandbox cannot be recreated: the run has no checkpoint", non_retryable=True
+            )
+        state.sandbox_id = await self._call(
+            acts.ENSURE_SANDBOX,
+            acts.EnsureSandboxInput(
+                task_id=state.spec.task_id,
+                head_sha=state.head_sha,
+                sandbox_id=state.sandbox_id,
+                spec=state.spec,
+            ),
+        )
 
     async def _code(self) -> Outcome:
         state = self.state
@@ -204,7 +255,11 @@ class TaskWorkflow:
             return await self._idle_turn(index, sampled.transcript_ref)
 
         self.idle = 0
-        ran = await rules.run_calls(calls, lambda call: self._run_tool(index, call))
+        try:
+            ran = await rules.run_calls(calls, lambda call: self._run_tool(index, call))
+        except _SandboxLost:
+            state.turn_index = index + 1
+            return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
         # The transcript lives in the blob store, so an activity answers the calls. It answers
         # all of them, `finish` and the calls that did not run included, so the transcript stays
         # paired when the run ends here.
@@ -285,17 +340,35 @@ class TaskWorkflow:
 
     async def _run_tool(self, index: int, call: acts.ToolCallSummary) -> ToolResult:
         state = self.state
-        result = await self._call(
-            acts.TOOL_EXEC,
-            acts.ToolExecInput(
-                task_id=state.spec.task_id,
-                turn_index=index,
-                call=call,
-                # Every call starts from the checkpoint the one before it left.
-                pre_sha=state.head_sha,
-                sandbox_id=self._sandbox_id(),
-            ),
-        )
+        recreated = 0
+        while True:
+            try:
+                result = await self._call(
+                    acts.TOOL_EXEC,
+                    acts.ToolExecInput(
+                        task_id=state.spec.task_id,
+                        turn_index=index,
+                        call=call,
+                        # Every call starts from the checkpoint the one before it left. After a
+                        # recreation it is the same one, and the new sandbox is at it.
+                        pre_sha=state.head_sha,
+                        sandbox_id=self._sandbox_id(),
+                    ),
+                )
+                break
+            except ActivityError as err:
+                if not _is_sandbox_gone(err):
+                    raise
+                if recreated == acts.MAX_SANDBOX_RECREATIONS:
+                    workflow.logger.error(
+                        "sandbox of task %s was gone %d times during %s, so the run ends",
+                        state.spec.task_id,
+                        recreated + 1,
+                        call.name,
+                    )
+                    raise _SandboxLost from err
+                recreated += 1
+                await self._ensure_sandbox()
         if result.post_sha is not None:
             state.head_sha = result.post_sha
         return result

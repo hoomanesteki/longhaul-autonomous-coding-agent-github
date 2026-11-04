@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -37,6 +40,7 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.telemetry import otel
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase7]
@@ -178,6 +182,22 @@ async def test_the_output_and_the_turn_row_carry_the_cost() -> None:
     assert out.cost_usd == pytest.approx(0.00435)
     (row,) = rig.recorder.turns
     assert row.cost_usd == pytest.approx(0.00435)
+
+
+async def test_the_chat_span_carries_the_ledger_cost() -> None:
+    memory = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    try:
+        with otel.configured(provider):
+            await rig.run()
+    finally:
+        provider.shutdown()
+
+    (span,) = [s for s in memory.get_finished_spans() if s.name.startswith("chat ")]
+    assert span.attributes is not None
+    assert span.attributes[otel.COST_USD] == pytest.approx(float(COST))
 
 
 async def test_the_ledger_attempt_is_the_temporal_attempt() -> None:

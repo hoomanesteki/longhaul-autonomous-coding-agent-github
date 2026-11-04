@@ -290,7 +290,7 @@ class ChatSpan:
     def record(self, response: LLMResponse, *, cost_usd: float = 0.0) -> None:
         """Set the reply's attributes.
 
-        `cost_usd` is 0.0 until the pricing table arrives (LH-701), as LlmTurnOutput.cost_usd is.
+        `cost_usd` is the price the cost ledger put on the call (0.0 when a run has no ledger).
         """
         span = self._span
         span.set_attribute(gen_ai.GEN_AI_RESPONSE_MODEL, response.model)

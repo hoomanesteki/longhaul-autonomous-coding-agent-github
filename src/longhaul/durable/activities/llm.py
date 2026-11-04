@@ -119,9 +119,8 @@ class LlmActivities:
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
         began = time.monotonic()
-        resp = await self._ask(inp, cfg, system, transcript, paused, attempt, started)
+        resp, cost = await self._ask(inp, cfg, system, transcript, paused, attempt, started)
         latency_ms = resp.latency_ms or int((time.monotonic() - began) * 1000)
-        cost = await self._charge(inp, cfg.model, resp.usage)
         out = await self._store(inp, resp, transcript, paused, attempt, cost)
         await self._recorder.record_turn(
             TurnRecord(
@@ -162,7 +161,12 @@ class LlmActivities:
         paused: list[Block],
         attempt: int,
         started: datetime,
-    ) -> LLMResponse:
+    ) -> tuple[LLMResponse, Decimal]:
+        """Call the model once and put the call on the ledger. Returns the reply and its cost.
+
+        The ledger row is written inside the chat span, as soon as the call returns, so the span
+        carries the same price as the row.
+        """
         # The text of a paused reply goes back as the last message, which the API continues.
         request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         cap = cfg.max_tokens_retry if inp.high_output_cap else cfg.max_tokens_per_turn
@@ -181,8 +185,9 @@ class LlmActivities:
                     resp = await llm_step(
                         self._provider, cfg.model, system, request, self._tools, cap, options
                     )
-                span.record(resp)
-            return resp
+                cost = await self._charge(inp, cfg.model, resp.usage)
+                span.record(resp, cost_usd=float(cost))
+            return resp, cost
         except ProviderError as exc:
             if exc.usage is not None:
                 # Billed, then failed: the call is on the ledger and in `turns` before the error

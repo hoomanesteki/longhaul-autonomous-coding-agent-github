@@ -8,6 +8,8 @@ Three parts, each small enough for the rest of the code to call without knowing 
   one trace. `durable.client.connect` registers it on the client, and a worker takes the
   interceptors of its client, so one registration covers both. Registering it again on the
   worker would trace every call twice.
+- `detached()` runs a block with no current span, so `durable.client.start_task` opens a new
+  trace for each task even when a poller activity calls it.
 - `chat_span` and `tool_span` wrap a provider call and a tool run inside an activity. Their
   names and attributes follow the OpenTelemetry GenAI conventions, taken from the constants of
   opentelemetry-semantic-conventions where it has them (docs/architecture.md lists them).
@@ -15,7 +17,9 @@ Three parts, each small enough for the rest of the code to call without knowing 
 Content capture is off by default. When it is off, nothing the model or a tool said goes into an
 attribute or an event: not the prompt, not tool arguments, not tool output, and not the text
 of an exception, because a provider error can echo the request. Spans keep names, sizes, token
-counts and timings, which is what an operator needs to see where time and tokens went.
+counts and timings, which is what an operator needs to see where time and tokens went. Temporal's
+own spans record the message and stacktrace of a failed activity or workflow, so while capture is
+off the interceptor gets a tracer that keeps only the error type (`_QuietTracer`).
 
 The provider is kept in module state and not in the global OpenTelemetry slot. The global slot
 accepts one provider per process and warns on a second, which a test suite would trigger.
@@ -28,6 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import SERVICE_NAME as RESOURCE_SERVICE_NAME
@@ -36,8 +41,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai
 from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
-from opentelemetry.trace import Span, SpanKind, Status, StatusCode, Tracer
-from opentelemetry.util.types import AttributeValue
+from opentelemetry.trace import Link, Span, SpanContext, SpanKind, Status, StatusCode, Tracer
+from opentelemetry.util.types import Attributes, AttributeValue
 from pydantic_core import to_json
 from temporalio.contrib.opentelemetry import TracingInterceptor
 
@@ -135,7 +140,144 @@ def interceptors() -> list[TracingInterceptor]:
     Pass the result as `interceptors=` to Client.connect. A worker uses its client's interceptors
     too, so the worker needs no list of its own.
     """
-    return [TracingInterceptor(tracer())] if _state.provider is not None else []
+    if _state.provider is None:
+        return []
+    chosen = tracer() if _state.capture_content else _QuietTracer(tracer())
+    return [TracingInterceptor(chosen)]
+
+
+@contextmanager
+def detached() -> Iterator[None]:
+    """Run the block with no current span, so a span opened inside it starts a new trace.
+
+    A poller activity starts one task per issue. Inside RunActivity:poll_once, every task would
+    otherwise join the trace of that poll, and Jaeger would show one trace per poll.
+    """
+    token = otel_context.attach(otel_context.Context())
+    try:
+        yield
+    finally:
+        otel_context.detach(token)
+
+
+# ---------- Temporal's spans without exception text ----------
+class _QuietSpan(Span):
+    """A span that keeps the type of an exception and drops its text.
+
+    Temporal's interceptor sets "Type: message" as the status description of a failed span and
+    records the exception, message and stacktrace included, as an event. A provider error can
+    echo the request, so with capture off the text must not reach the exporter.
+    """
+
+    def __init__(self, span: Span) -> None:
+        self._span = span
+
+    def end(self, end_time: int | None = None) -> None:
+        self._span.end(end_time)
+
+    def get_span_context(self) -> SpanContext:
+        return self._span.get_span_context()
+
+    def set_attributes(self, attributes: Mapping[str, AttributeValue]) -> None:
+        self._span.set_attributes(attributes)
+
+    def set_attribute(self, key: str, value: AttributeValue) -> None:
+        self._span.set_attribute(key, value)
+
+    def add_event(
+        self, name: str, attributes: Attributes = None, timestamp: int | None = None
+    ) -> None:
+        self._span.add_event(name, attributes, timestamp)
+
+    def add_link(self, context: SpanContext, attributes: Attributes = None) -> None:
+        self._span.add_link(context, attributes)
+
+    def update_name(self, name: str) -> None:
+        self._span.update_name(name)
+
+    def is_recording(self) -> bool:
+        return self._span.is_recording()
+
+    def set_status(self, status: Status | StatusCode, description: str | None = None) -> None:
+        code = status.status_code if isinstance(status, Status) else status
+        self._span.set_status(code)
+
+    def record_exception(
+        self,
+        exception: BaseException,
+        attributes: Attributes = None,
+        timestamp: int | None = None,
+        escaped: bool = False,
+    ) -> None:
+        self._span.set_attribute(ERROR_TYPE, type(exception).__name__)
+
+
+class _QuietTracer(Tracer):
+    """A tracer whose spans are `_QuietSpan`, for the interceptor while capture is off."""
+
+    def __init__(self, tracer: Tracer) -> None:
+        self._tracer = tracer
+
+    def start_span(
+        self,
+        name: str,
+        context: otel_context.Context | None = None,
+        kind: SpanKind = SpanKind.INTERNAL,
+        attributes: Attributes = None,
+        links: Sequence[Link] | None = None,
+        start_time: int | None = None,
+        record_exception: bool = True,
+        set_status_on_exception: bool = True,
+    ) -> Span:
+        span = self._tracer.start_span(
+            name,
+            context,
+            kind,
+            attributes,
+            links,
+            start_time,
+            record_exception,
+            set_status_on_exception,
+        )
+        return _QuietSpan(span)
+
+    # The API types this as its own private context manager class, which an ordinary
+    # contextmanager does not subclass. The call sites only use it in a with statement.
+    @contextmanager
+    def start_as_current_span(  # type: ignore[override]
+        self,
+        name: str,
+        context: otel_context.Context | None = None,
+        kind: SpanKind = SpanKind.INTERNAL,
+        attributes: Attributes = None,
+        links: Sequence[Link] | None = None,
+        start_time: int | None = None,
+        record_exception: bool = True,
+        set_status_on_exception: bool = True,
+        end_on_exit: bool = True,
+    ) -> Iterator[Span]:
+        # The SDK would record the exception and set the status itself on the way out. Doing
+        # both here, through the quiet span, keeps the same behavior without the text.
+        with self._tracer.start_as_current_span(
+            name,
+            context,
+            kind,
+            attributes,
+            links,
+            start_time,
+            record_exception=False,
+            set_status_on_exception=False,
+            end_on_exit=end_on_exit,
+        ) as span:
+            quiet = _QuietSpan(span)
+            try:
+                yield quiet
+            except BaseException as exc:
+                if record_exception:
+                    quiet.record_exception(exc)
+                if set_status_on_exception:
+                    quiet.set_status(StatusCode.ERROR)
+                raise
 
 
 # ---------- model calls ----------

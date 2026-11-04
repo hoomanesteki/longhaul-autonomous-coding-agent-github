@@ -56,12 +56,15 @@ async def start_task(
     table stays the record of what ran.
     """
     state = CarryState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
-    return await client.start_workflow(
-        TaskWorkflow.run,
-        state,
-        id=spec.task_id,
-        task_queue=task_queue,
-        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-        id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
-        memo={TUNING_MEMO_KEY: tuning} if tuning is not None else None,
-    )
+    # Each task is one trace. The poller starts tasks from an activity, where a current span
+    # would otherwise make every task of a poll a child of that activity.
+    with otel.detached():
+        return await client.start_workflow(
+            TaskWorkflow.run,
+            state,
+            id=spec.task_id,
+            task_queue=task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            memo={TUNING_MEMO_KEY: tuning} if tuning is not None else None,
+        )

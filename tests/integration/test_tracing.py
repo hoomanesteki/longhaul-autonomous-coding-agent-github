@@ -349,17 +349,15 @@ async def test_failed_activity_text_stays_out_of_spans(
     chat = by_name(spans, "chat ")[-1]
     assert dict(chat.attributes or {})[ERROR_TYPE] == "invalid_request"
     completion = by_name(spans, "CompleteWorkflow:")
-    assert [e.name for s in completion for e in s.events] == ["exception"]
+    assert completion and all(ERROR_TYPE in (s.attributes or {}) for s in completion)
 
     said = everything_said(spans)
     assert FAILURE_MARKER not in said
     assert "no scripted step matches" not in said
     assert "Traceback" not in said
-    # What stays: the exception class, so a failed span still says what kind of failure it was.
-    events = [e for s in spans for e in s.events if e.name == "exception"]
-    assert events
-    for event in events:
-        assert set(event.attributes or {}) <= {"exception.type"}
+    # A failed span keeps the type of its error, and no exception event with a message.
+    assert not [e for s in spans for e in s.events if e.name == "exception"]
+    assert ERROR_TYPE in (by_name(spans, "RunActivity:llm_turn")[-1].attributes or {})
 
 
 async def test_failed_activity_keeps_text_when_content_is_captured(

@@ -12,7 +12,7 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai
-from opentelemetry.trace import StatusCode
+from opentelemetry.trace import Status, StatusCode
 from temporalio.contrib.opentelemetry import TracingInterceptor
 
 from longhaul.contracts import (
@@ -174,6 +174,85 @@ def test_interceptors_trace_with_the_configured_provider(
     with interceptor.tracer.start_as_current_span("probe"):
         pass
     assert only(exporter).name == "probe"
+
+
+def test_interceptor_spans_keep_the_error_type_and_drop_the_text(
+    exporter: InMemorySpanExporter,
+) -> None:
+    # Temporal's interceptor sets "Type: message" as the description of a failed span, and the
+    # SDK records the exception with its message and stacktrace.
+    (interceptor,) = otel.interceptors()
+
+    with pytest.raises(RuntimeError), interceptor.tracer.start_as_current_span("probe") as span:
+        span.set_status(Status(StatusCode.ERROR, f"RuntimeError: {SECRET}"))
+        raise RuntimeError(f"boom {SECRET}")
+
+    done = only(exporter)
+    assert done.status.status_code is StatusCode.ERROR
+    assert done.status.description is None
+    assert dict(done.attributes or {})["error.type"] == "RuntimeError"
+    assert done.events == ()
+
+
+def test_a_span_started_by_hand_drops_exception_text_too(exporter: InMemorySpanExporter) -> None:
+    # The workflow completion span is started this way, and the interceptor then records the
+    # exception on it.
+    (interceptor,) = otel.interceptors()
+
+    span = interceptor.tracer.start_span("probe", attributes={"kept": 1})
+    span.set_attributes({"also": "kept"})
+    span.add_event("note")
+    span.update_name("renamed")
+    assert span.is_recording()
+    assert span.get_span_context().is_valid
+    span.record_exception(ValueError(f"bad {SECRET}"), {"exception.message": SECRET})
+    span.end()
+
+    done = only(exporter)
+    assert done.name == "renamed"
+    assert dict(done.attributes or {}) == {"kept": 1, "also": "kept", "error.type": "ValueError"}
+    assert [e.name for e in done.events] == ["note"]
+
+
+def test_interceptor_spans_keep_the_exception_text_when_capture_is_on() -> None:
+    memory = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    with otel.configured(provider, capture_content=True):
+        (interceptor,) = otel.interceptors()
+        with pytest.raises(RuntimeError), interceptor.tracer.start_as_current_span("probe"):
+            raise RuntimeError(f"boom {SECRET}")
+
+    (event,) = only(memory).events
+    assert SECRET in str((event.attributes or {})["exception.message"])
+    provider.shutdown()
+
+
+def test_a_span_opened_in_detached_starts_a_new_trace(exporter: InMemorySpanExporter) -> None:
+    tracer = otel.tracer()
+    with (
+        tracer.start_as_current_span("caller"),
+        otel.detached(),
+        tracer.start_as_current_span("task"),
+    ):
+        pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert spans["task"].parent is None
+    assert spans["task"].context.trace_id != spans["caller"].context.trace_id
+
+
+def test_a_span_opened_after_detached_is_a_child_again(exporter: InMemorySpanExporter) -> None:
+    tracer = otel.tracer()
+    with tracer.start_as_current_span("caller"):
+        with otel.detached():
+            pass
+        with tracer.start_as_current_span("after"):
+            pass
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert spans["after"].parent is not None
+    assert spans["after"].parent.span_id == spans["caller"].context.span_id
 
 
 # ---------- the chat span ----------

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
@@ -28,9 +29,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.current_spans: list[trace.Span] = []
 
     async def start_workflow(self, *args: Any, **kwargs: Any) -> str:
         self.calls.append((args, kwargs))
+        self.current_spans.append(trace.get_current_span())
         return "handle"
 
 
@@ -82,6 +85,19 @@ async def test_start_task_builds_the_first_carry_state(spec: TaskSpec) -> None:
     # Workflow code subtracts started_at from workflow.now(), which carries a timezone.
     assert state.started_at.tzinfo is not None
     assert before <= state.started_at <= datetime.now(UTC)
+
+
+async def test_start_task_starts_the_workflow_outside_the_callers_span(spec: TaskSpec) -> None:
+    # The poller calls start_task from an activity. A task started under that span would share
+    # its trace with every other task of the poll.
+    fake = FakeClient()
+    provider = TracerProvider()
+    with provider.get_tracer("test").start_as_current_span("RunActivity:poll_once") as caller:
+        await start_task(cast(Client, fake), spec)
+        assert trace.get_current_span() is caller
+
+    (seen,) = fake.current_spans
+    assert not seen.get_span_context().is_valid
 
 
 async def test_start_task_sends_no_memo_by_default(spec: TaskSpec) -> None:

@@ -32,6 +32,7 @@ import re
 import signal
 import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -377,7 +378,7 @@ async def execute(options: RunOptions) -> int:
     try:
         return await run_task(manager, run)
     finally:
-        await remove_sandbox(manager, run.task_id)
+        await remove_sandbox(lambda: manager, run.task_id)
 
 
 def stop_on_signals() -> None:
@@ -422,10 +423,14 @@ async def run_task(manager: WorkspaceManager, run: Run) -> int:
     return 0 if outcome.kind is OutcomeKind.PR_OPENED else EXIT_ERROR
 
 
-async def remove_sandbox(manager: WorkspaceManager, task_id: str) -> None:
-    """Remove the container and the volume. A failure is reported and changes no result."""
+async def remove_sandbox(make: Callable[[], WorkspaceManager], task_id: str) -> None:
+    """Remove the container and the volume. A failure is reported and changes no result.
+
+    The manager is built inside the guard: DockerSandboxManager() connects to the daemon, so a
+    Docker that is down fails there and not in cleanup_task.
+    """
     try:
-        await manager.cleanup_task(task_id)
+        await make().cleanup_task(task_id)
     except Exception as exc:
         typer.echo(f"warning: could not remove the sandbox of task {task_id}: {exc}", err=True)
 
@@ -536,7 +541,7 @@ async def submit(options: DurableOptions) -> int:
         raise
     except WorkflowFailureError as exc:
         typer.echo(f"error: the workflow failed: {failure_text(exc)}", err=True)
-        await remove_sandbox(make_manager(), task_id)
+        await remove_sandbox(make_manager, task_id)
         return EXIT_ERROR
 
     final = await try_status(handle)
@@ -544,7 +549,7 @@ async def submit(options: DurableOptions) -> int:
     await print_task_diff(make_store(blobs, settings), task_id, final)
     # A finished workflow leaves its sandbox until LH-507 makes it destroy it. The cleanup is
     # safe to run twice, so this keeps working after that.
-    await remove_sandbox(make_manager(), task_id)
+    await remove_sandbox(make_manager, task_id)
     return 0 if outcome.kind is OutcomeKind.PR_OPENED else EXIT_ERROR
 
 

@@ -755,6 +755,23 @@ async def test_pull_request_validation(fake: FakeGitHub, gh: httpx2.AsyncClient)
     assert (await gh.post(url, json=good)).status_code == 201
 
 
+async def test_close_issue_takes_an_issue_out_of_the_open_list(
+    fake: FakeGitHub, gh: httpx2.AsyncClient
+) -> None:
+    number = fake.seed_issue(REPO, "report", labels=["longhaul"])
+
+    fake.close_issue(REPO, number)
+
+    listed = (await gh.get(api("/issues"), params={"labels": "longhaul", "state": "open"})).json()
+    assert listed == []
+    closed = (await gh.get(api(f"/issues/{number}"))).json()
+    assert closed["state"] == "closed" and TIMESTAMP.match(closed["closed_at"])
+    with pytest.raises(ValueError, match="not open"):
+        fake.close_issue(REPO, number)
+    with pytest.raises(LookupError):
+        fake.close_issue(REPO, 99)
+
+
 async def test_merge_and_close_helpers(fake: FakeGitHub, gh: httpx2.AsyncClient) -> None:
     issue = fake.seed_issue(REPO, "report")
     merged = fake.seed_pull(REPO, "a")

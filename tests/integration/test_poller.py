@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, LiteralString
 
@@ -33,6 +34,7 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
+from temporalio.api.enums.v1 import EventType
 from temporalio.client import (
     Client,
     ScheduleActionStartWorkflow,
@@ -46,13 +48,14 @@ from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.contracts import RepoSettings, TaskSpec
 from longhaul.db.session import make_engine
-from longhaul.db.tasks import SqlTaskStore
+from longhaul.db.tasks import CommentCursor, SqlTaskStore
 from longhaul.durable import acts, schedule
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.client import connect
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
+from longhaul.github.side_effects import SqlLedger
 from longhaul.settings import AppConfig, EnvSettings, RepoEntry, get_settings, load_config
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase3]
@@ -186,7 +189,11 @@ async def polling(world: World, config: AppConfig) -> AsyncIterator[None]:
             FAKE_BASE_URL, PatAuth(TOKEN), transport=world.fake.transport()
         ) as github:
             activities = PollerActivities(
-                github, SqlTaskStore.from_engine(engine), config, task_queue=world.task_queue
+                github,
+                SqlTaskStore.from_engine(engine),
+                config,
+                task_queue=world.task_queue,
+                ledger=SqlLedger.from_engine(engine),
             )
             async with Worker(
                 world.client,
@@ -322,6 +329,156 @@ async def test_schedule_install_idempotent(world: World) -> None:
         await delete_schedule(handle)
 
 
+# --- the commands in the comments (LH-308) ----------------------------------------------------
+
+DENIED = "Only maintainers can steer this task"
+
+
+async def signals_of(world: World, task_id: str) -> list[tuple[str, list[Any]]]:
+    """The signals in the history of a task, in order, as (name, arguments)."""
+    history = await world.client.get_workflow_handle(task_id).fetch_history()
+    found: list[tuple[str, list[Any]]] = []
+    for event in history.events:
+        if event.event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_SIGNALED:
+            signaled = event.workflow_execution_signaled_event_attributes
+            found.append(
+                (signaled.signal_name, [json.loads(p.data) for p in signaled.input.payloads])
+            )
+    return found
+
+
+def staff(world: World) -> None:
+    """Three people with different roles on the repo of this test."""
+    world.fake.seed_collaborator(world.repo, "maintainer", "maintain")
+    world.fake.seed_collaborator(world.repo, "writer", "write")
+    world.fake.seed_collaborator(world.repo, "reader", "read")
+
+
+async def test_unauthorized_cancel_ignored(world: World) -> None:
+    number = world.fake.seed_issue(world.repo, "add() is wrong", labels=[LABEL])
+    staff(world)
+    task_id = world.task_id(number)
+    handle = world.client.get_workflow_handle(task_id)
+
+    async with polling(world, world.config()):
+        await run_poll(world)
+        world.fake.seed_comment(world.repo, number, "/longhaul cancel", user="reader")
+        world.fake.seed_comment(world.repo, number, "/longhaul cancel", user="stranger")
+        first = await run_poll(world)
+        second = await run_poll(world)
+
+    assert (await handle.describe()).status is WorkflowExecutionStatus.RUNNING
+    assert await signals_of(world, task_id) == [], "no cancel reached the task"
+    assert first.commands == second.commands == 0
+    bodies = world.fake.comment_bodies(world.repo, number)
+    replies = [body for body in bodies if DENIED in body]
+    assert len(replies) == 2, "one polite reply for each of the two users, and no more"
+    assert sorted(("@reader" in body, "@stranger" in body) for body in replies) == [
+        (False, True),
+        (True, False),
+    ]
+    rows = world.scratch.query("SELECT key, task_id, kind FROM side_effects ORDER BY key")
+    assert [(task, kind) for _, task, kind in rows] == [(task_id, "comment")] * 2
+    assert {key.split(":")[0] for key, _, _ in rows} == {task_id}
+
+
+async def test_the_commands_of_maintainers_are_signalled_once(world: World) -> None:
+    number = world.fake.seed_issue(world.repo, "add() is wrong", labels=[LABEL])
+    staff(world)
+    task_id = world.task_id(number)
+
+    async with polling(world, world.config()):
+        await run_poll(world)
+        for user, body in [
+            ("maintainer", "/longhaul hint look at add() first"),
+            ("octocat", "thanks for looking at this"),
+            ("writer", "/longhaul budget +5 turns +20"),
+            ("maintainer", "/longhaul status"),
+            ("maintainer", "```\n/longhaul cancel\n```"),
+        ]:
+            world.fake.seed_comment(world.repo, number, body, user=user)
+        first = await run_poll(world)
+        second = await run_poll(world)
+        third = await run_poll(world)
+
+    assert [first.commands, second.commands, third.commands] == [3, 0, 0]
+    assert await signals_of(world, task_id) == [
+        ("hint", ["maintainer", "look at add() first"]),
+        ("add_budget", ["writer", 5.0, 20]),
+        ("report_status", ["maintainer"]),
+    ]
+    assert world.fake.count_comments(world.repo, number, containing=DENIED) == 0
+
+
+async def test_a_retried_poll_does_not_deliver_a_command_twice(world: World) -> None:
+    number = world.fake.seed_issue(world.repo, "add() is wrong", labels=[LABEL])
+    staff(world)
+    task_id = world.task_id(number)
+
+    async with polling(world, world.config()):
+        await run_poll(world)
+        world.fake.seed_comment(world.repo, number, "/longhaul hint one", user="maintainer")
+        world.fake.seed_comment(world.repo, number, "/longhaul hint two", user="writer")
+        # The first attempt of the activity delivers the first command and then fails on the
+        # permission of the second author. Temporal runs the activity again after its backoff.
+        world.fake.fail_next(r"/collaborators/writer/permission", status=502, count=1)
+        retried = await run_poll(world)
+
+    assert retried.commands == 1, "the attempt that succeeded sent the second command only"
+    assert await signals_of(world, task_id) == [
+        ("hint", ["maintainer", "one"]),
+        ("hint", ["writer", "two"]),
+    ]
+
+
+async def test_retry_starts_the_next_attempt_of_a_finished_task(world: World) -> None:
+    number = world.fake.seed_issue(world.repo, "add() is wrong", labels=[LABEL])
+    staff(world)
+    first = world.task_id(number)
+    second = f"{first}-a2"
+
+    async with polling(world, world.config()):
+        await run_poll(world)
+        world.fake.seed_comment(world.repo, number, "/longhaul retry", user="maintainer")
+        running = await run_poll(world)
+        assert running.commands == 0, "the first attempt is still running"
+        assert await task_ids(world, expect=1) == [first]
+
+        await world.client.get_workflow_handle(first).terminate("the test ends this attempt")
+        retry = world.fake.seed_comment(world.repo, number, "/longhaul retry", user="maintainer")
+        started = await run_poll(world)
+        again = await run_poll(world)
+
+    assert started.commands == 1 and again.commands == 0
+    assert await task_ids(world, expect=2) == [first, second]
+    described = await world.client.get_workflow_handle(second).describe()
+    assert described.status is WorkflowExecutionStatus.RUNNING
+    assert described.task_queue == world.task_queue
+    rows = world.scratch.query(
+        "SELECT id, issue_number, last_comment_id FROM tasks ORDER BY length(id), id"
+    )
+    assert rows == [(first, number, rows[0][2]), (second, number, retry)]
+    assert rows[0][2] is not None and rows[0][2] >= retry, "the old attempt is past the retry too"
+
+
+async def test_commands_go_to_the_latest_attempt(world: World) -> None:
+    number = world.fake.seed_issue(world.repo, "add() is wrong", labels=[LABEL])
+    staff(world)
+    first = world.task_id(number)
+    second = f"{first}-a2"
+
+    async with polling(world, world.config()):
+        await run_poll(world)
+        await world.client.get_workflow_handle(first).terminate("the test ends this attempt")
+        world.fake.seed_comment(world.repo, number, "/longhaul retry", user="maintainer")
+        await run_poll(world)
+        world.fake.seed_comment(world.repo, number, "/longhaul hint try again", user="maintainer")
+        await run_poll(world)
+
+    assert await signals_of(world, first) == []
+    assert await signals_of(world, second) == [("hint", ["maintainer", "try again"])]
+
+
 # --- what only a server shows -----------------------------------------------------------------
 
 
@@ -427,5 +584,88 @@ async def test_known_answers_with_the_ids_that_have_a_row(world: World) -> None:
 
         assert await store.known(ids) == {world.task_id(1), world.task_id(3)}
         assert await store.known([]) == set()
+    finally:
+        await engine.dispose()
+
+
+# --- the comment cursor in Postgres (LH-308) --------------------------------------------------
+
+FIVE = datetime(2026, 3, 1, 12, 5, 0, tzinfo=UTC)
+
+
+async def test_the_cursor_columns_exist_and_start_empty(world: World) -> None:
+    columns = dict(
+        (name, (kind, nullable))
+        for name, kind, nullable in world.scratch.query(
+            "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+            "WHERE table_name = 'tasks' AND column_name LIKE 'last_comment_%'"
+        )
+    )
+    assert columns == {
+        "last_comment_at": ("timestamp with time zone", "YES"),
+        "last_comment_id": ("bigint", "YES"),
+    }
+    engine = make_engine(world.scratch.url)
+    try:
+        await SqlTaskStore.from_engine(engine).record_pickup(spec_for(world, 1))
+        row = world.scratch.query("SELECT last_comment_at, last_comment_id FROM tasks")
+        assert row == [(None, None)]
+    finally:
+        await engine.dispose()
+
+
+async def test_a_pickup_stores_the_cursor_and_a_second_pickup_keeps_it(world: World) -> None:
+    engine = make_engine(world.scratch.url)
+    try:
+        store = SqlTaskStore.from_engine(engine)
+        await store.record_pickup(spec_for(world, 1), cursor=CommentCursor(FIVE, 40))
+
+        await store.record_pickup(spec_for(world, 1, "retitled"), cursor=CommentCursor(FIVE, 2))
+
+        row = world.scratch.query("SELECT last_comment_at, last_comment_id, title FROM tasks")
+        assert row == [(FIVE, 40, "retitled")]
+    finally:
+        await engine.dispose()
+
+
+async def test_the_cursor_moves_forward_and_never_back(world: World) -> None:
+    engine = make_engine(world.scratch.url)
+    try:
+        store = SqlTaskStore.from_engine(engine)
+        await store.record_pickup(spec_for(world, 1))
+        later = CommentCursor(FIVE + timedelta(minutes=1), 90)
+
+        await store.advance_comments(world.task_id(1), CommentCursor(FIVE, 40))
+        await store.advance_comments(world.task_id(1), later)
+        await store.advance_comments(world.task_id(1), CommentCursor(FIVE, 40))
+        await store.advance_comments(world.task_id(9), later)  # no such task: nothing happens
+
+        row = world.scratch.query("SELECT id, last_comment_at, last_comment_id FROM tasks")
+        assert row == [(world.task_id(1), later.at, 90)]
+        (read,) = (await store.latest_attempts(world.repo, [1])).values()
+        assert read.cursor == later
+    finally:
+        await engine.dispose()
+
+
+async def test_the_latest_attempt_of_each_issue_comes_from_the_table(world: World) -> None:
+    engine = make_engine(world.scratch.url)
+    try:
+        store = SqlTaskStore.from_engine(engine)
+        for number, suffix in [(1, ""), (1, "-a2"), (1, "-a10"), (1, "-a9"), (2, ""), (3, "")]:
+            spec = spec_for(world, number).model_copy(
+                update={"task_id": world.task_id(number) + suffix}
+            )
+            await store.record_pickup(spec)
+
+        found = await store.latest_attempts(world.repo, [1, 2, 4])
+
+        assert {number: row.id for number, row in found.items()} == {
+            1: world.task_id(1) + "-a10",
+            2: world.task_id(2),
+        }
+        assert found[1].started_at.tzinfo is not None
+        assert await store.latest_attempts(world.repo, []) == {}
+        assert await store.latest_attempts("acme/other", [1]) == {}
     finally:
         await engine.dispose()

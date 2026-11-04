@@ -641,6 +641,15 @@ class FakeGitHub:
             target = self._get_repo(repo)
             self._close(self._get_pull(target, number), merged_by=None)
 
+    def close_issue(self, repo: str, number: int) -> None:
+        """Close an open issue, which then leaves the list of open issues."""
+        with self._lock:
+            issue = self._get_issue(self._get_repo(repo), number)
+            if issue.state != "open":
+                raise ValueError(f"issue {number} is not open")
+            now = self._now()
+            issue.state, issue.closed_at, issue.updated_at = "closed", now, now
+
     # -- reading state back
 
     def count_comments(self, repo: str, number: int | None = None, *, containing: str = "") -> int:

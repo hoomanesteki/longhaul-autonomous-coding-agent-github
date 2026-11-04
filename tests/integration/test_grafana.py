@@ -2,8 +2,10 @@
 
 Grafana and Prometheus come from the compose file. The fixture runs
 `docker compose up -d --wait prometheus grafana`, which does nothing for services that already
-run with the current files and recreates Grafana when its mounts changed. It never runs `down`
-or `stop`, and it names the two services, so the rest of the stack is not touched.
+run with the current files and recreates a service whose mounts or ports differ. That includes a
+run from another checkout of the repo, because the compose project is the same (docs/runbook.md,
+"Metrics and the dashboard"). It never runs `down` or `stop`, and it names the two services, so
+the rest of the stack is not touched.
 
 Everything is read through Grafana's own HTTP API, as a person with a browser would see it:
 

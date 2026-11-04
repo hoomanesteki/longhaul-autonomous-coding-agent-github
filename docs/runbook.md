@@ -208,7 +208,7 @@ Check a running worker with `curl -s http://127.0.0.1:9464/metrics | grep '^long
 | `longhaul_activity_retries_total{activity}` | Activity attempts after the first |
 | `longhaul_cache_ratio` | The share of a prompt that came from the cache (histogram) |
 
-The activities update the metrics and the workflow never does, because a workflow runs again on every replay. A run reaches the end of its task through one `record_event` call with the type `outcome`, which is also a row in the `events` table.
+The activities update the metrics and the workflow never does, because a workflow runs again on every replay. A run reaches the end of its task through one `record_event` call with the type `outcome`, which is also a row in the `events` table. The count is made before the row is written, so a task that ends while Postgres is down is still counted.
 
 Things to know when you read the numbers:
 
@@ -216,8 +216,9 @@ Things to know when you read the numbers:
 - `longhaul_active_tasks` counts the tasks a process has seen start, or has seen again after a hand-over. A task that Temporal ends from outside, by a terminate or a timeout, stays in the count until the worker restarts.
 - A task that was started from a local folder has the repo label `local`, whatever the folder. A tool name that the registry does not know is counted as `unknown`.
 - Two workers on one machine need two ports. The second one stops at the start with an error that names `LONGHAUL_METRICS_PORT`. Add its port as a second target under `worker` in `docker/prometheus/prometheus.yml`.
-- On Docker Desktop, Prometheus reaches a worker that listens on `127.0.0.1`. On Linux the container comes through the docker bridge, so run the worker with `LONGHAUL_METRICS_HOST=0.0.0.0` and keep the port closed to the network with a firewall. The worker in the compose service `worker` does this already and publishes `127.0.0.1:9464`.
+- On Docker Desktop, Prometheus reaches a worker that listens on `127.0.0.1`, and it reaches the compose service `worker` through the port that service publishes on `127.0.0.1:9464`. On Linux the container comes through the docker bridge, which a port published only on `127.0.0.1` does not answer. A worker on the host needs `LONGHAUL_METRICS_HOST=0.0.0.0` there, with the port closed to the network by a firewall. To scrape the compose service `worker` on Linux, put `worker:9464` in `docker/prometheus/prometheus.yml` in place of `host.docker.internal:9464`, since both services share the compose network. Do not list both on Docker Desktop: it would scrape the compose worker twice, and every sum on the dashboard would double.
 - A checkout that was running before this change has a Grafana without the dashboards folder. Run `docker compose up -d grafana` once. It recreates Grafana and nothing else.
+- Every checkout of the repo, a git worktree included, belongs to the one compose project `longhaul`, and its bind mounts name the folder of the checkout that started the container. `tests/integration/test_grafana.py` runs `docker compose up -d --wait prometheus grafana`, which recreates both containers with the files and the port variables of the checkout it runs in. Run it from a worktree only with `LH_GRAFANA_PORT` and `LH_PROMETHEUS_PORT` exported as in the main checkout, or the new containers ask for ports that another project may hold. When a worktree is deleted, run `docker compose up -d prometheus grafana` once from the main checkout, so that the two containers stop pointing at the deleted folder.
 
 `tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 

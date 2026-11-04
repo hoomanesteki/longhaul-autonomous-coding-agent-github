@@ -291,3 +291,60 @@ def test_importing_the_module_does_not_import_fastembed() -> None:
     # memory should not pay for. This also holds on a machine that has the extra installed.
     code = "import sys\nimport longhaul.memory.embedder\nprint('fastembed' in sys.modules)\n"
     assert _run_child(code).strip() == "False"
+
+
+# The signature of fastembed 0.9.1, which ships py.typed. With the memory extra installed,
+# mypy checks the call in LocalEmbedder against it. Without the extra there is nothing to
+# check, which is how CI and the base install stayed green while `make check` failed for a
+# developer who had run `uv sync --extra memory`.
+FASTEMBED_STUB = """\
+from collections.abc import Iterable, Iterator, Sequence
+from enum import Enum
+from typing import Any
+
+class Device(str, Enum):
+    CPU = "cpu"
+    CUDA = "cuda"
+    AUTO = "auto"
+
+class TextEmbedding:
+    def __init__(
+        self,
+        model_name: str = ...,
+        cache_dir: str | None = None,
+        threads: int | None = None,
+        providers: Sequence[Any] | None = None,
+        cuda: bool | Device = ...,
+        device_ids: list[int] | None = None,
+        lazy_load: bool = False,
+        **kwargs: Any,
+    ) -> None: ...
+    def embed(self, documents: str | Iterable[str], batch_size: int = 256) -> Iterator[Any]: ...
+"""
+
+
+def test_the_model_loader_type_checks_against_the_signature_of_fastembed(tmp_path: Path) -> None:
+    stubs = tmp_path / "stubs" / "fastembed"
+    stubs.mkdir(parents=True)
+    (stubs / "__init__.pyi").write_text(FASTEMBED_STUB, encoding="utf-8")
+    root = SRC.parent
+    env = {**os.environ, "MYPYPATH": str(stubs.parent)}
+
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "mypy",
+            "--cache-dir",
+            str(tmp_path / ".cache"),
+            "-m",
+            "longhaul.memory.embedder",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert done.returncode == 0, done.stdout

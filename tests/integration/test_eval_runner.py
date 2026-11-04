@@ -342,3 +342,36 @@ async def test_hidden_tests_not_visible() -> None:
         assert listed, "the base commit holds no files"
         assert not listed & set(names), listed
         assert not any("hidden" in item or "reference" in item for item in listed), listed
+
+
+# ---------- the task set itself ----------
+@pytest.mark.slow
+async def test_every_task_fails_before_and_passes_after_its_reference_patch() -> None:
+    """The plan asks for hidden tests that fail on the base and pass on a correct fix.
+
+    It sets up 30 sandboxes, each with a pip install, so it runs on request (`-m slow`).
+    """
+    require_image()
+    cfg = load_config(CONFIG)
+    grader = grade_custom.Grader(
+        DockerSandboxManager(), image=cfg.sandbox.image, limits=cfg.sandbox.limits
+    )
+    gate = asyncio.Semaphore(4)
+
+    async def check(task: custom_tasks.CustomTask) -> list[str]:
+        async with gate:
+            before = await grader.grade_base(task)
+        async with gate:
+            patch = custom_tasks.reference_patch_path(task).read_text(encoding="utf-8")
+            after = await grader.grade(task, patch)
+        problems = []
+        if before.hidden_failed == 0:
+            problems.append("its hidden tests pass on the base")
+        if before.repo_failed:
+            problems.append(f"the repo tests fail on the base: {before.output_tail}")
+        if not after.resolved:
+            problems.append(f"the reference patch is not resolved: {after.reason}")
+        return [f"{task.id}: {problem}" for problem in problems]
+
+    found = await asyncio.gather(*(check(task) for task in custom_tasks.load_tasks()))
+    assert [problem for task_problems in found for problem in task_problems] == []

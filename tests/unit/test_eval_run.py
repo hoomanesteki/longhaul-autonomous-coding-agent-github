@@ -5,14 +5,18 @@ one-minute pause timeout costs no time. The runner against the real stack is in
 tests/integration/test_eval_runner.py.
 """
 
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from eval import custom_tasks, run
+from eval.grade_custom import GradeResult
+from eval.results import TaskResult, Tokens
 from eval.run import RunOptions
-from longhaul.checkpoints.git_store import check_task_id
-from longhaul.contracts import Phase, TaskStatus
+from longhaul.checkpoints.git_store import CheckpointError, check_task_id
+from longhaul.contracts import Outcome, OutcomeKind, Phase, TaskStatus
 from longhaul.settings import load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -297,6 +301,7 @@ class FakeTask:
             turn_index=3,
             cost_usd=0.0,
             last_checkpoint=None,
+            plan_version=None,
         )
 
     async def cancel(self, reason: str) -> None:
@@ -398,3 +403,157 @@ async def test_the_last_status_that_was_seen_is_kept() -> None:
     watched = await watch(task, clock)
     assert watched.status is not None
     assert watched.status.turn_index == 3
+
+
+# ---------- reading the end of a task ----------
+class FakeStore:
+    def __init__(self, patch: str = "", error: Exception | None = None) -> None:
+        self.patch = patch
+        self.error = error
+        self.asked: list[tuple[str, str]] = []
+
+    async def diff(self, task_id: str, head_sha: str) -> str:
+        self.asked.append((task_id, head_sha))
+        if self.error is not None:
+            raise self.error
+        return self.patch
+
+
+def status_at(checkpoint: str | None) -> TaskStatus:
+    return TaskStatus(
+        task_id="lh-eval-try1-calc-01",
+        phase=Phase.DONE,
+        turn_index=5,
+        cost_usd=0.0,
+        last_checkpoint=checkpoint,
+        plan_version=None,
+    )
+
+
+async def test_the_patch_is_read_at_the_last_checkpoint_of_the_workflow() -> None:
+    store = FakeStore("diff --git a/x b/x\n")
+    patch, why = await run.read_patch(store, "lh-eval-try1-calc-01", status_at("a" * 40))  # type: ignore[arg-type]
+    assert (patch, why) == ("diff --git a/x b/x\n", None)
+    assert store.asked == [("lh-eval-try1-calc-01", "a" * 40)]
+
+
+@pytest.mark.parametrize("final", [None, status_at(None)])
+async def test_a_workflow_that_did_not_say_where_it_ended_has_no_patch(
+    final: TaskStatus | None,
+) -> None:
+    patch, why = await run.read_patch(FakeStore(), "lh-eval-try1-calc-01", final)  # type: ignore[arg-type]
+    assert patch == ""
+    assert why is not None
+    assert "where it ended" in why
+
+
+async def test_a_checkpoint_repo_that_cannot_be_read_gives_an_empty_patch_and_a_reason() -> None:
+    store = FakeStore(error=CheckpointError("the repo is gone"))
+    patch, why = await run.read_patch(store, "lh-eval-try1-calc-01", status_at("b" * 40))  # type: ignore[arg-type]
+    assert patch == ""
+    assert why is not None
+    assert "the repo is gone" in why
+
+
+class FakeGrader:
+    def __init__(self, result: GradeResult | None = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.graded: list[tuple[str, str, str | None]] = []
+
+    async def grade(
+        self, task: custom_tasks.CustomTask, patch: str, *, name: str | None = None
+    ) -> GradeResult:
+        self.graded.append((task.id, patch, name))
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+def grading_context(grader: FakeGrader) -> run.RunContext:
+    return SimpleNamespace(grader=grader)  # type: ignore[return-value]
+
+
+def outcome_of(kind: OutcomeKind) -> Outcome:
+    return Outcome(kind=kind, summary="done")
+
+
+async def test_a_finished_task_is_graded_under_a_name_the_run_can_clean_up() -> None:
+    grader = FakeGrader(GradeResult(True, "all tests passed (3 hidden, 4 repo)"))
+    resolved, line = await run.grade(
+        grading_context(grader),
+        first_task(),
+        outcome_of(OutcomeKind.PR_OPENED),
+        "the patch",
+        "lh-eval-try1-calc-01",
+    )
+    assert (resolved, line) == (True, "all tests passed (3 hidden, 4 repo)")
+    assert grader.graded == [("calc-01", "the patch", "lh-eval-try1-calc-01-grade")]
+
+
+async def test_a_patch_that_fails_the_grader_is_not_resolved() -> None:
+    grader = FakeGrader(GradeResult(False, "3 hidden tests failed"))
+    resolved, line = await run.grade(
+        grading_context(grader),
+        first_task(),
+        outcome_of(OutcomeKind.PR_OPENED),
+        "the patch",
+        "lh-eval-try1-calc-01",
+    )
+    assert (resolved, line) == (False, "3 hidden tests failed")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [OutcomeKind.STUCK, OutcomeKind.BUDGET_EXHAUSTED, OutcomeKind.CANCELLED, OutcomeKind.ERROR],
+)
+async def test_a_task_that_did_not_finish_is_not_graded_and_not_resolved(
+    kind: OutcomeKind,
+) -> None:
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    resolved, line = await run.grade(
+        grading_context(grader), first_task(), outcome_of(kind), "a patch", "lh-eval-try1-calc-01"
+    )
+    assert resolved is False
+    assert kind.value in line
+    assert grader.graded == []
+
+
+async def test_a_grader_that_fails_leaves_the_task_ungraded() -> None:
+    grader = FakeGrader(error=RuntimeError("docker is down"))
+    resolved, line = await run.grade(
+        grading_context(grader),
+        first_task(),
+        outcome_of(OutcomeKind.PR_OPENED),
+        "the patch",
+        "lh-eval-try1-calc-01",
+    )
+    assert resolved is None
+    assert "docker is down" in line
+
+
+def test_the_progress_line_names_the_task_the_outcome_and_the_verdict() -> None:
+    result = TaskResult(
+        run_id="try1",
+        task_id="calc-01",
+        workflow_id="lh-eval-try1-calc-01",
+        task_set="custom",
+        config="full",
+        model="m",
+        git_sha="f" * 40,
+        outcome="pr_opened",
+        outcome_summary="done",
+        resolved=None,
+        grading="the grader failed: boom",
+        cost_usd=0.5,
+        tokens=Tokens(),
+        cache_ratio=0.0,
+        started_at=datetime(2026, 11, 4, tzinfo=UTC),
+        ended_at=datetime(2026, 11, 4, 0, 1, tzinfo=UTC),
+        wall_time_s=60.0,
+        turns=5,
+    )
+    assert run.describe(result) == (
+        "calc-01: pr_opened, not graded, $0.5000, 5 turns, 60 s (the grader failed: boom)"
+    )

@@ -33,11 +33,15 @@ RUN uv sync --locked --no-dev --no-install-project
 
 COPY src ./src
 COPY config ./config
+COPY templates ./templates
 RUN uv sync --locked --no-dev --no-editable
 
 # The settings come from LONGHAUL_* variables (see .env.example). The config file is the example
 # one unless LONGHAUL_CONFIG names another.
 ENV LONGHAUL_CONFIG=/app/config/longhaul.example.yaml
+# The pull request body is a template. The installed package is not inside a checkout, so the
+# worker is told where the folder is.
+ENV LONGHAUL_TEMPLATES_DIR=/app/templates
 
 # SIGTERM from `docker stop` starts a graceful stop (src/longhaul/durable/worker.py).
 CMD ["longhaul", "worker"]

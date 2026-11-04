@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from longhaul.contracts import EffortLevel, Role, SandboxLimits
 from longhaul.settings import (
+    DEFAULT_GIT_AUTHOR,
     AppConfig,
     EffortLevels,
     EnvSettings,
@@ -18,6 +19,7 @@ from longhaul.settings import (
     config_path,
     get_settings,
     load_config,
+    templates_path,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase0]
@@ -645,3 +647,36 @@ def test_an_absolute_config_path_is_used_as_it_is(
     named = tmp_path / "mine.yaml"
     monkeypatch.setenv("LONGHAUL_CONFIG", str(named))
     assert config_path(EnvSettings(_env_file=None)) == named
+
+
+# ---------- LH-306: the commit author and the templates ----------
+def test_the_commit_author_defaults_to_longhaul(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_GIT_AUTHOR", raising=False)
+    assert EnvSettings(_env_file=None).git_author == (  # type: ignore[call-arg]
+        "longhaul <longhaul@users.noreply.github.com>"
+    )
+
+
+def test_the_commit_author_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GIT_AUTHOR", "Ada <ada@example.com>")
+    assert EnvSettings(_env_file=None).git_author == "Ada <ada@example.com>"  # type: ignore[call-arg]
+
+
+def test_a_blank_commit_author_counts_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GIT_AUTHOR", "")
+    assert EnvSettings(_env_file=None).git_author == DEFAULT_GIT_AUTHOR  # type: ignore[call-arg]
+
+
+def test_the_templates_are_found_from_any_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_TEMPLATES_DIR", raising=False)
+    found = templates_path(EnvSettings(_env_file=None))  # type: ignore[call-arg]
+    assert (found / "pr_body.md.j2").is_file()
+
+
+def test_the_templates_folder_can_be_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LONGHAUL_TEMPLATES_DIR", str(tmp_path))
+    assert templates_path(EnvSettings(_env_file=None)) == tmp_path  # type: ignore[call-arg]
+
+
+def test_env_example_lists_the_commit_author() -> None:
+    assert _env_example()["LONGHAUL_GIT_AUTHOR"] == ""

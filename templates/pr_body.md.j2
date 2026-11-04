@@ -1,0 +1,22 @@
+## Summary
+
+{{ summary }}
+
+## Changes
+
+{{ changes }}
+{% if files %}
+
+{% for file in files %}
+- `{{ file.path }}`: {{ file.counts }}
+{% endfor %}
+{% if hidden %}
+- and {{ hidden }} more {{ "file" if hidden == 1 else "files" }}
+{% endif %}
+{% endif %}
+
+## How it was tested
+
+{{ tested }}
+
+Closes #{{ issue_number }}

@@ -2,8 +2,10 @@
 
 `Recorder` is the small interface the activities use, so a unit test can run them without
 Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints` and `events` tables and
-`MemoryRecorder` keeps the same rows in memory. tests/integration/test_records.py runs the cases
-of tests/unit/test_records.py against both.
+`MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a tool
+(`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in the
+`Recorder` protocol: only the delivery activities read rows, and they name what they need.
+tests/integration/test_records.py runs the cases of tests/unit/test_records.py against both.
 
 Temporal runs an activity again after a crash or a timeout, and the second run writes what the
 first run may already have written. A turn, a tool call and a checkpoint are therefore written
@@ -140,6 +142,13 @@ class MemoryRecorder:
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         self.events.append(EventRecord(task_id, type, dict(payload)))
 
+    async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
+        found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
+        # The position breaks a tie between two calls of one turn in favour of the one recorded
+        # last, as created_at does in the table.
+        latest = max(enumerate(found), key=lambda item: (item[1].turn_index, item[0]), default=None)
+        return None if latest is None else latest[1]
+
 
 def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
     return (a.task_id, a.sha, a.kind) == (b.task_id, b.sha, b.kind)
@@ -198,6 +207,25 @@ class SqlRecorder:
         async with self._sessions.begin() as session:
             session.add(Event(task_id=task_id, type=type, payload=dict(payload)))
 
+    async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
+        """The call of this tool in the latest turn, or None if the task never used it.
+
+        A turn can hold several calls of one tool. The one written last wins, and `created_at`
+        says which that is. A retried call keeps the `created_at` of its first attempt, which
+        can only matter between two calls of one turn.
+        """
+        stmt = (
+            select(ToolCallRow)
+            .where(ToolCallRow.task_id == task_id, ToolCallRow.name == name)
+            .order_by(
+                ToolCallRow.turn_index.desc(), ToolCallRow.created_at.desc(), ToolCallRow.id.desc()
+            )
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            row = (await session.execute(stmt)).scalars().first()
+        return None if row is None else _tool_call_record(row)
+
 
 def _turn_values(r: TurnRecord) -> dict[str, Any]:
     return {
@@ -235,6 +263,23 @@ def _tool_call_values(r: ToolCallRecord) -> dict[str, Any]:
         "post_sha": r.post_sha,
         "attempt": r.attempt,
     }
+
+
+def _tool_call_record(row: ToolCallRow) -> ToolCallRecord:
+    return ToolCallRecord(
+        id=row.id,
+        task_id=row.task_id,
+        turn_index=row.turn_index,
+        name=row.name,
+        ok=row.ok,
+        attempt=row.attempt,
+        args_ref=row.args_ref,
+        exit_code=row.exit_code,
+        output_ref=row.output_ref,
+        duration_ms=row.duration_ms,
+        pre_sha=row.pre_sha,
+        post_sha=row.post_sha,
+    )
 
 
 def _checkpoint_values(r: CheckpointRecord) -> dict[str, Any]:

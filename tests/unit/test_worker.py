@@ -22,6 +22,7 @@ from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
 from longhaul.github.client import GitHubClient
 from longhaul.github.remote import GitHubRemote
+from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
@@ -307,3 +308,76 @@ async def test_the_poller_and_the_clone_share_one_github_client(
     finally:
         await parts.close()
     assert all(client._http.is_closed for client in built)
+
+
+# ---------- GitHub delivery (LH-306) ----------
+async def test_a_worker_with_a_github_token_registers_the_github_activities(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        # Everything the workflow calls, for a task of an issue as well as for a local one.
+        assert names_of(parts) == sorted(act.name for act in (*acts.ALL, *acts.GITHUB))
+    finally:
+        await parts.close()
+
+
+def test_a_worker_without_a_github_token_registers_none_of_them(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert not {act.name for act in acts.GITHUB} & set(names_of(parts))
+
+
+async def test_the_github_writes_go_through_the_ledger_of_the_worker(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (writes,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "post_comment"
+        }
+        (delivery,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"
+        }
+        assert isinstance(writes._ledger, SqlEffectLedger)
+        assert delivery._ledger is writes._ledger
+        assert delivery._author == "longhaul <longhaul@users.noreply.github.com>"
+    finally:
+        await parts.close()
+
+
+async def test_the_commit_author_and_the_templates_come_from_the_settings(tmp_path: Path) -> None:
+    templates = tmp_path / "templates"
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            git_author="Ada <ada@example.com>",
+            templates_dir=templates,
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (delivery,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"
+        }
+        assert delivery._author == "Ada <ada@example.com>"
+        assert delivery._templates == templates
+    finally:
+        await parts.close()
+
+
+def test_a_commit_author_git_would_misread_stops_the_worker_before_it_starts(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(
+        tmp_path, github_token="github-token-for-tests", git_author="no address here"
+    )
+    with pytest.raises(ValueError, match="LONGHAUL_GIT_AUTHOR"):
+        worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]

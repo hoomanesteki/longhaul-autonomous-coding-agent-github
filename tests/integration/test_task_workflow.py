@@ -12,6 +12,12 @@ and worker, so nothing is shared between tests. The first run downloads the test
 
 The worker runs under the same sandbox settings as a production worker (invalid_modules for
 the I/O libraries), so every test here also shows that the workflow loads under them.
+
+A task with an issue number on an owner/name repo is delivered as a pull request (LH-306): it is
+picked up with a comment and a label, and ends with build_pr_branch, deliver and the label swap.
+The stubs for those activities log apart from the others (`github_names`), so the exact lists of
+the loop's own activities in the tests below stay what they were. The default spec has no issue
+number and so is not delivered; `github_spec` has one.
 """
 
 import asyncio
@@ -52,6 +58,8 @@ from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github import lifecycle
+from longhaul.github.inputs import CommentInput, LabelInput
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
@@ -61,6 +69,11 @@ WAIT_S = 30.0
 # every 0.8 heartbeat timeouts. The timeouts of section 3.7 would make each cancel test wait
 # 24 s or more.
 SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=2)
+
+
+PR_URL = "https://github.com/acme/calc/pull/7"
+# The names of the activities of a GitHub task that the stubs log apart from the loop's own.
+GITHUB_NAMES = frozenset(act.name for act in acts.GITHUB)
 
 
 def sha(n: int) -> str:
@@ -100,7 +113,12 @@ class Stubs:
     A turn gate holds the model call of one turn (`hold_turn`), which keeps the workflow inside
     that turn and so inside one run. `run_ids` lists the runs that called an activity, in the
     order they began, and `turn_runs` says which run made the model call of each turn. A
-    `bundle_checkpoint` or `record_event` that has an error in `fails` raises it.
+    `bundle_checkpoint` or `record_event` that has an error in `fails` raises it, and so does
+    any of the GitHub activities.
+
+    The GitHub activities of LH-306 (acts.GITHUB) are logged in `github_log` and in `every`, the
+    order of all activities, and not in `log`. `names()` therefore lists the loop's activities
+    only, and `github_names()` the others.
     """
 
     MUTATING = frozenset({"edit_file", "write_file"})
@@ -109,7 +127,9 @@ class Stubs:
         self.script: Script = script or (lambda turn: [finish()])
         self.cost_usd = cost_usd
         self.log: list[tuple[str, Any]] = []
-        self.gates = {act.name: asyncio.Event() for act in acts.ALL}
+        self.github_log: list[tuple[str, Any]] = []
+        self.every: list[str] = []
+        self.gates = {act.name: asyncio.Event() for act in (*acts.ALL, *acts.GITHUB)}
         for gate in self.gates.values():
             gate.set()
         self.commits = 0
@@ -136,6 +156,11 @@ class Stubs:
             self.bundle_checkpoint,
             self.record_event,
             self.compact,
+            self.post_comment,
+            self.add_label,
+            self.remove_label,
+            self.build_pr_branch,
+            self.deliver,
         ]
 
     def hold(self, name: str) -> None:
@@ -156,15 +181,19 @@ class Stubs:
     def names(self) -> list[str]:
         return [name for name, _ in self.log]
 
+    def github_names(self) -> list[str]:
+        return [name for name, _ in self.github_log]
+
     def payloads(self, name: str) -> list[Any]:
-        return [payload for logged, payload in self.log if logged == name]
+        return [payload for logged, payload in (*self.log, *self.github_log) if logged == name]
 
     async def _enter(self, name: str, payload: Any, *, gate: asyncio.Event | None = None) -> None:
         info = activity.info()
         self.workflow_ids.add(info.workflow_id)
         if info.workflow_run_id not in self.run_ids:
             self.run_ids.append(info.workflow_run_id)
-        self.log.append((name, payload))
+        (self.github_log if name in GITHUB_NAMES else self.log).append((name, payload))
+        self.every.append(name)
         try:
             while not (self.gates[name].is_set() and (gate is None or gate.is_set())):
                 if not info.is_local:  # a local activity has no heartbeat
@@ -172,7 +201,10 @@ class Stubs:
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             # The workflow cancelled this activity, or the worker is shutting down.
-            self.log.append((f"{name}:cancelled", None))
+            (self.github_log if name in GITHUB_NAMES else self.log).append(
+                (f"{name}:cancelled", None)
+            )
+            self.every.append(f"{name}:cancelled")
             raise
 
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
@@ -254,6 +286,42 @@ class Stubs:
             raise self.fails[acts.COMPACT.name]
         return self.compaction(inp)
 
+    async def _github(self, name: str, payload: Any) -> None:
+        await self._enter(name, payload)
+        if name in self.fails:
+            raise self.fails[name]
+
+    @activity.defn(name=acts.POST_COMMENT.name)
+    async def post_comment(self, inp: CommentInput) -> str:
+        await self._github(acts.POST_COMMENT.name, inp)
+        return "comment-1"
+
+    @activity.defn(name=acts.ADD_LABEL.name)
+    async def add_label(self, inp: LabelInput) -> str:
+        await self._github(acts.ADD_LABEL.name, inp)
+        return inp.label
+
+    @activity.defn(name=acts.REMOVE_LABEL.name)
+    async def remove_label(self, inp: LabelInput) -> str:
+        await self._github(acts.REMOVE_LABEL.name, inp)
+        return inp.label
+
+    @activity.defn(name=acts.BUILD_PR_BRANCH.name)
+    async def build_pr_branch(self, inp: acts.BuildPrBranchInput) -> acts.PrBranchOutput:
+        await self._github(acts.BUILD_PR_BRANCH.name, inp)
+        return acts.PrBranchOutput(
+            branch="longhaul-pr/42",
+            head_sha=sha(900),
+            base_sha=BASE,
+            base_branch="main",
+            title="fix(calc): fix add",
+        )
+
+    @activity.defn(name=acts.DELIVER.name)
+    async def deliver(self, inp: acts.DeliverInput) -> str:
+        await self._github(acts.DELIVER.name, inp)
+        return PR_URL
+
 
 NOTES = ProgressNotes(
     goal="fix add()",
@@ -288,21 +356,38 @@ async def env() -> AsyncIterator[WorkflowEnvironment]:
         yield environment
 
 
-def make_spec(task_id: str = "lh-acme-calc-42", *, task_turns: int | None = None) -> TaskSpec:
+def make_spec(
+    task_id: str = "lh-acme-calc-42",
+    *,
+    task_turns: int | None = None,
+    repo: str = "acme/calc",
+    issue: int | None = None,
+) -> TaskSpec:
+    """A task on an owner/name repo with no issue, which is not delivered as a pull request."""
     budgets = Budgets() if task_turns is None else Budgets(task_turns=task_turns)
     return TaskSpec(
         task_id=task_id,
-        repo="acme/calc",
-        issue_number=42,
+        repo=repo,
+        issue_number=issue,
         title="add() subtracts",
         body="add(2, 3) returns -1",
-        settings=RepoSettings(repo="acme/calc", budgets=budgets),
+        settings=RepoSettings(repo=repo, budgets=budgets),
     )
+
+
+def github_spec(task_id: str = "lh-acme-calc-42", *, task_turns: int | None = None) -> TaskSpec:
+    """The task of an issue: an owner/name repo and an issue number."""
+    return make_spec(task_id, task_turns=task_turns, issue=42)
 
 
 @pytest.fixture
 def spec() -> TaskSpec:
     return make_spec()
+
+
+@pytest.fixture
+def gh_spec() -> TaskSpec:
+    return github_spec()
 
 
 def initial_state(spec: TaskSpec) -> CarryState:
@@ -1620,7 +1705,8 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
 
     One run takes signals and uses a tool before it finishes. One is cancelled in the middle of
     a turn. One finds its sandbox gone, recreates it and goes on. One hands over to a new run
-    after its first turn, so both of its runs are replayed.
+    after its first turn, so both of its runs are replayed. One is the task of an issue, which is
+    picked up and delivered as a pull request (LH-306).
     """
     stubs = Stubs(lambda turn: [call("edit_file", "c1")] if turn == 0 else [finish()])
     async with running(env, stubs) as queue:
@@ -1659,6 +1745,8 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
             tuning=acts.Tuning(continue_as_new_every_turns=1),
         )
         await result_of(chained)
+        delivered = await start_task(env.client, github_spec("lh-acme-calc-6"), task_queue=queue)
+        await result_of(delivered)
         first_run = env.client.get_workflow_handle(
             "lh-acme-calc-5", run_id=chained.first_execution_run_id
         )
@@ -1670,6 +1758,7 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
             await resumed_run.fetch_history(),
             await first_run.fetch_history(),
             await env.client.get_workflow_handle("lh-acme-calc-5").fetch_history(),
+            await delivered.fetch_history(),
         ]
 
     replayer = Replayer(
@@ -2016,3 +2105,240 @@ async def test_histories_with_a_compaction_replay(env: WorkflowEnvironment) -> N
         data_converter=pydantic_data_converter,
     )
     await replayer.replay_workflow(history)
+
+
+# ---------- LH-306: a task of an issue is delivered as a pull request ----------
+PICKUP = [acts.POST_COMMENT.name, acts.ADD_LABEL.name]
+DELIVERY = [
+    acts.BUILD_PR_BRANCH.name,
+    acts.DELIVER.name,
+    acts.REMOVE_LABEL.name,
+    acts.ADD_LABEL.name,
+]
+FINISHED = Outcome(kind=OutcomeKind.PR_OPENED, pr_url=PR_URL, summary="fixed add()")
+
+
+async def test_a_task_of_an_issue_is_picked_up_first_and_ends_with_a_pull_request(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    outcome, final = await play(env, stubs, gh_spec)
+
+    assert outcome == FINISHED
+    assert (final.phase, final.outcome) == (Phase.DONE, FINISHED)
+    # The pickup is the first activity, before the workspace exists. The loop is untouched.
+    assert stubs.every == [*PICKUP, "prepare_workspace", "llm_turn", "append_results", *DELIVERY]
+    assert stubs.names() == ["prepare_workspace", "llm_turn", "append_results"]
+
+    (comment,) = stubs.payloads(acts.POST_COMMENT.name)
+    assert comment == lifecycle.pickup_comment(gh_spec)
+    assert (comment.repo, comment.number) == ("acme/calc", 42)
+    working, swap_off, swap_on = (
+        *stubs.payloads(acts.ADD_LABEL.name)[:1],
+        *stubs.payloads(acts.REMOVE_LABEL.name),
+        *stubs.payloads(acts.ADD_LABEL.name)[1:],
+    )
+    assert working == lifecycle.on_pickup(gh_spec)[0].label
+    assert swap_off == lifecycle.on_pr_opened(gh_spec)[0].label
+    assert swap_on == lifecycle.on_pr_opened(gh_spec)[1].label
+
+
+async def test_the_pull_request_is_built_from_the_last_checkpoint_and_the_finish_summary(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs(lambda turn: [call("edit_file", "e1")] if turn == 0 else [finish("all done")])
+    outcome, _ = await play(env, stubs, gh_spec)
+
+    (build,) = stubs.payloads(acts.BUILD_PR_BRANCH.name)
+    assert build == acts.BuildPrBranchInput(
+        task_id=gh_spec.task_id, repo="acme/calc", summary="all done", head_sha=sha(1)
+    )
+    (deliver,) = stubs.payloads(acts.DELIVER.name)
+    assert deliver == acts.DeliverInput(
+        task_id=gh_spec.task_id,
+        repo="acme/calc",
+        issue_number=42,
+        summary="all done",
+        branch="longhaul-pr/42",
+        base_branch="main",
+        base_sha=BASE,
+        head_sha=sha(900),
+        title="fix(calc): fix add",
+    )
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, pr_url=PR_URL, summary="all done")
+
+
+async def test_the_phase_is_delivering_until_the_pull_request_is_open(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.hold(acts.DELIVER.name)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+
+        delivering = await wait_for_phase(handle, Phase.DELIVERING)
+        assert delivering.outcome is None, "the task is not over until the pull request is open"
+        assert delivering.last_checkpoint == BASE
+        assert stubs.github_names().count(acts.ADD_LABEL.name) == 1  # working, not pr-open yet
+        stubs.release(acts.DELIVER.name)
+
+        outcome = await result_of(handle)
+        done = await handle.query(TaskWorkflow.status)
+
+    assert outcome == FINISHED
+    assert (done.phase, done.outcome) == (Phase.DONE, FINISHED)
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param(make_spec(repo="local:/work/calc", issue=42), id="local folder with issue"),
+        pytest.param(make_spec(repo="acme/calc", issue=None), id="repo without issue"),
+        pytest.param(make_spec(repo="local:/work/calc", issue=None), id="local folder"),
+    ],
+)
+async def test_other_tasks_keep_todays_behaviour(env: WorkflowEnvironment, task: TaskSpec) -> None:
+    stubs = Stubs()
+    outcome, final = await play(env, stubs, task)
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="fixed add()")
+    assert (final.phase, final.outcome) == (Phase.DONE, outcome)
+    assert stubs.every == ["prepare_workspace", "llm_turn", "append_results"]
+
+
+async def test_the_pickup_is_not_repeated_after_a_hand_over(env: WorkflowEnvironment) -> None:
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(4))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+    assert len(stubs.run_ids) == 2
+    assert stubs.github_names() == [*PICKUP, *DELIVERY]
+
+
+async def test_a_task_that_cannot_be_picked_up_does_no_work(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {
+        acts.POST_COMMENT.name: ApplicationError(
+            "Resource not accessible by personal access token",
+            type=acts.GITHUB_FATAL,
+            non_retryable=True,
+        )
+    }
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError) as caught:
+            await result_of(handle)
+
+    # No model money is spent on a task that could not say it had begun.
+    assert isinstance(caught.value.cause, ActivityError)
+    assert stubs.names() == []
+    assert stubs.github_names() == [acts.POST_COMMENT.name]
+
+
+async def test_the_github_writes_are_retried_by_the_policy_of_section_3_7(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {
+        acts.ADD_LABEL.name: ApplicationError("GitHub is down", type=acts.GITHUB_RETRYABLE)
+    }
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+    assert stubs.github_names().count(acts.ADD_LABEL.name) == acts.ADD_LABEL.retry.maximum_attempts
+    assert stubs.names() == []
+
+
+async def test_a_task_that_changed_nothing_ends_with_an_error_and_no_pull_request(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {
+        acts.BUILD_PR_BRANCH.name: ApplicationError(
+            "the work does not change any file", type=acts.NOTHING_TO_DELIVER, non_retryable=True
+        )
+    }
+    outcome, final = await play(env, stubs, gh_spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="nothing to deliver: no file changed")
+    assert (final.phase, final.outcome) == (Phase.FAILED, outcome)
+    assert stubs.github_names() == [*PICKUP, acts.BUILD_PR_BRANCH.name]
+
+
+async def test_a_delivery_that_fails_for_good_leaves_the_working_label(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {
+        acts.DELIVER.name: ApplicationError(
+            "push rejected", type="CheckpointError", non_retryable=True
+        )
+    }
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+    # The labels follow the pull request: without one, the issue still says "working".
+    assert stubs.github_names() == [*PICKUP, acts.BUILD_PR_BRANCH.name, acts.DELIVER.name]
+
+
+async def test_a_cancel_while_delivering_cleans_up_and_swaps_no_label(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.hold(acts.DELIVER.name)  # never opened
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue, tuning=SHORT_HEARTBEAT)
+        await wait_for_phase(handle, Phase.DELIVERING)
+        await wait_until(lambda: acts.DELIVER.name in stubs.github_names(), "deliver to start")
+
+        await handle.signal("cancel", args=["alice", "wrong issue"])
+        outcome = await result_of(handle)
+        final = await handle.query(TaskWorkflow.status)
+
+    assert outcome == Outcome(kind=OutcomeKind.CANCELLED, summary="cancelled by alice: wrong issue")
+    assert final.phase is Phase.CANCELLED
+    assert stubs.github_names() == [
+        *PICKUP,
+        acts.BUILD_PR_BRANCH.name,
+        acts.DELIVER.name,
+        "deliver:cancelled",
+    ]
+    assert stubs.names()[-1] == acts.CLEANUP.name
+
+
+async def test_the_github_activities_get_the_policies_of_section_3_7(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        await result_of(handle)
+        sched = scheduled_options(await handle.fetch_history())
+
+    for act in (acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL):
+        assert timeouts(sched[act.name]) == (2 * 60, None)
+        assert sched[act.name].retry_policy.maximum_attempts == 10
+        assert sched[act.name].retry_policy.maximum_interval.ToTimedelta().total_seconds() == 300
+    assert timeouts(sched[acts.BUILD_PR_BRANCH.name]) == (5 * 60, None)
+    assert sched[acts.BUILD_PR_BRANCH.name].retry_policy.maximum_attempts == 3
+    assert timeouts(sched[acts.DELIVER.name]) == (10 * 60, 60)
+    assert sched[acts.DELIVER.name].retry_policy.maximum_attempts == 5
+    assert acts.CREATE_PR.name not in sched, "deliver calls create_pr itself, inside the activity"
+
+
+async def test_the_helpers_for_a_pause_and_a_resume_are_workflow_methods(
+    gh_spec: TaskSpec,
+) -> None:
+    # Phases 5 and 7 call these when a task pauses and resumes. They run the same label steps
+    # that lifecycle gives, as activities, so there is nothing else to wire.
+    assert callable(TaskWorkflow._needs_human)
+    assert callable(TaskWorkflow._human_done)

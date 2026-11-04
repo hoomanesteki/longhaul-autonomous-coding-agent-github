@@ -114,7 +114,7 @@ With `capture_content: true`, these attributes are added, each cut at 16,000 cha
 
 ## Logs
 
-Every log line the worker writes is one JSON object on stderr. `src/longhaul/telemetry/logging.py` holds all of it, and the rest of the code calls three things: `setup_logging()`, `interceptors()` and `redact(text)`.
+Every log line that Python code in the worker writes is one JSON object on stderr, with one exception named below. `src/longhaul/telemetry/logging.py` holds all of it, and the rest of the code calls three things: `setup_logging()`, `interceptors()` and `redact(text)`.
 
 ```json
 {"timestamp": "2026-11-04T13:22:06.955917Z", "level": "info", "logger": "longhaul.durable.activities.llm", "event": "calling the model", "task_id": "lh-acme-calc-42", "turn_index": 3, "activity": "llm_turn", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}
@@ -126,13 +126,14 @@ Every log line the worker writes is one JSON object on stderr. `src/longhaul/tel
 |---|---|
 | `task_id`, `turn_index` | The input of the running activity. `interceptors()` reads them from the model the activity was called with, so an activity whose input has no `task_id` (the poller) logs without one. |
 | `activity` | `temporalio.activity.info().activity_type`, bound by the same interceptor. |
-| `trace_id` | The current OpenTelemetry span, read when the line is written. It is the id that Jaeger shows for the `RunActivity` span, and it is left out when no span is open. |
+| `trace_id` | The current OpenTelemetry span, read when the line is written. It is the id that Jaeger shows for the `RunActivity` span. `interceptors()` also binds the id of that span for the rest of the activity, because temporalio writes "Completing activity as failed" after the span has closed. An open span wins over the bound id. A line with no open span and no bound id has none. |
 
 ### Where it is wired
 
 - `setup_logging()` configures structlog and replaces the handlers of the root logger with one that writes JSON. Standard library records, from the modules of this repo (`logging.getLogger(__name__)`) and from temporalio, go through the same processors as structlog events, so they get the same fields and the same redaction. Calling it twice does not write a line twice.
-- `interceptors()` is a Temporal client and worker interceptor. It belongs on the client next to `otel.interceptors()`, and the worker takes it from there. Registering it on the worker as well would run it twice. Each activity runs in a task of its own, so the fields stay on the lines of that activity only, including the "Completing activity as failed" warning that temporalio writes after the activity raised.
-- The worker module (LH-208) is built next to this story. The change that brings it in calls `setup_logging()` first, in place of `logging.basicConfig`, before `setup_tracing` and `connect`, and `durable.client.connect` passes `interceptors()` along with `otel.interceptors()`. Until then a worker logs without the task fields.
+- `interceptors()` is a Temporal client and worker interceptor. `durable.client.connect` registers it on the client after `otel.interceptors()`, so the `RunActivity` span is open when it binds the trace id, and the worker takes it from there. Registering it on the worker as well would run it twice. Each activity runs in a task of its own, so the fields stay on the lines of that activity only, including the "Completing activity as failed" warning that temporalio writes after the activity raised.
+- The worker module (LH-208) is built next to this story. The change that brings it in calls `setup_logging()` first, in place of `logging.basicConfig`, before `setup_tracing` and `connect`. The `connect` it uses already registers `interceptors()`.
+- Temporal Core, the Rust library under the SDK, is the exception to "one JSON object per line". It writes its own WARN and ERROR lines to stderr in a colored compact format, such as the warning about a server older than 1.16 or a lost connection, and those lines skip the JSON renderer and the redaction. A log shipper that parses every stderr line as JSON has to tolerate them. To bring them in, build the worker's `Runtime` with `LoggingConfig(filter=..., forwarding=LogForwardingConfig(logger=logging.getLogger("temporalio.core")))`, and they go through the same processors as every other record.
 - The lines that temporalio writes outside an activity, such as "Beginning worker shutdown", carry none of the four fields.
 
 ### Redaction
@@ -141,7 +142,7 @@ Every log line the worker writes is one JSON object on stderr. `src/longhaul/tel
 
 | Pattern | What it catches |
 |---|---|
-| `sk-[A-Za-z0-9_-]{20,}` | OpenAI and Anthropic keys. It must start a word, so `lh-acme-my-task-tracker-pro-edition-5` is left alone. |
+| `sk-[A-Za-z0-9_-]{20,}` | OpenAI and Anthropic keys. It must start a word, so `lh-acme-my-task-tracker-pro-edition-5` is left alone. A backslash and `n`, `r` or `t` before it counts as a line break, so a key in a repr, a `%r` argument or JSON text is caught. |
 | `ghp_[A-Za-z0-9]{30,}` | GitHub personal access tokens |
 | `github_pat_[A-Za-z0-9_]{30,}` | Fine-grained GitHub tokens |
 | `AKIA[0-9A-Z]{16}` | AWS access key ids |

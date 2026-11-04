@@ -147,6 +147,12 @@ class Stuck(StrictModel):
     hint_wait_hours: int
 
 
+class Telemetry(StrictModel):
+    # Prompts, tool arguments and tool output can hold code and secrets. Spans carry names,
+    # sizes and timings only, unless this is on (plan LH-703).
+    capture_content: bool
+
+
 class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
@@ -156,6 +162,7 @@ class AppConfig(StrictModel):
     context: Context
     loop: Loop
     stuck: Stuck
+    telemetry: Telemetry
     pricing_file: Path
 
 

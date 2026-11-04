@@ -41,4 +41,6 @@ stuck:
   churn_edits: 4
   consecutive_tool_errors: 5
   hint_wait_hours: 24
+telemetry:
+  capture_content: false   # true puts prompts and tool text into spans; leave off unless debugging
 pricing_file: config/pricing.yaml   # fill from the provider's pricing page; never hardcode in code

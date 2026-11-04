@@ -9,6 +9,7 @@ connecting here is enough.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
@@ -17,6 +18,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from longhaul.contracts import CarryState, Outcome, Phase, TaskSpec
 from longhaul.durable.acts import TUNING_MEMO_KEY, Tuning
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.telemetry import otel
 
 # The default of the task_queue setting (longhaul.settings.EnvSettings). A unit test keeps the
 # two equal.
@@ -24,8 +26,17 @@ DEFAULT_TASK_QUEUE = "longhaul"
 
 
 async def connect(address: str, *, namespace: str = "default") -> Client:
+    """Connect to Temporal.
+
+    When tracing is set up (telemetry.otel.setup_tracing), the client carries Temporal's tracing
+    interceptor. A worker built on this client uses it too, so workflow and activity spans share
+    one trace without a second registration.
+    """
+    options: dict[str, Any] = {}
+    if tracing := otel.interceptors():
+        options["interceptors"] = tracing
     return await Client.connect(
-        address, namespace=namespace, data_converter=pydantic_data_converter
+        address, namespace=namespace, data_converter=pydantic_data_converter, **options
     )
 
 
@@ -45,12 +56,15 @@ async def start_task(
     table stays the record of what ran.
     """
     state = CarryState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
-    return await client.start_workflow(
-        TaskWorkflow.run,
-        state,
-        id=spec.task_id,
-        task_queue=task_queue,
-        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-        id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
-        memo={TUNING_MEMO_KEY: tuning} if tuning is not None else None,
-    )
+    # Each task is one trace. The poller starts tasks from an activity, where a current span
+    # would otherwise make every task of a poll a child of that activity.
+    with otel.detached():
+        return await client.start_workflow(
+            TaskWorkflow.run,
+            state,
+            id=spec.task_id,
+            task_queue=task_queue,
+            id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+            id_conflict_policy=WorkflowIDConflictPolicy.FAIL,
+            memo={TUNING_MEMO_KEY: tuning} if tuning is not None else None,
+        )

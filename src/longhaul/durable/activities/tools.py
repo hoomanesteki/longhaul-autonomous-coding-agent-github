@@ -70,6 +70,7 @@ from longhaul.contracts import (
 from longhaul.db.records import CheckpointRecord, Recorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import call_slug, heartbeating, not_retried, small
+from longhaul.telemetry.otel import tool_span
 from longhaul.tools.registry import ToolRegistry
 
 # The two tools that run a shell command. Whether a command changes files is not known in
@@ -176,7 +177,15 @@ class ToolActivities:
         try:
             async with heartbeating():
                 await self._start_from(sandbox, inp.pre_sha)
-                result = await tool_step(self._registry, sandbox, call, ctx)
+                with tool_span(
+                    name=call.name,
+                    call_id=call.id,
+                    task_id=inp.task_id,
+                    turn_index=inp.turn_index,
+                    arguments=call.input,
+                ) as span:
+                    result = await tool_step(self._registry, sandbox, call, ctx)
+                    span.record(result)
                 post_sha = await self._save(sandbox, inp, call)
         except Exception as exc:
             if await self._is_gone(inp.sandbox_id):

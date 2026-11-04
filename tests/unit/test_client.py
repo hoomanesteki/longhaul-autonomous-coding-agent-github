@@ -8,8 +8,11 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.contracts import CarryState, Phase, RepoSettings, TaskSpec
@@ -18,6 +21,7 @@ from longhaul.durable.acts import TUNING_MEMO_KEY, Tuning
 from longhaul.durable.client import DEFAULT_TASK_QUEUE, connect, start_task
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.settings import EnvSettings
+from longhaul.telemetry import otel
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -25,9 +29,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 class FakeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.current_spans: list[trace.Span] = []
 
     async def start_workflow(self, *args: Any, **kwargs: Any) -> str:
         self.calls.append((args, kwargs))
+        self.current_spans.append(trace.get_current_span())
         return "handle"
 
 
@@ -79,6 +85,19 @@ async def test_start_task_builds_the_first_carry_state(spec: TaskSpec) -> None:
     # Workflow code subtracts started_at from workflow.now(), which carries a timezone.
     assert state.started_at.tzinfo is not None
     assert before <= state.started_at <= datetime.now(UTC)
+
+
+async def test_start_task_starts_the_workflow_outside_the_callers_span(spec: TaskSpec) -> None:
+    # The poller calls start_task from an activity. A task started under that span would share
+    # its trace with every other task of the poll.
+    fake = FakeClient()
+    provider = TracerProvider()
+    with provider.get_tracer("test").start_as_current_span("RunActivity:poll_once") as caller:
+        await start_task(cast(Client, fake), spec)
+        assert trace.get_current_span() is caller
+
+    (seen,) = fake.current_spans
+    assert not seen.get_span_context().is_valid
 
 
 async def test_start_task_sends_no_memo_by_default(spec: TaskSpec) -> None:
@@ -133,3 +152,23 @@ async def test_connect_defaults_to_the_default_namespace(monkeypatch: pytest.Mon
 
     await connect("localhost:7233")
     assert seen["namespace"] == "default"
+
+
+async def test_connect_registers_the_tracing_interceptor_when_tracing_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker takes its interceptors from its client, so this one registration also covers
+    # the worker's activities.
+    seen: dict[str, Any] = {}
+
+    async def fake_connect(address: str, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "client"
+
+    monkeypatch.setattr(durable_client.Client, "connect", fake_connect)
+
+    with otel.configured(TracerProvider()):
+        await connect("localhost:7233")
+
+    (interceptor,) = seen["interceptors"]
+    assert isinstance(interceptor, TracingInterceptor)

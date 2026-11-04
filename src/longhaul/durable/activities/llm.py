@@ -58,6 +58,7 @@ from longhaul.durable.activities.support import (
     small,
 )
 from longhaul.durable.payload_guard import json_size
+from longhaul.telemetry.otel import chat_span
 
 
 class LlmActivities:
@@ -149,10 +150,21 @@ class LlmActivities:
         cap = cfg.max_tokens_retry if inp.high_output_cap else cfg.max_tokens_per_turn
         options = CallOptions(effort=cfg.effort) if cfg.effort is not None else None
         try:
-            async with heartbeating():
-                return await llm_step(
-                    self._provider, cfg.model, system, request, self._tools, cap, options
-                )
+            with chat_span(
+                model=cfg.model,
+                provider=self._provider.name,
+                task_id=inp.task_id,
+                turn_index=inp.turn_index,
+                role=inp.role,
+                system=system,
+                messages=request,
+            ) as span:
+                async with heartbeating():
+                    resp = await llm_step(
+                        self._provider, cfg.model, system, request, self._tools, cap, options
+                    )
+                span.record(resp)
+            return resp
         except ProviderError as exc:
             if exc.usage is not None:
                 # Billed, then failed: the usage is recorded before the error goes up.

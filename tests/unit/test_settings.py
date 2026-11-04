@@ -115,12 +115,12 @@ def test_every_role_has_an_entry_in_models_and_effort(section: type[BaseModel]) 
     assert set(section.model_fields) == set(ROLES)
 
 
-@pytest.mark.parametrize("level", get_args(EffortLevel))
 def test_example_config_keeps_prompts_and_tool_text_out_of_traces() -> None:
     # Content capture is opt in (plan LH-703): prompts hold code and may hold secrets.
     assert load_config(EXAMPLE).telemetry.capture_content is False
 
 
+@pytest.mark.parametrize("level", get_args(EffortLevel))
 def test_every_effort_level_loads(tmp_path: Path, level: str) -> None:
     data = _example_data()
     data["effort"]["coder"] = level

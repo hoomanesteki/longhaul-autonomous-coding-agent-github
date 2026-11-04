@@ -44,6 +44,7 @@ from longhaul.contracts import (
 from longhaul.db.records import Recorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import call_slug, heartbeating, not_retried, small
+from longhaul.telemetry.otel import tool_span
 from longhaul.tools.registry import ToolRegistry
 
 # The error type of a sandbox that is gone. LH-206 recreates the sandbox when it sees this one.
@@ -108,7 +109,15 @@ class ToolActivities:
             output_max_tokens=self._output_max_tokens,
         )
         async with heartbeating():
-            result = await tool_step(self._registry, sandbox, call, ctx)
+            with tool_span(
+                name=call.name,
+                call_id=call.id,
+                task_id=inp.task_id,
+                turn_index=inp.turn_index,
+                arguments=call.input,
+            ) as span:
+                result = await tool_step(self._registry, sandbox, call, ctx)
+                span.record(result)
         slug = call_slug(call.id)
         output_ref = await self._blobs.put(
             result.output.encode("utf-8", errors="replace"),

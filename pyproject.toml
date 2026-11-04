@@ -28,6 +28,11 @@ dependencies = [
 [project.scripts]
 longhaul = "longhaul.cli:app"
 
+[project.optional-dependencies]
+memory = [
+    "fastembed>=0.9.1",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
 build-backend = "uv_build"
@@ -95,6 +100,12 @@ extra_checks = true
 module = ["longhaul.db.migrations.*"]
 disallow_untyped_defs = false
 disallow_untyped_calls = false
+
+# fastembed is the optional "memory" extra, so the base install that CI type-checks does not
+# have it. LocalEmbedder imports it lazily.
+[[tool.mypy.overrides]]
+module = ["fastembed"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

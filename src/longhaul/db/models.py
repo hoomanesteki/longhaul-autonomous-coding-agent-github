@@ -1,9 +1,11 @@
 """SQLAlchemy models. Each story that adds a table adds one migration."""
 
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -13,6 +15,7 @@ from sqlalchemy import (
     MetaData,
     Numeric,
     Text,
+    Uuid,
     func,
     text,
 )
@@ -249,6 +252,58 @@ class SideEffect(Base):
     # A comment id, a pull request URL, a label name or a pushed commit id, by kind.
     external_id: Mapped[str] = mapped_column(Text, nullable=False)
     payload_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MemoryItemRow(Base):
+    """One thing the agent remembers about a repo (ADR-0010).
+
+    The row is named for its table because longhaul.contracts already has a MemoryItem, the
+    shape that crosses module boundaries. Only an `approved` row may reach a prompt (invariant
+    I7), and a new row is a `candidate` unless its writer says otherwise, so an insert that
+    forgets about trust cannot put an item in front of the model.
+    """
+
+    __tablename__ = "memory_items"
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('repo_map', 'command', 'convention', 'pitfall', 'lesson')", name="kind"
+        ),
+        CheckConstraint("status IN ('candidate', 'approved', 'rejected')", name="status"),
+        CheckConstraint(
+            "source IN ('default_branch', 'merged_pr', 'human', 'task')", name="source"
+        ),
+        # Nearest neighbour by cosine distance. m and ef_construction are pgvector's own
+        # defaults, written out so that a change of the default does not change this index.
+        Index(
+            "ix_memory_items_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    repo: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Every row has a vector, so every item can be found by meaning. The width is part of the
+    # type: a vector of another width is refused on insert. It is the EMBEDDING_DIM of
+    # longhaul.memory.embedder, written out because this module imports nothing from the memory
+    # package, which keeps an import cycle out of reach. A unit test keeps the two equal.
+    embedding: Mapped[list[float]] = mapped_column(Vector(384), nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'candidate'"))
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    # What the source points at: a commit sha, a pull request number or a task id.
+    source_ref: Mapped[str | None] = mapped_column(Text)
+    approved_by: Mapped[str | None] = mapped_column(Text)
+    uses: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

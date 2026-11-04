@@ -28,7 +28,9 @@ from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import RepoNotFoundError
 from longhaul.contracts import Outcome, OutcomeKind, Phase, TaskSpec, TaskStatus
 from longhaul.durable import acts
+from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github.intake import FILE_CUT_NOTE, MAX_BODY_BYTES
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -265,6 +267,26 @@ def test_run_starts_a_task_for_the_local_folder(stack_for: Callable[..., Stack])
     assert spec.settings.test_command == cli.DEFAULT_TEST_COMMAND
     assert stack.start_kwargs["task_queue"] == QUEUE
     assert stack.start_kwargs["id"] == spec.task_id
+
+
+def test_run_cuts_a_300_kb_issue_file_before_it_starts_the_task(
+    stack_for: Callable[..., Stack], tmp_path: Path
+) -> None:
+    stack = stack_for(happy())
+    issue = tmp_path / "big.md"
+    issue.write_text("# Big issue\n\n" + "x" * 300_000, encoding="utf-8")
+    args = run_args(script=SCRIPT)
+    args[args.index("--issue-file") + 1] = str(issue)
+
+    result = invoke(args)
+
+    assert result.exit_code == 0, result.output
+    spec = stack.spec
+    assert spec.title == "Big issue"
+    assert spec.body == "x" * MAX_BODY_BYTES + FILE_CUT_NOTE
+    # The carry state holds the spec and goes into the history at the start. A cut body keeps
+    # it under the 16 KB of CONTRIBUTING.md rule 5, far below the 256 KB cap.
+    assert json_size(spec) < 16_000 < DEFAULT_LIMIT
 
 
 def test_the_task_id_is_the_folder_name_and_a_suffix_that_is_new_for_every_run(

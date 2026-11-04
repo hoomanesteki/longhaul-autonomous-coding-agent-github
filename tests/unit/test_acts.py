@@ -398,3 +398,30 @@ def test_ensure_sandbox_names_every_field_of_its_input(missing: str) -> None:
     del fields[missing]
     with pytest.raises(ValidationError):
         acts.EnsureSandboxInput.model_validate(fields)
+
+
+# ---------- LH-208: a script that travels with a task ----------
+def test_a_model_turn_starts_without_a_script() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    assert turn.script_ref is None
+
+
+def test_a_script_ref_survives_the_pydantic_data_converter() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x",
+        turn_index=0,
+        role=Role.CODER,
+        spec=SPEC,
+        transcript_ref=None,
+        script_ref=REF,
+    )
+    converter = pydantic_data_converter.payload_converter
+    payloads = converter.to_payloads([turn])
+    assert converter.from_payloads(payloads, [acts.LlmTurnInput]) == [turn]
+
+
+def test_the_script_and_the_tuning_have_memo_keys_of_their_own() -> None:
+    assert acts.SCRIPT_MEMO_KEY == "script"
+    assert acts.SCRIPT_MEMO_KEY != acts.TUNING_MEMO_KEY

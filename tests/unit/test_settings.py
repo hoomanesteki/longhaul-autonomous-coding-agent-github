@@ -15,6 +15,7 @@ from longhaul.settings import (
     EffortLevels,
     EnvSettings,
     ModelIds,
+    config_path,
     get_settings,
     load_config,
 )
@@ -585,3 +586,31 @@ def test_cache_prices_sit_around_the_input_price() -> None:
         assert block["cache_read_per_mtok"] < block["input_per_mtok"]
         assert block["input_per_mtok"] < block["cache_write_per_mtok"]
         assert block["cache_write_per_mtok"] < block["output_per_mtok"]
+
+
+# ---------- LH-208: finding the config from any working directory ----------
+def test_the_config_is_found_from_any_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LONGHAUL_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert not Path("config").exists()
+    assert config_path(EnvSettings(_env_file=None)).resolve() == EXAMPLE.resolve()
+
+
+def test_a_config_in_the_working_directory_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LONGHAUL_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "longhaul.example.yaml").write_text("{}", encoding="utf-8")
+    assert config_path(EnvSettings(_env_file=None)) == Path("config/longhaul.example.yaml")
+
+
+def test_an_absolute_config_path_is_used_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = tmp_path / "mine.yaml"
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(named))
+    assert config_path(EnvSettings(_env_file=None)) == named

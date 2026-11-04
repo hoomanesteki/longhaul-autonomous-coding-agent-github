@@ -132,6 +132,21 @@ def test_task_statement_has_the_facts_a_coder_needs() -> None:
     assert "2. Only add() is wrong." in task
 
 
+def test_a_local_repo_shows_its_folder_name_and_not_its_path() -> None:
+    # The path holds the user name and the directory layout, and the prompt goes to the provider.
+    spec = make_spec(repo="local:/home/alice/work/calc", issue_number=None)
+    task = build_system_prompt(Role.CODER, spec)
+    assert "Repository: local:calc\n" in task
+    assert "alice" not in task
+
+
+def test_the_local_prefix_is_the_one_the_intake_uses() -> None:
+    from longhaul.agent.prompts import LOCAL_PREFIX
+    from longhaul.github.intake import LOCAL_PREFIX as INTAKE_PREFIX
+
+    assert LOCAL_PREFIX == INTAKE_PREFIX
+
+
 def test_a_task_without_an_issue_number_or_test_command_or_body() -> None:
     spec = make_spec(
         issue_number=None,

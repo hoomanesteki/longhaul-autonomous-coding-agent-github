@@ -1037,6 +1037,76 @@ async def test_is_at_without_a_checkpoint_repo_says_so(env: Env) -> None:
         await sandbox.destroy()
 
 
+# ---------- diff (LH-208) ----------
+
+
+async def test_diff_is_the_patch_from_the_base_tag_to_a_checkpoint(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    head = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert head is not None
+
+    patch = await env.store.diff(TASK, head)
+
+    assert patch.splitlines()[0] == f"diff --git a/{MODULE} b/{MODULE}"
+    assert "-    return a - b" in patch and "+    return a + b" in patch
+    assert patch.endswith("\n")
+    assert patch.rstrip("\n") == env.bare("diff", "--no-color", env.base_sha, head)
+
+
+async def test_diff_of_the_base_commit_is_empty(env: Env) -> None:
+    assert await env.store.diff(TASK, env.base_sha) == ""
+
+
+async def test_diff_reads_the_checkpoint_it_is_given_and_not_the_branch(
+    env: Env, box: FakeSandbox
+) -> None:
+    # An attempt that died can leave a commit on the branch that the workflow never learned of.
+    await box.write_file(MODULE, FIXED.encode())
+    first = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    await box.write_file("NOTES.md", b"stray\n")
+    assert await env.store.commit(box, "lh: write_file turn 2 call c2")
+
+    patch = await env.store.diff(TASK, first or "")
+
+    assert "NOTES.md" not in patch
+
+
+async def test_diff_does_not_run_an_external_diff_program_the_agent_configured(
+    env: Env, box: FakeSandbox
+) -> None:
+    # The agent can write to the bare repo, so its config is untrusted (see the module docstring).
+    marker = env.tmp_path / "ran"
+    program = env.tmp_path / "spy.sh"
+    program.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    program.chmod(0o755)
+    env.bare("config", "diff.external", str(program))
+    await box.write_file(MODULE, FIXED.encode())
+    head = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+
+    patch = await env.store.diff(TASK, head or "")
+
+    assert "+    return a + b" in patch
+    assert not marker.exists()
+
+
+async def test_diff_of_a_task_without_a_repo_says_so(plain_store: GitCheckpointStore) -> None:
+    with pytest.raises(RepoNotFoundError):
+        await plain_store.diff(TASK, "a" * 40)
+
+
+@pytest.mark.parametrize("sha", ["HEAD", "main", "abc", "a" * 40 + " --output=x"])
+async def test_diff_only_takes_full_shas(env: Env, sha: str) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await env.store.diff(TASK, sha)
+
+
+async def test_diff_of_a_commit_the_repo_does_not_have_is_a_checkpoint_error(env: Env) -> None:
+    with pytest.raises(CheckpointError, match="diff"):
+        await env.store.diff(TASK, "1" * 40)
+
+
 # ---------- bundles ----------
 
 

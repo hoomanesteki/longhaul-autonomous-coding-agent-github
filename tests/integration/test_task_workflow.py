@@ -886,6 +886,48 @@ async def test_tuning_shortens_the_heartbeat_timeouts_of_one_run(
     }
 
 
+# ---------- a script that travels with the task (LH-208) ----------
+async def test_the_script_in_the_memo_goes_to_every_model_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    script = ref("script.yaml")
+    stubs = Stubs(lambda turn: never_finishes(turn) if turn < 2 else [finish()])
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, script=script)
+        await result_of(handle)
+
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 3
+    assert [turn.script_ref for turn in turns] == [script] * 3
+
+
+async def test_a_task_without_a_script_sends_none_to_the_model_turns(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await result_of(handle)
+
+    assert [turn.script_ref for turn in stubs.payloads(acts.LLM_TURN.name)] == [None]
+
+
+async def test_the_script_and_the_tuning_can_ride_in_the_same_memo(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    script = ref("script.yaml")
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=SHORT_HEARTBEAT, script=script
+        )
+        await result_of(handle)
+        sched = scheduled_options(await handle.fetch_history())
+
+    assert [turn.script_ref for turn in stubs.payloads(acts.LLM_TURN.name)] == [script]
+    assert timeouts(sched["llm_turn"]) == (10 * 60, 2)
+
+
 # ---------- sandbox recovery (LH-206) ----------
 def resumed(spec: TaskSpec) -> CarryState:
     """What a run starts from when an earlier run already prepared a sandbox."""

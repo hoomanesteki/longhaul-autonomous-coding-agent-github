@@ -622,3 +622,44 @@ def test_an_absolute_config_path_is_used_as_it_is(
     named = tmp_path / "mine.yaml"
     monkeypatch.setenv("LONGHAUL_CONFIG", str(named))
     assert config_path(EnvSettings(_env_file=None)) == named
+
+
+# ---------- the metrics endpoint of the worker (LH-704) ----------
+PROMETHEUS_CONFIG = ROOT / "docker" / "prometheus" / "prometheus.yml"
+
+
+def test_the_metrics_endpoint_defaults_to_the_port_prometheus_scrapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LONGHAUL_METRICS_PORT", raising=False)
+    monkeypatch.delenv("LONGHAUL_METRICS_HOST", raising=False)
+    settings = EnvSettings()
+
+    scraped = yaml.safe_load(PROMETHEUS_CONFIG.read_text(encoding="utf-8"))["scrape_configs"]
+    (worker,) = [job for job in scraped if job["job_name"] == "worker"]
+    (target,) = worker["static_configs"][0]["targets"]
+    assert target.rpartition(":")[2] == str(settings.metrics_port) == "9464"
+    # Only this machine can read it, unless an operator opens it (docs/runbook.md says how).
+    assert settings.metrics_host == "127.0.0.1"
+
+
+def test_the_metrics_endpoint_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", "9500")
+    monkeypatch.setenv("LONGHAUL_METRICS_HOST", "0.0.0.0")
+    settings = EnvSettings()
+    assert (settings.metrics_host, settings.metrics_port) == ("0.0.0.0", 9500)
+
+
+@pytest.mark.parametrize("port", ["-1", "65536", "nine"])
+def test_a_metrics_port_that_cannot_be_a_port_is_refused(
+    monkeypatch: pytest.MonkeyPatch, port: str
+) -> None:
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", port)
+    with pytest.raises(ValidationError):
+        EnvSettings()
+
+
+def test_the_example_env_file_names_the_metrics_settings() -> None:
+    example = _env_example()
+    assert example["LONGHAUL_METRICS_PORT"] == "9464"
+    assert example["LONGHAUL_METRICS_HOST"] == "127.0.0.1"

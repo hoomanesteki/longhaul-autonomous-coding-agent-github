@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from longhaul.telemetry.metrics import Metrics
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -301,3 +302,72 @@ async def test_without_a_ledger_nothing_is_recorded_and_the_cost_is_zero() -> No
 
     assert out.cost_usd == 0.0
     assert rig.ledger.entries == []
+
+
+# ---------- the metrics of a call (LH-704) ----------
+async def test_a_reply_is_counted_as_a_turn_with_its_cost_and_cache_ratio(
+    counters: Metrics,
+) -> None:
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    await rig.run()
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_turns_total", {"role": "coder"}) == 1
+    cost = reading("longhaul_llm_cost_usd_total", {"model": SONNET, "repo": "acme/calc"})
+    assert cost == pytest.approx(float(COST))
+    # The ratio is cache_read / (input + cache_read): 500 / (1,000 + 500).
+    assert reading("longhaul_cache_ratio_count") == 1
+    assert reading("longhaul_cache_ratio_sum") == pytest.approx(500 / 1_500)
+
+
+async def test_a_provider_error_is_counted_by_kind_and_is_not_a_turn(counters: Metrics) -> None:
+    rig = Rig(ProviderError(ProviderErrorKind.OVERLOADED, "busy"))
+    with pytest.raises(ApplicationError):
+        await rig.run()
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_llm_errors_total", {"kind": "overloaded"}) == 1
+    assert reading("longhaul_turns_total", {"role": "coder"}) == 0
+    assert reading("longhaul_cache_ratio_count") == 0
+
+
+async def test_a_call_that_was_billed_and_failed_still_adds_its_cost(counters: Metrics) -> None:
+    billed = Usage(input_tokens=700, output_tokens=30)
+    rig = Rig(ProviderError(ProviderErrorKind.SERVER, "body did not parse", usage=billed))
+    with pytest.raises(ApplicationError):
+        await rig.run()
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_llm_errors_total", {"kind": "server"}) == 1
+    cost = reading("longhaul_llm_cost_usd_total", {"model": SONNET, "repo": "acme/calc"})
+    assert cost == pytest.approx(0.0017)
+
+
+async def test_a_retry_that_succeeds_counts_one_error_and_one_turn(counters: Metrics) -> None:
+    rig = Rig(
+        ProviderError(ProviderErrorKind.RATE_LIMIT, "slow down"),
+        reply("end_turn", TextBlock(text="Done.")),
+    )
+    with pytest.raises(ApplicationError):
+        await rig.run(attempt=1)
+    await rig.run(attempt=2)
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_llm_errors_total", {"kind": "rate_limit"}) == 1
+    assert reading("longhaul_turns_total", {"role": "coder"}) == 1
+
+
+async def test_a_worker_without_a_ledger_counts_the_turn_and_no_cost(counters: Metrics) -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")))
+    bare = LlmActivities(rig.provider, MemoryBlobStore(), rig.recorder, TOOLS, lambda role: CFG)
+    inp = acts.LlmTurnInput(
+        task_id=SPEC.task_id, turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    await ActivityEnvironment().run(bare.llm_turn, inp)
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_turns_total", {"role": "coder"}) == 1
+    assert reading("longhaul_llm_cost_usd_total", {"model": SONNET, "repo": "acme/calc"}) in (
+        None,
+        0,
+    )

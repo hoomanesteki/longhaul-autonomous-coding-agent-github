@@ -173,6 +173,9 @@ class Durable:
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.tmp_path / "ckpt"),
             LONGHAUL_CONFIG=str(CONFIG),
+            # Port 0 lets the system pick a free port for the metrics endpoint. The default is
+            # taken by the worker of a developer or of another test run on the same machine.
+            LONGHAUL_METRICS_PORT="0",
         )
         return env
 

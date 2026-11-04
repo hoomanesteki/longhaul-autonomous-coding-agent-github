@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from longhaul.telemetry.metrics import Metrics
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -37,6 +38,7 @@ from longhaul.durable.activities.workspace import (
     WorkspaceActivities,
 )
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.telemetry import metrics
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -822,3 +824,58 @@ async def test_a_failed_cleanup_is_retried_by_temporal(rig: Rig) -> None:
     rig.host.cleanup_task = broken  # type: ignore[method-assign]
     with pytest.raises(OSError, match="docker went away"):
         await clean(rig)
+
+
+# ---------- the metrics of the workspace activities (LH-704) ----------
+async def test_a_prepared_workspace_makes_the_task_active(rig: Rig, counters: Metrics) -> None:
+    await rig.prepare()
+    assert counters.registry.get_sample_value("longhaul_active_tasks") == 1
+
+
+async def test_a_retried_prepare_does_not_make_the_task_active_twice(
+    rig: Rig, counters: Metrics
+) -> None:
+    await rig.prepare()
+    await rig.prepare()
+    assert counters.registry.get_sample_value("longhaul_active_tasks") == 1
+
+
+async def test_a_prepare_that_fails_leaves_the_task_inactive(rig: Rig, counters: Metrics) -> None:
+    with pytest.raises(SetupCommandError):
+        await rig.prepare(rig.spec(setup_command="exit 3"))
+    assert counters.registry.get_sample_value("longhaul_active_tasks") == 0
+
+
+async def test_a_recreated_sandbox_is_counted(rig: Rig, counters: Metrics) -> None:
+    out = await rig.prepare()
+    await rig.host.rm_f(out.sandbox_id)
+
+    await rig.ensure(out.sandbox_id, out.head_sha)
+
+    assert counters.registry.get_sample_value("longhaul_sandbox_recreated_total") == 1
+
+
+async def test_a_sandbox_that_runs_is_not_counted_as_recreated(rig: Rig, counters: Metrics) -> None:
+    out = await rig.prepare()
+    await rig.ensure(out.sandbox_id, out.head_sha)
+    assert counters.registry.get_sample_value("longhaul_sandbox_recreated_total") == 0
+
+
+async def test_a_run_that_starts_on_a_new_worker_makes_its_task_active_there(rig: Rig) -> None:
+    # After a hand-over to a new run, or a restart of the worker, the first thing a run does
+    # is ensure_sandbox. The task is running on this worker from then on, whatever it finds.
+    out = await rig.prepare()
+    fresh = metrics.Metrics()
+    with metrics.configured(fresh):
+        await rig.ensure(out.sandbox_id, out.head_sha)
+    assert fresh.registry.get_sample_value("longhaul_active_tasks") == 1
+
+
+async def test_a_sandbox_that_could_not_be_rebuilt_is_not_counted(
+    rig: Rig, counters: Metrics
+) -> None:
+    out = await rig.prepare()
+    await rig.host.rm_f(out.sandbox_id)
+    with pytest.raises(SetupCommandError):
+        await rig.ensure(out.sandbox_id, out.head_sha, rig.spec(setup_command="exit 3"))
+    assert counters.registry.get_sample_value("longhaul_sandbox_recreated_total") == 0

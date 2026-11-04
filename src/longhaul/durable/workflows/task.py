@@ -30,8 +30,8 @@ that ends the run with ERROR "sandbox lost", instead of looping on a host that c
 container alive. The end still answers every call of the turn through `append_results`: the
 calls that ran keep their results and the rest get an error result, so the stored transcript
 has no tool_use without a tool_result. A run that starts with a sandbox id, because an earlier
-run prepared it (LH-207 hands one over), calls `ensure_sandbox` before its first turn, since the
-container may be gone by then.
+run prepared it and handed over (see Continue-As-New below), calls `ensure_sandbox` before its
+first turn, since the container may be gone by then.
 
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
@@ -45,14 +45,53 @@ can tell them apart without reading prose:
   "context limit", "pause limit" and "unexpected stop reason: ...".
 
 Not here yet, each in its own story: the planner and verifier phases (Phase 5), budget
-enforcement and pauses (Phase 7), Continue-As-New (LH-207), clean-up and a final outcome for
-runs that end any way but a cancel (LH-507). An activity that fails for good, after its retries,
-fails the workflow with that error, except a prompt over the context window, which ends the run
-with "context limit" as it does in-process.
+enforcement and pauses (Phase 7), clean-up and a final outcome for runs that end any way but a
+cancel (LH-507). An activity that fails for good, after its retries, fails the workflow with that
+error, except a prompt over the context window, which ends the run with "context limit" as it
+does in-process.
 
-The count of turns without a tool call (`self.idle`) belongs to the running workflow and is not
-in CarryState, which the contracts do not let this story change. LH-207 has to carry it over a
-Continue-As-New. Losing it there only gives the model one more nudge.
+Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
+the same workflow id. After a turn that did not end the run, the workflow hands over when the
+turns done are a multiple of the interval (acts.CONTINUE_AS_NEW_EVERY_TURNS, 40, or the run's
+Tuning), or when the server suggests it (workflow.info().is_continue_as_new_suggested()). A run
+that has used its turns ends with "turn limit" instead, because the new run would only find that
+out after a bundle upload. The hand-over goes in this order:
+
+1. `bundle_checkpoint` uploads the history of the checkpoint repo, so that a lost host costs at
+   most the work since the last hand-over (failure mode F4);
+2. `record_event` writes a `continue_as_new` event (a local activity);
+3. the workflow waits for its signal handlers to finish (workflow.all_handlers_finished);
+4. it looks at the cancel request one last time and calls continue_as_new with its state. Nothing
+   is awaited between that look and the call, so a signal cannot land in the gap. A signal that
+   reaches the server together with the command makes the server refuse the command, and the SDK
+   runs the workflow task again with the signal in the history (ADR-0004, appendix section 4).
+
+The bundle and the event are best effort. They are a record for people and a safety net for a
+lost host, and a task that failed because its log was unreachable would lose far more than they
+protect. A failure is logged and the hand-over goes on, since the history has to be reset.
+
+What the new run starts with. The state travels in CarryState: the turn index, the transcript, the
+checkpoint, the sandbox id, the cost, the hints and the budget top-ups. `hint` and `add_budget`
+write to it, so everything that arrived before the hand-over is in it, and a signal that arrives
+later goes to the new run (same id; the state is built in @workflow.init before any handler runs,
+so none is dropped). The Tuning is in the memo, which continue_as_new carries over. The new run
+calls `ensure_sandbox` first, like any run that starts with a sandbox id (LH-206).
+
+Hints stay in `state.hints` for the life of the task. Each model call gets all of them, and
+`llm_turn` shows the model the ones its transcript does not hold yet (turns.show_hints). The
+transcript is the record of what the model has read, so no marker has to cross the hand-over, and
+a hint signalled just before it is in the first prompt of the next run.
+
+What does not cross, and why that is fine:
+
+- A cancel is not carried. One that has arrived by the last look is acted on in this run, with the
+  clean-up and the CANCELLED outcome. Any later one reaches the new run as a signal.
+- The count of turns without a tool call (`self.idle`) is not in CarryState, which this story may
+  not change. After a hand-over that follows a nudge, the model gets one more nudge before the run
+  ends with "no tool calls".
+- `plan_decision` is not carried. The plan gate (Phase 5) waits and reads the decision inside one
+  run, before any hand-over, and CarryState keeps `plan_approved`.
+- `outcome` is never set at a hand-over, because a run that has an outcome ends.
 """
 
 from __future__ import annotations
@@ -60,9 +99,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
+from typing import Any, NoReturn
 
 from temporalio import workflow
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 
 # Contracts, acts and the turn rules are pure. Passing them through the sandbox saves about
 # 30 ms per run and keeps one class object for each model, so an isinstance check against a
@@ -103,6 +143,11 @@ def cancel_summary(by: str, reason: str) -> str:
 
 # The summary of the outcome when one tool call keeps finding its sandbox gone.
 SANDBOX_LOST = "sandbox lost"
+
+# The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
+CONTINUE_AS_NEW_EVENT = "continue_as_new"
+HAND_OVER_TURNS = "turns"  # the turn count reached the interval
+HAND_OVER_HISTORY = "history"  # the server suggested it, because the history grew
 
 
 class _CancelRequested(Exception):
@@ -247,12 +292,82 @@ class TaskWorkflow:
         state = self.state
         state.phase = Phase.CODING
         while True:
-            # add_budget can raise the limit while the task runs, so it is read on each turn.
-            if state.turn_index >= state.spec.settings.budgets.task_turns + state.extra_turns:
+            if self._out_of_turns():
                 return self._end(rules.turn_limit_outcome(), Phase.FAILED)
             outcome = await self._turn()
             if outcome is not None:
                 return outcome
+            reason = self._hand_over_reason()
+            if reason is not None and not self._out_of_turns():
+                await self._hand_over(reason)
+
+    def _out_of_turns(self) -> bool:
+        # add_budget can raise the limit while the task runs, so it is read each time.
+        state = self.state
+        return state.turn_index >= state.spec.settings.budgets.task_turns + state.extra_turns
+
+    def _hand_over_reason(self) -> str | None:
+        """Why the run should hand over to a new one now, or None when it should go on."""
+        turns, tuning = self.state.turn_index, self._tuning()
+        suggested = workflow.info().is_continue_as_new_suggested()
+        if not acts.hand_off_due(turns, tuning, suggested=suggested):
+            return None
+        return HAND_OVER_TURNS if acts.hand_off_due(turns, tuning) else HAND_OVER_HISTORY
+
+    async def _hand_over(self, reason: str) -> NoReturn:
+        """End this run and start the next one with the same state (see the module docstring).
+
+        continue_as_new raises ContinueAsNewError, which is a BaseException. Nothing between here
+        and the call may catch it or await in a `finally`.
+        """
+        state = self.state
+        bundle = await self._bundle()
+        await self._note(
+            CONTINUE_AS_NEW_EVENT,
+            {
+                "reason": reason,
+                "turn_index": state.turn_index,
+                "head_sha": state.head_sha,
+                "bundle": bundle,
+            },
+        )
+        await workflow.wait_condition(workflow.all_handlers_finished)
+        # A cancel that came in during the awaits above must not be lost with this run. It is
+        # acted on here. No await follows, so none can arrive between this look and the call.
+        self._stop_if_cancelled()
+        workflow.continue_as_new(state)
+
+    async def _bundle(self) -> str | None:
+        """Upload the repo history. Returns the key of the blob, or None when it was not made."""
+        state = self.state
+        try:
+            ref = await self._call(
+                acts.BUNDLE_CHECKPOINT,
+                acts.BundleCheckpointInput(task_id=state.spec.task_id, turn_index=state.turn_index),
+            )
+        except ActivityError as err:
+            workflow.logger.warning(
+                "no bundle of task %s before the hand-over: %s",
+                state.spec.task_id,
+                err.cause or err,
+            )
+            return None
+        return ref.key
+
+    async def _note(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Record an event. A log line that cannot be written does not fail the task."""
+        task_id = self.state.spec.task_id
+        try:
+            await self._call(
+                acts.RECORD_EVENT,
+                acts.RecordEventInput(task_id=task_id, type=event_type, payload=payload),
+            )
+        except FailureError as err:
+            # A local activity that fails raises its own error, an ApplicationError, and not the
+            # ActivityError that a remote one is wrapped in.
+            workflow.logger.warning(
+                "event %s of task %s not recorded: %s", event_type, task_id, err.cause or err
+            )
 
     async def _turn(self) -> Outcome | None:
         """One model turn and what follows it. Returns the outcome when the turn ends the run."""
@@ -464,9 +579,14 @@ class TaskWorkflow:
         (see acts.options), and only then does the clean-up run.
         """
         self._stop_if_cancelled()
-        handle = workflow.start_activity(
-            act.name, arg, result_type=act.result_type, **acts.options(act, self._tuning())
-        )
+        if act.local:
+            handle = workflow.start_local_activity(
+                act.name, arg, result_type=act.result_type, **acts.local_options(act)
+            )
+        else:
+            handle = workflow.start_activity(
+                act.name, arg, result_type=act.result_type, **acts.options(act, self._tuning())
+            )
         await workflow.wait_condition(lambda: handle.done() or self.cancel_request is not None)
         if handle.done():
             result: Out = await handle
@@ -474,8 +594,9 @@ class TaskWorkflow:
         handle.cancel()
         # The handle resolves once the activity has stopped. It ends as cancelled, or as a
         # failure if the activity raised something else while it stopped, and either way the
-        # run is over, so the outcome of the attempt does not matter.
-        with contextlib.suppress(ActivityError, asyncio.CancelledError):
+        # run is over, so the outcome of the attempt does not matter. A local activity that
+        # fails raises its own error and not an ActivityError, hence FailureError.
+        with contextlib.suppress(FailureError, asyncio.CancelledError):
             await handle
         raise _CancelRequested
 

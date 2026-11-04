@@ -11,6 +11,9 @@ their numbers here: `append_results`, which reads and writes one blob, and `clea
 sized like `load_memory`. `ensure_sandbox` is in the table with 10 minutes and 5 attempts, and
 has a heartbeat timeout like `prepare_workspace`: it builds a container and runs the setup
 command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
+`bundle_checkpoint` has the table's 5 minutes and 3 attempts and the same kind of heartbeat
+timeout, because it uploads the whole history of a repository. `record_event` is a local
+activity: it is one row insert, and it runs inside the worker that holds the workflow.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -75,6 +78,14 @@ OUTPUT_PREVIEW_CHARS = 2_000
 # equal.
 TOOL_TIMEOUT_S = 600
 
+# The turns one run of TaskWorkflow takes before it hands over to a new run (Continue-As-New).
+# The workflow cannot read the config file, so the number is copied from
+# `loop.continue_as_new_every_turns`. A unit test keeps the two equal. A turn with one tool call
+# adds 18 history events and one with three calls adds 30, so 40 turns come to 720 to 1,200, well
+# under the 4,096 at which the server suggests a hand-over (ADR-0004, appendix section 4). That
+# suggestion is the safety net for a turn with many calls.
+CONTINUE_AS_NEW_EVERY_TURNS = 40
+
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
 
@@ -136,11 +147,13 @@ class LlmTurnInput(BaseModel):
     # The system prompt is built from it, in the same bytes on every call of a transcript (D7).
     spec: TaskSpec
     transcript_ref: BlobRef | None  # None before the first turn
-    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6, and
-    # a hint reaches it with the pause and hint flow of LH-506.
+    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
     memory_ref: BlobRef | None = None
+    # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
+    # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
+    # LH-506 builds on this.
     hints: list[str] = Field(default_factory=list)
     # D8: the one retry of a turn that stopped on max_tokens runs at the higher cap. The
     # activity maps this to the number in the config, which the workflow cannot read.
@@ -218,6 +231,25 @@ class CleanupInput(BaseModel):
     reason: str
 
 
+class RecordEventInput(BaseModel):
+    """One row for the `events` table. The workflow cannot write to Postgres itself."""
+
+    task_id: str
+    type: str  # one of the event types in plan section 3.5
+    payload: dict[str, Any] = Field(default_factory=dict)  # JSON, and small
+
+
+class BundleCheckpointInput(BaseModel):
+    """What bundle_checkpoint needs: the task, and the turn that has just ended.
+
+    The bundle holds the branch head, and the `checkpoints` row that names it is filed under
+    this turn.
+    """
+
+    task_id: str
+    turn_index: int
+
+
 # ---------- activities ----------
 @dataclass(frozen=True)
 class Act[In, Out]:
@@ -229,6 +261,10 @@ class Act[In, Out]:
     start_to_close: timedelta
     retry: RetryPolicy
     heartbeat: timedelta | None = None
+    # A local activity runs in the worker that holds the workflow, with no task queue round trip
+    # and no heartbeat. It is for a call of a few seconds that should add no server-side task,
+    # such as a log row. The workflow starts it with local_options().
+    local: bool = False
 
 
 # Retrying cannot make a payload smaller (ADR-0005), and the payload guard raises this type.
@@ -299,6 +335,24 @@ CLEANUP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+BUNDLE_CHECKPOINT = Act(
+    "bundle_checkpoint",
+    BundleCheckpointInput,
+    BlobRef,
+    start_to_close=timedelta(minutes=5),
+    heartbeat=timedelta(seconds=60),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
+RECORD_EVENT = Act(
+    "record_event",
+    RecordEventInput,
+    NoneType,
+    start_to_close=timedelta(seconds=10),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+    local=True,
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -306,6 +360,8 @@ ALL: tuple[Act[Any, Any], ...] = (
     TOOL_EXEC,
     APPEND_RESULTS,
     CLEANUP,
+    BUNDLE_CHECKPOINT,
+    RECORD_EVENT,
 )
 
 
@@ -328,6 +384,10 @@ class Tuning(BaseModel):
     # The server fires the timeout on its own clock, so the activity has to heartbeat well
     # inside it. The Python SDK sends at most one heartbeat per 0.8 timeouts.
     heartbeat_timeout_s: float | None = Field(default=None, gt=0)
+    # A test or a chaos run cannot wait for 40 turns to see a hand-over, so it sets a small
+    # number. Every run of the chain then hands over after that many turns, because the memo
+    # carries over Continue-As-New.
+    continue_as_new_every_turns: int | None = Field(default=None, ge=1)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:
@@ -356,6 +416,35 @@ def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.Activi
         "retry_policy": act.retry,
         "cancellation_type": workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
     }
+
+
+def local_options(act: Act[Any, Any]) -> workflow.LocalActivityConfig:
+    """The keyword arguments for workflow.start_local_activity.
+
+    A local activity has no heartbeat, so a cancel reaches it only when it ends. That is why
+    only a call of a few seconds is local.
+    """
+    return {
+        "start_to_close_timeout": act.start_to_close,
+        "retry_policy": act.retry,
+        "cancellation_type": workflow.ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+    }
+
+
+def continue_as_new_every(tuning: Tuning | None = None) -> int:
+    """The turns between two hand-overs: the run's tuning, or the configured number."""
+    if tuning is not None and tuning.continue_as_new_every_turns is not None:
+        return tuning.continue_as_new_every_turns
+    return CONTINUE_AS_NEW_EVERY_TURNS
+
+
+def hand_off_due(turn_index: int, tuning: Tuning | None = None, *, suggested: bool = False) -> bool:
+    """True when the run should hand over to a new one after the turn that has just ended.
+
+    `turn_index` counts the turns done so far, so it is 1 after the first. `suggested` is the
+    server's own advice, workflow.info().is_continue_as_new_suggested().
+    """
+    return suggested or (turn_index > 0 and turn_index % continue_as_new_every(tuning) == 0)
 
 
 def finish_summary(call: ToolCallSummary) -> str:

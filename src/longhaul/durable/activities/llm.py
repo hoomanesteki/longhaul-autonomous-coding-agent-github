@@ -10,6 +10,15 @@ off at max_tokens, a refusal, a full window or a pause is not stored, and none o
 are returned. For a turn that was paused, the text so far is stored under `paused_ref` and the
 workflow hands it back with the next call.
 
+Hints. The workflow passes every hint of the task with every call, and this activity shows the
+model the ones it has not read: `show_hints` adds each as user text to the last message, once,
+and the transcript is the record of it. The text goes into the stored transcript together with
+a complete reply. A reply that is not stored takes the hint with it, and the call that asks
+again adds it again, so the model reads it once and the transcript holds it once. The system
+prompt and the tool list do not change (D7), and nothing before the last message changes, so the
+cached prefix stays valid. The `request_ref` of a turn row names the transcript the call began
+from, without the hints it added, as it does not hold the text of a paused reply either.
+
 Every call that was billed has a row in `turns`, also when it failed. A call that failed before
 it was billed leaves no row.
 
@@ -39,6 +48,7 @@ from longhaul.agent.turns import (
     append_assistant,
     append_user_text,
     llm_step,
+    show_hints,
     validate_pairs,
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key
@@ -111,7 +121,7 @@ class LlmActivities:
         cfg = self._config_for(inp.role)
         try:
             system = build_system_prompt(inp.role, inp.spec)
-            transcript = await self._transcript(inp)
+            transcript = show_hints(await self._transcript(inp), inp.hints)
             validate_pairs(transcript)  # a transcript the API would reject is not sent
         except ValueError as exc:  # also TranscriptError and a damaged blob
             raise not_retried(exc) from exc
@@ -245,7 +255,9 @@ class LlmActivities:
 
         response_ref = await self._blobs.put_json(resp, key(f"response-{attempt}.json"))
         if len(grown) == len(transcript) and inp.transcript_ref is not None:
-            transcript_ref = inp.transcript_ref  # nothing was added, so there is nothing to store
+            # The reply added nothing, so there is nothing to store. A hint that joined the last
+            # message stays out as well, and the next call adds it again.
+            transcript_ref = inp.transcript_ref
         else:
             transcript_ref = await self._blobs.put_json(grown, key(f"transcript-{attempt}.json"))
         tool_calls_ref = None

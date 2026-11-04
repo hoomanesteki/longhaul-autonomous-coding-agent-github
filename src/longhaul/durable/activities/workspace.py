@@ -1,4 +1,5 @@
-"""The prepare_workspace and ensure_sandbox activities: a sandbox that can come back.
+"""The prepare_workspace, ensure_sandbox and bundle_checkpoint activities: a sandbox that can
+come back, and a copy of its history outside the host.
 
 prepare_workspace makes the first sandbox of a task and ensure_sandbox makes another when the
 first is gone (failure mode F3). Both end the same way: a container that has the task's bare
@@ -22,6 +23,11 @@ that exactly one is live whatever the state of the old one: running, stopped, pa
 `DockerSandboxManager.get` answers None for any container that does not run, and that is the
 case this module replaces.
 
+bundle_checkpoint uploads the whole history of the task's bare repo as one git bundle. The
+workflow calls it before a hand-over to a new run (Continue-As-New), so that a lost host (failure
+mode F4) costs at most the work since the last hand-over. The blob is named after the head it
+holds, and a `checkpoints` row of kind `bundle` names the blob, so a restore can find the latest.
+
 The setup command is `spec.settings.setup_command`, or the default of `longhaul run-local` when
 there is none. The default is read from the pyproject.toml of the workspace, so a recovery sets
 up what the workspace holds at `head_sha` and does not depend on the folder the task started
@@ -37,7 +43,7 @@ import shutil
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from temporalio import activity
@@ -51,8 +57,8 @@ from longhaul.agent.workspace import (
 )
 from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError, check_task_id
 from longhaul.checkpoints.snapshot import snapshot_folder
-from longhaul.contracts import Sandbox, SandboxLimits, TaskSpec
-from longhaul.db.records import Recorder
+from longhaul.contracts import BlobRef, Sandbox, SandboxLimits, TaskSpec
+from longhaul.db.records import CheckpointRecord, Recorder
 from longhaul.durable import acts
 from longhaul.durable.activities.support import heartbeating, not_retried, small
 from longhaul.github.intake import LOCAL_PREFIX, is_local
@@ -96,7 +102,7 @@ class LocalFolder:
 
 
 class WorkspaceActivities:
-    """prepare_workspace and ensure_sandbox, with what they need.
+    """prepare_workspace, ensure_sandbox and bundle_checkpoint, with what they need.
 
     `image` and `limits` are `sandbox.image` and `sandbox.limits` of the config, which the
     workflow cannot read. `checkpoints` is the store that tool_exec uses, because the repo that
@@ -123,7 +129,7 @@ class WorkspaceActivities:
     @property
     def activities(self) -> list[Callable[..., Any]]:
         """What to register on a worker."""
-        return [self.prepare_workspace, self.ensure_sandbox]
+        return [self.prepare_workspace, self.ensure_sandbox, self.bundle_checkpoint]
 
     # ---------- prepare_workspace ----------
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
@@ -190,7 +196,7 @@ class WorkspaceActivities:
         running = await self._sandboxes.get(inp.sandbox_id) if inp.sandbox_id else None
         if running is not None:
             return running.id
-        self._require_repo(inp.task_id)
+        self._require_repo(inp.task_id, "its sandbox cannot be recreated")
         async with heartbeating():
             sandbox = await self._rebuild(inp)
         await self._recorder.record_event(
@@ -211,11 +217,27 @@ class WorkspaceActivities:
         )
         return sandbox.id
 
-    def _require_repo(self, task_id: str) -> None:
-        """Without the bare repo there is nothing to return to, and asking again changes nothing.
+    # ---------- bundle_checkpoint ----------
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        inp = small(inp)
+        self._require_repo(inp.task_id, "there is nothing to bundle")
+        async with heartbeating():
+            ref = await self._store.bundle(inp.task_id)
+        # bundle() names the blob after the head it bundled, so the sha is read from the key and
+        # cannot differ from what the bundle holds.
+        sha = PurePosixPath(ref.key).stem
+        await self._recorder.record_checkpoint(
+            CheckpointRecord(inp.task_id, sha, "bundle", inp.turn_index, bundle_ref=ref)
+        )
+        return ref
+
+    def _require_repo(self, task_id: str, consequence: str) -> None:
+        """Without the bare repo there is nothing to work from, and asking again changes nothing.
 
         That is failure mode F4: the host that held the repo is gone. Building the repo again
         from the latest bundle (GitCheckpointStore.restore_from_bundle) is not wired in yet.
+        `consequence` finishes the sentence "..., so " in the message.
         """
         try:
             found = self._store.has_repo(task_id)
@@ -225,7 +247,7 @@ class WorkspaceActivities:
             raise not_retried(
                 RepoNotFoundError(
                     f"task {task_id} has no checkpoint repo on this host (failure mode F4), "
-                    "so its sandbox cannot be recreated"
+                    f"so {consequence}"
                 )
             )
 

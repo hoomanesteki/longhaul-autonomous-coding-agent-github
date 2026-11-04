@@ -3,7 +3,8 @@
 The stubs take the place of the activities. They are registered under the names in acts.py, so
 the workflow cannot tell them from the real ones. These tests check what the workflow itself
 does with what an activity returns: the phases, the signals, the order of the calls, how each
-stop reason is handled and how a sandbox that is gone is recreated. test_activities.py runs the
+stop reason is handled, how a sandbox that is gone is recreated and how a long run hands over to
+a new one (Continue-As-New). test_activities.py runs the
 real activities, test_sandbox_recovery.py runs the recovery on real containers, and
 test_parity.py compares the whole loop with the in-process one. Each test gets its own server
 and worker, so nothing is shared between tests. The first run downloads the test server (about
@@ -93,6 +94,11 @@ class Stubs:
 
     `gone` maps a call id to the number of times that call finds its sandbox gone before it
     runs. `ensure_sandbox` answers with a new id each time: sbx-2, then sbx-3, and so on.
+
+    A turn gate holds the model call of one turn (`hold_turn`), which keeps the workflow inside
+    that turn and so inside one run. `run_ids` lists the runs that called an activity, in the
+    order they began, and `turn_runs` says which run made the model call of each turn. A
+    `bundle_checkpoint` or `record_event` that has an error in `fails` raises it.
     """
 
     MUTATING = frozenset({"edit_file", "write_file"})
@@ -107,6 +113,11 @@ class Stubs:
         self.commits = 0
         self.gone: dict[str, int] = {}
         self.recreated = 0
+        self.turn_gates: dict[int, asyncio.Event] = {}
+        self.run_ids: list[str] = []
+        self.workflow_ids: set[str] = set()
+        self.turn_runs: dict[int, str] = {}
+        self.fails: dict[str, ApplicationError] = {}
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -117,6 +128,8 @@ class Stubs:
             self.tool_exec,
             self.append_results,
             self.cleanup,
+            self.bundle_checkpoint,
+            self.record_event,
         ]
 
     def hold(self, name: str) -> None:
@@ -125,17 +138,31 @@ class Stubs:
     def release(self, name: str) -> None:
         self.gates[name].set()
 
+    def hold_turn(self, turn: int) -> None:
+        self.turn_gates.setdefault(turn, asyncio.Event()).clear()
+
+    def release_turn(self, turn: int) -> None:
+        self.turn_gates.setdefault(turn, asyncio.Event()).set()
+
+    def started(self, turn: int) -> bool:
+        return any(p.turn_index == turn for p in self.payloads(acts.LLM_TURN.name))
+
     def names(self) -> list[str]:
         return [name for name, _ in self.log]
 
     def payloads(self, name: str) -> list[Any]:
         return [payload for logged, payload in self.log if logged == name]
 
-    async def _enter(self, name: str, payload: Any) -> None:
+    async def _enter(self, name: str, payload: Any, *, gate: asyncio.Event | None = None) -> None:
+        info = activity.info()
+        self.workflow_ids.add(info.workflow_id)
+        if info.workflow_run_id not in self.run_ids:
+            self.run_ids.append(info.workflow_run_id)
         self.log.append((name, payload))
         try:
-            while not self.gates[name].is_set():
-                activity.heartbeat()
+            while not (self.gates[name].is_set() and (gate is None or gate.is_set())):
+                if not info.is_local:  # a local activity has no heartbeat
+                    activity.heartbeat()
                 await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             # The workflow cancelled this activity, or the worker is shutting down.
@@ -149,7 +176,8 @@ class Stubs:
 
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
-        await self._enter(acts.LLM_TURN.name, inp)
+        self.turn_runs[inp.turn_index] = activity.info().workflow_run_id
+        await self._enter(acts.LLM_TURN.name, inp, gate=self.turn_gates.get(inp.turn_index))
         return acts.LlmTurnOutput(
             transcript_ref=ref(f"turns/{inp.turn_index:04d}/assistant.json"),
             tool_call_summaries=self.script(inp.turn_index),
@@ -193,6 +221,19 @@ class Stubs:
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
         await self._enter(acts.CLEANUP.name, inp)
+
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        await self._enter(acts.BUNDLE_CHECKPOINT.name, inp)
+        if acts.BUNDLE_CHECKPOINT.name in self.fails:
+            raise self.fails[acts.BUNDLE_CHECKPOINT.name]
+        return ref(f"ckpt/{inp.turn_index}.bundle")
+
+    @activity.defn(name=acts.RECORD_EVENT.name)
+    async def record_event(self, inp: acts.RecordEventInput) -> None:
+        await self._enter(acts.RECORD_EVENT.name, inp)
+        if acts.RECORD_EVENT.name in self.fails:
+            raise self.fails[acts.RECORD_EVENT.name]
 
 
 @pytest.fixture
@@ -1172,11 +1213,328 @@ async def test_a_run_with_a_sandbox_and_no_checkpoint_cannot_be_recreated(
     assert stubs.names() == []
 
 
+# ---------- Continue-As-New (LH-207) ----------
+EVERY_3 = acts.Tuning(continue_as_new_every_turns=3)
+HINT = "alice: use pytest -x"
+TURN = [acts.LLM_TURN.name, acts.TOOL_EXEC.name, acts.APPEND_RESULTS.name]
+# What a run does at its end, and what the next one does before its first turn.
+HAND_OVER = [acts.BUNDLE_CHECKPOINT.name, acts.RECORD_EVENT.name, acts.ENSURE_SANDBOX.name]
+
+
+def edits_then_finishes(last_turn: int) -> Script:
+    """Every turn edits a file and so leaves a checkpoint, until `last_turn` calls finish."""
+
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        if turn == last_turn:
+            return [finish()]
+        return [call("edit_file", f"edit-{turn}", path="calc.py")]
+
+    return script
+
+
+def current_run(env: WorkflowEnvironment, spec: TaskSpec) -> WorkflowHandle[Any, Outcome]:
+    """A handle without a run id, so a query reaches the run that is open now."""
+    return env.client.get_workflow_handle(spec.task_id)
+
+
+async def test_continue_as_new_preserves_state(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    # Ten turns, a hand-over every three: runs of turns 0-2, 3-5, 6-8 and 9.
+    stubs = Stubs(edits_then_finishes(9), cost_usd=0.25)
+    stubs.hold_turn(1)
+    stubs.hold_turn(3)  # the first turn of the second run
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        await handle.signal("hint", args=["alice", "use pytest -x"])
+        stubs.release_turn(1)
+
+        # The second run has started and has not asked the model anything yet, so a query
+        # shows exactly what the first run handed over.
+        await wait_until(lambda: stubs.started(3), "the second run's first turn")
+        carried = await current_run(env, spec).query(TaskWorkflow.status)
+        stubs.release_turn(3)
+
+        outcome = await result_of(handle)
+        final = await current_run(env, spec).query(TaskWorkflow.status)
+
+    assert (carried.turn_index, carried.last_checkpoint) == (3, sha(3))
+    assert carried.cost_usd == pytest.approx(0.75)
+    assert carried.phase is Phase.CODING
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="fixed add()")
+    assert (final.phase, final.turn_index, final.last_checkpoint) == (Phase.DONE, 10, sha(9))
+    assert final.cost_usd == pytest.approx(2.5)
+
+    # Four runs under the one workflow id, and each took its share of the turns.
+    assert stubs.workflow_ids == {spec.task_id}
+    assert len(stubs.run_ids) == 4
+    by_run = [[t for t, run in stubs.turn_runs.items() if run == r] for r in stubs.run_ids]
+    assert by_run == [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+
+    # At the end of a run: bundle and event. The next run puts its sandbox back at the head.
+    assert stubs.names() == [
+        "prepare_workspace",
+        *TURN * 3,
+        *HAND_OVER,
+        *TURN * 3,
+        *HAND_OVER,
+        *TURN * 3,
+        *HAND_OVER,
+        acts.LLM_TURN.name,
+        acts.APPEND_RESULTS.name,
+    ]
+    assert stubs.payloads(acts.BUNDLE_CHECKPOINT.name) == [
+        acts.BundleCheckpointInput(task_id=spec.task_id, turn_index=n) for n in (3, 6, 9)
+    ]
+    events = stubs.payloads(acts.RECORD_EVENT.name)
+    assert [(e.task_id, e.type) for e in events] == [(spec.task_id, "continue_as_new")] * 3
+    assert [e.payload for e in events] == [
+        {
+            "reason": "turns",
+            "turn_index": n,
+            "head_sha": sha(n),
+            "bundle": f"tasks/lh-acme-calc-42/ckpt/{n}.bundle",
+        }
+        for n in (3, 6, 9)
+    ]
+    # Each run asks about the sandbox the one before it ended with, and the stub answers with a
+    # new id every time, so the id travels across the hand-overs as well.
+    ensured = stubs.payloads(acts.ENSURE_SANDBOX.name)
+    assert [(e.head_sha, e.sandbox_id) for e in ensured] == [
+        (sha(3), "sbx-1"),
+        (sha(6), "sbx-2"),
+        (sha(9), "sbx-3"),
+    ]
+    tools = stubs.payloads(acts.TOOL_EXEC.name)
+    assert [(t.turn_index, t.sandbox_id) for t in tools] == [
+        (n, f"sbx-{n // 3 + 1}") for n in range(9)
+    ]
+
+    # The turns after the hint all carry it, and the turn that was running when it came does not.
+    inputs = stubs.payloads(acts.LLM_TURN.name)
+    assert {i.turn_index: i.hints for i in inputs} == {
+        0: [],
+        1: [],
+        **{n: [HINT] for n in range(2, 10)},
+    }
+    # Each turn reads the transcript the one before it wrote, across the hand-over too.
+    transcripts = {i.turn_index: i.transcript_ref for i in inputs}
+    assert transcripts[3] == ref("turns/0002/results.json")
+    assert transcripts[9] == ref("turns/0008/results.json")
+
+
+async def test_signal_not_lost_across_can(env: WorkflowEnvironment) -> None:
+    # The first run is held inside its hand-over when the signals come, which is the window in
+    # which a signal could fall between two runs. The budget shows in where the run ends.
+    spec = make_spec(task_turns=6)
+    stubs = Stubs(never_finishes)
+    stubs.hold(acts.BUNDLE_CHECKPOINT.name)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: acts.BUNDLE_CHECKPOINT.name in stubs.names(), "the hand-over")
+        await handle.signal("hint", args=["alice", "use pytest -x"])
+        await handle.signal("add_budget", args=["alice", 2.5, 2])
+        stubs.release(acts.BUNDLE_CHECKPOINT.name)
+
+        outcome = await result_of(handle)
+        final = await current_run(env, spec).query(TaskWorkflow.status)
+
+    # Six turns and the two the top-up added.
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="turn limit")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 8)
+    inputs = stubs.payloads(acts.LLM_TURN.name)
+    assert [i.hints for i in inputs] == [[]] * 3 + [[HINT]] * 5
+    # Hand-overs after turns 3 and 6: the second is allowed only because of the top-up.
+    assert len(stubs.payloads(acts.BUNDLE_CHECKPOINT.name)) == 2
+    assert len(stubs.run_ids) == 3
+
+
+async def test_a_burst_of_hints_survives_many_hand_overs(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # A hand-over after every turn, and hints arriving the whole time. The state is built in
+    # @workflow.init for this: a hint that lands in the first task of a run must not be dropped
+    # (ADR-0004, appendix section 4).
+    last, sent = 9, 30
+    stubs = Stubs(edits_then_finishes(last))
+    stubs.hold_turn(last)  # keeps the workflow open until the last hint is in
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client,
+            spec,
+            task_queue=queue,
+            tuning=acts.Tuning(continue_as_new_every_turns=1),
+        )
+        for n in range(sent):
+            await handle.signal("hint", args=["alice", f"hint {n}"])
+            await asyncio.sleep(0.01)
+        await wait_until(lambda: stubs.started(last), "the last turn")
+        stubs.release_turn(last)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == last + 1
+    assert stubs.payloads(acts.LLM_TURN.name)[-1].hints == [f"alice: hint {n}" for n in range(sent)]
+
+
+async def test_a_run_that_has_used_its_turns_ends_instead_of_handing_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # Turn 3 is both the hand-over turn and the last turn the budget allows. A new run would
+    # only find that out, after a bundle upload.
+    stubs = Stubs(never_finishes)
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, make_spec(task_turns=3), task_queue=queue, tuning=EVERY_3
+        )
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="turn limit")
+    assert acts.BUNDLE_CHECKPOINT.name not in stubs.names()
+    assert len(stubs.run_ids) == 1
+
+
+async def test_a_run_that_finishes_on_the_hand_over_turn_does_not_hand_over(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(edits_then_finishes(2))  # the third turn finishes, and turn_index is 3 after it
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert acts.BUNDLE_CHECKPOINT.name not in stubs.names()
+    assert len(stubs.run_ids) == 1
+
+
+async def test_a_cancel_that_arrives_during_the_hand_over_still_cancels(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(never_finishes)
+    stubs.hold(acts.BUNDLE_CHECKPOINT.name)  # never opened
+    tuning = acts.Tuning(continue_as_new_every_turns=3, heartbeat_timeout_s=2)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: acts.BUNDLE_CHECKPOINT.name in stubs.names(), "the hand-over")
+
+        await handle.signal("cancel", args=["alice", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.CANCELLED, summary="cancelled by alice: enough")
+    # The bundle is stopped before the clean-up starts, and no second run is made.
+    assert stubs.names()[-3:] == ["bundle_checkpoint", "bundle_checkpoint:cancelled", "cleanup"]
+    assert acts.RECORD_EVENT.name not in stubs.names()
+    assert len(stubs.run_ids) == 1
+
+
+async def test_a_cancel_while_the_hand_over_event_is_written_still_cancels(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The event is a local activity, which has its own way to be stopped.
+    stubs = Stubs(never_finishes)
+    stubs.hold(acts.RECORD_EVENT.name)  # never opened
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: acts.RECORD_EVENT.name in stubs.names(), "the hand-over event")
+
+        await handle.signal("cancel", args=["alice", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+    assert stubs.names()[-3:] == ["record_event", "record_event:cancelled", "cleanup"]
+    assert len(stubs.run_ids) == 1
+
+
+async def test_a_cancel_after_the_hand_over_cancels_the_new_run(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The signal goes to the workflow id, so it reaches the run that is open when it arrives.
+    stubs = Stubs(never_finishes)
+    stubs.hold(acts.ENSURE_SANDBOX.name)  # the new run's first step
+    tuning = acts.Tuning(continue_as_new_every_turns=3, heartbeat_timeout_s=2)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: acts.ENSURE_SANDBOX.name in stubs.names(), "the second run")
+        await handle.signal("cancel", args=["alice", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+    assert len(stubs.run_ids) == 2
+    (cleanup,) = stubs.payloads(acts.CLEANUP.name)
+    assert cleanup.sandbox_id == "sbx-1"  # the id the first run handed over
+
+
+async def test_a_bundle_or_event_that_cannot_be_written_does_not_stop_the_hand_over(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # Both are a record for people and a safety net for a lost host. Failing the task for them
+    # would trade a small loss for a large one, and the history still has to be reset.
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.fails = {
+        acts.BUNDLE_CHECKPOINT.name: ApplicationError(
+            "the bundle is too large", type="CheckpointError", non_retryable=True
+        ),
+        acts.RECORD_EVENT.name: ApplicationError("database is down", type="OperationalError"),
+    }
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert len(stubs.run_ids) == 2
+    assert len(stubs.payloads(acts.BUNDLE_CHECKPOINT.name)) == 1  # not retried: it cannot work
+    assert len(stubs.payloads(acts.RECORD_EVENT.name)) == acts.RECORD_EVENT.retry.maximum_attempts
+
+
+async def test_an_event_for_a_failed_bundle_says_there_is_no_bundle(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.fails = {
+        acts.BUNDLE_CHECKPOINT.name: ApplicationError(
+            "no space left", type="CheckpointError", non_retryable=True
+        )
+    }
+    async with running(env, stubs) as queue:
+        await result_of(await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3))
+
+    (event,) = stubs.payloads(acts.RECORD_EVENT.name)
+    assert event.payload["bundle"] is None
+
+
+async def test_the_hand_over_activities_get_the_policies_of_section_3_7(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(edits_then_finishes(4))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+        first_run = env.client.get_workflow_handle(
+            spec.task_id, run_id=handle.first_execution_run_id
+        )
+        history = await first_run.fetch_history()
+
+    sched = scheduled_options(history)
+    assert timeouts(sched[acts.BUNDLE_CHECKPOINT.name]) == (5 * 60, 60)
+    assert sched[acts.BUNDLE_CHECKPOINT.name].retry_policy.maximum_attempts == 3
+    # A local activity is not scheduled as an activity task. It shows up as a marker.
+    assert acts.RECORD_EVENT.name not in sched
+    markers = [
+        event
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+        and event.marker_recorded_event_attributes.marker_name == "core_local_activity"
+    ]
+    assert len(markers) == 1
+    # The first run ended by continuing as new.
+    assert history.events[-1].HasField("workflow_execution_continued_as_new_event_attributes")
+
+
 async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
     """The workflow makes the same commands when its own history is replayed (F13).
 
     One run takes signals and uses a tool before it finishes. One is cancelled in the middle of
-    a turn. One finds its sandbox gone, recreates it and goes on.
+    a turn. One finds its sandbox gone, recreates it and goes on. One hands over to a new run
+    after its first turn, so both of its runs are replayed.
     """
     stubs = Stubs(lambda turn: [call("edit_file", "c1")] if turn == 0 else [finish()])
     async with running(env, stubs) as queue:
@@ -1208,11 +1566,24 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
         await result_of(resumed_run)
         assert acts.ENSURE_SANDBOX.name in stubs.names()
 
+        chained = await start_task(
+            env.client,
+            make_spec("lh-acme-calc-5"),
+            task_queue=queue,
+            tuning=acts.Tuning(continue_as_new_every_turns=1),
+        )
+        await result_of(chained)
+        first_run = env.client.get_workflow_handle(
+            "lh-acme-calc-5", run_id=chained.first_execution_run_id
+        )
+
         histories = [
             await done.fetch_history(),
             await cancelled.fetch_history(),
             await recovered.fetch_history(),
             await resumed_run.fetch_history(),
+            await first_run.fetch_history(),
+            await env.client.get_workflow_handle("lh-acme-calc-5").fetch_history(),
         ]
 
     replayer = Replayer(

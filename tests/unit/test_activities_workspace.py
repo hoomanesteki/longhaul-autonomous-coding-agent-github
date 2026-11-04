@@ -26,10 +26,10 @@ from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.workspace import SetupCommandError, collect_source_files, default_setup_command
 from longhaul.blobs.memory import MemoryBlobStore
-from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore
 from longhaul.checkpoints.snapshot import snapshot_folder
-from longhaul.contracts import ExecResult, RepoSettings, Sandbox, SandboxLimits, TaskSpec
-from longhaul.db.records import EventRecord, MemoryRecorder
+from longhaul.contracts import BlobRef, ExecResult, RepoSettings, Sandbox, SandboxLimits, TaskSpec
+from longhaul.db.records import CheckpointRecord, EventRecord, MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.workspace import (
     SANDBOX_RECREATED,
@@ -275,7 +275,7 @@ async def until(condition: Callable[[], bool], what: str, wait_s: float = 15.0) 
 
 async def test_the_activities_list_what_a_worker_registers(rig: Rig) -> None:
     names = sorted(a.__name__ for a in rig.activities.activities)
-    assert names == ["ensure_sandbox", "prepare_workspace"]
+    assert names == ["bundle_checkpoint", "ensure_sandbox", "prepare_workspace"]
 
 
 def test_the_setup_has_less_time_than_the_activity_that_runs_it() -> None:
@@ -672,3 +672,83 @@ async def test_the_default_setup_is_read_from_the_workspace_at_head_sha(rig: Rig
 
     ((command, network_on),) = rig.box(new_id).commands
     assert command.endswith("-e . pytest") and network_on
+
+
+# ---------- bundle_checkpoint (LH-207) ----------
+async def bundle(rig: Rig, turn_index: int = 3, **kwargs: Any) -> BlobRef:
+    inp = acts.BundleCheckpointInput(task_id=TASK, turn_index=turn_index)
+    out: BlobRef = await rig.environment(**kwargs).run(rig.activities.bundle_checkpoint, inp)
+    return out
+
+
+async def test_bundle_checkpoint_uploads_the_branch_head_and_files_a_row_for_it(
+    rig: Rig,
+) -> None:
+    out = await rig.prepare()
+    head = await rig.edit_and_save(out.sandbox_id)
+
+    ref = await bundle(rig, turn_index=7)
+
+    assert ref.key == f"tasks/{TASK}/ckpt/{head}.bundle"
+    assert rig.recorder.checkpoints == [CheckpointRecord(TASK, head, "bundle", 7, bundle_ref=ref)]
+    assert ref.size > 0
+
+
+async def test_a_bundle_made_again_after_a_retry_files_one_row(rig: Rig) -> None:
+    out = await rig.prepare()
+    await rig.edit_and_save(out.sandbox_id)
+
+    first = await bundle(rig)
+    again = await bundle(rig)
+
+    assert again.key == first.key
+    assert len(rig.recorder.checkpoints) == 1
+
+
+async def test_a_bundle_of_a_later_head_files_another_row(rig: Rig) -> None:
+    out = await rig.prepare()
+    first_head = await rig.edit_and_save(out.sandbox_id)
+    await bundle(rig, turn_index=3)
+    box = rig.box(out.sandbox_id)
+    await box.write_file("notes.txt", b"more\n")
+    second_head = await rig.store.commit(box, "lh: write_file turn 4 call c2")
+    assert second_head is not None
+
+    await bundle(rig, turn_index=6)
+
+    assert [(c.sha, c.turn_index) for c in rig.recorder.checkpoints] == [
+        (first_head, 3),
+        (second_head, 6),
+    ]
+
+
+async def test_bundle_checkpoint_heartbeats_while_it_works(rig: Rig) -> None:
+    out = await rig.prepare()
+    await rig.edit_and_save(out.sandbox_id)
+
+    await bundle(rig, heartbeat_timeout_s=0.3)
+
+    assert rig.beats, "a cancel and a dead worker are noticed through the heartbeat"
+
+
+async def test_bundle_checkpoint_without_a_repo_is_not_retried(rig: Rig) -> None:
+    # Failure mode F4: the host that held the repo is gone. Asking again finds no repo.
+    with pytest.raises(ApplicationError, match="checkpoint repo") as caught:
+        await bundle(rig)
+
+    assert caught.value.non_retryable
+    assert caught.value.type == "RepoNotFoundError"
+    assert rig.recorder.checkpoints == []
+
+
+async def test_a_bundle_that_is_too_large_files_no_row(rig: Rig) -> None:
+    out = await rig.prepare()
+    await rig.edit_and_save(out.sandbox_id)
+    small = GitCheckpointStore(MemoryBlobStore(), root=rig.store.root, max_bundle_bytes=100)
+    activities = WorkspaceActivities(rig.host, small, rig.recorder, image=IMAGE, limits=LIMITS)
+    inp = acts.BundleCheckpointInput(task_id=TASK, turn_index=3)
+
+    with pytest.raises(CheckpointError, match="larger than the limit"):
+        await rig.environment().run(activities.bundle_checkpoint, inp)
+
+    assert rig.recorder.checkpoints == []

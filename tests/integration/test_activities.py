@@ -16,7 +16,7 @@ import asyncio
 import shlex
 import sys
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,12 +55,14 @@ from longhaul.contracts import (
     Sandbox,
     SandboxLimits,
     TaskSpec,
+    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.support import heartbeating
 from longhaul.durable.activities.tools import NoCheckpoints, SandboxLookup, ToolActivities
@@ -296,8 +298,12 @@ async def running(
     sandboxes: SandboxLookup,
     workspace: Workspace,
     registry: ToolRegistry | None = None,
+    extra: Sequence[Callable[..., Any]] = (),
 ) -> AsyncIterator[Run]:
-    """A worker with the real activities. Yields the task queue it polls."""
+    """A worker with the real activities. Yields the task queue it polls.
+
+    `extra` are more activities to register, such as the ones a hand-over calls.
+    """
     toolbox = registry or default_registry()
     llm = LlmActivities(provider, blobs, recorder, toolbox.specs(), lambda role: CFG)
     tools = SpyTools(toolbox, sandboxes, blobs, recorder, checkpoints=NoCheckpoints())
@@ -311,6 +317,7 @@ async def running(
             *tools.activities,
             workspace.prepare_workspace,
             workspace.cleanup,
+            *extra,
         ],
         workflow_runner=workflow_runner(),
     ):
@@ -647,3 +654,133 @@ async def test_a_prompt_over_the_window_ends_the_run_with_context_limit(
     assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
     assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
     assert len(provider.options_seen) == 1
+
+
+# ---------- LH-207: a task that hands over to a new run ----------
+class PromptSpy(ScriptedProvider):
+    """A scripted provider that keeps the messages of every request it gets."""
+
+    def __init__(self, script: Path) -> None:
+        super().__init__(script)
+        self.prompts: list[list[Message]] = []
+
+    async def complete(self, **kwargs: Any) -> LLMResponse:
+        self.prompts.append([m.model_copy(deep=True) for m in kwargs["messages"]])
+        return await super().complete(**kwargs)
+
+
+class HandOverStubs:
+    """ensure_sandbox and bundle_checkpoint for a task that hands over.
+
+    The sandbox is the fake one the test seeded, so ensure_sandbox only says that it is still
+    there. bundle_checkpoint waits for the test, which keeps the first run inside its hand-over
+    while the test signals a hint.
+    """
+
+    def __init__(self, boxes: FakeBoxes) -> None:
+        self.boxes = boxes
+        self.go = asyncio.Event()
+        self.bundled: list[acts.BundleCheckpointInput] = []
+        self.ensured: list[acts.EnsureSandboxInput] = []
+
+    @activity.defn(name=acts.ENSURE_SANDBOX.name)
+    async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
+        self.ensured.append(inp)
+        assert inp.sandbox_id in self.boxes.boxes
+        return inp.sandbox_id
+
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        self.bundled.append(inp)
+        await self.go.wait()
+        key = f"tasks/{inp.task_id}/ckpt/{BASE}.bundle"
+        return BlobRef(key=key, sha256="0" * 64, size=1)
+
+
+def texts_of(messages: list[Message]) -> list[str]:
+    return [b.text for m in messages for b in m.content if isinstance(b, TextBlock)]
+
+
+async def test_a_task_hands_over_and_the_hint_reaches_the_next_run(
+    env: WorkflowEnvironment,
+    database: Scratch,
+    recorder: SqlRecorder,
+    blobs: BlobStoreBase,
+    tmp_path: Path,
+) -> None:
+    """Five turns with a hand-over every two: three runs, one transcript, one fix.
+
+    The hint comes while the first run is handing over. The model reads it in the first request
+    of the next run, and never twice. The real record_event writes the events.
+    """
+    read = {"name": "read_file", "input": {"path": "src/calc/__init__.py"}}
+    edit = {
+        "name": "edit_file",
+        "input": {
+            "path": "src/calc/__init__.py",
+            "old_str": "    return a - b",
+            "new_str": "    return a + b",
+        },
+    }
+    steps = [
+        {"respond": {"tool_calls": [{"name": "list_dir", "input": {"path": "."}}]}},
+        {"respond": {"tool_calls": [read]}},
+        {"respond": {"tool_calls": [edit]}},
+        {"respond": {"tool_calls": [read]}},
+        {"respond": {"tool_calls": [{"name": "finish", "input": {"summary": "Fixed add()."}}]}},
+    ]
+    script = tmp_path / "five_turns.yaml"
+    script.write_text(yaml.safe_dump({"steps": steps}))
+
+    provider = PromptSpy(script)
+    boxes = FakeBoxes()
+    hand_over = HandOverStubs(boxes)
+    spec = make_spec()
+    hint_text = "Hint from alice: use pytest -x"
+    async with running(
+        env,
+        provider=provider,
+        blobs=blobs,
+        recorder=recorder,
+        sandboxes=boxes,
+        workspace=boxes.workspace(),
+        extra=[
+            hand_over.ensure_sandbox,
+            hand_over.bundle_checkpoint,
+            *EventActivities(recorder).activities,
+        ],
+    ) as run:
+        handle = await start_task(
+            env.client,
+            spec,
+            task_queue=run.queue,
+            tuning=acts.Tuning(continue_as_new_every_turns=2),
+        )
+        async with asyncio.timeout(WAIT_S):
+            while not hand_over.bundled:
+                await asyncio.sleep(0.02)
+        await handle.signal("hint", args=["alice", "use pytest -x"])
+        hand_over.go.set()
+        outcome = await result_of(handle)
+        box = boxes.boxes[f"sbx-{spec.task_id}"]
+        fixed = (await box.read_file("src/calc/__init__.py")).decode()
+        transcript = await run.final_transcript()
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Fixed add().")
+    assert "return a + b" in fixed
+
+    # Hand-overs after turns 2 and 4, and the new run found the sandbox where it was left.
+    assert [b.turn_index for b in hand_over.bundled] == [2, 4]
+    assert [e.sandbox_id for e in hand_over.ensured] == [f"sbx-{spec.task_id}"] * 2
+    events = database.rows(
+        "SELECT type, payload->>'turn_index', payload->>'reason' FROM events ORDER BY id"
+    )
+    assert events == [("continue_as_new", "2", "turns"), ("continue_as_new", "4", "turns")]
+
+    # The first two requests are from before the hint. The third is the next run's first.
+    assert [hint_text in texts_of(p) for p in provider.prompts] == [False, False, True, True, True]
+    assert all(texts_of(p).count(hint_text) <= 1 for p in provider.prompts)
+    # The stored transcript is whole, and the hint is in it once.
+    validate_pairs(transcript)
+    assert texts_of(transcript).count(hint_text) == 1
+    assert sum(1 for m in transcript if m.role == "assistant") == 5

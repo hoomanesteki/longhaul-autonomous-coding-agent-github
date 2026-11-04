@@ -29,6 +29,7 @@ from longhaul.durable.client import (
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.settings import EnvSettings
 from longhaul.telemetry import otel
+from longhaul.telemetry.logging import LogContextInterceptor
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -141,11 +142,13 @@ async def test_connect_uses_the_pydantic_data_converter(monkeypatch: pytest.Monk
     monkeypatch.setattr(durable_client.Client, "connect", fake_connect)
 
     assert await connect("temporal.internal:7233", namespace="prod") == "client"
+    interceptors = seen.pop("interceptors")
     assert seen == {
         "address": "temporal.internal:7233",
         "namespace": "prod",
         "data_converter": pydantic_data_converter,
     }
+    assert [type(i) for i in interceptors] == [LogContextInterceptor]  # tracing is off here
 
 
 async def test_connect_defaults_to_the_default_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -177,8 +180,29 @@ async def test_connect_registers_the_tracing_interceptor_when_tracing_is_on(
     with otel.configured(TracerProvider()):
         await connect("localhost:7233")
 
+    # Tracing goes first, so its RunActivity span is open when the logging interceptor runs.
+    tracing, logging_context = seen["interceptors"]
+    assert isinstance(tracing, TracingInterceptor)
+    assert isinstance(logging_context, LogContextInterceptor)
+
+
+async def test_connect_registers_the_logging_interceptor_without_tracing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without it a worker activity logs no task_id, turn_index or activity. It sits on the client
+    # because the worker takes its interceptors from there.
+    seen: dict[str, Any] = {}
+
+    async def fake_connect(address: str, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "client"
+
+    monkeypatch.setattr(durable_client.Client, "connect", fake_connect)
+
+    await connect("localhost:7233")
+
     (interceptor,) = seen["interceptors"]
-    assert isinstance(interceptor, TracingInterceptor)
+    assert isinstance(interceptor, LogContextInterceptor)
 
 
 # ---------- LH-208: a script in the memo, and the handle calls of the CLI ----------

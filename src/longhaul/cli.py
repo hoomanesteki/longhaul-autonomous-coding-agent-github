@@ -34,10 +34,8 @@ item, a missing database setting and a database that cannot be reached exit 2 wi
 
 import asyncio
 import getpass
-import logging
 import re
 import signal
-import sys
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -269,12 +267,10 @@ def worker_command() -> None:
     # Imported here: the worker pulls in SQLAlchemy, boto3 and every activity, which the other
     # commands do not need.
     from longhaul.durable import worker
+    from longhaul.telemetry.logging import setup_logging
 
-    logging.basicConfig(
-        level=logging.INFO,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # JSON lines with the task context, and secrets redacted (LH-706).
+    setup_logging()
     try:
         asyncio.run(worker.main())
     except DURABLE_ERRORS as exc:

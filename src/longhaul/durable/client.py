@@ -18,6 +18,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from longhaul.contracts import BlobRef, CarryState, Outcome, Phase, TaskSpec, TaskStatus
 from longhaul.durable.acts import SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.telemetry import logging as logging_context
 from longhaul.telemetry import otel
 
 # The default of the task_queue setting (longhaul.settings.EnvSettings). A unit test keeps the
@@ -28,13 +29,15 @@ DEFAULT_TASK_QUEUE = "longhaul"
 async def connect(address: str, *, namespace: str = "default") -> Client:
     """Connect to Temporal.
 
-    When tracing is set up (telemetry.otel.setup_tracing), the client carries Temporal's tracing
-    interceptor. A worker built on this client uses it too, so workflow and activity spans share
-    one trace without a second registration.
+    The client carries two interceptors. When tracing is set up (telemetry.otel.setup_tracing),
+    Temporal's tracing interceptor comes first, and the logging interceptor after it, so the
+    RunActivity span is open when the logging one binds the trace id. A worker built on this
+    client uses both, so workflow and activity spans share one trace and the log lines of an
+    activity carry its task_id, turn_index and activity, without a second registration.
     """
-    options: dict[str, Any] = {}
-    if tracing := otel.interceptors():
-        options["interceptors"] = tracing
+    options: dict[str, Any] = {
+        "interceptors": [*otel.interceptors(), *logging_context.interceptors()]
+    }
     try:
         return await Client.connect(
             address, namespace=namespace, data_converter=pydantic_data_converter, **options

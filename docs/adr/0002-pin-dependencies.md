@@ -39,6 +39,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | opentelemetry-exporter-otlp-proto-grpc | 1.45.2 |
 | opentelemetry-semantic-conventions | 0.66b2 (a pre-release; the GenAI names are checked again on each upgrade) |
 | boto3 | 1.43.123 (runtime since LH-202, see ADR-0005) |
+| structlog | 26.1.0 (runtime since LH-706, JSON logs, see docs/architecture.md) |
 
 `psycopg` sits in the `dev` dependency group of `pyproject.toml` today. `boto3` moved to the runtime dependencies with LH-202, and its type stubs sit in the `dev` group. `temporalio` moved to the runtime dependencies with LH-203, because the workflow and the client in `longhaul.durable` import it, and a worker image built without the `dev` group needs it. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.3.0 requires `httpx2>=2.0.0,<3` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`. `anthropic` 2.3.0 sends API version `2026-10-21` unless told otherwise. A test in `tests/unit/test_anthropic_provider.py` fails when an upgrade moves that version, so the change is read before it merges.
 

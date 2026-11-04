@@ -49,6 +49,21 @@ uv run pytest -m slow tests/slow/test_local_embedder.py -rs
 
 The first run downloads the model (66 MB). fastembed keeps it in `FASTEMBED_CACHE_PATH`, or under the system temp directory when that is unset, where a reboot may clear it. Set the variable to a folder that stays for any worker that embeds. Without the extra the test is skipped, and `-rs` shows how to install it. A plain `uv sync` takes the extra's packages out again. ADR-0010 has the reasons.
 
+### Memory items
+
+The agent keeps notes about each repo (ADR-0010). `longhaul memory` shows them and decides on the ones that wait for a person. The commands read `LONGHAUL_DATABASE_URL`, so run them after `make up` and `make migrate`.
+
+```bash
+uv run longhaul memory list --repo acme/inventory                  # every item, oldest first
+uv run longhaul memory list --repo acme/inventory --status candidate --kind lesson
+uv run longhaul memory approve ID --by alice                       # the note may now reach a prompt
+uv run longhaul memory reject ID                                   # it stays in the table, out of every prompt
+```
+
+`--by` is the name recorded as the approver. Without it, the name of the user of the machine is used. `list` prints the id that `approve` and `reject` take.
+
+When a task starts, `prepare_workspace` runs the test and lint commands that the repo's `pyproject.toml`, `tox.ini`, Makefile and CI files name. It keeps the ones that print a pytest, ruff or tox summary as approved `command` items. This runs only on a worker that was given a memory store, and `memory list --kind command` shows the result.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.

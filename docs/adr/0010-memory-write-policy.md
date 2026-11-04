@@ -35,6 +35,19 @@ Two more rules limit the harm if the first one ever fails. The memory block of t
 
 The table backs the rules where it can. `status` defaults to `candidate`, so an insert that says nothing about trust cannot reach a prompt. `kind`, `status` and `source` accept only the values of plan section 3.5, and a unit test compares those lists with the `Literal` types of `MemoryItem` in the contracts.
 
+### The store
+
+`PgMemoryStore` (`longhaul.memory.store`, LH-603) is the one place that writes the table, and it keeps the rules above in code.
+
+- `add_candidate` writes a `candidate` and refuses an item that says it is approved. A task has no other way in.
+- `add_verified` is how Longhaul approves its own findings. It accepts only a repo map or a command of the default branch, and writes the item as `approved` with `approved_by = default_branch` and the sha it was checked at as `source_ref`.
+- `promote` and `reject` need a name and fail on an unknown id. `promote` sets `approved_by` every time, so the last person to approve is on the row. `reject` clears it: a rejected item has no approver, and the table has no column for who rejected, so that name goes to the log.
+- `search` returns approved items unless it is asked for the others, and adds one to `uses` and sets `last_used_at` for every item it returns.
+
+**One note, one row.** The same note is stored once for a repo and kind. Migration 0008 adds `content_hash`, the sha256 of the content in lower case with every run of whitespace turned into one space, and a unique index on `(repo, kind, content_hash)`. The plan's table has no such column. An add that finds the note returns the id of the first one and changes nothing, whatever its status, so a task cannot bring back a note that a person rejected. The column is nullable: a row that something other than the store wrote has no hash, and NULLs do not collide in a unique index.
+
+**Verified commands.** `prepare_workspace` finds the commands that run a repo's tests, so the agent does not guess (`longhaul.memory.commands`). It reads the pytest config in `pyproject.toml`, `tox.ini`, the `test` and `lint` targets of a Makefile, and the lines of CI steps that run pytest, ruff or tox. It runs each candidate once at the base commit, in the sandbox, after the setup and with the network cut, and keeps the ones that printed a summary of a pytest, ruff or tox run. Failing tests still count, because the issue may be a failing test. A run that found no tests, a missing target, a missing tool and a timeout do not. Each kept command becomes an approved item of kind `command` and source `default_branch`, with the base sha as `source_ref`. A failure of this step is logged and does not stop the task.
+
 ### Embeddings
 
 A vector has 384 numbers and unit length, and vectors are compared by cosine distance. For unit vectors that distance is one minus the dot product. Two embedders make them, both in `longhaul.memory.embedder`.
@@ -69,8 +82,8 @@ The column is `vector(384)`, with an HNSW index on `vector_cosine_ops`, which ma
 
 **To watch**
 
-- **Filters run after the index scan.** pgvector reads the `hnsw.ef_search` nearest rows (40 by default) through the index and applies `WHERE repo = ... AND status = 'approved'` to them afterwards. Measured on pgvector 0.8.0 with the index forced on: 200 rows of one repo lay next to the query and 5 rows of another repo lay far away. A query for the second repo returned 0 rows, and 5 with `hnsw.iterative_scan = relaxed_order`. On a table this small the planner reads the whole table and returns the right rows, so the problem appears with scale. LH-604 sets the iterative scan for its query, or checks the plan.
-- **`approved_by` can be empty.** The plan marks it nullable, so the database does not force an approver onto an approved row. The store (LH-603) should set it on every promotion.
+- **Filters run after the index scan.** pgvector reads the `hnsw.ef_search` nearest rows (40 by default) through the index and applies `WHERE repo = ... AND status = 'approved'` to them afterwards. Measured on pgvector 0.8.0 with the index forced on: 200 rows of one repo lay next to the query and 5 rows of another repo lay far away. A query for the second repo returned 0 rows, and 5 with `hnsw.iterative_scan = relaxed_order`. On a table this small the planner reads the whole table, or finds the rows of one repo through the unique index of migration 0008, and returns the right rows, so the problem appears with scale. `PgMemoryStore.search` (LH-603) sets `hnsw.iterative_scan = strict_order` in its transaction, so LH-604 gets it by calling `search`. It uses `strict_order` and not `relaxed_order` because the latter can return a farther row before a nearer one, and a top-k query would then cut at the wrong row. `tests/integration/test_memory_store.py` builds the case (300 candidates nearer than 6 approved notes, with the unique index dropped from the throwaway database so that the planner has to use HNSW) and checks that the plain query loses rows and the store does not.
+- **`approved_by` can be empty.** The plan marks it nullable, so the database does not force an approver onto an approved row. The store sets it on every promotion and on every verified add, and `promote` refuses a blank name. A row that something else wrote can still have none.
 - **The model file is not pinned.** `uv.lock` pins fastembed, but fastembed fetches the current revision of the model repository on Hugging Face. If the file is replaced there, new vectors drift from the stored ones. Baking the file into the worker image pins it.
 
 ## Alternatives

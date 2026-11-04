@@ -6,6 +6,9 @@ on:
   push:
     branches: [dev, main, "feat/**", "fix/**", "spike/**", "chore/**"]
   workflow_dispatch:
+  # Once a day on the default branch, for the chaos-lite job. The jobs above run as well.
+  schedule:
+    - cron: "17 3 * * *"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -271,6 +274,115 @@ jobs:
         run: >-
           uv run pytest -q
           -m "e2e and not live and not slow and not (chaos and not chaos_lite)"
+      - name: Show Temporal log on failure
+        if: failure()
+        run: docker logs temporal || true
+
+  # The short chaos run (tests/chaos): five runs of the scripted inventory fix, each with the
+  # worker killed once, and a check that every run ends with the diff of an unkilled one. It
+  # needs the services of the integration job and the network for the sandbox setup, and it takes
+  # many minutes, so it runs on the nightly schedule and by hand and not on pushes. The `ci` job
+  # does not wait for it: a job that did not run is "skipped", which `ci` would count as a
+  # failure (tests/unit/test_ci_config.py keeps the two apart).
+  chaos-lite:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        env:
+          MINIO_ROOT_USER: longhaul
+          MINIO_ROOT_PASSWORD: longhaul-secret
+          MINIO_DEFAULT_BUCKETS: longhaul
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LONGHAUL_DATABASE_URL: postgresql://longhaul:longhaul@localhost:5432/longhaul
+      LONGHAUL_TEMPORAL_ADDRESS: localhost:7233
+      LONGHAUL_BLOB_ENDPOINT: http://localhost:9000
+      LONGHAUL_BLOB_BUCKET: longhaul
+      LONGHAUL_BLOB_ACCESS_KEY: longhaul
+      LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      # The image docker-compose.yml uses (ADR-0002), pinned by digest. A tag can be moved to
+      # other content and a digest cannot, so CI and `make up` run the same server.
+      - name: Start Temporal dev server
+        env:
+          TEMPORAL_IMAGE: temporalio/temporal:1.5.1@sha256:597a5dbbcc6e7716b326dde4a51622d5ea0879eb0cf06ff8a94381361d0a987d
+        run: |
+          docker run -d --name temporal -p 7233:7233 "$TEMPORAL_IMAGE" \
+            server start-dev --ip 0.0.0.0 --headless
+          for _ in $(seq 1 60); do
+            if docker exec temporal temporal operator cluster health \
+              --address localhost:7233 > /dev/null 2>&1; then
+              echo "temporal is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not start within 60s" >&2
+          docker logs temporal >&2
+          exit 1
+      - name: Ensure the blob bucket exists
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+
+          import boto3
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=os.environ["LONGHAUL_BLOB_ENDPOINT"],
+              aws_access_key_id=os.environ["LONGHAUL_BLOB_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["LONGHAUL_BLOB_SECRET_KEY"],
+              region_name="us-east-1",
+          )
+          bucket = os.environ["LONGHAUL_BLOB_BUCKET"]
+          for _ in range(30):
+              try:
+                  names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+                  if bucket not in names:
+                      s3.create_bucket(Bucket=bucket)
+                  print("bucket ready")
+                  break
+              except (BotoCoreError, ClientError) as exc:
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("minio bucket was not ready in time")
+          PY
+      - name: Build sandbox image
+        run: make sandbox-image
+      # The full chaos suite (20 runs) is opt-in and runs on the owner's machine in Phase 9.
+      - name: Run the short chaos tests
+        run: uv run pytest -q -m "chaos_lite"
       - name: Show Temporal log on failure
         if: failure()
         run: docker logs temporal || true

@@ -180,6 +180,17 @@ Ctrl-C ends `run` and leaves the task running. `longhaul status <id>` shows it a
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.
 
+### What the worker logs
+
+The worker logs one line when an activity starts and one when it ends or fails:
+
+```
+INFO longhaul.durable.activity_log: activity tool_exec started: task lh-local-inventory-1a2b3c4d, attempt 1, turn 8, run_command
+INFO longhaul.durable.activity_log: activity tool_exec ended: task lh-local-inventory-1a2b3c4d, attempt 1, turn 8, run_command
+```
+
+A line names the activity, the task, the Temporal attempt and, for `llm_turn` and `tool_exec`, the turn and the tool. It never holds arguments or output, which can hold code and secrets. After a SIGKILL these lines are all the worker leaves behind. A `started` line with no `ended` after it is the activity that was cut off. An `ended` line as the last one means the worker was between two activities. A line with `attempt 2` or higher is a retry. The chaos tests read these lines to say where each kill landed.
+
 ### The worker in Docker
 
 The compose service `worker` is optional. It is in the profile `full`, so `make up` does not start it:
@@ -227,6 +238,72 @@ What the poller does and does not do:
 - A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. Nothing pushes the branch or opens a pull request until LH-306 adds the delivery, so a finished task leaves no change on GitHub yet.
 - To change the label or the interval, edit the config, restart the worker, and run `longhaul poller install` again for the interval.
 
+## Kill the worker on purpose
+
+A task has to survive a worker that dies at any moment. Two things check it.
+
+**By hand.** `scripts/chaos_kill.sh [SECONDS]` runs the inventory fix with a worker, waits for the first model turn plus SECONDS (default 3), sends SIGKILL to that worker, starts another and waits for the task to finish. It then looks for containers of its own task and prints `no leftovers`. It needs `make up`, `make sandbox-image` and `make migrate`. The scripted provider plays the task, so no key is needed. The script uses a task queue of its own, kills only the pid it started, and removes nothing else, so it is safe on a shared machine. With the default timeouts Temporal notices the dead worker after the heartbeat timeout of the activity that was running (15 to 60 seconds), so the run pauses for that long. The Temporal UI shows the retried activity.
+
+**By test.** `tests/chaos/test_kill_worker.py` starts `longhaul worker` as a process, starts a task, sends SIGKILL to the worker, starts it again, and checks what the run left behind:
+
+- the run ended with `finish`;
+- its final diff equals the diff of a run that was never killed, played from the same script;
+- its `tool_calls` rows form one line of checkpoints, from the first `pre_sha` to the last `post_sha`, and the commits in the checkpoint repo are exactly those (no killed attempt left a fork). A call that was retried has one row, the one of its last attempt.
+
+The task is `tests/fixtures/scripts/inventory_fix.yaml`: eleven turns, with reads, edits, a command and a test run. Two of its steps exist for the test. Turn 3 waits 3 seconds before it answers (`delay_s`), as a slow model does, so a kill can land inside a model call. Turn 8 is a command that is not safe to run twice: it appends a line to `CHANGES.txt` and then sleeps.
+
+| Marker | Runs | Kills per run | Model | Where it runs |
+|---|---|---|---|---|
+| `chaos_lite` | 5 | 1 | scripted | `make gate`, and the `chaos-lite` CI job at night and by hand |
+| `chaos` without `chaos_lite` | 20 | 1 to 3 | replay | on request, in Phase 9 |
+
+```bash
+uv run pytest -m chaos_lite                    # 6 to 9 minutes
+uv run pytest -m "chaos and not chaos_lite"    # the full suite, about 25 minutes
+```
+
+Both need `make up` and `make sandbox-image`, and the sandbox setup installs pytest from PyPI. They run on a private task queue with a scratch database, a checkpoint folder and task ids of their own, and remove what they made. If a run is killed, a `longhaul_chaos_*` database, containers labelled `longhaul.task_id=lh-local-inventory-*` and their `lh-ws-*` volumes can stay behind. They are safe to remove.
+
+Each run starts its task with a heartbeat timeout of 5 seconds (`acts.Tuning`), so a dead activity is retried in seconds and not after the 15 to 60 seconds of the plan. Activities that have no heartbeat timeout, such as `append_results`, are retried only when their start-to-close timeout of 2 minutes passes.
+
+**Where the kills land.** The five `chaos_lite` runs are:
+
+| Test | The kill |
+|---|---|
+| `test_kill_during_tool_exec_resumes` | inside the command of turn 8, after it wrote its line and before the call ended |
+| `test_kill_during_llm_turn_resumes` | one second into the wait of turn 3 |
+| `test_kill_between_activities` | right after the first `edit_file` call ended |
+| `test_a_kill_at_a_random_moment_resumes` (two seeds) | at a seeded random delay between 0.5 seconds and 85 percent of the duration of a run that was not killed, counted from the first model turn |
+
+Each of the first three asserts the kill point from the last activity line in the worker's log, so a kill that misses its aim fails the test and does not pass for the wrong reason. The full suite draws 1 to 3 kills for each of 20 seeds. Its later kills wait until the new worker has finished an activity, so they fall in new work and not in the retry of the activity that was killed (an activity gives up after three attempts). It also hands the run over to a new one every four turns (Continue-As-New), so the kills also fall in the hand-over.
+
+**The mutation check.** The test must fail when the recovery code is gone. To see it, comment out `await self._checkpoints.restore(sandbox, pre_sha)` in `ToolActivities._start_from` (`src/longhaul/durable/activities/tools.py`) and run `uv run pytest tests/chaos/test_kill_worker.py::test_kill_during_tool_exec_resumes`. The retried command appends its line to the half done tree of the first attempt, `CHANGES.txt` ends up with the line twice, and the test fails on the diff. Put the line back afterwards. The result of this check belongs in the gate report.
+
+## Record and replay model calls
+
+The full chaos suite must not depend on what a model says, so it plays a recording. A recording is a folder with one JSON file per model call: the request, the reply, and the turn. Two settings control it:
+
+| Setting | Meaning |
+|---|---|
+| `LONGHAUL_PROVIDER=replay` | The provider plays the folder in `LONGHAUL_RECORDINGS_DIR`. |
+| `LONGHAUL_RECORD=1` | The provider named by `LONGHAUL_PROVIDER` is wrapped, and every call it makes is saved into `LONGHAUL_RECORDINGS_DIR`. Not with `replay`. |
+
+Both work for `longhaul worker` and for `longhaul run-local`, which reads the provider from `LONGHAUL_PROVIDER` when you give no `--provider`. A worker that records needs a provider of its own, so a scripted worker needs `LONGHAUL_SCRIPT` (tasks that bring a script are not recorded).
+
+**Matching.** A call is found by its turn and the SHA-256 of its request: the model, the system prompt, the messages, the tools and `max_tokens`, as JSON with sorted keys. When no recording has that hash, the provider plays the first recording of the same turn and logs a warning with the hash (risk R6 in the plan). That happens when a prompt or a tool description changed after the recording, and also for any turn that follows a `run_tests` call, because its output holds the seconds the tests took. A turn with no recording at all is an error that is not retried. Record again when the warnings are many.
+
+**Recording a real run (manual, Phase 9).** The recording of the inventory fix with a real model is made once, by hand, because it needs a key and costs money:
+
+```bash
+rm -f eval/chaos/recordings/inventory/*.json
+LONGHAUL_RECORD=1 LONGHAUL_RECORDINGS_DIR=eval/chaos/recordings/inventory \
+  uv run longhaul run-local --provider anthropic \
+  --path tests/fixtures/repos/inventory \
+  --issue-file tests/fixtures/repos/inventory/ISSUE.md
+```
+
+Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The full chaos suite plays this folder when it holds recordings. Until then it records a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and plays that.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -238,13 +315,14 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below) |
 | `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
+| `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
 | `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 
-The required check is `ci`. Branch protection points at that one name, so a new job must be added to the `needs` list of `ci`. `tests/unit/test_ci_config.py` fails if any job is missing from that list.
+The required check is `ci`. Branch protection points at that one name, so a new job must be added to the `needs` list of `ci`. `tests/unit/test_ci_config.py` fails if any job is missing from that list. The one exception is a job that only a schedule or a manual run starts, such as `chaos-lite`: a job that did not run is "skipped", and `ci` counts that as a failure, so `ci` does not wait for it. The test holds such a job to an `if` that lets through `schedule` and `workflow_dispatch` only. A failed nightly run shows on the workflow run and not on a pull request.
 
 The Temporal server in the `integration` job is the image that `docker-compose.yml` uses (`temporalio/temporal:1.5.1`, see ADR-0002), so CI and `make up` run the same server. CI also pins it by digest, because a tag can be moved to other content. When the version in the compose file changes, change the tag and the digest in `ci.yml` too. To find the digest of a new tag, run `docker pull temporalio/temporal:<tag>` and read it from `docker image ls --digests temporalio/temporal`. `tests/unit/test_ci_config.py` fails if the tags differ or the digest is missing.
 

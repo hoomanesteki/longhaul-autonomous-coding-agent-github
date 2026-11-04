@@ -440,6 +440,7 @@ def test_environment_wins_over_dotenv(isolated_cwd: Path, monkeypatch: pytest.Mo
         ("LONGHAUL_GITHUB_APP_KEY_PATH", "github_app_key_path"),
         ("LONGHAUL_ADMIN_TOKEN", "admin_token"),
         ("LONGHAUL_SCRIPT", "script"),
+        ("LONGHAUL_RECORDINGS_DIR", "recordings_dir"),
         ("ANTHROPIC_API_KEY", "anthropic_api_key"),
         ("OPENAI_API_KEY", "openai_api_key"),
         ("OPENAI_BASE_URL", "openai_base_url"),
@@ -460,6 +461,28 @@ def test_env_example_config_path_exists_and_matches_default() -> None:
 
     assert (ROOT / configured).is_file()
     assert configured == EnvSettings.model_fields["config"].default
+
+
+def test_recording_settings_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_RECORDINGS_DIR", raising=False)
+    monkeypatch.delenv("LONGHAUL_RECORD", raising=False)
+    settings = EnvSettings()
+    assert settings.recordings_dir is None
+    assert settings.record is False
+
+
+def test_recording_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_RECORDINGS_DIR", "eval/chaos/recordings/inventory")
+    monkeypatch.setenv("LONGHAUL_RECORD", "true")
+    settings = EnvSettings()
+    assert settings.recordings_dir == Path("eval/chaos/recordings/inventory")
+    assert settings.record is True
+
+
+def test_a_blank_record_variable_means_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A copied .env.example has the variable blank, and a blank must not turn recording on.
+    monkeypatch.setenv("LONGHAUL_RECORD", "")
+    assert EnvSettings().record is False
 
 
 def test_script_setting_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:

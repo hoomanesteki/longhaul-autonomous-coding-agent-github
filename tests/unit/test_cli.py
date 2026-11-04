@@ -478,18 +478,19 @@ def test_anthropic_without_a_key_exits_2_before_docker(
     assert "ANTHROPIC_API_KEY" in result.stderr
 
 
-def test_a_provider_that_is_not_built_yet_exits_2_before_docker(
+def test_replay_without_a_recordings_folder_exits_2_before_docker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def no_docker() -> Any:
         raise AssertionError("docker was touched")
 
     monkeypatch.setattr(cli, "make_manager", no_docker)
-    monkeypatch.setenv("LONGHAUL_PROVIDER", "replay")  # a known name that has no provider yet
+    monkeypatch.setenv("LONGHAUL_PROVIDER", "replay")
+    monkeypatch.delenv("LONGHAUL_RECORDINGS_DIR", raising=False)
     args = ["run-local", "--path", str(CALC), "--issue-file", str(CALC / "ISSUE.md")]
     result = invoke(args)
     assert result.exit_code == 2
-    assert "not implemented yet" in result.stderr
+    assert "LONGHAUL_RECORDINGS_DIR" in result.stderr
 
 
 def test_a_missing_config_exits_2_and_says_where_to_set_it(

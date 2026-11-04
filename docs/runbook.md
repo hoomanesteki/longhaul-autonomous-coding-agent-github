@@ -99,8 +99,11 @@ The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model n
 
 ```bash
 make up && make sandbox-image && make migrate
-uv run longhaul worker                  # shell 1: stays in the foreground
-uv run longhaul run \                   # shell 2
+# shell 1: the worker stays in the foreground
+uv run longhaul worker
+
+# shell 2: start a task and follow it
+uv run longhaul run \
   --path tests/fixtures/repos/calc \
   --issue-file tests/fixtures/repos/calc/ISSUE.md \
   --provider scripted --script tests/fixtures/scripts/calc_fix.yaml

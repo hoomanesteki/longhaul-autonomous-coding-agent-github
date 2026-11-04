@@ -15,9 +15,10 @@ Scope. A handle resolves inside the task of the ToolContext it is used in. Anoth
 handle is unknown, and a handle with slashes or dots in it is cleaned into a name inside the
 task's own prefix, so it cannot reach another key.
 
-No sandbox. read_output reads the blob store, never the sandbox. The text of an old call
-cannot change because the agent edited a file since, and the call still works when the sandbox
-is being recreated.
+No sandbox. read_output reads the blob store, never the sandbox, so the text of an old call
+cannot change because the agent edited a file since. That is all it promises: in the durable
+path tool_exec looks the sandbox up before it runs any tool, so a sandbox that is gone fails this
+call with SANDBOX_GONE like every other one, and the workflow recreates it first.
 
 Paging and filtering. A page is at most MAX_LINES lines and also fits the ToolContext's token
 cap, because a page that was over the cap would itself be cut and get a new handle. When a page

@@ -30,7 +30,7 @@ The design, contracts and story plan are in [docs/plan/longhaul-build-plan.md](d
 | Shared contracts (v2) | Messages, blocks, stop reasons, call options, task and plan models |
 | Providers | Scripted (for CI), Anthropic (thinking stripped at ingestion, see ADR-0003), OpenAI-compatible |
 | Sandbox | Hardened Docker container per task, streamed and bounded command output, background processes cleaned up after every command |
-| Tools | `list_dir`, `read_file`, `search`, `edit_file`, `write_file`, `run_command`, `run_tests`, `git_diff`, `finish` |
+| Tools | `list_dir`, `read_file`, `search`, `edit_file`, `write_file`, `run_command`, `run_tests`, `git_diff`, `read_output`, `finish` |
 | Agent loop | In-process loop with explicit rules for refusals, output limits, context limits and tool pairing |
 | CLI | `longhaul run-local` runs the agent on a local folder |
 

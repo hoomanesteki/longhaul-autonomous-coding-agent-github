@@ -151,9 +151,12 @@ class ToolActivities:
     `checkpoints` has no default on purpose: a worker that forgot it would run every call on
     whatever the last attempt left, and nothing would say so.
 
-    `registry` should be built with the same blob store as `blobs` (default_registry(blobs=...)).
+    `registry` has to be built on the same blob store as `blobs` (default_registry(blobs=...)).
     The activities write the full text of every output there, and read_output, which belongs to
-    the registry, reads it from its own store. With two different stores no handle resolves.
+    the registry, reads it from its own store. With two different stores no handle resolves, and
+    the model, which is told not to run the command again, could never read the middle of a long
+    output. A registry that is on another store is refused here, when the worker starts, and not
+    left to fail on every handle.
     """
 
     def __init__(
@@ -166,6 +169,11 @@ class ToolActivities:
         checkpoints: WorkspaceCheckpoints,
         tool_output_max_tokens: int = 4000,
     ) -> None:
+        if registry.blobs is not blobs:
+            raise ValueError(
+                "the tool registry reads output handles from a different blob store than the "
+                "tool activities write to; build it with default_registry(blobs=<that store>)"
+            )
         self._registry = registry
         self._sandboxes = sandboxes
         self._blobs = blobs

@@ -588,10 +588,12 @@ class DiesOnce:
     async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
         return await self.store.init_task(task_id, clone_url, base_sha)
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         if self.where == "before" and not self.died:
             await self._die(sandbox)
-        sha = await self.store.commit(sandbox, message)
+        sha = await self.store.commit(sandbox, message, parent=parent)
         if self.where == "after" and not self.died:
             await self._die(sandbox)
         return sha

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from docker.errors import DockerException
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -487,6 +488,43 @@ def test_a_sandbox_that_cannot_be_removed_is_a_warning_and_not_a_failure(
     stack.manager.error = OSError("docker went away")
     result = invoke(run_args())
     assert result.exit_code == 0
+    assert "could not remove the sandbox" in result.stderr
+
+
+def test_docker_that_cannot_be_reached_for_the_cleanup_is_a_warning_and_not_a_failure(
+    stack_for: Callable[..., Stack], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Building the manager connects to the daemon, so the failure comes before cleanup_task.
+    stack = stack_for(happy())
+
+    def unreachable() -> Any:
+        raise DockerException("Error while fetching server API version: connection refused")
+
+    monkeypatch.setattr(cli, "make_manager", unreachable)
+    result = invoke(run_args())
+
+    assert result.exit_code == 0, result.output
+    assert DIFF_MARKER in result.stdout
+    assert "could not remove the sandbox" in result.stderr
+    assert "Error while fetching server API version" in result.stderr
+    assert stack.manager.cleaned == []
+
+
+def test_docker_that_cannot_be_reached_after_a_failed_workflow_keeps_the_cause(
+    stack_for: Callable[..., Stack], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stack_for(
+        FakeHandle([status(Phase.CODING, 2)], outcome=failed_run("no checkpoint to return to"))
+    )
+
+    def unreachable() -> Any:
+        raise DockerException("Error while fetching server API version: connection refused")
+
+    monkeypatch.setattr(cli, "make_manager", unreachable)
+    result = invoke(run_args())
+
+    assert result.exit_code == 2
+    assert "no checkpoint to return to" in result.stderr
     assert "could not remove the sandbox" in result.stderr
 
 

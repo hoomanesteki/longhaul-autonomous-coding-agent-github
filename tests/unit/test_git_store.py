@@ -46,6 +46,10 @@ TASK = "lh-acme-calc-42"
 BRANCH = "longhaul/42"
 MODULE = "src/calc/__init__.py"
 FIXED = "def add(a: int, b: int) -> int:\n    return a + b\n"
+# The third line after the changed one is empty, so the hunk of the patch ends on a context
+# line that holds a single space. Text that is stripped loses it.
+BLANK_TAIL_BEFORE = "def f():\n    x = 1\n    y = 2\n    return x + y\n\ndef g():\n    return 0\n"
+BLANK_TAIL_AFTER = BLANK_TAIL_BEFORE.replace("x = 1", "x = 10")
 
 _spec = importlib.util.spec_from_file_location(
     "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
@@ -56,11 +60,15 @@ _spec.loader.exec_module(_module)
 make_fixture_git = _module.make_fixture_git
 
 
+def host_env() -> dict[str, str]:
+    """The environment without GIT_* variables, which a running hook exports."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def git(*args: str) -> str:
     """Git on the host with no GIT_* variables from a running hook."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     result = subprocess.run(
-        ["git", *args], check=True, capture_output=True, text=True, env=env, timeout=60
+        ["git", *args], check=True, capture_output=True, text=True, env=host_env(), timeout=60
     )
     return result.stdout.strip()
 
@@ -1053,6 +1061,39 @@ async def test_diff_is_the_patch_from_the_base_tag_to_a_checkpoint(
     assert "-    return a - b" in patch and "+    return a + b" in patch
     assert patch.endswith("\n")
     assert patch.rstrip("\n") == env.bare("diff", "--no-color", env.base_sha, head)
+
+
+async def test_diff_keeps_the_blank_context_line_a_hunk_ends_on(tmp_path: Path) -> None:
+    folder = tmp_path / "blank-tail"
+    folder.mkdir()
+    (folder / "m.py").write_text(BLANK_TAIL_BEFORE, encoding="utf-8")
+    source = make_fixture_git(folder, tmp_path / "blank-tail-repo")
+    base_sha = git("-C", str(source), "rev-parse", "HEAD")
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "blank-root")
+    await store.init_task(TASK, str(source), base_sha)
+    store.mount_point = str(store.repo_path(TASK))
+    box = FakeSandbox()
+    try:
+        await store.attach(box, TASK)
+        await box.write_file("m.py", BLANK_TAIL_AFTER.encode())
+        head = await store.commit(box, "lh: edit_file turn 1 call c1")
+    finally:
+        await box.destroy()
+    assert head is not None
+
+    patch = await store.diff(TASK, head)
+
+    raw = subprocess.run(
+        ["git", f"--git-dir={store.repo_path(TASK)}", "diff", "--no-color", base_sha, head],
+        check=True, capture_output=True, text=True, timeout=60, env=host_env(),
+    ).stdout  # fmt: skip
+    assert raw.endswith("     return x + y\n \n"), "the probe must end on a blank context line"
+    assert patch == raw
+    # The patch has to apply to the base it was made against.
+    target = shutil.copytree(source, tmp_path / "target", ignore=shutil.ignore_patterns(".git"))
+    git("-C", str(target), "init", "-q", "--template=")
+    (target / "p.patch").write_text(patch, encoding="utf-8")
+    git("-C", str(target), "apply", "--check", "p.patch")
 
 
 async def test_diff_of_the_base_commit_is_empty(env: Env) -> None:

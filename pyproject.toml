@@ -70,11 +70,19 @@ extend-exclude = ["docs"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 
+[tool.ruff.lint.isort]
+# The eval package sits at the repo root. Listing "." in `src` would also make the docker/
+# folder of Dockerfiles shadow the docker SDK.
+known-first-party = ["eval"]
+
 [tool.mypy]
 python_version = "3.12"
 mypy_path = "src"
 packages = ["longhaul"]
 warn_unused_configs = true
+# eval/custom holds the repos the agent works on and the tests that grade them. They are task
+# content with their own imports, not code of this project.
+exclude = ["^eval/custom/"]
 # Part of --strict, but mypy accepts it only as a global setting, never in an override.
 warn_redundant_casts = true
 
@@ -115,7 +123,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["src"]
+# The repo root is on the path so that tests can import the eval package.
+pythonpath = ["src", "."]
 # importlib mode gives each test file a name from its path, so tests/unit/test_x.py and
 # tests/integration/test_x.py can both exist. The default mode names them by basename.
 addopts = "--strict-markers --import-mode=importlib"

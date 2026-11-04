@@ -1,0 +1,30 @@
+# Fixes eval task calc-01: add() subtracts instead of adding.
+# The same shape as calc_fix.yaml. The first four steps run by turn index, and the last one
+# also waits for a passing run of the whole calc suite ("4 passed"), so a broken edit ends with
+# a no-match error and not with a finish call that claims the tests pass.
+steps:
+  - respond:
+      text: "Looking at the repo layout."
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: src/calc/__init__.py}}
+  - respond:
+      text: "add() subtracts. Replacing the line."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/calc/__init__.py
+            old_str: "    return a - b"
+            new_str: "    return a + b"
+  - respond:
+      tool_calls:
+        - {name: run_tests, input: {}}
+  - match:
+      turn_index: 4
+      last_tool_result_contains: "4 passed"
+    respond:
+      tool_calls:
+        - name: finish
+          input: {summary: "Changed add() to return a + b. All tests pass."}

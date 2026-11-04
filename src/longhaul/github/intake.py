@@ -31,6 +31,9 @@ What goes into the spec, and why:
   text on TaskSpec, which is a contracts change and is listed in docs/architecture.md under
   deferred contract changes. Until then the full text stays on the issue.
 * Older comments go first, because a later comment usually corrects an earlier one.
+* `longhaul run --issue-file` cuts the body of its file with the same function and the same
+  limit (`clip_text`, MAX_BODY_BYTES), so a local task and a GitHub task obey one rule. Only the
+  note differs, because the rest of a file is not on a GitHub issue (FILE_CUT_NOTE).
 
 Task ids. `lh-<owner>-<repo>-<n>` in lowercase, where every run of characters other than
 a-z and 0-9 becomes one dash, so `Acme/My.Repo_v2` issue 7 is `lh-acme-my-repo-v2-7`. Two
@@ -54,11 +57,13 @@ from longhaul.settings import AppConfig, RepoEntry
 
 __all__ = [
     "CUT_NOTE",
+    "FILE_CUT_NOTE",
     "LOCAL_PREFIX",
     "MAX_BODY_BYTES",
     "MAX_COMMENTS_BYTES",
     "WRITE_PERMISSIONS",
     "allowlisted_entry",
+    "clip_text",
     "is_allowlisted",
     "is_local",
     "issue_to_spec",
@@ -87,6 +92,8 @@ MAX_BODY_BYTES = 8_000
 MAX_COMMENTS_BYTES = 6_000
 # Added after the kept text, so it is not part of the limit.
 CUT_NOTE = "\n\n[cut here: the rest is on the GitHub issue]"
+# The same for a body that came from a local issue file (cli.read_issue).
+FILE_CUT_NOTE = "\n\n[cut here: the rest is in the issue file]"
 
 _NAME_PART = re.compile(r"[A-Za-z0-9._-]+")
 _HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
@@ -270,13 +277,13 @@ def _text(value: str | None) -> str:
     return value.replace("\x00", "").encode("utf-8", "replace").decode("utf-8")
 
 
-def _clip(text: str, limit: int) -> str:
-    """At most `limit` bytes of `text`, cut on a character boundary, then CUT_NOTE."""
+def clip_text(text: str, limit: int, note: str = CUT_NOTE) -> str:
+    """At most `limit` bytes of `text`, cut on a character boundary, then `note`."""
     raw = text.encode("utf-8")
     if len(raw) <= limit:
         return text
     # "ignore" drops the half of a character that the cut may have left at the end.
-    return raw[:limit].decode("utf-8", "ignore") + CUT_NOTE
+    return raw[:limit].decode("utf-8", "ignore") + note
 
 
 def _level(answer: object) -> str | None:
@@ -325,7 +332,7 @@ def _fit_comments(texts: Sequence[str], limit: int) -> list[str]:
     for text in reversed(texts):
         if room <= 0:
             break
-        kept.append(_clip(text, room))
+        kept.append(clip_text(text, room))
         room -= len(text.encode("utf-8"))
     kept.reverse()
     left_out = len(texts) - len(kept)
@@ -388,7 +395,7 @@ def issue_to_spec(
         repo=repo_settings.repo,
         issue_number=number,
         title=title,
-        body=_clip(body, MAX_BODY_BYTES),
+        body=clip_text(body, MAX_BODY_BYTES),
         comments=_fit_comments(_steering_comments(comments, permissions), MAX_COMMENTS_BYTES),
         settings=_contract_settings(repo_settings),
     )

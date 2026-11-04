@@ -26,6 +26,10 @@ tool calls, a refusal, a failing setup, a provider error, a missing Docker or im
 was interrupted. Bad options exit 2 as well, which is what Typer does for usage errors. An
 unexpected exception is a bug in longhaul and exits 1 with its traceback.
 
+The body of an issue file is cut to the limit of a GitHub issue, by the function that intake.py
+cuts a GitHub body with. The command says so on stderr, and the model sees a note after the kept
+text.
+
 `run-local` removes the sandbox at the end, together with its volume, whatever happened: a
 finish, an error, a bug, Ctrl-C, SIGTERM or SIGHUP. Only SIGKILL and a crash of the machine
 leave one behind. Its container and volume carry the task id, which the header line prints.
@@ -95,6 +99,7 @@ from longhaul.db.session import database_url, make_engine
 from longhaul.durable import acts, schedule
 from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
 from longhaul.durable.scripts import upload_script
+from longhaul.github.intake import FILE_CUT_NOTE, MAX_BODY_BYTES, clip_text
 from longhaul.memory.embedder import LocalEmbedder
 from longhaul.memory.store import KINDS, STATUSES, MemoryEntry, PgMemoryStore
 from longhaul.providers.base import get_provider
@@ -922,14 +927,28 @@ def split_issue(text: str) -> tuple[str, str]:
 
 
 def read_issue(path: Path) -> tuple[str, str]:
+    """The title and the body of an issue file, with the body cut to the limit of a GitHub issue.
+
+    The body goes into the spec of the task, and the spec is part of the carry state and the
+    input of several activities. A 300 KB file would put 300 KB into each of them, so a local
+    task is held to the limit that intake.py sets for a GitHub one.
+    """
     try:
         text = path.read_text(encoding="utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"cannot read {path}: it is not UTF-8 text ({exc.reason})") from exc
     try:
-        return split_issue(text)
+        title, body = split_issue(text)
     except ValueError as exc:
         raise ValueError(f"{path}: {exc}") from exc
+    kept = clip_text(body, MAX_BODY_BYTES, FILE_CUT_NOTE)
+    if kept != body:
+        typer.echo(
+            f"note: the body of {path} is {len(body.encode())} bytes, so the task keeps the "
+            f"first {MAX_BODY_BYTES}",
+            err=True,
+        )
+    return title, kept
 
 
 def new_task_id(path: Path) -> str:

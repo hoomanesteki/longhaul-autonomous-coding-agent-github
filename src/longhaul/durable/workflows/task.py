@@ -197,7 +197,7 @@ def _ended_by(err: ActivityError) -> Outcome | None:
     return rules.provider_error_outcome(kind)
 
 
-@workflow.defn(name="TaskWorkflow")
+@workflow.defn(name="TaskWorkflow", failure_exception_types=acts.FAIL_THE_WORKFLOW)
 class TaskWorkflow:
     # @workflow.init runs before any signal handler, also for a signal that arrives in the
     # same first workflow task as the start. Building the state in run() lost most of the
@@ -339,6 +339,11 @@ class TaskWorkflow:
         # A cancel that came in during the awaits above must not be lost with this run. It is
         # acted on here. No await follows, so none can arrive between this look and the call.
         self._stop_if_cancelled()
+        # The SDK converts the state of a hand-over after this code has let go of it, and an
+        # error there does not end the run: the workflow stays open and does nothing. Converting
+        # it here raises the guard's error where FAIL_THE_WORKFLOW ends the run with it
+        # (ADR-0005). A signal can add to the hints, so the look has to be this late.
+        workflow.payload_converter().to_payload(state)
         workflow.continue_as_new(state)
 
     async def _bundle(self) -> str | None:

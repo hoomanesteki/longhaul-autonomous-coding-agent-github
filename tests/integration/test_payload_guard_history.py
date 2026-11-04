@@ -13,9 +13,10 @@ converter of `durable.client.connect`.
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
-from datetime import timedelta
+from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from temporalio import activity, workflow
@@ -29,11 +30,21 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from tests.fakes.history import payload_sizes
 
 from longhaul import cli
-from longhaul.contracts import Budgets, RepoSettings, TaskSpec
+from longhaul.contracts import (
+    BlobRef,
+    Budgets,
+    CarryState,
+    Phase,
+    RepoSettings,
+    Role,
+    TaskSpec,
+    ToolResult,
+    Usage,
+)
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
-from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError
+from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, json_size
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.intake import MAX_BODY_BYTES
@@ -71,8 +82,31 @@ def make_spec(body: str = "`calc.add` subtracts its arguments instead of adding 
     )
 
 
+def ref(name: str) -> BlobRef:
+    return BlobRef(key=f"tasks/lh-acme-calc-42/{name}", sha256="0" * 64, size=1)
+
+
 class Stubs:
-    """The activities a task needs before its first model call. The model call itself stops."""
+    """The activities a task needs. The model call either stops the run or asks for one tool.
+
+    With `model_stops` the run ends at the first model call, which is as far as the tests of an
+    input need. Without it the model asks for `read_file` and never finishes, so the run goes on
+    to a hand-over.
+    """
+
+    def __init__(self, *, model_stops: bool = True) -> None:
+        self.model_stops = model_stops
+
+    @property
+    def activities(self) -> list[Callable[..., Any]]:
+        return [
+            self.prepare_workspace,
+            self.llm_turn,
+            self.tool_exec,
+            self.append_results,
+            self.bundle_checkpoint,
+            self.record_event,
+        ]
 
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
@@ -80,16 +114,41 @@ class Stubs:
 
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
-        raise ApplicationError("the stand-in model stops here", non_retryable=True)
+        if self.model_stops:
+            raise ApplicationError("the stand-in model stops here", non_retryable=True)
+        return acts.LlmTurnOutput(
+            transcript_ref=ref("assistant.json"),
+            tool_call_summaries=[
+                acts.ToolCallSummary(id="read-0", name="read_file", input={"path": "calc.py"})
+            ],
+            stop_reason="tool_use",
+            usage=Usage(),
+            cost_usd=0.0,
+        )
+
+    @activity.defn(name=acts.TOOL_EXEC.name)
+    async def tool_exec(self, inp: acts.ToolExecInput) -> ToolResult:
+        return ToolResult(call_id=inp.call.id, ok=True, output="ran", pre_sha=inp.pre_sha)
+
+    @activity.defn(name=acts.APPEND_RESULTS.name)
+    async def append_results(self, inp: acts.AppendResultsInput) -> BlobRef:
+        return ref("results.json")
+
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        return ref("ckpt.bundle")
+
+    @activity.defn(name=acts.RECORD_EVENT.name)
+    async def record_event(self, inp: acts.RecordEventInput) -> None:
+        return None
 
 
-def task_worker(env: WorkflowEnvironment, queue: str) -> Worker:
-    stubs = Stubs()
+def task_worker(env: WorkflowEnvironment, queue: str, stubs: Stubs | None = None) -> Worker:
     return Worker(
         env.client,
         task_queue=queue,
         workflows=[TaskWorkflow],
-        activities=[stubs.prepare_workspace, stubs.llm_turn],
+        activities=(stubs or Stubs()).activities,
         workflow_runner=workflow_runner(),
     )
 
@@ -111,7 +170,7 @@ def assert_no_big_payload(history: WorkflowHistory, *, largest_seen_over: int = 
     """Every payload is under the cap. `largest_seen_over` proves that the scan saw something."""
     sizes = payload_sizes(history)
     assert sizes, "the scan found no payloads, so it proves nothing"
-    assert max(sizes) < DEFAULT_LIMIT
+    assert max(sizes) <= DEFAULT_LIMIT
     assert max(sizes) > largest_seen_over
 
 
@@ -221,21 +280,12 @@ class ProbeActivityResult:
         return len(text)
 
 
-@workflow.defn(name="ProbeContinueAsNew", failure_exception_types=[PayloadTooLargeError])
-class ProbeContinueAsNew:
-    @workflow.run
-    async def run(self, text: str) -> int:
-        if text.startswith("hand-over-"):
-            workflow.continue_as_new("x" * int(text.removeprefix("hand-over-")))
-        return len(text)
-
-
 @pytest.fixture
 async def probe_queue(env: WorkflowEnvironment, queue: str) -> AsyncIterator[str]:
     async with Worker(
         env.client,
         task_queue=queue,
-        workflows=[ProbeActivityResult, ProbeContinueAsNew],
+        workflows=[ProbeActivityResult],
         activities=[probe_big_result],
         workflow_runner=UnsandboxedWorkflowRunner(),
     ):
@@ -269,18 +319,60 @@ async def test_an_activity_result_over_the_limit_fails_the_activity(
     assert_no_big_payload(await handle.fetch_history())
 
 
-async def test_a_continue_as_new_over_the_limit_fails_the_workflow(
-    env: WorkflowEnvironment, probe_queue: str
+def hint_that_fills(spec: TaskSpec) -> str:
+    """Hint text that makes the llm_turn input of turn 0 exactly as big as the limit allows.
+
+    The state at the hand-over after that turn holds the same hint, the ref of the transcript,
+    the sandbox and the checkpoint, so it is over the limit. The test checks that, so it cannot
+    pass by accident if either model changes.
+    """
+    plain = acts.LlmTurnInput(
+        task_id=spec.task_id, turn_index=0, role=Role.CODER, spec=spec, transcript_ref=None
+    )
+    # The hint is stored as "ann: <text>", and a JSON string costs two quotes.
+    room = DEFAULT_LIMIT - json_size(plain) - 2 - len("ann: ")
+    text = "h" * room
+    with_hint = plain.model_copy(update={"hints": [f"ann: {text}"]})
+    assert json_size(with_hint) == DEFAULT_LIMIT
+    handed_over = CarryState(
+        spec=spec,
+        phase=Phase.CODING,
+        turn_index=1,
+        transcript_ref=ref("results.json"),
+        head_sha=BASE,
+        sandbox_id="sbx-1",
+        started_at=datetime.now(UTC),
+        hints=[f"ann: {text}"],
+    )
+    assert json_size(handed_over) > DEFAULT_LIMIT
+    return text
+
+
+async def test_a_hand_over_with_a_state_over_the_limit_fails_the_workflow(
+    env: WorkflowEnvironment, queue: str
 ) -> None:
-    ok = await run_probe(env, probe_queue, ProbeContinueAsNew.run, "hand-over-200000")
-    assert await asyncio.wait_for(ok.result(), WAIT_S) == 200_000
+    """The SDK drops an error from the arguments of a Continue-As-New and leaves the run open.
 
-    handle = await run_probe(env, probe_queue, ProbeContinueAsNew.run, "hand-over-300000")
-    with pytest.raises(WorkflowFailureError) as caught:
-        await asyncio.wait_for(handle.result(), WAIT_S)
+    TaskWorkflow converts its state first, so the run ends with the guard's error. The state of
+    a hand-over is a few hundred bytes larger than the llm_turn input that carries the same
+    hints, so a hint can fit in the one and push the other over. This one fits the model call
+    to the byte.
+    """
+    spec = make_spec()
+    hint = hint_that_fills(spec)
+    handle = await start_task(
+        env.client, spec, task_queue=queue, tuning=acts.Tuning(continue_as_new_every_turns=1)
+    )
+    await handle.signal(TaskWorkflow.hint, args=["ann", hint])
 
-    assert isinstance(caught.value.cause, ApplicationError)
-    assert caught.value.cause.type == OVERSIZED
+    async with task_worker(env, queue, Stubs(model_stops=False)):
+        with pytest.raises(WorkflowFailureError) as caught:
+            await asyncio.wait_for(handle.result(), WAIT_S)
+
+    cause = caught.value.cause
+    assert isinstance(cause, ApplicationError)
+    assert cause.type == OVERSIZED
     history = await handle.fetch_history()
+    assert acts.LLM_TURN.name in scheduled(history)  # the turn ran: the input was just small enough
     assert EventType.EVENT_TYPE_WORKFLOW_EXECUTION_CONTINUED_AS_NEW not in event_types(history)
-    assert_no_big_payload(history)
+    assert_no_big_payload(history, largest_seen_over=250_000)

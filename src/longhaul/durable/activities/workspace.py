@@ -54,6 +54,14 @@ as approved items of the default branch (longhaul.memory.commands). The agent th
 commands that were seen to work and does not guess. The commands may write files, so the
 workspace is put back on the base commit afterwards. Memory is an extra: a failure to find or to
 store the commands is logged and the task goes on without them. Without a store nothing is run.
+
+With a memory store and a blob store it also builds the repo map (LH-602, longhaul.memory.
+repo_map) before the commands run, while the workspace is still the base commit and nothing has
+written to it. The parsed structure is cached by base sha as an approved item, so a second task
+on the same commit does not parse again. The map itself depends on the issue, so each task
+gets its own, in the blob store, and `repo_map_ref` in the output names it for the prompt
+builder (LH-604). A map that cannot be built is logged, and the task goes on without one. A
+person who rejected the map of the base commit also leaves the task without one.
 """
 
 from __future__ import annotations
@@ -76,9 +84,10 @@ from longhaul.agent.workspace import (
     collect_source_files,
     pip_install_command,
 )
+from longhaul.blobs.base import blob_key
 from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError, check_task_id
 from longhaul.checkpoints.snapshot import snapshot_folder
-from longhaul.contracts import BlobRef, MemoryItem, Sandbox, SandboxLimits, TaskSpec
+from longhaul.contracts import BlobRef, BlobStore, MemoryItem, Sandbox, SandboxLimits, TaskSpec
 from longhaul.db.records import CheckpointRecord, Recorder
 from longhaul.durable import acts
 from longhaul.durable.activities.support import github_failure, heartbeating, not_retried, small
@@ -86,6 +95,7 @@ from longhaul.github.client import GitHubError
 from longhaul.github.intake import LOCAL_PREFIX, is_local
 from longhaul.github.remote import GitHubRemote
 from longhaul.memory.commands import discover_commands
+from longhaul.memory.repo_map import RepoMapCache, StructureMemory
 
 log = logging.getLogger(__name__)
 
@@ -118,9 +128,13 @@ class WorkspaceHost(Protocol):
 
 
 class CommandMemory(Protocol):
-    """The part of PgMemoryStore that prepare_workspace uses."""
+    """The part of PgMemoryStore that prepare_workspace uses to keep the verified commands."""
 
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str: ...
+
+
+class WorkspaceMemory(CommandMemory, StructureMemory, Protocol):
+    """What prepare_workspace needs of the memory store: the commands, and the cached repo map."""
 
 
 @dataclass(frozen=True)
@@ -147,10 +161,13 @@ class WorkspaceActivities:
     `image` and `limits` are `sandbox.image` and `sandbox.limits` of the config, which the
     workflow cannot read. `checkpoints` is the store that tool_exec uses, because the repo that
     this class creates is the one that tool_exec saves into. `memory` is where the verified
-    commands of a repo are kept. Without it, prepare_workspace does not look for them, which is
-    how a run or a test without a database works. `github` is how the host reaches GitHub.
-    Without it a worker prepares local folders only, and it can still recover the sandbox of a
-    GitHub task, because ensure_sandbox reads nothing but the bare repo.
+    commands of a repo are kept, and the parsed structure of its default branch. `blobs` is where
+    the repo map of each task goes. Without `memory`, prepare_workspace does not look for the
+    commands, which is how a run or a test without a database works, and without both it does
+    not build the map, since a map with nowhere to go is work for nothing.
+    `github` is how the host reaches GitHub. Without it a worker prepares local folders only, and
+    it can still recover the sandbox of a GitHub task, because ensure_sandbox reads nothing but the
+    bare repo.
     """
 
     def __init__(
@@ -162,8 +179,9 @@ class WorkspaceActivities:
         image: str,
         limits: SandboxLimits,
         setup_timeout_s: int = SETUP_TIMEOUT_S,
-        memory: CommandMemory | None = None,
+        memory: WorkspaceMemory | None = None,
         github: GitHubRemote | None = None,
+        blobs: BlobStore | None = None,
     ) -> None:
         self._sandboxes = sandboxes
         self._store = checkpoints
@@ -173,6 +191,9 @@ class WorkspaceActivities:
         self._setup_timeout_s = setup_timeout_s
         self._memory = memory
         self._github = github
+        self._blobs = blobs
+        # Public, so that a test can read repo_maps.script_runs and tell a cache hit from a parse.
+        self.repo_maps = RepoMapCache(memory) if memory is not None and blobs is not None else None
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -197,13 +218,16 @@ class WorkspaceActivities:
                 sandbox = await self._boot(task_id)
                 await self._set_up(sandbox, spec)
                 await self._sandboxes.set_network(sandbox.id, False)
+                # The map comes first: it reads the workspace as the base commit has it, before
+                # the commands that are tried next can write into it.
+                repo_map_ref = await self._map_repo(sandbox, spec, base_sha)
                 await self._learn_commands(sandbox, spec, base_sha)
                 head_sha = await self._store.head(task_id)
             except BaseException:  # also a cancel: a task that is cancelled must leave nothing
                 await self._discard(task_id)
                 raise
         return acts.PrepareWorkspaceOutput(
-            sandbox_id=sandbox.id, base_sha=base_sha, head_sha=head_sha
+            sandbox_id=sandbox.id, base_sha=base_sha, head_sha=head_sha, repo_map_ref=repo_map_ref
         )
 
     async def _source(self, spec: TaskSpec) -> LocalFolder | GitHubBase:
@@ -278,6 +302,29 @@ class WorkspaceActivities:
         finally:
             await asyncio.to_thread(shutil.rmtree, scratch, True)
         return base_sha
+
+    async def _map_repo(self, sandbox: Sandbox, spec: TaskSpec, base_sha: str) -> BlobRef | None:
+        """Write the repo map for the task's issue to the blob store and return its ref.
+
+        A retried attempt builds the same map again and writes it to the same key, so there is
+        nothing to undo. Whatever goes wrong here, other than a cancel, is logged: the map is a
+        hint for the agent and the task can run without it.
+        """
+        if self.repo_maps is None or self._blobs is None:
+            return None
+        try:
+            text = await self.repo_maps.build(
+                sandbox, spec.repo, base_sha, f"{spec.title}\n\n{spec.body}"
+            )
+            if not text:  # no Python module to show
+                return None
+            key = blob_key(spec.task_id, "memory", 0, "repo-map.txt")
+            return await self._blobs.put(text.encode(), key=key)
+        except Exception as exc:
+            log.warning(
+                "could not build the repo map of %s for task %s: %s", spec.repo, spec.task_id, exc
+            )
+            return None
 
     async def _learn_commands(self, sandbox: Sandbox, spec: TaskSpec, base_sha: str) -> None:
         """Keep the commands that run this repo's tests, as seen working at the base commit.

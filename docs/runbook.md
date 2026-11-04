@@ -64,6 +64,22 @@ uv run longhaul memory reject ID                                   # it stays in
 
 When a task starts, `prepare_workspace` runs the test and lint commands that the repo's `pyproject.toml`, `tox.ini`, Makefile and CI files name. It keeps the ones that print a pytest, ruff or tox summary as approved `command` items. This runs only on a worker that was given a memory store, and `memory list --kind command` shows the result.
 
+### The repo map
+
+Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. The prompt builder (LH-604) reads it from the `repo_map_ref` of the workspace output. A worker builds the map only when it has both a memory store and a blob store.
+
+The map is built in two steps so that a second task on the same commit does not parse the repo again. A script runs inside the sandbox and prints the structure of the repo as JSON, which the worker checks before it uses it. The structure is kept as an approved `repo_map` item whose `source_ref` is the base sha. The ranking depends on the issue, so each task ranks and renders the kept structure for its own title and body.
+
+```bash
+uv run longhaul memory list --repo acme/inventory --kind repo_map    # one item for each base sha that was mapped
+```
+
+A file that does not parse, or is over 200 KB, is left out of the map and named in it as "Not parsed", and the worker logs it as a warning. A map that cannot be built at all is logged and the task goes on without one.
+
+A big repo is not cut at a path. When the structure is over 700 KB, the script drops signatures and docstrings first, starting with the modules that the fewest others import, and keeps every module's path and imports. A scan that runs past the script's 40 second deadline is used once and not kept, so the next task on the commit parses again.
+
+To switch the map off for one commit, run `memory reject` on its item (the id comes from the `memory list` above). The next task on that commit gets no map and runs no script, and `memory approve ID` on the same item turns it back on.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.

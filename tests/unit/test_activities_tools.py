@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from longhaul.context.log import read_log
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -1194,3 +1195,63 @@ async def test_a_call_id_used_in_two_turns_never_reaches_the_model_twice(
         await rig.append(append_input(ref, acts.summarize_result(second)))
     assert caught.value.type == "TranscriptError"
     assert caught.value.non_retryable
+
+
+# ---------- the log (LH-404) ----------
+async def test_the_results_go_to_the_log_as_the_model_read_them() -> None:
+    rig = Rig(None)
+    ref = await rig.put_json("t.json", calls_transcript(call_block("a"), call_block("b")))
+    await rig.append(
+        append_input(
+            ref,
+            acts.ToolResultSummary(call_id="a", ok=True, output="first"),
+            acts.ToolResultSummary(call_id="b", ok=False, output="second"),
+        )
+    )
+
+    # The reply part was written by llm_turn; here the transcript only needed the results.
+    assert await read_log(rig.blobs, TASK) == [
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(tool_use_id="a", content="first"),
+                ToolResultBlock(tool_use_id="b", content="second", is_error=True),
+            ],
+        )
+    ]
+
+
+async def test_a_nudge_that_joins_the_last_user_message_is_logged_on_its_own() -> None:
+    rig = Rig(None)
+    ref = await rig.put_json("t.json", [FIRST])
+
+    await rig.append(append_input(ref, user_text="Use tools or call finish."))
+
+    assert await read_log(rig.blobs, TASK) == [
+        Message(role="user", content=[TextBlock(text="Use tools or call finish.")])
+    ]
+
+
+async def test_results_that_are_answered_again_are_logged_once() -> None:
+    rig = Rig(None)
+    ref = await rig.put_json("t.json", calls_transcript(call_block("a")))
+    inp = append_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output="fine"))
+
+    await rig.append(inp)
+    await rig.append(inp)
+
+    assert len(await read_log(rig.blobs, TASK)) == 1
+
+
+async def test_the_log_keeps_the_text_that_the_model_was_given_for_a_long_output() -> None:
+    rig = Rig(None, tool_output_max_tokens=200)
+    ref = await rig.put_json("t.json", calls_transcript(call_block("a")))
+    stored = await rig.put_text("tool-a-output.txt", "line\n" * 5000)
+
+    await rig.append(
+        append_input(ref, acts.ToolResultSummary(call_id="a", ok=True, output_ref=stored))
+    )
+
+    (logged,) = result_blocks((await read_log(rig.blobs, TASK))[0])
+    assert "[output truncated: 5000 lines" in logged.content
+    assert "handle out_a" in logged.content

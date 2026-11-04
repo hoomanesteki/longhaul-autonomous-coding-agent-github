@@ -15,6 +15,7 @@ from longhaul.agent.prompts import (
     FIRST_USER_MESSAGE,
     SECTION_HEADINGS,
     build_system_prompt,
+    task_statement,
 )
 from longhaul.contracts import RepoSettings, Role, TaskSpec
 from longhaul.providers.base import format_role_line, parse_role_line
@@ -130,6 +131,16 @@ def test_task_statement_has_the_facts_a_coder_needs() -> None:
     assert "Issue #42: add() returns the difference" in task
     assert "1. Seen on 0.1.0 too." in task
     assert "2. Only add() is wrong." in task
+
+
+def test_the_task_statement_is_the_third_block_of_the_prompt() -> None:
+    # The compactor reads it on the first round (LH-404), so it is the same text the coder gets.
+    spec = make_spec()
+    prompt = build_system_prompt(Role.CODER, spec)
+
+    assert task_statement(spec).startswith(TASK)
+    assert task_statement(spec) in prompt
+    assert prompt.index(task_statement(spec)) > prompt.index(TOOLS)
 
 
 def test_a_local_repo_shows_its_folder_name_and_not_its_path() -> None:

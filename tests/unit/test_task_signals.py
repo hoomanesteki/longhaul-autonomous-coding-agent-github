@@ -69,6 +69,7 @@ def test_the_signals_and_the_query_have_the_names_of_section_3_7() -> None:
         "add_budget",
         "approve_plan",
         "reject_plan",
+        "report_status",  # LH-308: the answer to /longhaul status
     }
     assert set(definition.queries) == {"status"}
 
@@ -155,3 +156,10 @@ def test_status_carries_the_outcome_once_there_is_one(wf: TaskWorkflow) -> None:
 )
 def test_cancel_summary_names_who_and_why(by: str, reason: str, expected: str) -> None:
     assert cancel_summary(by, reason) == expected
+
+
+def test_a_run_that_posted_no_status_comment_leaves_the_memo_to_the_next_run(
+    wf: TaskWorkflow,
+) -> None:
+    # The memo of the run already holds the count of an earlier run, and None carries it as it is.
+    assert wf._memo_to_carry() is None

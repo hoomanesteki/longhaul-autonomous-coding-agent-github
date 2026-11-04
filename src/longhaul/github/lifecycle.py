@@ -13,6 +13,11 @@ goes:
 Pause and resume arrive in Phases 5 and 7. Their helpers are here so that those stories only
 have to call them.
 
+The commands of LH-308 add two comments. `status_comment` is what a task posts when a
+maintainer asks `/longhaul status`, and `denied_comment` is the answer to a command from
+someone who may not steer the task. The workflow posts the first, as the `post_comment`
+activity. The poller posts the second, through the same function of side_effects.py.
+
 This module only says what to write and under which key. The workflow runs each step as the
 `post_comment`, `add_label` or `remove_label` activity, so every write goes through
 github/side_effects.py (CONTRIBUTING.md rule 6). The keys are stable: the same step of the same
@@ -23,9 +28,10 @@ so the pause and resume keys carry the number of the pause.
 The module has no I/O and imports only the pure inputs, so the workflow can import it.
 """
 
+import re
 from typing import NamedTuple
 
-from longhaul.contracts import TaskSpec
+from longhaul.contracts import TaskSpec, TaskStatus
 from longhaul.github.inputs import CommentInput, LabelInput, key_of
 
 __all__ = [
@@ -33,12 +39,14 @@ __all__ = [
     "PR_OPEN",
     "WORKING",
     "LabelStep",
+    "denied_comment",
     "is_github_task",
     "on_pause",
     "on_pickup",
     "on_pr_opened",
     "on_resume",
     "pickup_comment",
+    "status_comment",
 ]
 
 WORKING = "longhaul:working"
@@ -49,6 +57,14 @@ NEEDS_HUMAN = "longhaul:needs-human"
 # imported because intake pulls in SQLAlchemy, which a workflow may not load. A unit test keeps
 # the two equal.
 LOCAL_PREFIX = "local:"
+
+# A checkpoint is a 40 or 64 character hash. Seven characters name it well enough on an issue.
+SHORT_SHA_CHARS = 7
+# The key of a reply is built from a login, and a key part holds letters, digits, dot, underscore
+# and hyphen (side_effects.effect_key). A login is made of letters, digits and hyphens already,
+# so this only guards the key against a value that GitHub would never send.
+_NOT_KEY_CHAR = re.compile(r"[^a-z0-9._-]")
+MAX_LOGIN_CHARS = 60
 
 
 class LabelStep(NamedTuple):
@@ -117,3 +133,48 @@ def on_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
 def on_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
     """The person answered. `pause` is the number that on_pause was given."""
     return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off", pause))]
+
+
+def status_comment(spec: TaskSpec, status: TaskStatus, *, by: str, n: int) -> CommentInput:
+    """The answer to `/longhaul status`. `n` counts the requests of the task from 1.
+
+    Each request has a key of its own, so that two requests give two comments, and the same
+    request after a replay gives none. The person who asked is named in code quotes and not with
+    an @, because the comment is not meant to notify them.
+    """
+    checkpoint = status.last_checkpoint
+    saved = f"`{checkpoint[:SHORT_SHA_CHARS]}`" if checkpoint else "no checkpoint yet"
+    parts = [
+        f"Status of `{spec.task_id}`, asked by `{by}`: phase `{status.phase.value}`, "
+        f"turn {status.turn_index}, spend ${status.cost_usd:.4f}, last checkpoint {saved}."
+    ]
+    if status.paused_reason:
+        parts.append(f"Paused: {status.paused_reason}.")
+    if status.outcome is not None:
+        parts.append(f"Outcome: {status.outcome.kind.value}.")
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=" ".join(parts),
+        idempotency_key=key_of(spec.task_id, "status", n),
+    )
+
+
+def denied_comment(task_id: str, repo: str, number: int, login: str) -> CommentInput:
+    """The one polite answer to a command from someone who may not steer the task.
+
+    The key holds the login, so a user gets one answer for each task however many commands they
+    send. GitHub ignores the case of a login, and so does the key.
+    """
+    who = _NOT_KEY_CHAR.sub("_", login.lower())[:MAX_LOGIN_CHARS]
+    return CommentInput(
+        task_id=task_id,
+        repo=repo,
+        number=number,
+        body=(
+            f"@{login} Only maintainers can steer this task. "
+            f"A command counts only from people with write access to {repo}."
+        ),
+        idempotency_key=key_of(task_id, f"denied-{who}", 1),
+    )

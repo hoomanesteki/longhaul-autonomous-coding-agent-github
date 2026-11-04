@@ -123,6 +123,11 @@ TUNING_MEMO_KEY = "tuning"
 # model turn (LlmTurnInput.script_ref). Like the tuning, it works for a worker in another process,
 # survives a replay and carries over Continue-As-New.
 SCRIPT_MEMO_KEY = "script"
+# The workflow memo key under which a run carries the count of the status comments it has posted
+# (LH-308). The key of a status comment is its number, and a run that began counting at 1 again
+# after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
+# contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
+STATUS_MEMO_KEY = "status_posts"
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -376,13 +381,15 @@ class PollResult(BaseModel):
 
     `repos` is the allowlisted repos it looked at, `issues` the open issues it saw with the label,
     `started` the tasks it started, and `known` the issues it left alone because their task
-    already has a row or a workflow.
+    already has a row or a workflow. `commands` is the comment commands (LH-308) that it carried
+    out: a signal sent to a task, or an attempt started by `/longhaul retry`.
     """
 
     repos: int = Field(default=0, ge=0)
     issues: int = Field(default=0, ge=0)
     started: int = Field(default=0, ge=0)
     known: int = Field(default=0, ge=0)
+    commands: int = Field(default=0, ge=0)
 
 
 class BuildPrBranchInput(BaseModel):

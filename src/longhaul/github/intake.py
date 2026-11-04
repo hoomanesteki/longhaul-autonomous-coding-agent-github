@@ -14,6 +14,7 @@ longhaul.yaml, and this module is the one place that turns that flag into behavi
   says why. It does no I/O. The caller fetches the issue, its comments and the commenters'
   permissions, so the function can be tested with plain dicts.
 * `task_id_for` builds the task id, which is also the Temporal workflow id.
+* `attempt_of` reads the attempt back from a task id (LH-308).
 
 What goes into the spec, and why:
 
@@ -37,6 +38,11 @@ a-z and 0-9 becomes one dash, so `Acme/My.Repo_v2` issue 7 is `lh-acme-my-repo-v
 different repos can still give the same id (`acme/my.repo` and `acme/my-repo`), and a start
 with an id that is taken is a silent no-op (REJECT_DUPLICATE in durable/client.py). The
 allowlist is a closed list, so the sync refuses a config that holds two such repos.
+
+Attempts. `/longhaul retry` on a task that has ended starts the next attempt for the same issue
+(LH-308). Attempt 1 keeps the id above, and attempt n from 2 on adds `-a<n>`, as in
+`lh-acme-calc-42-a2`. A task id of attempt 1 ends in the issue number, so the two forms cannot be
+mixed up, and a repo that is called `calc-a2` still gives `lh-acme-calc-a2-5`.
 """
 
 import logging
@@ -59,6 +65,7 @@ __all__ = [
     "MAX_COMMENTS_BYTES",
     "WRITE_PERMISSIONS",
     "allowlisted_entry",
+    "attempt_of",
     "is_allowlisted",
     "is_local",
     "issue_to_spec",
@@ -91,6 +98,7 @@ CUT_NOTE = "\n\n[cut here: the rest is on the GitHub issue]"
 _NAME_PART = re.compile(r"[A-Za-z0-9._-]+")
 _HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
 _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
+_ATTEMPT = re.compile(r"-a([0-9]+)$")
 
 
 # ---------- repo names and task ids ----------
@@ -120,12 +128,24 @@ def _task_prefix(repo: str) -> str:
     return f"lh-{_slug(f'{owner}/{name}')}"
 
 
-def task_id_for(repo: str, issue_number: int) -> str:
-    """The task id, and workflow id, of an issue: `lh-<owner>-<repo>-<n>` in lowercase."""
+def task_id_for(repo: str, issue_number: int, attempt: int = 1) -> str:
+    """The task id, and workflow id, of an issue: `lh-<owner>-<repo>-<n>` in lowercase.
+
+    A later attempt adds `-a<attempt>`: `lh-<owner>-<repo>-<n>-a2`.
+    """
     prefix = _task_prefix(repo)
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
         raise ValueError(f"an issue number is a positive integer, got {issue_number!r}")
-    return f"{prefix}-{issue_number}"
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ValueError(f"an attempt is a positive integer, got {attempt!r}")
+    suffix = "" if attempt == 1 else f"-a{attempt}"
+    return f"{prefix}-{issue_number}{suffix}"
+
+
+def attempt_of(task_id: str) -> int:
+    """The attempt that a task id names: 1 when it has no `-a<n>` suffix."""
+    found = _ATTEMPT.search(task_id)
+    return int(found.group(1)) if found else 1
 
 
 # ---------- the allowlist ----------
@@ -367,13 +387,16 @@ def issue_to_spec(
     issue: Mapping[str, Any],
     comments: Sequence[Mapping[str, Any]],
     permissions: Mapping[str, Mapping[str, Any] | str],
+    *,
+    attempt: int = 1,
 ) -> TaskSpec | None:
     """The TaskSpec for an issue, or None when Longhaul should not work on it.
 
     `issue` and `comments` are GitHub's JSON. `permissions` maps a login to the answer of
     `GitHubClient.get_collaborator_permission` for that user (a plain permission string works
     too), and has to cover every login in `comments`. None comes back, with a log line that
-    says why, for a repo that is not allowlisted, a local repo, and a pull request.
+    says why, for a repo that is not allowlisted, a local repo, and a pull request. `attempt` is
+    the attempt that the spec is for, and it only changes the task id.
 
     Raises ValueError for an issue without a usable number or title, which means the client
     or the API changed, and a quiet skip would hide it.
@@ -384,7 +407,7 @@ def issue_to_spec(
         return None
     number, title, body = _read_issue(issue)
     return TaskSpec(
-        task_id=task_id_for(repo_settings.repo, number),
+        task_id=task_id_for(repo_settings.repo, number, attempt),
         repo=repo_settings.repo,
         issue_number=number,
         title=title,

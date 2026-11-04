@@ -29,10 +29,13 @@ def test_task_columns_match_data_model() -> None:
     assert set(columns) == {
         "id", "repo", "issue_number", "title", "status", "phase", "outcome", "pr_url",
         "model_coder", "cost_usd", "turns", "started_at", "ended_at", "settings", "created_at",
+        "last_comment_at", "last_comment_id",
     }  # fmt: skip
     assert columns["id"].primary_key
     assert columns["issue_number"].nullable
     assert not columns["repo"].nullable
+    # The comment cursor of the poller (LH-308) is empty until the poller has set it.
+    assert columns["last_comment_at"].nullable and columns["last_comment_id"].nullable
 
 
 def test_task_indexes_and_pk_name() -> None:

@@ -22,7 +22,9 @@ What it is built from, and why each piece is what it is:
   carries the tracing interceptor, so the worker built on it needs no list of its own.
 * GitHub repos need LONGHAUL_GITHUB_TOKEN, a fine-grained PAT (ADR-0012). The worker clones and
   pushes with it on the host; it never enters a sandbox (ADR-0009). Without it the worker takes
-  local folders only and still recovers the sandbox of a GitHub task.
+  local folders only and still recovers the sandbox of a GitHub task. LONGHAUL_GITHUB_API_URL and
+  LONGHAUL_GITHUB_WEB_URL point it at a GitHub Enterprise server, or at a FakeGitHub and a folder
+  of bare repos in the end-to-end test of LH-308. Unset, they mean api.github.com and github.com.
 * Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
   that is all a worker leaves behind, and it says where the kill landed.
 * With the token the worker also registers the GitHub writes (post_comment, add_label,
@@ -35,10 +37,12 @@ What it is built from, and why each piece is what it is:
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
-  own queue. Without a token the worker still starts and still registers `poll_once`, so a
-  worker for local runs needs none. A poll on it fails with the name of the setting, and the
-  Temporal UI shows that. The Schedule that triggers the polls is made by `longhaul poller
-  install` and not by the worker.
+  own queue. It also carries out the slash commands in the comments of the task issues (LH-308),
+  and posts the one reply to a command from someone who may not steer, through the same
+  idempotency ledger as the other GitHub writes. Without a token the worker still starts and
+  still registers `poll_once`, so a worker for local runs needs none. A poll on it fails with the
+  name of the setting, and the Temporal UI shows that. The Schedule that triggers the polls is
+  made by `longhaul poller install` and not by the worker.
 * The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
@@ -90,7 +94,7 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
-from longhaul.github.remote import GitHubRemote
+from longhaul.github.remote import GitHubRemote, clone_url_under
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
@@ -141,6 +145,13 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
             )
         return None
     return get_provider(settings)
+
+
+def _github_remote(settings: EnvSettings, github: GitHubClient, auth: PatAuth) -> GitHubRemote:
+    """The remote of the worker: github.com, or the server that LONGHAUL_GITHUB_WEB_URL names."""
+    if settings.github_web_url is None:
+        return GitHubRemote(github, auth)
+    return GitHubRemote(github, auth, clone_url=clone_url_under(settings.github_web_url))
 
 
 def build_parts(
@@ -203,10 +214,12 @@ def build_parts(
     )
     github: GitHubClient | None = None
     remote: GitHubRemote | None = None
+    # One ledger for every GitHub write, so that a key is held and recorded once.
+    effects = EffectLedger(sessions)
     if settings.github_token is not None:
         auth = PatAuth(settings.github_token)
-        github = GitHubClient(GITHUB_API_URL, auth)
-        remote = GitHubRemote(github, auth)
+        github = GitHubClient(settings.github_api_url or GITHUB_API_URL, auth)
+        remote = _github_remote(settings, github, auth)
     workspace = WorkspaceActivities(
         sandboxes,
         store,
@@ -218,11 +231,11 @@ def build_parts(
     events = EventActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
-    poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
+    poller = PollerActivities(
+        github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue, ledger=effects
+    )
     delivery: list[Callable[..., Any]] = []
     if github is not None and remote is not None:
-        # One ledger for the writes and the delivery, so that a key is held and recorded once.
-        effects = EffectLedger(sessions)
         delivery = [
             *SideEffectActivities(github, effects).activities,
             *DeliveryActivities(

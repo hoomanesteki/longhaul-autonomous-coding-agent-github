@@ -57,6 +57,13 @@ Pause and resume (Phases 5 and 7) add and remove `longhaul:needs-human` through 
 and `_human_done`, which are here for them. Nothing calls them yet. The labels of a task that
 ends any other way (an error, a cancel) are left alone until LH-507.
 
+`/longhaul status` on the issue reaches the task as the signal `report_status` (LH-308). The
+handler posts a comment with the state of the task through the `post_comment` activity, so it is
+a side effect with a key like any other, `status:<n>`, where n counts the requests the task has had.
+The count is part of the workflow's state, so a replay posts nothing again, and the memo carries it
+over a Continue-As-New. The handler is best effort: a status that cannot be posted is logged and
+does not fail the task, and a cancel does not wait for it. It posts for a task of an issue only.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -115,8 +122,9 @@ What the new run starts with. The state travels in CarryState: the turn index, t
 checkpoint, the sandbox id, the cost, the hints and the budget top-ups. `hint` and `add_budget`
 write to it, so everything that arrived before the hand-over is in it, and a signal that arrives
 later goes to the new run (same id; the state is built in @workflow.init before any handler runs,
-so none is dropped). The Tuning is in the memo, which continue_as_new carries over. The new run
-calls `ensure_sandbox` first, like any run that starts with a sandbox id (LH-206).
+so none is dropped). The Tuning is in the memo, which continue_as_new carries over, and so is the
+count of status comments (`_memo_to_carry`). The new run calls `ensure_sandbox` first, like any
+run that starts with a sandbox id (LH-206).
 
 Hints stay in `state.hints` for the life of the task. Each model call gets all of them, and
 `llm_turn` shows the model the ones its transcript does not hold yet (turns.show_hints). The
@@ -264,6 +272,9 @@ class TaskWorkflow:
         self.cancel_request: CancelRequest | None = None
         self.plan_decision: PlanDecision | None = None
         self.idle = 0  # turns in a row that ended without a tool call
+        # The status comments posted so far, which a hand-over carries in the memo. None until
+        # the first request of this run: only then is the memo read (see _next_status_number).
+        self.status_posts: int | None = None
 
     # ---------- signals and the query ----------
     @workflow.signal
@@ -293,8 +304,40 @@ class TaskWorkflow:
         self.state.plan_approved = False
         self.plan_decision = PlanDecision(approved=False, by=by, feedback=feedback)
 
+    # A task that ends while its status comment is still being posted does not wait for it: the
+    # person asked for the state of a task that is over, and a retry is not worth a delay.
+    @workflow.signal(unfinished_policy=workflow.HandlerUnfinishedPolicy.ABANDON)
+    async def report_status(self, by: str) -> None:
+        """Post the state of the task on its issue. `by` is the person who asked."""
+        spec = self.state.spec
+        if not lifecycle.is_github_task(spec):
+            return  # a local task has no issue to answer on
+        # The count goes up before the first await, so two requests that arrive together get
+        # two keys. The comment is built from the state as it is when the request arrives.
+        number = self._next_status_number()
+        comment = lifecycle.status_comment(spec, self._snapshot(), by=by, n=number)
+        try:
+            await workflow.execute_activity(
+                acts.POST_COMMENT.name,
+                comment,
+                result_type=acts.POST_COMMENT.result_type,
+                **acts.options(acts.POST_COMMENT, self._tuning()),
+            )
+        except ActivityError as err:
+            # Not _call: a cancel must not be raised from inside a handler, and a status that
+            # was asked for is no reason to end the task.
+            workflow.logger.warning(
+                "status comment %d of task %s not posted: %s",
+                number,
+                spec.task_id,
+                err.cause or err,
+            )
+
     @workflow.query
     def status(self) -> TaskStatus:
+        return self._snapshot()
+
+    def _snapshot(self) -> TaskStatus:
         state = self.state
         return TaskStatus(
             task_id=state.spec.task_id,
@@ -407,7 +450,7 @@ class TaskWorkflow:
         # A cancel that came in during the awaits above must not be lost with this run. It is
         # acted on here. No await follows, so none can arrive between this look and the call.
         self._stop_if_cancelled()
-        workflow.continue_as_new(state)
+        workflow.continue_as_new(state, memo=self._memo_to_carry())
 
     async def _bundle(self) -> str | None:
         """Upload the repo history. Returns the key of the blob, or None when it was not made."""
@@ -806,6 +849,28 @@ class TaskWorkflow:
     def _stop_if_cancelled(self) -> None:
         if self.cancel_request is not None:
             raise _CancelRequested
+
+    def _next_status_number(self) -> int:
+        """The number of the next status comment: the count carried in the memo, plus one.
+
+        The memo is read on the first request of a run and not in __init__, so a workflow that
+        is built outside a Temporal loop, as the signal unit tests do, still works.
+        """
+        if self.status_posts is None:
+            self.status_posts = workflow.memo_value(acts.STATUS_MEMO_KEY, 0, type_hint=int)
+        self.status_posts += 1
+        return self.status_posts
+
+    def _memo_to_carry(self) -> dict[str, Any] | None:
+        """The memo of the next run: this one, plus the count of status comments if it changed.
+
+        None keeps the memo as it is, which already holds the count of an earlier run when this
+        run has had no status request. A memo that is passed replaces the whole memo, so it
+        starts from the current one.
+        """
+        if self.status_posts is None:
+            return None
+        return {**workflow.memo(), acts.STATUS_MEMO_KEY: self.status_posts}
 
     def _tuning(self) -> acts.Tuning | None:
         return workflow.memo_value(acts.TUNING_MEMO_KEY, None, type_hint=acts.Tuning)

@@ -6,7 +6,14 @@ explains from steering a task.
 """
 
 import pytest
-from longhaul.github.commands import MAX_TEXT_CHARS, Command, CommandKind, parse_command
+
+from longhaul.github.commands import (
+    MAX_TEXT_CHARS,
+    Command,
+    CommandKind,
+    may_steer,
+    parse_command,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
@@ -170,3 +177,25 @@ def test_a_command_after_a_closed_fence_is_not_the_first_line() -> None:
 def test_every_kind_has_a_name_that_a_person_types(kind: CommandKind) -> None:
     assert kind.value == kind.name.lower()
     assert kind.value.isalpha()
+
+
+@pytest.mark.parametrize(
+    ("answer", "may"),
+    [
+        ({"permission": "admin", "role_name": "admin"}, True),
+        ({"permission": "write", "role_name": "maintain"}, True),
+        ({"permission": "write", "role_name": "write"}, True),
+        ({"permission": "write"}, True),
+        ({"role_name": "maintain"}, True),
+        ({"permission": "Admin"}, True),
+        ({"permission": "read", "role_name": "triage"}, False),
+        ({"permission": "read", "role_name": "read"}, False),
+        ({"permission": "none"}, False),
+        ({"permission": "read", "role_name": "custom-role-on-write"}, False),
+        ({}, False),
+        ({"permission": None, "role_name": None}, False),
+        ({"permission": ["admin"], "role_name": 3}, False),
+    ],
+)
+def test_only_admin_maintain_and_write_may_steer(answer: dict[str, object], may: bool) -> None:
+    assert may_steer(answer) is may

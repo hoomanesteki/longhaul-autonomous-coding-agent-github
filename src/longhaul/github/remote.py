@@ -29,6 +29,7 @@ __all__ = [
     "GitHubRemote",
     "RepoReads",
     "check_repo_name",
+    "clone_url_under",
     "github_clone_url",
 ]
 
@@ -76,6 +77,19 @@ def check_repo_name(repo: str) -> str:
 def github_clone_url(repo: str) -> str:
     """The https address of a repo on github.com, with no credential in it."""
     return f"{GITHUB_WEB_URL}/{check_repo_name(repo)}.git"
+
+
+def clone_url_under(base: str) -> Callable[[str], str]:
+    """A clone address builder for a server that is not github.com: `<base>/<owner>/<name>.git`.
+
+    A GitHub Enterprise server has its own host, and a test points it at a folder of bare repos.
+    """
+    root = base.rstrip("/")
+
+    def clone_url(repo: str) -> str:
+        return f"{root}/{check_repo_name(repo)}.git"
+
+    return clone_url
 
 
 class GitHubRemote:

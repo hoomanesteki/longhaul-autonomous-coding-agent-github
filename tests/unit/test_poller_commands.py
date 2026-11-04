@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from temporalio import workflow
 from temporalio.client import Client, WorkflowExecutionStatus
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -29,8 +30,10 @@ from longhaul.contracts import CarryState
 from longhaul.db.tasks import MemoryTaskStore
 from longhaul.durable import acts
 from longhaul.durable.activities.github import PollerActivities
+from longhaul.durable.activities.steering import SIGNALS
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
+from longhaul.github.commands import CommandKind
 from longhaul.github.side_effects import MemoryLedger, has_marker, marker
 from longhaul.settings import AppConfig, RepoEntry, load_config
 
@@ -70,9 +73,17 @@ class FakeHandle:
 
     async def signal(self, signal: Any, arg: Any = None, *, args: Sequence[Any] = ()) -> None:
         temporal = self._temporal
+        # The server refuses a signal to a workflow that has closed, or that it has forgotten.
+        if (
+            self._task_id in temporal.forgotten
+            or temporal.ended.get(self._task_id, WorkflowExecutionStatus.RUNNING)
+            is not WorkflowExecutionStatus.RUNNING
+        ):
+            raise RPCError("workflow execution already completed", RPCStatusCode.NOT_FOUND, b"")
         if temporal.signal_error is not None and len(temporal.sent) >= temporal.fail_after:
             raise temporal.signal_error
-        temporal.sent.append(Sent(self._task_id, signal.__name__, tuple(args)))
+        name = signal if isinstance(signal, str) else signal.__name__
+        temporal.sent.append(Sent(self._task_id, name, tuple(args)))
 
 
 class FakeTemporal:
@@ -797,7 +808,7 @@ async def test_a_task_that_the_server_forgot_counts_as_ended(
 
     await poll(poller, temporal)
 
-    assert temporal.ids == [task_of(number, 2)]
+    assert temporal.ids == [first, task_of(number, 2)]
 
 
 async def test_a_retry_from_a_user_without_write_access_starts_nothing(
@@ -864,3 +875,13 @@ async def test_the_poller_posts_nothing_but_the_reply_to_a_stranger(
     writes = {r.method for r in fake.requests if r.method != "GET"}
     assert writes == set(), "the signals and the retry are Temporal's, and GitHub is only read"
     assert fake.label_events(REPO, number) == []
+
+
+# --- the names of the signals -----------------------------------------------------------------
+
+
+def test_every_command_but_retry_has_a_signal_that_the_workflow_takes() -> None:
+    signals = workflow._Definition.must_from_class(TaskWorkflow).signals
+
+    assert set(SIGNALS) == set(CommandKind) - {CommandKind.RETRY}
+    assert set(SIGNALS.values()) <= set(signals)

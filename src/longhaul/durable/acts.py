@@ -54,6 +54,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 from longhaul.agent import rules
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
@@ -110,6 +111,12 @@ TUNING_MEMO_KEY = "tuning"
 # model turn (LlmTurnInput.script_ref). Like the tuning, it works for a worker in another process,
 # survives a replay and carries over Continue-As-New.
 SCRIPT_MEMO_KEY = "script"
+# The workflow memo key under which a run carries the context mode it asked for (`longhaul run
+# --context-mode`, LH-406). A run that names none has no key, and the context.mode of the worker's
+# config decides. The workflow hands the mode to every llm_turn and compact, which hold the config.
+# Like the script, it works for a worker in another process, survives a replay and carries over
+# Continue-As-New.
+CONTEXT_MODE_MEMO_KEY = "context_mode"
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -209,6 +216,9 @@ class LlmTurnInput(BaseModel):
     # The script that answers this task instead of the provider of the worker. It comes from the
     # memo (SCRIPT_MEMO_KEY) and is the same on every turn of a task.
     script_ref: BlobRef | None = None
+    # The context mode this run asked for, from the memo (CONTEXT_MODE_MEMO_KEY). None means the
+    # run did not ask, and the config of the worker decides.
+    context_mode: ContextMode | None = None
 
 
 class LlmTurnOutput(BaseModel):
@@ -280,7 +290,8 @@ class AppendResultsInput(BaseModel):
 
 
 # What a compaction came to. The first three are context.compact.CompactStatus, and a test keeps
-# them equal. "unchanged" is the activity's own: there was no turn old enough to fold.
+# them equal. "unchanged" is the activity's own: there was no turn old enough to fold, or the mode
+# of the run has no compaction.
 CompactStatus = Literal["ok", "repaired", "fallback", "unchanged"]
 
 
@@ -301,6 +312,8 @@ class CompactInput(BaseModel):
     forced: bool = False
     # The script of the task, as in LlmTurnInput. The compactor is scripted in a scripted run.
     script_ref: BlobRef | None = None
+    # The context mode of the run, as in LlmTurnInput. Only `full` compacts.
+    context_mode: ContextMode | None = None
 
 
 class CompactOutput(BaseModel):
@@ -309,6 +322,7 @@ class CompactOutput(BaseModel):
     `notes` are the notes to carry from now on. For a fallback they are the previous ones, and
     for "unchanged" the input's. The tokens are those of the whole request (system prompt, view
     and tools) before and after. `cost_usd` is what the compactor's calls cost on the ledger.
+    A mode without compaction answers "unchanged" too, without a model call.
     """
 
     transcript_ref: BlobRef

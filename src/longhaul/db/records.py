@@ -10,6 +10,15 @@ first run may already have written. A turn, a tool call and a checkpoint are the
 once, however often they are recorded: the first two as upserts on their key, the checkpoint by
 looking for the same sha first, because its table has no natural key. An event is a log line.
 The same event twice means that the thing happened twice, so it is written every time.
+
+Two of the totals in `tasks` come from here (LH-406). `record_request_fraction` keeps the largest
+share of the window that a request took, as a maximum, so it cannot count a request twice. A
+`compaction` event sets `tasks.compactions` to the number of different compaction events of the
+task, counted from the log and not added to a counter. An activity that ran again after its write
+went through leaves a second, identical line in the log (an event is a log line), and the count
+stays right. Two real compactions differ in the tokens they started from, so they are two. A
+task with no row in `tasks`, as in a local run, is not an error: the update changes nothing, as
+it does for the cost ledger (cost/ledger.py).
 """
 
 from __future__ import annotations
@@ -20,12 +29,17 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from longhaul.contracts import BlobRef, Usage
-from longhaul.db.models import Checkpoint, Event, ToolCallRow, Turn
+from longhaul.db.models import Checkpoint, Event, Task, ToolCallRow, Turn
+
+# The type of the event that the workflow records for a compaction (durable/workflows/task.py).
+# The workflow cannot import this module, so each side has the name, and a unit test keeps the two
+# equal.
+COMPACTION_EVENT = "compaction"
 
 
 @dataclass(frozen=True)
@@ -109,6 +123,14 @@ class Recorder(Protocol):
         """Add an event to the log of the task. The payload must be JSON."""
         ...
 
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        """Note that a request took `fraction` of the window. The task keeps the largest.
+
+        This is `tasks.max_fraction`. It only goes up, so recording a request again, or a smaller
+        one, changes nothing.
+        """
+        ...
+
 
 class MemoryRecorder:
     """The rows in memory, for tests. Public, so that a test can read what was written."""
@@ -118,6 +140,7 @@ class MemoryRecorder:
         self.tool_calls: dict[str, ToolCallRecord] = {}
         self.checkpoints: list[CheckpointRecord] = []
         self.events: list[EventRecord] = []
+        self.max_fractions: dict[str, float] = {}
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -139,6 +162,9 @@ class MemoryRecorder:
 
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         self.events.append(EventRecord(task_id, type, dict(payload)))
+
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        self.max_fractions[task_id] = max(fraction, self.max_fractions.get(task_id, 0.0))
 
 
 def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
@@ -197,6 +223,28 @@ class SqlRecorder:
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         async with self._sessions.begin() as session:
             session.add(Event(task_id=task_id, type=type, payload=dict(payload)))
+            if type == COMPACTION_EVENT:
+                # The new line has to be visible to the count, and a count is not an increment:
+                # see the module docstring.
+                await session.flush()
+                compactions = (
+                    select(func.count(distinct(Event.payload)))
+                    .where(Event.task_id == task_id, Event.type == COMPACTION_EVENT)
+                    .scalar_subquery()
+                )
+                await session.execute(
+                    update(Task).where(Task.id == task_id).values(compactions=compactions)
+                )
+
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        # One statement, so two requests that finish together cannot lower the maximum.
+        stmt = (
+            update(Task)
+            .where(Task.id == task_id)
+            .values(max_fraction=func.greatest(Task.max_fraction, fraction))
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(stmt)
 
 
 def _turn_values(r: TurnRecord) -> dict[str, Any]:

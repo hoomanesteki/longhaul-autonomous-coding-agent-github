@@ -36,6 +36,9 @@ What it is built from, and why each piece is what it is:
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
   replies of a task taught. The compactor's calls are on the cost ledger one by one (I6).
+  `context.mode` can switch the tiers off (LH-406), and a run can name its own mode. A run that
+  names none takes the config of whichever worker runs each of its turns, so the workers of a
+  queue should share one `context.mode`.
 
 Stopping. SIGTERM and SIGINT start a graceful stop: the worker polls no more, waits up to
 GRACEFUL_SHUTDOWN_S for the activities that are running, and cancels the rest. A cancelled

@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
 
 # A key is secret-looking when its name contains one of these after it is lower-cased and
@@ -140,6 +141,10 @@ class Context(StrictModel):
     keep_recent_turns: int
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
+    # Which of the two tiers run (LH-406). `full` is what the product does, and the default keeps
+    # every config written before the mode existed on that behavior. A run can name its own mode
+    # (`longhaul run --context-mode`), and that wins over this one.
+    mode: ContextMode = ContextMode.FULL
 
 
 class Loop(StrictModel):

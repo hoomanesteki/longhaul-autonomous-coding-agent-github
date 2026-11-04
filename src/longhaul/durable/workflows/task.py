@@ -70,6 +70,17 @@ and the notes, and asks the turn again, once. It does not ask again when the com
 nothing, because the view would be the same. A second overflow in the same turn, or one with
 nothing to fold (the first turn has no view at all), ends the run with "context limit" as before.
 
+The context modes (LH-406). `context.mode` of the worker's config, or the mode a run asks for with
+`longhaul run --context-mode`, switches the tiers off for an ablation: `no_compaction` keeps tier 1
+and `none` has neither (longhaul.context.modes). The workflow cannot read the config, so a run's
+own mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
+and `compact`, which resolve it against the config, and it skips the `compact` call itself when the
+memo says the mode has no compaction. When the memo is empty the config decides, and the workflow
+asks as it always did: `compact` answers "unchanged" in a mode without compaction, and
+`_compact` reads that as nothing to fold. A prompt over the hard limit then ends the run with
+"context limit" at once, since there is nothing to relieve it with. The memo is read and no
+command is added, so the histories of runs before this story replay as they were.
+
 Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
 the same workflow id. After a turn that did not end the run, the workflow hands over when the
 turns done are a multiple of the interval (acts.CONTINUE_AS_NEW_EVERY_TURNS, 40, or the run's
@@ -129,6 +140,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 # model that came from outside still works (ADR-0004, appendix section 1).
 with workflow.unsafe.imports_passed_through():
     from longhaul.agent import rules
+    from longhaul.context.modes import ContextMode
     from longhaul.context.tokens import Decision
     from longhaul.contracts import (
         BlobRef,
@@ -504,6 +516,7 @@ class TaskWorkflow:
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
                         script_ref=self._script(),
+                        context_mode=self._context_mode(),
                     ),
                 )
             except ActivityError as err:
@@ -547,9 +560,12 @@ class TaskWorkflow:
         The compactor is paid for either way, so its cost is added before anything else. A view
         with nothing to fold, or one that a failed compactor left as it was, changes nothing and
         records no event. The failure of the activity, after its retries, fails the workflow
-        like any other activity does.
+        like any other activity does. A run whose mode has no compaction never calls it.
         """
         state = self.state
+        mode = self._context_mode()
+        if mode is not None and not mode.compacts:
+            return False
         if state.transcript_ref is None:
             return False  # nothing has been said yet, so there is nothing to fold
         done = await self._call(
@@ -563,6 +579,7 @@ class TaskWorkflow:
                 notes=state.notes,
                 forced=forced,
                 script_ref=self._script(),
+                context_mode=mode,
             ),
         )
         state.cost_usd += done.cost_usd
@@ -706,6 +723,10 @@ class TaskWorkflow:
 
     def _script(self) -> BlobRef | None:
         return workflow.memo_value(acts.SCRIPT_MEMO_KEY, None, type_hint=BlobRef)
+
+    def _context_mode(self) -> ContextMode | None:
+        """The context mode the run asked for, or None when the worker's config decides."""
+        return workflow.memo_value(acts.CONTEXT_MODE_MEMO_KEY, None, type_hint=ContextMode)
 
     def _sandbox_id(self) -> str:
         sandbox_id = self.state.sandbox_id

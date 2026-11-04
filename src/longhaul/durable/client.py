@@ -15,8 +15,9 @@ from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, CarryState, Outcome, Phase, TaskSpec, TaskStatus
-from longhaul.durable.acts import SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.acts import CONTEXT_MODE_MEMO_KEY, SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.telemetry import logging as logging_context
 from longhaul.telemetry import otel
@@ -53,12 +54,14 @@ async def start_task(
     task_queue: str = DEFAULT_TASK_QUEUE,
     tuning: Tuning | None = None,
     script: BlobRef | None = None,
+    context_mode: ContextMode | None = None,
 ) -> WorkflowHandle[TaskWorkflow, Outcome]:
     """Start the workflow for a task. Its id is the task id.
 
     `script` names the uploaded script that the scripted provider plays for this task
     (longhaul.durable.scripts). It rides in the memo with the tuning, because the worker is a
-    process of its own and started before the task.
+    process of its own and started before the task. So does `context_mode`, the mode this run
+    asks for in place of the config's (longhaul.context.modes); None leaves it to the config.
 
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run
@@ -72,6 +75,8 @@ async def start_task(
         memo[TUNING_MEMO_KEY] = tuning
     if script is not None:
         memo[SCRIPT_MEMO_KEY] = script
+    if context_mode is not None:
+        memo[CONTEXT_MODE_MEMO_KEY] = context_mode
     # Each task is one trace. The poller starts tasks from an activity, where a current span
     # would otherwise make every task of a poll a child of that activity.
     with otel.detached():

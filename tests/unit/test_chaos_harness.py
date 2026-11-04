@@ -298,7 +298,7 @@ def kill_it(
 
 
 @pytest.mark.parametrize("pace", [0.5, 2.0], ids=["twice as fast", "twice as slow"])
-@pytest.mark.parametrize("seed", [9, 19])
+@pytest.mark.parametrize("seed", [3, 19])
 def test_a_kill_meets_a_run_that_is_faster_or_slower_than_the_reference(
     tmp_path: Path, seed: int, pace: float
 ) -> None:

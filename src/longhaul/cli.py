@@ -1,8 +1,8 @@
 """The `longhaul` command line.
 
-Five commands. `run-local` copies a folder into a Docker sandbox, lets the agent work on the
-issue in a text file, and prints what it did. No Temporal and no database are involved, so it is
-the quickest way to watch the agent work.
+Five commands and the `memory` group. `run-local` copies a folder into a Docker sandbox, lets
+the agent work on the issue in a text file, and prints what it did. No Temporal and no database
+are involved, so it is the quickest way to watch the agent work.
 
 The other four use the durable stack that `make up` starts. `worker` runs the process that does
 the work (durable/worker.py). `run` starts a task for a folder on that stack and follows it
@@ -24,15 +24,23 @@ unexpected exception is a bug in longhaul and exits 1 with its traceback.
 finish, an error, a bug, Ctrl-C, SIGTERM or SIGHUP. Only SIGKILL and a crash of the machine
 leave one behind. Its container and volume carry the task id, which the header line prints.
 `run` removes the sandbox of a task that has ended and leaves a task that is still running alone.
+
+`memory` is a group of commands on the notes the agent keeps about a repo (ADR-0010). They read
+the database of LONGHAUL_DATABASE_URL: `memory list --repo REPO` shows the items, and
+`memory approve ID` and `memory reject ID` decide on a candidate. The person who decides is
+recorded as the approver, from `--by` or else the name of the user of the machine. A missing
+item, a missing database setting and a database that cannot be reached exit 2 with one line.
 """
 
 import asyncio
+import getpass
 import logging
 import re
 import signal
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -41,6 +49,8 @@ from typing import Annotated, Any
 import typer
 import yaml
 from docker.errors import DockerException, ImageNotFound
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import (
     Client,
     WorkflowExecutionStatus,
@@ -77,8 +87,11 @@ from longhaul.contracts import (
     ToolCall,
     ToolContext,
 )
+from longhaul.db.session import database_url, make_engine
 from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
 from longhaul.durable.scripts import upload_script
+from longhaul.memory.embedder import LocalEmbedder
+from longhaul.memory.store import KINDS, STATUSES, MemoryEntry, PgMemoryStore
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
@@ -112,6 +125,14 @@ RUN_ERRORS = (
 # The same for the durable commands, which also talk to Temporal and the stores.
 DURABLE_ERRORS = (*RUN_ERRORS, RPCError, WorkflowAlreadyStartedError, BlobError, CheckpointError)
 
+# Failures of the database or of the request to the memory commands, which they report in one
+# line: a missing item, a blank name, a database that is not configured or cannot be reached.
+MEMORY_ERRORS = (LookupError, ValueError, OSError, SQLAlchemyError)
+# The approver when `--by` is not given and the machine has no user name to offer.
+FALLBACK_APPROVER = "cli"
+# The longest content that `memory list` prints on its line.
+LIST_CONTENT_CHARS = 100
+
 app = typer.Typer(
     name="longhaul",
     add_completion=False,
@@ -119,6 +140,13 @@ app = typer.Typer(
     # A traceback with locals could print the API key held in the settings.
     pretty_exceptions_enable=False,
 )
+memory_app = typer.Typer(
+    name="memory",
+    help="Look at what the agent remembers about a repo, and decide on what it proposes.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(memory_app, name="memory")
 
 
 class ProviderName(StrEnum):
@@ -343,6 +371,130 @@ def cancel(
         typer.echo(f"error: {describe(exc, task_id)}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(f"cancel sent to task {task_id}")
+
+
+# ---------- memory ----------
+@asynccontextmanager
+async def open_memory() -> AsyncIterator[PgMemoryStore]:
+    """The memory store on the database of LONGHAUL_DATABASE_URL, closed at the end.
+
+    A function of its own so that unit tests can replace it. These commands never embed a text,
+    so the local model is not loaded: LocalEmbedder reads its model when it is first used.
+    """
+    try:
+        url = database_url()
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    # One short loop per command: a pooled connection would wait for a loop that is gone.
+    engine = make_engine(url, pooled=False)
+    try:
+        sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
+        yield PgMemoryStore(sessions, LocalEmbedder())
+    finally:
+        await engine.dispose()
+
+
+def with_memory[T](job: Callable[[PgMemoryStore], Awaitable[T]]) -> T:
+    """Run `job` on the memory store. A failure of the request or the database exits with 2."""
+
+    async def main() -> T:
+        async with open_memory() as store:
+            return await job(store)
+
+    try:
+        return asyncio.run(main())
+    except MEMORY_ERRORS as exc:
+        typer.echo(f"error: {describe(exc)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+def one_of(allowed: tuple[str, ...]) -> Callable[[str | None], str | None]:
+    """An option check for a value that must be one of `allowed`."""
+
+    def check(value: str | None) -> str | None:
+        if value is not None and value not in allowed:
+            raise typer.BadParameter(f"{value!r} is not one of {', '.join(allowed)}")
+        return value
+
+    return check
+
+
+def default_approver() -> str:
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError):  # no user name in the environment or in the password file
+        return FALLBACK_APPROVER
+
+
+def one_line(text: str, limit: int = LIST_CONTENT_CHARS) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 3] + "..."
+
+
+def format_entry(entry: MemoryEntry) -> str:
+    return (
+        f"{entry.id:<36}  {entry.status:<9}  {entry.kind:<10}  {entry.source:<14}  "
+        f"{entry.uses:>4}  {one_line(entry.content)}"
+    )
+
+
+LIST_HEADER = f"{'ID':<36}  {'STATUS':<9}  {'KIND':<10}  {'SOURCE':<14}  {'USES':>4}  CONTENT"
+
+
+@memory_app.command("list")
+def memory_list(
+    repo: Annotated[str, typer.Option("--repo", help="The repo, as owner/name.")],
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help=f"Only items with this status: {', '.join(STATUSES)}.",
+            callback=one_of(STATUSES),
+        ),
+    ] = None,
+    kind: Annotated[
+        str | None,
+        typer.Option(
+            "--kind",
+            help=f"Only items of this kind: {', '.join(KINDS)}.",
+            callback=one_of(KINDS),
+        ),
+    ] = None,
+) -> None:
+    """List the items the agent remembers about a repo, oldest first.
+
+    Only approved items reach a prompt. Candidates wait here for `memory approve`.
+    """
+    entries = with_memory(lambda store: store.list_items(repo, status=status, kind=kind))
+    if not entries:
+        typer.echo(f"no memory items for {repo}", err=True)
+        return
+    typer.echo(LIST_HEADER)
+    for entry in entries:
+        typer.echo(format_entry(entry))
+
+
+ItemId = Annotated[str, typer.Argument(metavar="ID", help="The id that `memory list` shows.")]
+Approver = Annotated[
+    str | None,
+    typer.Option("--by", help="Who decides. Default: the name of the user of this machine."),
+]
+
+
+@memory_app.command("approve")
+def memory_approve(item_id: ItemId, by: Approver = None) -> None:
+    """Approve an item, so that it can reach the prompt of later tasks."""
+    who = by if by is not None else default_approver()
+    with_memory(lambda store: store.promote(item_id, who))
+    typer.echo(f"approved {item_id} (by {who})")
+
+
+@memory_app.command("reject")
+def memory_reject(item_id: ItemId, by: Approver = None) -> None:
+    """Reject an item. It stays in the table and never reaches a prompt."""
+    who = by if by is not None else default_approver()
+    with_memory(lambda store: store.reject(item_id, who))
+    typer.echo(f"rejected {item_id} (by {who})")
 
 
 # ---------- the run ----------
@@ -740,6 +892,10 @@ def describe(exc: Exception, task_id: str | None = None) -> str:
         return f"{exc}. Build the sandbox image with `make sandbox-image`."
     if isinstance(exc, DockerException):
         return f"docker: {exc}"
+    if isinstance(exc, DBAPIError):
+        return f"database: {exc.orig}"  # without the SQL and the link to the SQLAlchemy docs
+    if isinstance(exc, SQLAlchemyError):
+        return f"database: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}"
     return str(exc) or type(exc).__name__
 
 

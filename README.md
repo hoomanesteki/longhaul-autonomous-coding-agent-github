@@ -32,7 +32,7 @@ The design, contracts and story plan are in [docs/plan/longhaul-build-plan.md](d
 | Sandbox | Hardened Docker container per task, streamed and bounded command output, background processes cleaned up after every command |
 | Tools | `list_dir`, `read_file`, `search`, `edit_file`, `write_file`, `run_command`, `run_tests`, `git_diff`, `read_output`, `finish` |
 | Agent loop | In-process loop with explicit rules for refusals, output limits, context limits and tool pairing |
-| CLI | `longhaul run-local` runs the agent on a local folder |
+| CLI | `longhaul run-local` runs the agent on a local folder, and `longhaul memory` lists and decides on what it remembers about a repo |
 
 ## Quickstart
 

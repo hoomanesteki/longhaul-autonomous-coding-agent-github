@@ -3,7 +3,7 @@
 from typing import Any, get_args
 
 import pytest
-from sqlalchemy import CheckConstraint
+from sqlalchemy import CheckConstraint, Index
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
@@ -27,6 +27,11 @@ def _check_text(name: str) -> str:
     return checks[name]
 
 
+def _index(name: str) -> Index:
+    (found,) = (i for i in MemoryItemRow.__table__.indexes if i.name == name)
+    return found
+
+
 def _literal_values(field: str) -> tuple[Any, ...]:
     return get_args(MemoryItem.model_fields[field].annotation)
 
@@ -35,15 +40,17 @@ def test_columns_match_the_data_model() -> None:
     columns = {c.name: c for c in MemoryItemRow.__table__.columns}
     assert set(columns) == {
         "id", "repo", "kind", "content", "embedding", "status", "source", "source_ref",
-        "approved_by", "uses", "last_used_at", "created_at",
+        "approved_by", "uses", "last_used_at", "created_at", "content_hash",
     }  # fmt: skip
     assert columns["id"].primary_key
     # The plan marks approved_by "null". A reference exists only for what came from a commit,
-    # a pull request or a task, and an item has no use until something retrieves it.
+    # a pull request or a task, and an item has no use until something retrieves it. The hash
+    # is LH-603's: a row that something other than the store wrote has none.
     assert {name for name, column in columns.items() if column.nullable} == {
         "source_ref",
         "approved_by",
         "last_used_at",
+        "content_hash",
     }
 
 
@@ -94,9 +101,23 @@ def test_the_only_checks_are_the_three_value_lists() -> None:
 
 
 def test_the_embedding_index_is_hnsw_on_cosine_distance() -> None:
-    (index,) = MemoryItemRow.__table__.indexes
+    index = _index("ix_memory_items_embedding")
     ddl = str(CreateIndex(index).compile(dialect=postgresql.dialect()))
     assert index.name == "ix_memory_items_embedding"
     assert "USING hnsw (embedding vector_cosine_ops)" in ddl
     # pgvector's own defaults, written out so a change of the default does not change the index.
     assert "WITH (m = 16, ef_construction = 64)" in ddl
+
+
+def test_the_hash_of_a_note_is_unique_within_a_repo_and_kind() -> None:
+    # De-duplication (LH-603): the same note cannot be stored twice for one repo and kind.
+    index = _index("uq_memory_items_repo_kind_content_hash")
+    assert index.unique
+    assert [c.name for c in index.columns] == ["repo", "kind", "content_hash"]
+    ddl = str(CreateIndex(index).compile(dialect=postgresql.dialect()))
+    assert "CREATE UNIQUE INDEX uq_memory_items_repo_kind_content_hash" in ddl
+
+
+def test_the_table_has_the_two_indexes_and_no_more() -> None:
+    names = {i.name for i in MemoryItemRow.__table__.indexes}
+    assert names == {"ix_memory_items_embedding", "uq_memory_items_repo_kind_content_hash"}

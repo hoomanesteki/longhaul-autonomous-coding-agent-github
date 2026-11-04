@@ -15,6 +15,18 @@ command, so a cancel has to reach it and a killed worker has to be noticed in a 
 timeout, because it uploads the whole history of a repository. `record_event` is a local
 activity: it is one row insert, and it runs inside the worker that holds the workflow.
 
+The GitHub activities (LH-306) are in `GITHUB`, and not in `ALL`, because only a worker with a
+GitHub token registers them. `post_comment`, `add_label`, `remove_label` and `create_pr` are the
+idempotent writes of github/side_effects.py with the policies of section 3.7: 2 minutes and 10
+attempts, backing off to 5 minutes. The workflow calls the first three itself, for the labels and
+the pickup comment (github/lifecycle.py). It does not call `create_pr`: `deliver` makes the pull
+request inside the activity with the plain function, after the push, because the body is built
+there from the diff and from the test output, and a body over 16 KB may not cross an activity
+boundary (CONTRIBUTING.md rule 5). `build_pr_branch` has the 5 minutes and 3 attempts of section
+3.7. `deliver` is not in the table. It pushes a branch, whose git timeout is 10 minutes, and then
+does what create_pr does, so it gets 10 minutes, a heartbeat that a killed worker is noticed by in
+a minute, and 5 attempts with the backoff of the writes.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -58,6 +70,7 @@ from longhaul.contracts import (
     Usage,
 )
 from longhaul.durable.payload_guard import PayloadTooLargeError
+from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
 
 # The `finish` control tool ends a task. The workflow runs nothing for it: rules.run_calls reads
 # its summary. A unit test keeps the name equal to longhaul.tools.control.FINISH.
@@ -105,6 +118,21 @@ SANDBOX_GONE = "SandboxGoneError"
 # run ends with an error. A sandbox that dies every time, because the call kills it or because
 # the host is failing, must not make the workflow loop.
 MAX_SANDBOX_RECREATIONS = 2
+
+# The error types that the GitHub activities raise as ApplicationError. The retry policies name
+# them, so the activity and the policy cannot drift apart. A unit test keeps the first two equal
+# to the names of the client's exceptions, which the workflow cannot import.
+GITHUB_FATAL = "GitHubFatal"
+GITHUB_RETRYABLE = "GitHubRetryable"
+# A request to a write that no retry can fix: a missing body, a key that is not valid, a key that
+# was used for another effect (github/side_effects.py).
+SIDE_EFFECT_ERRORS = ("SideEffectError", "InvalidKeyError", "KeyReuseError")
+# The work of the task changes no file, so there is no pull request to make. build_pr_branch
+# raises it, and the workflow ends the task with an error outcome. A unit test keeps the name
+# equal to checkpoints.squash.NothingToDeliverError.
+NOTHING_TO_DELIVER = "NothingToDeliverError"
+# A push to the default branch or a protected name (failure mode F15). Never retried.
+FORBIDDEN_BRANCH = "ForbiddenBranchError"
 
 
 # ---------- payloads ----------
@@ -260,6 +288,48 @@ class BundleCheckpointInput(BaseModel):
     turn_index: int
 
 
+class BuildPrBranchInput(BaseModel):
+    """What build_pr_branch needs: the finish summary, which titles the commit, and the checkpoint.
+
+    `head_sha` is the latest checkpoint the workflow knows. The work of the whole task is the
+    change from the base commit to it.
+    """
+
+    task_id: str
+    repo: str
+    summary: str
+    head_sha: str
+
+
+class PrBranchOutput(BaseModel):
+    """The pull request branch: its name and head, the commit it sits on and the title.
+
+    `base_branch` is the default branch of the repo as GitHub reported it when the branch was
+    built. The pull request goes into it, and keeping it here means that every attempt of
+    `deliver` sends the same request.
+    """
+
+    branch: str
+    head_sha: str
+    base_sha: str
+    base_branch: str
+    title: str
+
+
+class DeliverInput(BaseModel):
+    """What deliver needs: the branch to push, and the facts for the title and the body."""
+
+    task_id: str
+    repo: str
+    issue_number: int
+    summary: str
+    branch: str
+    base_branch: str
+    base_sha: str
+    head_sha: str
+    title: str
+
+
 # ---------- activities ----------
 @dataclass(frozen=True)
 class Act[In, Out]:
@@ -363,6 +433,73 @@ RECORD_EVENT = Act(
     local=True,
 )
 
+# Backoff for a write to GitHub: the first retry comes quickly, and the wait doubles up to the
+# five minutes of section 3.7. GitHub's own advice (a rate limit) replaces it for one attempt.
+_GITHUB_ERRORS = [_OVERSIZED, GITHUB_FATAL, *SIDE_EFFECT_ERRORS]
+
+
+def _github_write(attempts: int, never: list[str]) -> RetryPolicy:
+    return RetryPolicy(
+        initial_interval=timedelta(seconds=5),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(minutes=5),
+        maximum_attempts=attempts,
+        non_retryable_error_types=never,
+    )
+
+
+POST_COMMENT = Act(
+    "post_comment",
+    CommentInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+ADD_LABEL = Act(
+    "add_label",
+    LabelInput,
+    str,  # the name of the label
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+REMOVE_LABEL = Act(
+    "remove_label",
+    LabelInput,
+    str,
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+CREATE_PR = Act(
+    "create_pr",
+    PullRequestInput,
+    str,  # the URL of the pull request
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+BUILD_PR_BRANCH = Act(
+    "build_pr_branch",
+    BuildPrBranchInput,
+    PrBranchOutput,
+    start_to_close=timedelta(minutes=5),
+    retry=RetryPolicy(
+        maximum_attempts=3,
+        non_retryable_error_types=[_OVERSIZED, GITHUB_FATAL, NOTHING_TO_DELIVER, FORBIDDEN_BRANCH],
+    ),
+)
+
+DELIVER = Act(
+    "deliver",
+    DeliverInput,
+    str,  # the URL of the pull request
+    start_to_close=timedelta(minutes=10),
+    heartbeat=timedelta(seconds=60),
+    retry=_github_write(5, [*_GITHUB_ERRORS, FORBIDDEN_BRANCH]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -372,6 +509,16 @@ ALL: tuple[Act[Any, Any], ...] = (
     CLEANUP,
     BUNDLE_CHECKPOINT,
     RECORD_EVENT,
+)
+
+# What a worker with a GitHub token registers in addition to ALL (LH-306).
+GITHUB: tuple[Act[Any, Any], ...] = (
+    POST_COMMENT,
+    ADD_LABEL,
+    REMOVE_LABEL,
+    CREATE_PR,
+    BUILD_PR_BRANCH,
+    DELIVER,
 )
 
 

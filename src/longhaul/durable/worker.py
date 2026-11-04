@@ -20,6 +20,13 @@ What it is built from, and why each piece is what it is:
 * GitHub repos need LONGHAUL_GITHUB_TOKEN, a fine-grained PAT (ADR-0012). The worker clones and
   pushes with it on the host; it never enters a sandbox (ADR-0009). Without it the worker takes
   local folders only and still recovers the sandbox of a GitHub task.
+* With the token the worker also registers the GitHub writes (post_comment, add_label,
+  remove_label, create_pr) and the delivery (build_pr_branch, deliver), LH-306. They share one
+  idempotency ledger, the `side_effects` table on this worker's database, so a retry of any of
+  them finds the row of the attempt before. The commits of a pull request branch are made by
+  LONGHAUL_GIT_AUTHOR, and the body of the pull request comes from the templates folder
+  (LONGHAUL_TEMPLATES_DIR). Without the token none of them is registered, and a task of an
+  issue could not have been prepared in the first place.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 
@@ -54,6 +61,7 @@ from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import load_pricing
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
+from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import ToolActivities
@@ -63,9 +71,11 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
 from longhaul.github.remote import GitHubRemote
+from longhaul.github.side_effects import SideEffectActivities
+from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
+from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
 
@@ -161,12 +171,30 @@ def build_parts(
         github=remote,
     )
     events = EventActivities(recorder)
+    delivery: list[Callable[..., Any]] = []
+    if github is not None and remote is not None:
+        # One ledger for the writes and the delivery, so that a key is held and recorded once.
+        effects = EffectLedger(sessions)
+        delivery = [
+            *SideEffectActivities(github, effects).activities,
+            *DeliveryActivities(
+                store,
+                remote,
+                github,
+                effects,
+                recorder,
+                blobs,
+                author=settings.git_author,
+                templates=templates_path(settings),
+            ).activities,
+        ]
     return WorkerParts(
         activities=[
             *llm.activities,
             *tools.activities,
             *workspace.activities,
             *events.activities,
+            *delivery,
         ],
         blobs=blobs,
         store=store,

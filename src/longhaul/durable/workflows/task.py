@@ -1,7 +1,8 @@
 """TaskWorkflow: the one durable owner of a task.
 
 It holds the task's CarryState, answers `status()`, takes the signals that steer a task, and
-drives the phases through activities: PREPARING, a CODING loop, then DONE. All I/O happens in
+drives the phases through activities: PREPARING, a CODING loop, then DONE. The task of an issue
+goes through DELIVERING before DONE (see "A task of an issue" below). All I/O happens in
 activities, which this module calls by name through longhaul.durable.acts. It imports no I/O
 library (invariant I1, checked by tests/unit/test_invariants.py), reads time only through
 workflow.now() (it needs none yet), and uses no random numbers.
@@ -37,11 +38,31 @@ has no tool_use without a tool_result. A run that starts with a sandbox id, beca
 run prepared it and handed over (see Continue-As-New below), calls `ensure_sandbox` before its
 first turn, since the container may be gone by then.
 
+A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
+(lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
+
+1. Its first activity is the pickup: the "Picked up" comment and the `longhaul:working` label on
+   the issue, both written through github/side_effects.py with stable keys. A run that starts
+   with a sandbox id, because an earlier run prepared it and handed over, has been picked up
+   already and does not repeat it. The keys would make a repeat harmless, but each one costs an
+   activity and a place in the history.
+2. When the model calls `finish`, the phase becomes DELIVERING and the task is not over. The
+   `build_pr_branch` activity makes the pull request branch, and `deliver` pushes it and opens
+   a draft pull request. The task then swaps the label (`longhaul:working` out, `longhaul:pr-open`
+   in) and ends with PR_OPENED carrying the URL. `status()` shows no outcome until then.
+3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
+   because GitHub refuses a pull request with no commit.
+
+Pause and resume (Phases 5 and 7) add and remove `longhaul:needs-human` through `_needs_human`
+and `_human_done`, which are here for them. Nothing calls them yet. The labels of a task that
+ends any other way (an error, a cancel) are left alone until LH-507.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
-- the model calls `finish` with a summary: PR_OPENED with the model's summary and no pr_url, since
-  opening the pull request is Phase 3 work. This is the same outcome the in-process loop returns;
+- the model calls `finish` with a summary: PR_OPENED with the model's summary. A local task has
+  no pull request and so no pr_url, which is the outcome the in-process loop returns too. The
+  task of an issue has the URL of its pull request;
 - a `cancel` signal: CANCELLED, after a `cleanup` activity;
 - `task_turns` plus the turns added by `add_budget` pass: ERROR "turn limit";
 - a tool call finds its sandbox gone more often than it may: ERROR "sandbox lost";
@@ -125,6 +146,7 @@ with workflow.unsafe.imports_passed_through():
         ToolResult,
     )
     from longhaul.durable import acts
+    from longhaul.github import lifecycle
 
 
 @dataclass(frozen=True)
@@ -147,6 +169,8 @@ def cancel_summary(by: str, reason: str) -> str:
 
 # The summary of the outcome when one tool call keeps finding its sandbox gone.
 SANDBOX_LOST = "sandbox lost"
+# The summary of the outcome of a task of an issue whose work changes no file.
+NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 
 # The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
 CONTINUE_AS_NEW_EVENT = "continue_as_new"
@@ -179,6 +203,12 @@ def _is_sandbox_gone(err: ActivityError) -> bool:
     """
     cause = err.cause
     return isinstance(cause, ApplicationError) and cause.type == acts.SANDBOX_GONE
+
+
+def _has_nothing_to_deliver(err: ActivityError) -> bool:
+    """True when build_pr_branch failed because the work changes no file."""
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == acts.NOTHING_TO_DELIVER
 
 
 def _ended_by(err: ActivityError) -> Outcome | None:
@@ -257,10 +287,23 @@ class TaskWorkflow:
     async def run(self, state: CarryState) -> Outcome:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
+            await self._pick_up()
             await self._prepare()
-            return await self._code()
+            outcome = await self._code()
+            if self.state.phase is Phase.DELIVERING:
+                outcome = await self._deliver(outcome)
+            return outcome
         except _CancelRequested:
             return await self._cancelled()
+
+    async def _pick_up(self) -> None:
+        """Tell the issue that the task has begun: the first activity of a task of an issue."""
+        state = self.state
+        if state.sandbox_id is not None or not lifecycle.is_github_task(state.spec):
+            return
+        state.phase = Phase.PREPARING
+        await self._call(acts.POST_COMMENT, lifecycle.pickup_comment(state.spec))
+        await self._label(lifecycle.on_pickup(state.spec))
 
     async def _prepare(self) -> None:
         state = self.state
@@ -411,7 +454,7 @@ class TaskWorkflow:
         )
         state.turn_index = index + 1
         if ran.finish is not None:
-            return self._end(rules.finished(ran.finish), Phase.DONE)
+            return self._finish(rules.finished(ran.finish))
         return None
 
     async def _end_lost(
@@ -547,6 +590,69 @@ class TaskWorkflow:
         if result.post_sha is not None:
             state.head_sha = result.post_sha
         return result
+
+    # ---------- delivery and labels ----------
+    def _finish(self, finished: Outcome) -> Outcome:
+        """The model finished. A local task is done. The task of an issue still has to deliver."""
+        if lifecycle.is_github_task(self.state.spec):
+            self.state.phase = Phase.DELIVERING  # run() delivers, and ends the task
+            return finished
+        return self._end(finished, Phase.DONE)
+
+    async def _deliver(self, finished: Outcome) -> Outcome:
+        """Open the draft pull request and move the label. Ends the task with its URL."""
+        state = self.state
+        issue = state.spec.issue_number
+        if state.head_sha is None or issue is None:
+            # Both are set for a task of an issue that has run. Asking again changes nothing.
+            raise ApplicationError(
+                "a pull request cannot be built: the task has no checkpoint or no issue",
+                non_retryable=True,
+            )
+        task_id, repo = state.spec.task_id, state.spec.repo
+        try:
+            built = await self._call(
+                acts.BUILD_PR_BRANCH,
+                acts.BuildPrBranchInput(
+                    task_id=task_id, repo=repo, summary=finished.summary, head_sha=state.head_sha
+                ),
+            )
+        except ActivityError as err:
+            if not _has_nothing_to_deliver(err):
+                raise
+            return self._end(rules.error(NOTHING_TO_DELIVER), Phase.FAILED)
+        pr_url = await self._call(
+            acts.DELIVER,
+            acts.DeliverInput(
+                task_id=task_id,
+                repo=repo,
+                issue_number=issue,
+                summary=finished.summary,
+                branch=built.branch,
+                base_branch=built.base_branch,
+                base_sha=built.base_sha,
+                head_sha=built.head_sha,
+                title=built.title,
+            ),
+        )
+        await self._label(lifecycle.on_pr_opened(state.spec))
+        done = Outcome(kind=OutcomeKind.PR_OPENED, pr_url=pr_url, summary=finished.summary)
+        return self._end(done, Phase.DONE)
+
+    async def _label(self, steps: list[lifecycle.LabelStep]) -> None:
+        """Run label changes in order, each as an idempotent activity."""
+        for step in steps:
+            await self._call(acts.ADD_LABEL if step.add else acts.REMOVE_LABEL, step.label)
+
+    async def _needs_human(self, pause: int) -> None:
+        """Ask for a person on the issue. For the pause of Phases 5 and 7: `pause` counts from 1."""
+        if lifecycle.is_github_task(self.state.spec):
+            await self._label(lifecycle.on_pause(self.state.spec, pause))
+
+    async def _human_done(self, pause: int) -> None:
+        """Take the request for a person back when the task resumes."""
+        if lifecycle.is_github_task(self.state.spec):
+            await self._label(lifecycle.on_resume(self.state.spec, pause))
 
     # ---------- cancel ----------
     async def _cancelled(self) -> Outcome:

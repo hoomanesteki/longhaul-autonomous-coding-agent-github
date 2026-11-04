@@ -29,7 +29,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -227,6 +227,7 @@ async def _run_git(
     timeout_s: float = HOST_GIT_TIMEOUT_S,
     strip: bool = True,
     config: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run git on the host and return its exit code, stdout and stderr. Never raises on exit.
 
@@ -235,6 +236,9 @@ async def _run_git(
 
     `config` goes before the subcommand and lives for this process only. Its values are
     removed from the text that comes back, because that text ends up in exceptions.
+
+    `env` adds variables to the environment of this process, such as the author and the dates of
+    a commit that has to come out the same every time (checkpoints/squash.py).
     """
     where = ("--git-dir", str(git_dir)) if git_dir is not None else ()
     proc = await asyncio.create_subprocess_exec(
@@ -243,7 +247,7 @@ async def _run_git(
         *config,
         *where,
         *args,
-        env=_host_env(),
+        env={**_host_env(), **(env or {})},
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -270,10 +274,11 @@ async def git(
     timeout_s: float = HOST_GIT_TIMEOUT_S,
     strip: bool = True,
     config: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Like _run_git, but a failure raises CheckpointError and the result is stdout."""
     code, out, err = await _run_git(
-        *args, git_dir=git_dir, timeout_s=timeout_s, strip=strip, config=config
+        *args, git_dir=git_dir, timeout_s=timeout_s, strip=strip, config=config, env=env
     )
     if code != 0:
         raise CheckpointError(f"git {args[0]} failed (exit {code}): {_tail(err or out)}")

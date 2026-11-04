@@ -15,6 +15,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
 
+# The identity of the commits on a pull request branch, written the way git writes an author.
+# squash.parse_author checks it when the worker starts.
+DEFAULT_GIT_AUTHOR = "longhaul <longhaul@users.noreply.github.com>"
+
 # A key is secret-looking when its name contains one of these after it is lower-cased and
 # stripped of separators. Matching inside the flattened name catches camelCase (githubToken),
 # names without separators (apikey) and plurals (api_keys), which whole-word matching missed.
@@ -61,6 +65,10 @@ class EnvSettings(BaseSettings):
     script: Path | None = None
     # Where the worker keeps one bare repo per task. Unset means ~/.longhaul/ckpt (ADR-0006).
     ckpt_dir: Path | None = None
+    # Author and committer of the commits on a pull request branch (LH-306).
+    git_author: str = DEFAULT_GIT_AUTHOR
+    # Where the Jinja templates are, such as pr_body.md.j2. Unset means templates/ in the checkout.
+    templates_dir: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )
@@ -81,6 +89,17 @@ def config_path(settings: EnvSettings) -> Path:
         return path
     bundled = PROJECT_ROOT / path
     return bundled if bundled.exists() else path
+
+
+def templates_path(settings: EnvSettings) -> Path:
+    """The folder of the Jinja templates: LONGHAUL_TEMPLATES_DIR, else templates/ of the checkout.
+
+    The worker image copies the folder next to the code and sets the variable, because an
+    installed package does not sit inside the checkout.
+    """
+    return (
+        settings.templates_dir if settings.templates_dir is not None else PROJECT_ROOT / "templates"
+    )
 
 
 class StrictModel(BaseModel):

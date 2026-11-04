@@ -205,7 +205,7 @@ async def test_the_github_writes_go_through_the_ledger_of_the_worker(tmp_path: P
             fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"
         }
         assert isinstance(writes._ledger, SqlEffectLedger)
-        assert delivery._ledger is writes._ledger or isinstance(delivery._ledger, SqlEffectLedger)
+        assert delivery._ledger is writes._ledger
         assert delivery._author == "longhaul <longhaul@users.noreply.github.com>"
     finally:
         await parts.close()

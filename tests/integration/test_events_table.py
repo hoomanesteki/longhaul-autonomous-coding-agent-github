@@ -100,7 +100,9 @@ def test_the_table_is_one_step_on_the_migration_path(scratch: Scratch) -> None:
     revision = script.get_revision(REVISION)
     assert revision is not None
     assert revision.down_revision == "0004_side_effects"
-    assert script.get_heads() == [REVISION], "the history has one head, and it is this step"
+    # Later migrations chain on top of this one, so it is on the path, not always the head.
+    assert len(script.get_heads()) == 1, "the history has one head"
+    assert REVISION in {step.revision for step in script.walk_revisions()}
 
     command.upgrade(cfg, "head")
     assert scratch.tables() >= {"side_effects", "events"}

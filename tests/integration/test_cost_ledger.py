@@ -55,7 +55,7 @@ from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.tools import ToolActivities
+from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -231,7 +231,7 @@ async def running(
     llm = LlmActivities(
         provider, store, recorder, registry.specs(), lambda role: CFG, ledger=ledger
     )
-    tools = ToolActivities(registry, boxes, store, recorder)
+    tools = ToolActivities(registry, boxes, store, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
         async with Worker(

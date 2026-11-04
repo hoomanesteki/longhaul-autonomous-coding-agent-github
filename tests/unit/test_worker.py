@@ -214,3 +214,32 @@ def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: P
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert _workspace_of(parts)._github is None
     assert parts.github is None
+
+
+# ---------- one GitHub client (LH-305 and LH-307) ----------
+async def test_the_poller_and_the_clone_share_one_github_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two clients would leave one of them out of WorkerParts.close(), and its connection pool
+    # would stay open when the worker stops.
+    built: list[GitHubClient] = []
+
+    class Recording(GitHubClient):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(worker, "GitHubClient", Recording)
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token=TOKEN),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert len(built) == 1
+        assert parts.github is built[0]
+        assert poller_of(parts)._github is built[0]
+        assert _workspace_of(parts)._github._client is built[0]
+    finally:
+        await parts.close()
+    assert all(client._http.is_closed for client in built)

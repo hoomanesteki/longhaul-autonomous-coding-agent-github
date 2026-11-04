@@ -9,6 +9,7 @@ worker, against Postgres.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from pathlib import Path
@@ -499,6 +500,39 @@ async def test_the_longest_wait_of_several_failed_repos_wins(
 
     assert failed.value.next_retry_delay == timedelta(seconds=20)
     assert REPO in str(failed.value) and OTHER in str(failed.value)
+
+
+SPENT_QUOTA = {
+    "x-ratelimit-remaining": "0",
+    # Forty minutes ahead, as GitHub answers when the primary rate limit is used up.
+    "x-ratelimit-reset": str(int(time.time()) + 40 * 60),
+}
+
+
+@pytest.mark.parametrize(
+    "status, headers",
+    [(429, {"retry-after": "3000"}), (403, SPENT_QUOTA)],
+    ids=["retry-after", "spent quota"],
+)
+async def test_a_long_wait_is_cut_to_the_longest_backoff_of_the_policy(
+    fake: FakeGitHub,
+    github: GitHubClient,
+    store: MemoryTaskStore,
+    temporal: FakeTemporal,
+    status: int,
+    headers: dict[str, str],
+) -> None:
+    # The run of a poll lasts POLLER_RUN_TIMEOUT at most, and ADR-0008 backs rate limits off by
+    # 5 to 30 seconds. A wait of an hour would idle the run until the server times it out, with
+    # no GitHub message on it, and the Schedule would skip every tick meanwhile.
+    fake.fail_next(rf"/repos/{REPO}/issues", status=status, headers=headers)
+
+    with pytest.raises(ApplicationError) as failed:
+        await poll(poller(github, store), temporal)
+
+    assert failed.value.type == acts.GITHUB_RETRYABLE
+    assert failed.value.next_retry_delay == acts.POLL_ONCE.retry.maximum_interval
+    assert "polling failed" in failed.value.message
 
 
 async def test_a_failure_message_stays_short_enough_for_the_history(

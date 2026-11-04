@@ -121,6 +121,30 @@ def test_an_exception_message_is_redacted(out: Captured) -> None:
     assert GITHUB_TOKEN not in out.text()
 
 
+def test_a_key_after_an_escaped_newline_is_redacted(out: Captured) -> None:
+    # Tool output reaches a log as a repr more often than as raw text, and a repr writes a
+    # newline as the two characters backslash and n, so the letter n sits just before a key.
+    class Result(BaseModel):
+        output: str
+
+    text = "OK\n" + OPENAI_KEY
+    structlog.get_logger("a").info("tool done", result=Result(output=text))
+    logging.getLogger("b").info("tool output %r", text)
+    logging.getLogger("c").info("tool output %s", [text])
+    try:
+        raise RuntimeError(f"provider echoed {text!r}")
+    except RuntimeError:
+        logging.getLogger("d").exception("completing as failed")
+
+    lines = out.lines()
+    assert len(lines) == 4
+    assert lines[0]["result"] == f"Result(output='OK\\n{REDACTED}')"
+    assert lines[1]["event"] == f"tool output 'OK\\n{REDACTED}'"
+    assert lines[2]["event"] == f"tool output ['OK\\n{REDACTED}']"
+    assert REDACTED in lines[3]["exception"]
+    assert OPENAI_KEY not in out.text()
+
+
 def test_an_object_that_is_not_json_is_redacted_too(out: Captured) -> None:
     class Holder:
         def __repr__(self) -> str:
@@ -145,6 +169,19 @@ def test_trace_id_comes_from_the_current_span(out: Captured) -> None:
     assert inside["trace_id"] == expected
     assert inside_too["trace_id"] == expected
     assert "trace_id" not in outside  # no span, so no made-up id
+    provider.shutdown()
+
+
+def test_a_bound_trace_id_gives_way_to_the_current_span(out: Captured) -> None:
+    provider = TracerProvider()
+    structlog.contextvars.bind_contextvars(trace_id="0" * 31 + "1")
+    with provider.get_tracer("test").start_as_current_span("work") as span:
+        structlog.get_logger("a").info("inside")
+    structlog.get_logger("a").info("outside")
+
+    inside, outside = out.lines()
+    assert inside["trace_id"] == format(span.get_span_context().trace_id, "032x")
+    assert outside["trace_id"] == "0" * 31 + "1"  # nothing is open, so the bound id stands
     provider.shutdown()
 
 
@@ -218,3 +255,34 @@ async def test_an_activity_without_a_task_binds_only_its_name(out: Captured) -> 
     assert line["activity"] == "poll_once"
     assert "task_id" not in line
     assert "turn_index" not in line
+
+
+async def test_the_trace_id_of_the_activity_span_outlives_the_span(out: Captured) -> None:
+    # temporalio closes the RunActivity span and then writes "Completing activity as failed".
+    # The interceptor runs inside that span, so it can keep the id for the line written after it.
+    provider = TracerProvider()
+    interceptor = longhaul_logging.interceptors()[0].intercept_activity(Final())
+    env = ActivityEnvironment()
+    env.info = dataclasses.replace(env.info, activity_type="llm_turn")
+
+    async def llm_turn(inp: Work) -> None:
+        structlog.get_logger("a").info("inside the span")
+
+    call = ExecuteActivityInput(
+        fn=llm_turn, args=(Work(task_id="lh-acme-calc-7", turn_index=2),), executor=None, headers={}
+    )
+    ids: list[str] = []
+
+    async def body() -> None:
+        with provider.get_tracer("test").start_as_current_span("RunActivity") as span:
+            ids.append(format(span.get_span_context().trace_id, "032x"))
+            await interceptor.execute_activity(call)
+        logging.getLogger("temporalio.activity").warning("Completing activity as failed")
+
+    await env.run(body)
+
+    inside, after = out.lines()
+    assert inside["trace_id"] == ids[0]
+    assert after["trace_id"] == ids[0]
+    assert after["task_id"] == "lh-acme-calc-7"
+    provider.shutdown()

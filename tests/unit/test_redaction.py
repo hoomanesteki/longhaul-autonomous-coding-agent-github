@@ -4,6 +4,8 @@ CI runs gitleaks over the whole history, so no secret-shaped string is written o
 file. Each fake is put together from parts when the test module loads.
 """
 
+import json
+
 import pytest
 
 from longhaul.telemetry.logging import REDACTED, redact
@@ -106,6 +108,32 @@ PATTERN_CASES = [
         "lh-acme-my-task-tracker-pro-edition-v2-5",
         "lh-acme-my-task-tracker-pro-edition-v2-5",
         id="sk-inside-a-longer-word",
+    ),
+    pytest.param(
+        "OK\\ntask-tracker-pro-edition-v2-5",
+        "OK\\ntask-tracker-pro-edition-v2-5",
+        id="sk-inside-a-longer-word-after-an-escaped-newline",
+    ),
+    # Text that shows a newline, tab or carriage return as two characters (a repr, a %r log
+    # argument, str() of a list, JSON) puts a letter just before the key. It still starts a word.
+    pytest.param(
+        "OK\\n" + openai_key(), "OK\\n" + REDACTED, id="openai-key-after-an-escaped-newline"
+    ),
+    pytest.param("OK\\t" + openai_key(), "OK\\t" + REDACTED, id="openai-key-after-an-escaped-tab"),
+    pytest.param(
+        "OK\\r" + openai_key(),
+        "OK\\r" + REDACTED,
+        id="openai-key-after-an-escaped-carriage-return",
+    ),
+    pytest.param(
+        repr("OK\n" + openai_key()),
+        repr("OK\n" + REDACTED),
+        id="openai-key-in-the-repr-of-a-multi-line-string",
+    ),
+    pytest.param(
+        json.dumps({"stdout": "OK\n" + openai_key()}),
+        json.dumps({"stdout": "OK\n" + REDACTED}),
+        id="openai-key-in-json-encoded-output",
     ),
     pytest.param("", "", id="empty-text"),
 ]

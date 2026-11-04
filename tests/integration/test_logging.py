@@ -141,4 +141,7 @@ async def test_the_failure_warning_of_the_sdk_names_the_task() -> None:
     assert line["level"] == "warning"
     assert line["task_id"] == run.inp.task_id
     assert line["activity"] == ACTIVITY_NAME
+    assert line["turn_index"] == 3
     assert "gave up" in line["exception"]
+    # The RunActivity span is closed by then, and an operator still needs the id to find it.
+    assert line["trace_id"] == run.trace_id

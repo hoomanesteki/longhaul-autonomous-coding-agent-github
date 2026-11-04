@@ -9,10 +9,17 @@ builds the base commit from the repo. The second is told the commit to return to
 latest checkpoint the workflow knows (`head_sha`), and not whatever the branch in /ckpt holds,
 because an attempt that died can leave a commit there that the workflow never learned about.
 
-prepare_workspace handles `local:/abs/path` repos. The folder is not a git repo, so it is
-committed first (checkpoints/snapshot.py) using the same copy rules as `longhaul run-local`
-(agent/workspace.py), and that commit is what the bare repo is cloned from. A GitHub repo
-arrives with LH-305, which adds the clone to `_source`.
+prepare_workspace handles two kinds of repo. A `local:/abs/path` folder is not a git repo, so it
+is committed first (checkpoints/snapshot.py) using the same copy rules as `longhaul run-local`
+(agent/workspace.py), and that commit is what the bare repo is cloned from.
+
+An `owner/name` repo is cloned from GitHub (LH-305). The host asks the API for the default branch
+and the commit it holds, then clones into the task's bare repo with the token as a setting of
+that one git process, and puts longhaul/<n> on the commit it asked for. The clone happens here, on
+the host, so the sandbox never holds a token (ADR-0009): it gets the bare repo at /ckpt and
+nothing else. The API answers first, so a repo that does not exist or a token that GitHub
+refuses fails before the host has touched anything. From the bare repo on, both kinds go the
+same way.
 
 A retried attempt must succeed after an earlier one died halfway. The earlier one can leave a
 container with the network on, a volume with half a workspace, a repo and a half-built clone.
@@ -74,8 +81,10 @@ from longhaul.checkpoints.snapshot import snapshot_folder
 from longhaul.contracts import BlobRef, MemoryItem, Sandbox, SandboxLimits, TaskSpec
 from longhaul.db.records import CheckpointRecord, Recorder
 from longhaul.durable import acts
-from longhaul.durable.activities.support import heartbeating, not_retried, small
+from longhaul.durable.activities.support import github_failure, heartbeating, not_retried, small
+from longhaul.github.client import GitHubError
 from longhaul.github.intake import LOCAL_PREFIX, is_local
+from longhaul.github.remote import GitHubRemote
 from longhaul.memory.commands import discover_commands
 
 log = logging.getLogger(__name__)
@@ -122,6 +131,16 @@ class LocalFolder:
     files: list[SourceFile]
 
 
+@dataclass(frozen=True)
+class GitHubBase:
+    """A commit of a GitHub repo to start from, and where and how to clone it."""
+
+    remote: GitHubRemote
+    clone_url: str
+    default_branch: str
+    sha: str
+
+
 class WorkspaceActivities:
     """prepare_workspace, ensure_sandbox, bundle_checkpoint and cleanup, with what they need.
 
@@ -129,7 +148,9 @@ class WorkspaceActivities:
     workflow cannot read. `checkpoints` is the store that tool_exec uses, because the repo that
     this class creates is the one that tool_exec saves into. `memory` is where the verified
     commands of a repo are kept. Without it, prepare_workspace does not look for them, which is
-    how a run or a test without a database works.
+    how a run or a test without a database works. `github` is how the host reaches GitHub.
+    Without it a worker prepares local folders only, and it can still recover the sandbox of a
+    GitHub task, because ensure_sandbox reads nothing but the bare repo.
     """
 
     def __init__(
@@ -142,6 +163,7 @@ class WorkspaceActivities:
         limits: SandboxLimits,
         setup_timeout_s: int = SETUP_TIMEOUT_S,
         memory: CommandMemory | None = None,
+        github: GitHubRemote | None = None,
     ) -> None:
         self._sandboxes = sandboxes
         self._store = checkpoints
@@ -150,6 +172,7 @@ class WorkspaceActivities:
         self._limits = limits
         self._setup_timeout_s = setup_timeout_s
         self._memory = memory
+        self._github = github
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -165,12 +188,12 @@ class WorkspaceActivities:
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
         spec = small(spec)
-        folder = await self._source(spec)  # a bad input is refused before anything is touched
+        source = await self._source(spec)  # a bad input is refused before anything is touched
         task_id = spec.task_id
         async with heartbeating():
             try:
                 await self._clear(task_id)
-                base_sha = await self._publish_base(task_id, folder)
+                base_sha = await self._publish_base(task_id, source)
                 sandbox = await self._boot(task_id)
                 await self._set_up(sandbox, spec)
                 await self._sandboxes.set_network(sandbox.id, False)
@@ -183,31 +206,67 @@ class WorkspaceActivities:
             sandbox_id=sandbox.id, base_sha=base_sha, head_sha=head_sha
         )
 
-    async def _source(self, spec: TaskSpec) -> LocalFolder:
-        """The folder to commit as the base, or a refusal that no retry can change.
+    async def _source(self, spec: TaskSpec) -> LocalFolder | GitHubBase:
+        """What the base commit comes from, or a refusal that no retry can change.
 
-        This is the seam for LH-305. A GitHub repo is cloned on the host here, and what it
-        gives back is a place that init_task can clone from, with the sha of the base commit.
+        Nothing on the host is touched here. A GitHub repo costs two API reads, which is how a
+        repo that does not exist, or a token that GitHub refuses, fails before a clone starts.
         """
         try:
             check_task_id(spec.task_id)
-            if not is_local(spec.repo):
-                raise NotImplementedError(
-                    f"{spec.repo!r} is a GitHub repo, and cloning one arrives with LH-305. "
-                    f"Only {LOCAL_PREFIX}<absolute path> repos can be prepared until then"
-                )
-            path = Path(spec.repo[len(LOCAL_PREFIX) :])
-            if not path.is_absolute():
-                raise WorkspaceError(
-                    f"{spec.repo!r}: a local repo needs an absolute path, as in "
-                    f"{LOCAL_PREFIX}/abs/path"
-                )
-            files = await asyncio.to_thread(collect_source_files, path)
-        except (ValueError, NotImplementedError, WorkspaceError) as exc:
+            if is_local(spec.repo):
+                return await self._local_folder(spec.repo)
+            return await self._github_base(spec.repo)
+        except (ValueError, WorkspaceError) as exc:
             raise not_retried(exc) from exc
-        return LocalFolder(path, files)
+        except GitHubError as exc:
+            raise github_failure(exc) from exc
 
-    async def _publish_base(self, task_id: str, folder: LocalFolder) -> str:
+    @staticmethod
+    async def _local_folder(repo: str) -> LocalFolder:
+        path = Path(repo[len(LOCAL_PREFIX) :])
+        if not path.is_absolute():
+            raise WorkspaceError(
+                f"{repo!r}: a local repo needs an absolute path, as in {LOCAL_PREFIX}/abs/path"
+            )
+        return LocalFolder(path, await asyncio.to_thread(collect_source_files, path))
+
+    async def _github_base(self, repo: str) -> GitHubBase:
+        remote = self._remote(repo)
+        base = await remote.resolve_base(repo)
+        log.info("task base: %s of %s is at %s", base.default_branch, repo, base.sha)
+        return GitHubBase(remote, remote.clone_url(repo), base.default_branch, base.sha)
+
+    def _remote(self, repo: str) -> GitHubRemote:
+        if self._github is None:
+            raise WorkspaceError(
+                f"{repo!r} is a GitHub repo, and this worker has no GitHub access configured, "
+                "so it cannot clone it"
+            )
+        return self._github
+
+    async def _publish_base(self, task_id: str, source: LocalFolder | GitHubBase) -> str:
+        """Make the task's bare repo with its branch on the base commit, and return that sha."""
+        if isinstance(source, GitHubBase):
+            return await self._clone_base(task_id, source)
+        return await self._commit_folder(task_id, source)
+
+    async def _clone_base(self, task_id: str, base: GitHubBase) -> str:
+        """Clone on the host, with the token on the command line of that one clone.
+
+        The token is read now and not in `_source`, so one that expires in between is renewed.
+        init_task keeps nothing of the URL or the header in the repo.
+        """
+        try:
+            config = await base.remote.auth_config()
+        except GitHubError as exc:
+            raise github_failure(exc) from exc
+        except ValueError as exc:  # a token that cannot go in a header; the text does not repeat it
+            raise not_retried(exc) from exc
+        await self._store.init_task(task_id, base.clone_url, base.sha, git_config=config)
+        return base.sha
+
+    async def _commit_folder(self, task_id: str, folder: LocalFolder) -> str:
         """Commit the folder, make the task's bare repo from the commit, and return its sha."""
         scratch = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="lh-base-"))
         try:

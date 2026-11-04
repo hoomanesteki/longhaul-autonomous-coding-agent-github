@@ -10,6 +10,7 @@ in. tests/integration/test_sandbox_recovery.py runs the same activities on real 
 from __future__ import annotations
 
 import asyncio
+import base64
 import dataclasses
 import logging
 import os
@@ -24,9 +25,12 @@ from typing import Any
 import pytest
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
+from tests.fakes.calc_remote import REPO, TOKEN, Github, commit_on, github_for, seed_calc
+from tests.fakes.fake_github import FakeGitHub
 
 from longhaul.agent.workspace import SetupCommandError, collect_source_files, default_setup_command
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.checkpoints import git_store
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore
 from longhaul.checkpoints.snapshot import snapshot_folder
 from longhaul.contracts import (
@@ -45,6 +49,8 @@ from longhaul.durable.activities.workspace import (
     SETUP_TIMEOUT_S,
     WorkspaceActivities,
 )
+from longhaul.github.client import PatAuth
+from longhaul.github.remote import GitHubRemote
 from longhaul.memory.commands import DISCOVERY_BUDGET_S
 from longhaul.sandbox.local_manager import FakeSandbox
 
@@ -458,7 +464,8 @@ async def test_the_activity_heartbeats_while_it_works(rig: Rig) -> None:
 @pytest.mark.parametrize(
     ("repo", "kind", "words"),
     [
-        ("acme/calc", "NotImplementedError", "LH-305"),
+        # The rig has no GitHub access, so a GitHub repo is refused until a worker has some.
+        ("acme/calc", "WorkspaceError", "GitHub access"),
         ("local:/no/such/folder", "WorkspaceError", "/no/such/folder"),
         ("local:calc", "WorkspaceError", "absolute"),
         ("local:", "WorkspaceError", "absolute"),
@@ -1040,3 +1047,217 @@ def test_the_setup_and_the_commands_together_fit_in_the_activity() -> None:
     # time limit of the activity or Temporal cancels it.
     total = timedelta(seconds=SETUP_TIMEOUT_S + DISCOVERY_BUDGET_S)
     assert total < acts.PREPARE_WORKSPACE.start_to_close
+
+
+# ---------- GitHub repos (LH-305) ----------
+# The remote is a local bare repo behind FakeGitHub, so the clone is the real git command against
+# a path. The auth header cannot show up in a path clone, so one test records the command line.
+HEADER = "AUTHORIZATION: basic " + base64.b64encode(f"x-access-token:{TOKEN}".encode()).decode()
+
+
+@dataclasses.dataclass
+class Remote:
+    """A rig whose activities can clone `acme/calc` from a FakeGitHub."""
+
+    rig: Rig
+    fake: FakeGitHub
+    github: Github
+    base_sha: str
+    activities: WorkspaceActivities
+
+    @property
+    def bare_remote(self) -> Path:
+        return Path(self.fake.clone_url(REPO))
+
+    async def prepare(
+        self, spec: TaskSpec | None = None, activities: WorkspaceActivities | None = None
+    ) -> acts.PrepareWorkspaceOutput:
+        out: acts.PrepareWorkspaceOutput = await self.rig.environment().run(
+            (activities or self.activities).prepare_workspace, spec or make_spec(REPO)
+        )
+        return out
+
+    def untouched(self) -> bool:
+        """True when a failed preparation made no container, no volume and no repo."""
+        host, store = self.rig.host, self.rig.store
+        empty = not store.root.exists() or not any(store.root.iterdir())
+        return host.log == [] and host.created == [] and empty
+
+
+def activities_with(rig: Rig, remote: GitHubRemote | None) -> WorkspaceActivities:
+    return WorkspaceActivities(
+        rig.host, rig.store, rig.recorder, image=IMAGE, limits=LIMITS, github=remote
+    )
+
+
+@pytest.fixture
+async def remote(rig: Rig, tmp_path: Path) -> AsyncIterator[Remote]:
+    fake = FakeGitHub()
+    base = seed_calc(fake, tmp_path / "gh")
+    github = github_for(fake)
+    try:
+        yield Remote(rig, fake, github, base, activities_with(rig, github.remote))
+    finally:
+        await github.aclose()
+
+
+async def test_a_github_repo_becomes_a_sandbox_at_the_head_of_its_default_branch(
+    remote: Remote,
+) -> None:
+    out = await remote.prepare()
+
+    assert out.base_sha == out.head_sha == remote.base_sha
+    assert remote.rig.bare("rev-parse", f"refs/heads/{BRANCH}") == remote.base_sha
+    assert remote.rig.bare("rev-parse", "refs/tags/base") == remote.base_sha
+    box = remote.rig.box(out.sandbox_id)
+    assert await sh(box, "git rev-parse HEAD") == remote.base_sha
+    assert await sh(box, "git status --porcelain") == ""
+    assert (box.root / MODULE).is_file()
+    # Continued as for a local repo: set up with the network on, then cut. The probes above are
+    # commands too, so only the first one is the setup.
+    assert box.commands[0] == (SETUP, True)
+    assert remote.rig.host.network[out.sandbox_id] is False
+
+
+async def test_the_base_is_the_head_of_the_default_branch_and_not_of_a_newer_branch(
+    rig: Rig, tmp_path: Path
+) -> None:
+    fake = FakeGitHub()
+    trunk_head = seed_calc(fake, tmp_path / "gh", default_branch="trunk")
+    feature_head = commit_on(Path(fake.clone_url(REPO)), trunk_head, "feature", "newer")
+    github = github_for(fake)
+    try:
+        out = await rig.environment().run(
+            activities_with(rig, github.remote).prepare_workspace, make_spec(REPO)
+        )
+    finally:
+        await github.aclose()
+
+    assert feature_head != trunk_head
+    assert out.base_sha == trunk_head, "the default branch is trunk, as GitHub reports it"
+
+
+async def test_the_clone_signs_in_with_the_header_and_the_url_has_no_token(
+    remote: Remote, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: Any, **kwargs: Any) -> Any:
+        seen.append([str(word) for word in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(git_store.asyncio, "create_subprocess_exec", record)
+
+    await remote.prepare()
+
+    (clone,) = [words for words in seen if "clone" in words]
+    header = f"http.https://github.com/.extraheader={HEADER}"
+    assert header in clone[: clone.index("clone")]
+    assert not any(TOKEN in word for word in clone if word != header)
+
+
+async def test_no_token_reaches_the_sandbox_the_repo_or_the_container_settings(
+    remote: Remote,
+) -> None:
+    out = await remote.prepare()
+
+    secrets = (TOKEN.encode(), HEADER.encode(), HEADER.rsplit(" ", 1)[-1].encode())
+    box = remote.rig.box(out.sandbox_id)
+    repo = remote.rig.store.repo_path(TASK)
+    for root in (box.root, repo):
+        for path in root.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                data = path.read_bytes()
+                assert not any(secret in data for secret in secrets), path
+    assert TOKEN not in repr(remote.rig.host.created)
+    assert TOKEN not in repr(box.commands)
+    assert "remote" not in (repo / "config").read_text(), "the clone's origin is gone"
+
+
+async def test_a_repo_that_github_does_not_have_is_refused_without_a_retry(
+    remote: Remote,
+) -> None:
+    with pytest.raises(ApplicationError, match="404") as caught:
+        await remote.prepare(make_spec("acme/missing"))
+
+    assert caught.value.non_retryable
+    assert caught.value.type == "GitHubFatal"
+    assert remote.untouched()
+
+
+async def test_a_github_outage_is_retried_and_the_retry_works(remote: Remote) -> None:
+    remote.fake.fail_next(r"/repos/acme/calc$", 502)
+
+    with pytest.raises(ApplicationError) as caught:
+        await remote.prepare()
+    assert not caught.value.non_retryable
+    assert caught.value.type == "GitHubRetryable"
+    assert remote.untouched()
+
+    out = await remote.prepare()
+    assert out.base_sha == remote.base_sha
+
+
+async def test_a_name_that_is_not_owner_slash_name_is_refused_without_a_request(
+    remote: Remote,
+) -> None:
+    with pytest.raises(ApplicationError, match="owner/name") as caught:
+        await remote.prepare(make_spec("acme/calc/extra"))
+
+    assert caught.value.non_retryable
+    assert remote.untouched()
+    assert remote.fake.requests == []
+
+
+class StaleClient:
+    """A GitHub that names a commit which the repo no longer has, as after a force push."""
+
+    async def get_repo(self, repo: str) -> dict[str, Any]:
+        return {"default_branch": "main"}
+
+    async def get_branch(self, repo: str, branch: str) -> dict[str, Any]:
+        return {"commit": {"sha": "a" * 40}}
+
+
+async def test_a_base_that_the_clone_does_not_hold_is_an_error_and_leaves_nothing(
+    remote: Remote,
+) -> None:
+    stale = GitHubRemote(StaleClient(), PatAuth(TOKEN), clone_url=remote.fake.clone_url)
+
+    with pytest.raises(CheckpointError, match="not in the repository"):
+        await remote.prepare(activities=activities_with(remote.rig, stale))
+
+    # The clone started, so the host cleared the task first. No container was made, and no
+    # repo or half-built clone is left.
+    store = remote.rig.store
+    assert remote.rig.host.created == []
+    assert not store.has_repo(TASK)
+    assert list(store.root.glob(".*.tmp")) == []
+
+
+async def test_a_retry_starts_from_the_head_the_default_branch_has_by_then(remote: Remote) -> None:
+    first = await remote.prepare()
+    newer = commit_on(remote.bare_remote, remote.base_sha, "main", "landed between the attempts")
+    assert newer != first.base_sha
+
+    second = await remote.prepare()
+
+    assert second.base_sha == newer
+    assert remote.rig.bare("config", "longhaul.base-sha") == newer
+    assert remote.rig.bare("rev-parse", f"refs/heads/{BRANCH}") == newer
+
+
+async def test_a_worker_without_github_access_can_still_recover_a_github_task(
+    remote: Remote,
+) -> None:
+    out = await remote.prepare()
+    await remote.rig.host.rm_f(out.sandbox_id)
+    plain = activities_with(remote.rig, None)
+
+    inp = acts.EnsureSandboxInput(
+        task_id=TASK, head_sha=out.head_sha, sandbox_id=out.sandbox_id, spec=make_spec(REPO)
+    )
+    new_id: str = await remote.rig.environment().run(plain.ensure_sandbox, inp)
+
+    assert await sh(remote.rig.box(new_id), "git rev-parse HEAD") == out.head_sha

@@ -28,6 +28,7 @@ from longhaul.checkpoints.git_store import (
     GitCheckpointStore,
     RepoNotFoundError,
     _script,
+    _scrub,
     branch_name,
     bundle_key,
     check_clone_url,
@@ -1517,3 +1518,88 @@ async def test_cleanup_removes_the_repo_even_when_its_files_are_read_only(
 
     assert not env.repo.exists()
     assert not env.store.has_repo(TASK)
+
+
+# ---------- git config for a clone that needs a credential (LH-305) ----------
+
+SECRET = "c2VjcmV0LXRva2Vu"
+GIT_CONFIG = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {SECRET}"]
+
+
+def record_commands(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """The words of every command that the store starts, as git sees them."""
+    seen: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: str, **kwargs: object) -> asyncio.subprocess.Process:
+        seen.append([str(word) for word in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr("longhaul.checkpoints.git_store.asyncio.create_subprocess_exec", record)
+    return seen
+
+
+async def test_init_task_gives_git_the_config_before_the_clone_and_keeps_none_of_it(
+    tmp_path: Path, template: Template, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = record_commands(monkeypatch)
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    await store.init_task(TASK, str(template.source), template.base_sha, git_config=GIT_CONFIG)
+
+    (clone,) = [words for words in seen if "clone" in words]
+    at = clone.index("clone")
+    assert clone[at - 2 : at] == GIT_CONFIG, "the pair sits right before the subcommand"
+    # Not in a file of the repo (the sandbox reads them), and not in any other command's words.
+    for path in store.repo_path(TASK).rglob("*"):
+        if path.is_file():
+            assert SECRET.encode() not in path.read_bytes(), path
+    assert [words for words in seen if SECRET in " ".join(words) and "clone" not in words] == []
+
+
+async def test_a_failed_clone_with_config_is_still_reported_as_a_clone(
+    tmp_path: Path,
+) -> None:
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    with pytest.raises(CheckpointError, match="git clone failed") as caught:
+        await store.init_task(TASK, str(tmp_path / "missing"), "a" * 40, git_config=GIT_CONFIG)
+
+    assert SECRET not in str(caught.value)
+    assert list((tmp_path / "ckpt").iterdir()) == [], "nothing half built is left"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ["--exec-path=/tmp/x"],
+        ["-c"],
+        ["-c", "core.sshCommand"],
+        ["-c", "=value"],
+        ["-C", "/", "-c", "a=b"],
+        ["-c", "a=b", "--upload-pack=x"],
+        ["-c", "a=b\n-c"],
+    ],
+)
+async def test_init_task_takes_only_pairs_of_dash_c_and_a_setting(
+    tmp_path: Path, template: Template, config: list[str]
+) -> None:
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    with pytest.raises(ValueError, match="git_config"):
+        await store.init_task(TASK, str(template.source), template.base_sha, git_config=config)
+
+    assert not (tmp_path / "ckpt").exists()
+
+
+def test_scrub_hides_the_value_of_the_config_and_the_secret_inside_it() -> None:
+    text = f"fatal: AUTHORIZATION: basic {SECRET} was refused ({SECRET})"
+
+    scrubbed = _scrub(text, GIT_CONFIG)
+
+    assert SECRET not in scrubbed
+    assert scrubbed == "fatal: *** was refused (***)"
+
+
+def test_scrub_leaves_text_alone_when_there_is_no_config() -> None:
+    assert _scrub("fatal: nothing secret", ()) == "fatal: nothing secret"

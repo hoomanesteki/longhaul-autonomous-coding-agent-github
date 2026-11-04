@@ -17,6 +17,9 @@ What it is built from, and why each piece is what it is:
   in the config without a price stops the worker before it takes a task (load_pricing).
 * Spans go to the OpenTelemetry collector when OTEL_EXPORTER_OTLP_ENDPOINT is set. The client
   carries the tracing interceptor, so the worker built on it needs no list of its own.
+* GitHub repos need LONGHAUL_GITHUB_TOKEN, a fine-grained PAT (ADR-0012). The worker clones and
+  pushes with it on the host; it never enters a sandbox (ADR-0009). Without it the worker takes
+  local folders only and still recovers the sandbox of a GitHub task.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 
@@ -58,6 +61,8 @@ from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import connect
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
+from longhaul.github.remote import GitHubRemote
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
@@ -81,10 +86,13 @@ class WorkerParts:
     blobs: S3BlobStore
     store: GitCheckpointStore
     engine: AsyncEngine
+    github: GitHubClient | None = None
 
     async def close(self) -> None:
-        """Close the database pool. The other clients hold no connection that needs closing."""
+        """Close the database pool and the GitHub client. The others hold no open connection."""
         await self.engine.dispose()
+        if self.github is not None:
+            await self.github.aclose()
 
 
 def build_provider(settings: EnvSettings) -> LLMProvider | None:
@@ -138,8 +146,19 @@ def build_parts(
         checkpoints=store,
         tool_output_max_tokens=cfg.context.tool_output_max_tokens,
     )
+    github: GitHubClient | None = None
+    remote: GitHubRemote | None = None
+    if settings.github_token is not None:
+        auth = PatAuth(settings.github_token)
+        github = GitHubClient(GITHUB_API_URL, auth)
+        remote = GitHubRemote(github, auth)
     workspace = WorkspaceActivities(
-        sandboxes, store, recorder, image=cfg.sandbox.image, limits=cfg.sandbox.limits
+        sandboxes,
+        store,
+        recorder,
+        image=cfg.sandbox.image,
+        limits=cfg.sandbox.limits,
+        github=remote,
     )
     events = EventActivities(recorder)
     return WorkerParts(
@@ -152,6 +171,7 @@ def build_parts(
         blobs=blobs,
         store=store,
         engine=engine,
+        github=github,
     )
 
 

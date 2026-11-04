@@ -333,6 +333,17 @@ def repo_path(repo: str) -> str:
     return f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}"
 
 
+def _branch_path(branch: str) -> str:
+    """A branch name as the tail of an API path. Slashes stay, because GitHub reads them.
+
+    A name with an empty or dot segment would change the path once a server or proxy
+    normalizes it, so it is refused here, before a request carries the token anywhere.
+    """
+    if any(part in ("", ".", "..") for part in branch.split("/")):
+        raise GitHubFatal(f"{branch[:80]!r} is not a branch name")
+    return quote(branch, safe="/")
+
+
 def _utc_stamp(moment: datetime) -> str:
     if moment.tzinfo is None:
         # A naive time could be read as local time or as UTC, and the answer would differ.
@@ -593,6 +604,17 @@ class GitHubClient:
         for admin and write, which includes the maintain role.
         """
         path = f"{repo_path(repo)}/collaborators/{quote(login, safe='')}/permission"
+        return _json_object(await self._request("GET", path))
+
+    # ----- reads that start a task from the repo itself (LH-305) -----
+
+    async def get_repo(self, repo: str) -> dict[str, Any]:
+        """The repo's own record. `default_branch` is the branch a task starts from."""
+        return _json_object(await self._request("GET", repo_path(repo)))
+
+    async def get_branch(self, repo: str, branch: str) -> dict[str, Any]:
+        """One branch of the repo. `commit.sha` is the commit the branch holds right now."""
+        path = f"{repo_path(repo)}/branches/{_branch_path(branch)}"
         return _json_object(await self._request("GET", path))
 
     # ----- reads that side_effects.py uses to find the earlier attempt of a write -----

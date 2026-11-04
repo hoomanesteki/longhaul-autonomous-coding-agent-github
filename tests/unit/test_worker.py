@@ -19,6 +19,7 @@ from longhaul.blobs.s3 import S3BlobStore
 from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
+from longhaul.github.remote import GitHubRemote
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
 
@@ -139,3 +140,30 @@ def test_the_graceful_timeout_lets_a_running_test_command_finish() -> None:
     # on a long one, which Temporal then retries on the next worker.
     assert worker.GRACEFUL_SHUTDOWN_S >= 30
     assert acts.TOOL_EXEC.start_to_close.total_seconds() > worker.GRACEFUL_SHUTDOWN_S
+
+
+# ---------- GitHub (LH-305) ----------
+def _workspace_of(parts: worker.WorkerParts) -> Any:
+    (found,) = {
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "prepare_workspace"
+    }
+    return found
+
+
+async def test_a_worker_with_a_github_token_can_prepare_github_repos(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert isinstance(_workspace_of(parts)._github, GitHubRemote)
+    finally:
+        await parts.close()
+    assert parts.github is not None and parts.github._http.is_closed
+
+
+def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert _workspace_of(parts)._github is None
+    assert parts.github is None

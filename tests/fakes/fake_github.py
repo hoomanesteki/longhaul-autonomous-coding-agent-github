@@ -1,7 +1,8 @@
 """An in-memory GitHub for tests (LH-301).
 
 FakeGitHub is a FastAPI app plus the helpers a test needs around it. It answers only the
-REST calls Longhaul makes: issues, comments, labels, pulls and collaborator permission. It
+REST calls Longhaul makes: the repo and its branches, issues, comments, labels, pulls and
+collaborator permission. It
 copies GitHub's response shapes and the behaviours that catch clients out:
 
 * An issue and a pull request share one number sequence. A pull request also appears in the
@@ -1243,6 +1244,23 @@ class _Api:
             refs = self.fake._read_refs(repo)
             return JSONResponse(_pull_json(repo, issue, refs, full=True), status_code=201)
 
+    # -- the repo and its branches
+
+    async def get_repo(self, request: Request) -> Response:
+        with self.fake._lock:
+            return JSONResponse(_repo_json(self._repo(request)))
+
+    async def get_branch(self, request: Request) -> Response:
+        name = request.path_params["branch"]
+        with self.fake._lock:
+            repo = self._repo(request)
+            sha = self.fake._read_refs(repo).get(f"refs/heads/{name}")
+            if sha is None:
+                raise NotFound(f"{repo.full_name} has no branch {name}", "Branch not found")
+            return JSONResponse(
+                {"name": name, "commit": {"sha": sha}, "protected": name == repo.default_branch}
+            )
+
     # -- collaborators
 
     async def get_permission(self, request: Request) -> Response:
@@ -1286,6 +1304,8 @@ def _build_app(fake: FakeGitHub) -> FastAPI:
 
     api, repo = _Api(fake), "/repos/{owner}/{repo}"
     routes: list[tuple[str, Callable[..., Any], str]] = [
+        (repo, api.get_repo, "GET"),
+        (f"{repo}/branches/{{branch:path}}", api.get_branch, "GET"),
         (f"{repo}/issues", api.list_issues, "GET"),
         (f"{repo}/issues/{{number}}", api.get_issue, "GET"),
         (f"{repo}/issues/{{number}}/comments", api.list_comments, "GET"),

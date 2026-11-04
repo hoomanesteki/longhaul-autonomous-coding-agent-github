@@ -2499,3 +2499,50 @@ async def test_a_cancel_does_not_wait_for_a_status_comment(
         outcome = await result_of(handle)
 
     assert outcome.kind is OutcomeKind.CANCELLED
+
+
+async def test_a_cancel_at_a_hand_over_does_not_wait_for_a_status_comment(
+    env: WorkflowEnvironment,
+) -> None:
+    # GitHub is failing, so the status comment keeps retrying. The task reaches its hand-over
+    # meanwhile, and a person who cancels there must not wait for the comment.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, heartbeat_timeout_s=2)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)  # the status comment cannot be posted
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+        await wait_until(lambda: acts.RECORD_EVENT.name in stubs.names(), "the hand-over")
+
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.CANCELLED, summary="cancelled by maintainer: enough")
+    assert len(stubs.run_ids) == 1, "the task did not hand over after the cancel"
+
+
+async def test_a_status_comment_that_is_still_posting_does_not_stop_the_hand_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # The hand-over gives the comment a short while, then goes on without it. The count is in
+    # the memo already, so the next status comment gets a new key.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.hold_turn(1)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+    assert len(stubs.run_ids) == 2, "the task handed over while the status comment was pending"

@@ -61,6 +61,7 @@ from longhaul.contracts import (
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import SANDBOX_RECREATED, WorkspaceActivities
@@ -281,6 +282,7 @@ async def running(
             *llm.activities,
             *tools.activities,
             *stack.workspace.activities,  # includes the real cleanup
+            *EventActivities(stack.recorder).activities,
         ],
         workflow_runner=workflow_runner(),
     ):
@@ -506,7 +508,8 @@ async def test_container_removed_is_recreated_at_head(
     (edit_sha,) = database.rows("SELECT post_sha FROM tool_calls WHERE name = 'edit_file'")[0]
     assert edit_sha is not None
     events = database.rows("SELECT type, payload FROM events ORDER BY id")
-    assert [kind for kind, _ in events] == [SANDBOX_RECREATED]
+    # The run ends with the note that the metrics count the task from (LH-704).
+    assert [kind for kind, _ in events] == [SANDBOX_RECREATED, acts.OUTCOME_EVENT]
     payload = events[0][1]
     assert payload["head_sha"] == edit_sha
     (container,) = containers_of(stack.task_id)
@@ -536,7 +539,11 @@ async def test_container_and_volume_removed_is_rebuilt_at_head(
         outcome = await result_of(handle)
 
     assert outcome.kind is OutcomeKind.PR_OPENED
-    assert database.rows("SELECT count(*) FROM events") == [(1,)]
+    # The recreation, and the note at the end of the run (LH-704).
+    assert database.rows("SELECT type FROM events ORDER BY id") == [
+        (SANDBOX_RECREATED,),
+        (acts.OUTCOME_EVENT,),
+    ]
     assert stack.tree_at(stack.head()) == reference_tree(CALC, stack.tmp_path / "reference")
     (container,) = containers_of(stack.task_id)
     assert container.status == "running"

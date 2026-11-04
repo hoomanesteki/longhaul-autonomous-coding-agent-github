@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.telemetry.metrics import Metrics
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -51,6 +50,7 @@ from longhaul.durable.activities.tools import (
     WorkspaceCheckpoints,
 )
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.telemetry.metrics import Metrics
 from longhaul.tools.registry import ToolRegistry, default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]

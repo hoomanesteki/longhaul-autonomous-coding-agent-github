@@ -44,6 +44,7 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
@@ -197,6 +198,7 @@ async def traced_run(
                     *tools.activities,
                     boxes.prepare_workspace,
                     boxes.cleanup,
+                    *EventActivities(recorder).activities,
                 ],
                 workflow_runner=workflow_runner(),
             ):

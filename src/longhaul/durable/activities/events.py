@@ -8,6 +8,13 @@ of their own, such as ensure_sandbox with `sandbox_recreated`, use the recorder 
 An event is a log line. The recorder writes it every time it is asked, so a retry of this
 activity after a write that went through adds a second row. That is rare for a single insert, and
 a log that says a thing happened twice is a smaller fault than one that lost it.
+
+Metrics (LH-704). Some events are also counted, after the row is written, so the metric follows
+the table. A compaction and a stuck event move their counters (telemetry/metrics.py). The outcome
+event, which a run sends as its last act (acts.OUTCOME_EVENT), counts the task as finished and
+takes it out of the active tasks. It is counted once per workflow run: a workflow task that is
+retried runs this local activity again for the same run, and the second call writes a second row
+of the log and no second count.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from temporalio import activity
 from longhaul.db.records import Recorder
 from longhaul.durable import acts
 from longhaul.durable.activities.support import small
+from longhaul.telemetry import metrics
 
 
 class EventActivities:
@@ -37,3 +45,13 @@ class EventActivities:
     async def record_event(self, inp: acts.RecordEventInput) -> None:
         inp = small(inp)
         await self._recorder.record_event(inp.task_id, inp.type, inp.payload)
+        if inp.type == acts.OUTCOME_EVENT:
+            payload = inp.payload
+            metrics.current().finished(
+                activity.info().workflow_run_id or inp.task_id,
+                inp.task_id,
+                str(payload.get("repo", metrics.UNKNOWN)),
+                str(payload.get("kind", metrics.UNKNOWN)),
+            )
+        else:
+            metrics.current().count_event(inp.type, inp.payload)

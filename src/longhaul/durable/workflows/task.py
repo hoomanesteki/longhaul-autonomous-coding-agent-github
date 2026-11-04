@@ -54,6 +54,16 @@ cancel (LH-507). An activity that fails for good, after its retries, fails the w
 error, except a prompt over the context window, which ends the run with "context limit" as it
 does in-process.
 
+The end of a run is noted for the metrics (LH-704). Counting is I/O, so the workflow cannot do it.
+When run() ends, by any of the outcomes above or by an activity that failed for good, it calls
+the `record_event` local activity once with the type acts.OUTCOME_EVENT, and the worker counts the
+task as finished and no longer active. A hand-over to a new run (below) is not an end and makes no
+such call. The note is made after the cleanup of a cancel, outside `_call`, because `_call` stops
+at once when a cancel was requested. It is a record for people, like the hand-over event: a
+failure to write it is logged and the outcome stands. A run that Temporal itself ends, by a
+terminate or a timeout, never gets to make it, and its task stays among the active ones until the
+worker restarts.
+
 Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
 the same workflow id. After a turn that did not end the run, the workflow hands over when the
 turns done are a multiple of the interval (acts.CONTINUE_AS_NEW_EVERY_TURNS, 40, or the run's
@@ -172,6 +182,14 @@ class _SandboxLost(Exception):
         self.call_id = call_id
 
 
+def _error_type(err: FailureError) -> str:
+    """The type of the error that failed the run: an application error's type, else its class."""
+    cause = err.cause or err
+    if isinstance(cause, ApplicationError) and cause.type:
+        return cause.type
+    return type(cause).__name__
+
+
 def _is_sandbox_gone(err: ActivityError) -> bool:
     """True when a tool call failed because its container was not there.
 
@@ -257,10 +275,49 @@ class TaskWorkflow:
     async def run(self, state: CarryState) -> Outcome:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
+            outcome = await self._finish_the_task()
+        except FailureError as err:
+            # The workflow is about to fail. The task is over all the same, and its error type is
+            # all the note says: the message of a provider error can echo the request.
+            await self._note_outcome(
+                Outcome(kind=OutcomeKind.ERROR, summary=f"workflow failed: {_error_type(err)}")
+            )
+            raise
+        await self._note_outcome(outcome)
+        return outcome
+
+    async def _finish_the_task(self) -> Outcome:
+        try:
             await self._prepare()
             return await self._code()
         except _CancelRequested:
             return await self._cancelled()
+
+    async def _note_outcome(self, outcome: Outcome) -> None:
+        """Tell the worker that the task ended, so that it counts it (see the module docstring)."""
+        state = self.state
+        note = acts.RecordEventInput(
+            task_id=state.spec.task_id,
+            type=acts.OUTCOME_EVENT,
+            payload={
+                "kind": outcome.kind.value,
+                "repo": state.spec.repo,
+                "turns": state.turn_index,
+                "cost_usd": state.cost_usd,
+                "summary": outcome.summary[: acts.OUTCOME_SUMMARY_CHARS],
+            },
+        )
+        try:
+            await workflow.execute_local_activity(
+                acts.RECORD_EVENT.name,
+                note,
+                result_type=acts.RECORD_EVENT.result_type,
+                **acts.local_options(acts.RECORD_EVENT),
+            )
+        except FailureError as err:
+            workflow.logger.warning(
+                "outcome of task %s not recorded: %s", state.spec.task_id, err.cause or err
+            )
 
     async def _prepare(self) -> None:
         state = self.state

@@ -28,6 +28,10 @@ call that is billed and then lost to a failure of this activity is still on the 
 runs the activity again and the model is called again, which makes a second row with attempt 2.
 The cost on the ledger is the cost in `LlmTurnOutput` and in the `turns` row.
 
+Metrics (LH-704). A call that returns a reply counts as a turn and adds its cache ratio. A call
+that fails counts as an error of its kind. The cost counter follows the ledger: it grows by the
+price that `_charge` got back, for a call that failed after it was billed as well.
+
 Who answers. A task that carries a script (`script_ref`, from `longhaul run --script`) is answered
 by a scripted provider built from it, and any other task by the provider of the worker. A worker
 whose provider is the scripted one but that was given no script has none of its own, and refuses
@@ -84,6 +88,7 @@ from longhaul.durable.activities.support import (
 )
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import chat_span
 
 NO_PROVIDER = (
@@ -229,8 +234,10 @@ class LlmActivities:
                     )
                 cost = await self._charge(inp, cfg.model, resp.usage)
                 span.record(resp, cost_usd=float(cost))
+            metrics.current().count_turn(inp.role, resp.usage)
             return resp, cost
         except ProviderError as exc:
+            metrics.current().count_llm_error(exc.kind.value)
             if exc.usage is not None:
                 # Billed, then failed: the call is on the ledger and in `turns` before the error
                 # goes up.
@@ -262,11 +269,14 @@ class LlmActivities:
         of those calls could be priced.
         """
         try:
-            return await self._ledger.record(
+            cost = await self._ledger.record(
                 inp.task_id, inp.spec.repo, model, inp.turn_index, activity.info().attempt, usage
             )
         except PricingError as exc:
             raise not_retried(exc) from exc
+        # The metric follows the ledger, so a call that is not on the ledger adds no cost.
+        metrics.current().add_cost(model, inp.spec.repo, float(cost))
+        return cost
 
     # ----- what came back -----
     async def _store(

@@ -17,6 +17,11 @@ What it is built from, and why each piece is what it is:
   in the config without a price stops the worker before it takes a task (load_pricing).
 * Spans go to the OpenTelemetry collector when OTEL_EXPORTER_OTLP_ENDPOINT is set. The client
   carries the tracing interceptor, so the worker built on it needs no list of its own.
+* Metrics are served at /metrics on LONGHAUL_METRICS_PORT (default 9464, which Prometheus in
+  docker/prometheus/prometheus.yml scrapes) from before the worker connects until it stops. The
+  activities update them (telemetry/metrics.py), and the interceptor that `serve` gives the
+  worker counts the retries of every activity. A port that is taken stops the worker at the
+  start, with the name of the setting to change.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 
@@ -61,6 +66,7 @@ from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
 
@@ -179,6 +185,7 @@ async def serve(
         activities=activities,
         workflow_runner=workflow_runner(),
         graceful_shutdown_timeout=grace,
+        interceptors=[metrics.RetryCounter()],
     )
     running = asyncio.create_task(worker.run())
     stopping = asyncio.create_task(stop.wait())
@@ -201,7 +208,10 @@ async def main() -> None:
     tracer = setup_tracing(settings, cfg.telemetry)
     stop = asyncio.Event()
     install_signal_handlers(stop)  # before the connection, so an early stop is not a crash
+    endpoint: metrics.MetricsServer | None = None
     try:
+        endpoint = metrics.serve(settings.metrics_port, settings.metrics_host)
+        log.info("metrics on http://%s:%d/metrics", settings.metrics_host, endpoint.port)
         client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)
         log.info(
             "worker running on task queue %s at %s (namespace %s)",
@@ -212,6 +222,8 @@ async def main() -> None:
         await serve(client, settings.task_queue, parts.activities, stop)
         log.info("worker stopped")
     finally:
+        if endpoint is not None:
+            endpoint.stop()
         await parts.close()
         if tracer is not None:
             tracer.shutdown()  # sends the spans that are still queued

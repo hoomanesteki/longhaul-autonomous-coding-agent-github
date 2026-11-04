@@ -13,7 +13,6 @@ from collections.abc import AsyncIterator
 from datetime import timedelta
 
 import pytest
-from longhaul.telemetry.metrics import Metrics
 from temporalio import activity
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ApplicationError
@@ -23,6 +22,7 @@ from longhaul.contracts import RepoSettings, TaskSpec
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.worker import serve
+from longhaul.telemetry.metrics import Metrics
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 

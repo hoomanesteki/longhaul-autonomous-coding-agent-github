@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.telemetry.metrics import Metrics
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -42,6 +41,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.telemetry import otel
+from longhaul.telemetry.metrics import Metrics
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase7]

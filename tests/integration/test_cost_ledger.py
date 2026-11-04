@@ -54,6 +54,7 @@ from longhaul.cost.pricing import Pricing, PricingError
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
@@ -238,7 +239,13 @@ async def running(
             env.client,
             task_queue=queue,
             workflows=[TaskWorkflow],
-            activities=[*llm.activities, *tools.activities, boxes.prepare_workspace, boxes.cleanup],
+            activities=[
+                *llm.activities,
+                *tools.activities,
+                boxes.prepare_workspace,
+                boxes.cleanup,
+                *EventActivities(recorder).activities,
+            ],
             workflow_runner=workflow_runner(),
         ):
             yield queue

@@ -51,6 +51,7 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
@@ -297,6 +298,7 @@ async def through_the_workflow(
                 *tools.activities,
                 workspace.prepare_workspace,
                 workspace.cleanup,
+                *EventActivities(recorder).activities,
             ],
             workflow_runner=workflow_runner(),
         ):

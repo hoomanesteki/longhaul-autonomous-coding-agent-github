@@ -9,7 +9,6 @@ from collections.abc import Mapping
 from typing import Any
 
 import pytest
-from longhaul.telemetry.metrics import Metrics
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -17,6 +16,7 @@ from longhaul.db.records import EventRecord, MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
+from longhaul.telemetry.metrics import Metrics
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 

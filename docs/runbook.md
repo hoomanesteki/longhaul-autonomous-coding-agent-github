@@ -177,9 +177,49 @@ docker compose --profile full up -d --build worker
 
 The service builds `docker/worker/Dockerfile` and mounts two things from the host. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
 
-**Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and do not publish a port from it (the service has none). The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
+**Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and publish no port from it beyond the metrics port below, which compose binds to `127.0.0.1`. The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
 
 The folder that `--path` names has to exist inside the worker container to be read, and the example folders do not. For local folders use the worker from `uv run`, and use the container for a worker that fixes cloned repos (Phase 3).
+
+## Metrics and the dashboard
+
+Each worker serves Prometheus metrics at `/metrics`, and the compose stack shows them in a Grafana dashboard. The metrics are in `src/longhaul/telemetry/metrics.py`.
+
+| What | Where |
+|---|---|
+| The metrics endpoint | `http://127.0.0.1:9464/metrics`. Set the port with `LONGHAUL_METRICS_PORT` (0 lets the system pick one) and the address with `LONGHAUL_METRICS_HOST`. The worker logs the address when it starts. |
+| Prometheus | `http://127.0.0.1:9090`, or `LH_PROMETHEUS_PORT`. It scrapes `host.docker.internal:9464` every 15 seconds (`docker/prometheus/prometheus.yml`). |
+| Grafana | `http://127.0.0.1:3000`, or `LH_GRAFANA_PORT`. Anonymous visitors are viewers. The dashboard is called Longhaul. |
+| The dashboard | `docker/grafana/dashboards/longhaul.json`, loaded by `docker/grafana/provisioning/dashboards/longhaul.yaml`. Grafana reads the file again every 30 seconds. The file is the only copy, so Grafana does not let the dashboard be saved or deleted from its screen. Edit the file instead. |
+
+Check a running worker with `curl -s http://127.0.0.1:9464/metrics | grep '^longhaul_'`.
+
+| Metric | Counts |
+|---|---|
+| `longhaul_tasks_total{outcome,repo}` | Tasks that ended, by outcome (`pr_opened`, `stuck`, `budget_exhausted`, `cancelled`, `error`) |
+| `longhaul_active_tasks` | Tasks the worker is running now |
+| `longhaul_turns_total{role}` | Model calls that returned a reply |
+| `longhaul_llm_cost_usd_total{model,repo}` | Dollars the cost ledger priced for model calls |
+| `longhaul_llm_errors_total{kind}` | Model calls that failed, by provider error kind |
+| `longhaul_tool_duration_seconds{tool}` | How long tool runs took (histogram) |
+| `longhaul_compactions_total` | Transcript compactions (counted from the `compaction` event, LH-404) |
+| `longhaul_stuck_total{reason}` | Stuck detections (counted from the `stuck` event, LH-505) |
+| `longhaul_sandbox_recreated_total` | Sandboxes rebuilt after the container was lost |
+| `longhaul_activity_retries_total{activity}` | Activity attempts after the first |
+| `longhaul_cache_ratio` | The share of a prompt that came from the cache (histogram) |
+
+The activities update the metrics and the workflow never does, because a workflow runs again on every replay. A run reaches the end of its task through one `record_event` call with the type `outcome`, which is also a row in the `events` table.
+
+Things to know when you read the numbers:
+
+- The counters belong to one worker process and start again at zero when it restarts. Prometheus functions such as `rate()` and `increase()` handle that.
+- `longhaul_active_tasks` counts the tasks a process has seen start, or has seen again after a hand-over. A task that Temporal ends from outside, by a terminate or a timeout, stays in the count until the worker restarts.
+- A task that was started from a local folder has the repo label `local`, whatever the folder. A tool name that the registry does not know is counted as `unknown`.
+- Two workers on one machine need two ports. The second one stops at the start with an error that names `LONGHAUL_METRICS_PORT`. Add its port as a second target under `worker` in `docker/prometheus/prometheus.yml`.
+- On Docker Desktop, Prometheus reaches a worker that listens on `127.0.0.1`. On Linux the container comes through the docker bridge, so run the worker with `LONGHAUL_METRICS_HOST=0.0.0.0` and keep the port closed to the network with a firewall. The worker in the compose service `worker` does this already and publishes `127.0.0.1:9464`.
+- A checkout that was running before this change has a Grafana without the dashboards folder. Run `docker compose up -d grafana` once. It recreates Grafana and nothing else.
+
+`tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 
 ## CI
 
@@ -190,7 +230,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `lint` | `ruff check` and `ruff format --check` |
 | `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
-| `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below) |
+| `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
 | `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |

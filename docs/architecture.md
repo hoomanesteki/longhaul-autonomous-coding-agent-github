@@ -111,3 +111,17 @@ With `capture_content: true`, these attributes are added, each cut at 16,000 cha
 | `execute_tool <name>` | `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` |
 
 `tests/integration/test_tracing.py` checks both settings: it puts a marker into the issue text, a tool's arguments, a tool's output and the model's reply, and looks for each marker in every attribute and event.
+
+## Metrics
+
+The worker serves Prometheus metrics, and `docker/grafana/dashboards/longhaul.json` draws them. `src/longhaul/telemetry/metrics.py` holds all of it, and the metric list, the labels and the operating notes are in "Metrics and the dashboard" in `docs/runbook.md`. This section gives the design choices.
+
+**Only activities update metrics.** A workflow runs again on every replay, so a counter bumped in workflow code would count a turn once for each replay. Each activity updates the metrics of the thing it does: `llm_turn` the turns, the cost, the errors and the cache ratio, `tool_exec` the tool durations, `ensure_sandbox` the rebuilds, and `prepare_workspace` the start of a task. An interceptor on the worker (`RetryCounter`) counts the attempts after the first of any activity, from the attempt number that Temporal sets.
+
+**The end of a task goes through `record_event`.** The workflow cannot count a finished task, so when `run()` ends it calls the `record_event` local activity once with the type `outcome`. That also leaves a row in the `events` table with the kind of the outcome, the repo, the turns and the cost. The worker counts the task from that call. A hand-over to a new run is not an end and makes no call. The count is made once for each workflow run id, because a workflow task that is retried runs the local activity again; a replay does not, since Temporal keeps its result in the history. Events that later stories send (`compaction` from LH-404, `stuck` from LH-505) move their counters through the same activity.
+
+**An event is counted after its row is written.** The metric then follows the events table: a write that failed is not counted, and the retry that writes it is.
+
+**Labels come from fixed sets.** Each label value is a series that Prometheus keeps. Roles, outcomes, provider error kinds, stuck reasons, tool names of the registry and activity names are fixed. Repos are the allowlisted ones, and models come from the config. A tool name the model made up, a stuck reason nobody defined and every `local:<path>` repo become one label each (`unknown`, `other` and `local`).
+
+**The registry belongs to the object.** `Metrics` has a `CollectorRegistry` of its own, and the process uses the one in `metrics.current()`. A test makes a fresh `Metrics` and reads only what it made. The Prometheus global registry would carry counts from one test to the next.

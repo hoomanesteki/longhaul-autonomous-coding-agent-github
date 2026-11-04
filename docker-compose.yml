@@ -158,6 +158,7 @@ services:
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      LONGHAUL_GITHUB_TOKEN: "${LONGHAUL_GITHUB_TOKEN:-}"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - "${LH_CKPT_DIR:-/var/lib/longhaul/ckpt}:${LH_CKPT_DIR:-/var/lib/longhaul/ckpt}"

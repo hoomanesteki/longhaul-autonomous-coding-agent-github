@@ -1509,3 +1509,104 @@ def test_the_compact_module_imports_nothing_that_does_io() -> None:
             assert node.level == 0 and node.module is not None
             found.add(node.module)
     assert found <= ALLOWED_IMPORTS
+
+
+# ---------- one ledger row for every billed call (I6, LH-404) ----------
+# A summed usage can sit on the other side of a price line than any single call. Haiku's rate
+# changes with the size of one prompt, so the sum of two cheap calls is not the price of the two.
+# compact() therefore reports each call to `on_billed` as soon as the call is known, and the
+# activity writes a ledger row for each, whether compact() then succeeds or fails.
+FIRST_CALL = Usage(input_tokens=150_000, output_tokens=200)
+SECOND_CALL = Usage(input_tokens=90_000, output_tokens=300)
+
+
+class Billed:
+    """An on_billed callback that keeps what it was given."""
+
+    def __init__(self) -> None:
+        self.usages: list[Usage] = []
+
+    async def __call__(self, usage: Usage) -> None:
+        self.usages.append(usage)
+
+
+async def test_each_billed_call_is_reported_on_its_own() -> None:
+    billed = Billed()
+    second = llm(
+        use("toolu_n2", NOTES_TOOL_NAME, **payload(NOTES)), stop="tool_use", usage=SECOND_CALL
+    )
+    provider = FakeProvider(llm(text("Here are the notes."), usage=FIRST_CALL), second)
+
+    result = await compact(provider, "m", None, "[turn 1]", on_billed=billed)
+
+    assert result.status == "repaired"
+    assert billed.usages == [FIRST_CALL, SECOND_CALL]
+    assert tuple(billed.usages) == result.usages
+
+
+async def test_calls_before_a_failure_are_reported_one_by_one() -> None:
+    billed = Billed()
+    failed_after_billing = ProviderError(ProviderErrorKind.SERVER, "bad body", usage=SECOND_CALL)
+    provider = FakeProvider(llm(text("prose"), usage=FIRST_CALL), failed_after_billing)
+
+    with pytest.raises(ProviderError) as caught:
+        await compact(provider, "m", None, "[turn 1]", on_billed=billed)
+
+    assert billed.usages == [FIRST_CALL, SECOND_CALL]
+    # The error still carries the sum, as it always did.
+    assert caught.value.usage == Usage(
+        input_tokens=FIRST_CALL.input_tokens + SECOND_CALL.input_tokens,
+        output_tokens=FIRST_CALL.output_tokens + SECOND_CALL.output_tokens,
+    )
+
+
+async def test_a_failure_that_billed_nothing_reports_nothing() -> None:
+    billed = Billed()
+    provider = FakeProvider(ProviderError(ProviderErrorKind.OVERLOADED, "busy"))
+
+    with pytest.raises(ProviderError):
+        await compact(provider, "m", None, "[turn 1]", on_billed=billed)
+
+    assert billed.usages == []
+
+
+async def test_a_refused_force_that_was_billed_is_reported_before_the_next_call() -> None:
+    billed = Billed()
+    refused = ProviderError(ProviderErrorKind.INVALID_REQUEST, "unknown block", usage=BILLED)
+    provider = FakeProvider(refused, notes_reply(NOTES))
+
+    result = await compact(provider, "m", None, "[turn 1]", on_billed=billed)
+
+    assert result.status == "ok"
+    assert billed.usages == [BILLED, USAGE]
+
+
+async def test_the_failed_call_is_reported_once_when_it_follows_a_refused_force() -> None:
+    billed = Billed()
+    refused = ProviderError(ProviderErrorKind.INVALID_REQUEST, "unknown block", usage=BILLED)
+    busy = ProviderError(ProviderErrorKind.OVERLOADED, "busy", usage=MORE)
+    provider = FakeProvider(refused, busy)
+
+    with pytest.raises(ProviderError):
+        await compact(provider, "m", None, "[turn 1]", on_billed=billed)
+
+    assert billed.usages == [BILLED, MORE]
+
+
+async def test_an_error_from_the_callback_stops_compact() -> None:
+    # A model without a price cannot be ledgered. Going on would bill calls that no row holds.
+    async def refuse(usage: Usage) -> None:
+        raise LookupError("no price for this model")
+
+    provider = FakeProvider(chatter(), notes_reply(NOTES))
+
+    with pytest.raises(LookupError):
+        await compact(provider, "m", None, "[turn 1]", on_billed=refuse)
+
+    assert len(provider.calls) == 1
+
+
+async def test_compact_needs_no_callback() -> None:
+    result = await compact(FakeProvider(notes_reply(NOTES)), "m", None, "[turn 1]")
+
+    assert result.status == "ok"

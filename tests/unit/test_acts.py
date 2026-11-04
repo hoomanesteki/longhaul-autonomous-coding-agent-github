@@ -7,14 +7,17 @@ these tests pin what each side may rely on.
 from datetime import timedelta
 from pathlib import Path
 from types import NoneType
+from typing import get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.workflow import ActivityCancellationType
 
+from longhaul.context import compact
 from longhaul.contracts import (
     BlobRef,
+    ProgressNotes,
     ProviderErrorKind,
     RepoSettings,
     Role,
@@ -33,6 +36,16 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 ROOT = Path(__file__).resolve().parents[2]
 REF = BlobRef(key="tasks/lh-x/turns/0001/transcript.json", sha256="0" * 64, size=10)
 SHA = "a" * 40
+NOTES = ProgressNotes(
+    goal="fix add()",
+    plan_status=[],
+    files_touched=["src/calc/__init__.py"],
+    decisions=[],
+    failing_tests=[],
+    open_hypotheses=[],
+    tried_and_failed=["casting to int"],
+    covers_turns_up_to=6,
+)
 SPEC = TaskSpec(
     task_id="lh-x",
     repo="acme/calc",
@@ -49,6 +62,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "append_results",
         "bundle_checkpoint",
         "cleanup",
+        "compact",
         "ensure_sandbox",
         "llm_turn",
         "poll_once",
@@ -71,6 +85,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.BUNDLE_CHECKPOINT, acts.BundleCheckpointInput, BlobRef),
         (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
         (acts.POLL_ONCE, NoneType, acts.PollResult),
+        (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -105,6 +120,9 @@ def test_each_activity_names_its_payload_types(
         # the tasks that are new, so three minutes is far more than it needs. The heartbeat is
         # what ends a poll on a killed worker: the schedule skips a tick while a poll is open.
         pytest.param(acts.POLL_ONCE, 3 * 60, 30, 3, id="poll_once"),
+        # Section 3.7 gives compact 10 minutes and 5 attempts. The heartbeat is added for the
+        # reason llm_turn has one: it is a model call, and a cancel has to reach it.
+        pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -364,6 +382,35 @@ SAMPLES: list[BaseModel] = [
     acts.RecordEventInput(
         task_id="lh-x", type="continue_as_new", payload={"turn_index": 40, "bundle": None}
     ),
+    acts.CompactInput(
+        task_id="lh-x",
+        turn_index=7,
+        role=Role.CODER,
+        spec=SPEC,
+        transcript_ref=REF,
+        notes=NOTES,
+        forced=True,
+        script_ref=REF,
+    ),
+    acts.CompactInput(
+        task_id="lh-x", turn_index=7, role=Role.CODER, spec=SPEC, transcript_ref=REF, notes=None
+    ),
+    acts.CompactOutput(
+        transcript_ref=REF,
+        notes=NOTES,
+        status="repaired",
+        tokens_before=5_000,
+        tokens_after=2_000,
+        folded_turns=6,
+        cost_usd=0.003,
+    ),
+    acts.LlmTurnOutput(
+        transcript_ref=REF,
+        stop_reason="tool_use",
+        usage=Usage(),
+        context_decision="compact",
+        request_tokens=4_321,
+    ),
 ]
 
 
@@ -553,3 +600,77 @@ def test_a_poll_result_counts_and_is_small() -> None:
 def test_a_poll_result_cannot_count_below_zero() -> None:
     with pytest.raises(ValidationError):
         acts.PollResult(started=-1)
+
+
+# ---------- LH-404: the context decision and the compact activity ----------
+def test_a_model_turn_says_ok_until_it_says_otherwise() -> None:
+    out = acts.LlmTurnOutput(transcript_ref=REF, stop_reason="end_turn", usage=Usage())
+    assert out.context_decision == "ok"
+    assert out.request_tokens == 0
+
+
+@pytest.mark.parametrize("decision", ["ok", "compact", "force"])
+def test_a_model_turn_may_ask_for_compaction(decision: str) -> None:
+    out = acts.LlmTurnOutput(
+        transcript_ref=REF, stop_reason="end_turn", usage=Usage(), context_decision=decision
+    )
+    assert out.context_decision == decision
+
+
+def test_a_model_turn_cannot_ask_for_anything_else() -> None:
+    with pytest.raises(ValidationError):
+        acts.LlmTurnOutput(
+            transcript_ref=REF, stop_reason="end_turn", usage=Usage(), context_decision="halve"
+        )
+
+
+def test_a_projection_cannot_be_negative() -> None:
+    with pytest.raises(ValidationError):
+        acts.LlmTurnOutput(
+            transcript_ref=REF, stop_reason="end_turn", usage=Usage(), request_tokens=-1
+        )
+
+
+def test_compact_backs_off_like_llm_turn_and_does_not_retry_what_a_retry_cannot_fix() -> None:
+    retry = acts.COMPACT.retry
+    assert retry.initial_interval == acts.LLM_TURN.retry.initial_interval
+    assert retry.maximum_interval == acts.LLM_TURN.retry.maximum_interval
+    never = set(retry.non_retryable_error_types or [])
+    assert {
+        ProviderErrorKind.INVALID_REQUEST.value,
+        ProviderErrorKind.AUTH.value,
+        ProviderErrorKind.CONTEXT_TOO_LONG.value,
+    } <= never
+    assert "PayloadTooLargeError" in never
+
+
+def test_a_forced_compaction_keeps_the_last_two_turns() -> None:
+    # F6: when the window is too full to wait, keep only the most recent 2 turns and the notes.
+    assert acts.FORCED_KEEP_RECENT_TURNS == 2
+
+
+def test_compaction_has_four_outcomes() -> None:
+    out = acts.CompactOutput(
+        transcript_ref=REF,
+        notes=None,
+        status="unchanged",
+        tokens_before=10,
+        tokens_after=10,
+        folded_turns=0,
+    )
+    assert out.cost_usd == 0.0
+    with pytest.raises(ValidationError):
+        acts.CompactOutput(
+            transcript_ref=REF,
+            notes=None,
+            status="lost",  # type: ignore[arg-type]
+            tokens_before=10,
+            tokens_after=10,
+            folded_turns=0,
+        )
+
+
+def test_the_compaction_outcomes_of_the_activity_include_those_of_compact() -> None:
+    # acts.py cannot import compact.py, which reaches the tool registry, so the words are
+    # written twice and this keeps them equal.
+    assert set(get_args(compact.CompactStatus)) | {"unchanged"} == set(get_args(acts.CompactStatus))

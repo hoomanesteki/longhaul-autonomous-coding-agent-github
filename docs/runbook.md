@@ -176,6 +176,26 @@ The task path has to be a folder on the machine of the worker, and the model see
 
 Ctrl-C ends `run` and leaves the task running. `longhaul status <id>` shows it and `longhaul cancel <id>` stops it.
 
+### Long tasks: eviction, compaction and the log
+
+A task that runs for many turns keeps two records of its transcript (ADR-0013). The view is what the model reads, and the log is everything that was said. The `context` section of the config sets when the view shrinks:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `window_tokens` | 200000 | The budget Longhaul plans for, not the limit of the model. |
+| `elide_tool_outputs_after_turns` | 4 | A tool result older than this many turns becomes `[elided: <tool> output, <n> lines, handle <h>]`. The model reads it again with `read_output`. |
+| `compact_at` | 0.60 | At this share of the window the older turns are folded into progress notes by the compactor model. |
+| `hard_limit` | 0.85 | A request projected above this share is not sent. The view is compacted down to the last two turns and the turn is asked once more. |
+| `keep_recent_turns` | 6 | The turns a compaction leaves as they are. |
+
+Each compaction writes a `compaction` event with the tokens before and after, and each call of the compactor model has its own row in `cost_ledger`:
+
+```sql
+SELECT ts, payload FROM events WHERE task_id = 'lh-local-calc-1a2b3c4d' AND type = 'compaction';
+```
+
+The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` and a `results.json` for each turn. `longhaul.context.log.read_log(blobs, task_id)` joins them into one transcript. It is never elided or compacted, so a report can say what the agent did in turn 3 of 150. The view of a task is the `transcript_ref` of the workflow state, under `tasks/<task id>/turns/`.
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

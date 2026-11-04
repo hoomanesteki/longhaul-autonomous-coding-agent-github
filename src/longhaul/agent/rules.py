@@ -89,8 +89,10 @@ def turn_limit_outcome() -> Outcome:
 def provider_error_outcome(kind: ProviderErrorKind) -> Outcome | None:
     """The outcome a provider error ends the run with, or None when it is not the run's to end.
 
-    A prompt over the window cannot be fixed by asking again. Compaction handles it from
-    Phase 4 on; until then the run ends. Every other kind is for the retry policy of the caller.
+    A prompt over the window cannot be fixed by asking again. This is the outcome of the second
+    overflow: the durable workflow compacts after the first one and asks once more (F6), and the
+    in-process loop does not compact, so it ends at the first. Every other kind is for the retry
+    policy of the caller.
     """
     return error(CONTEXT_LIMIT) if kind is ProviderErrorKind.CONTEXT_TOO_LONG else None
 

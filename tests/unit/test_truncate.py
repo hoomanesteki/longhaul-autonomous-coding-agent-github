@@ -7,6 +7,7 @@ from longhaul.context.truncate import (
     HEAD_LINES,
     TAIL_LINES,
     format_size,
+    marker_line_count,
     shape_output,
     split_lines,
 )
@@ -146,3 +147,24 @@ def test_lines_are_counted_the_way_read_output_pages_them() -> None:
 def test_the_handle_is_written_into_the_marker_as_given() -> None:
     shaped = shape_output(numbered_lines(1_000), 500, "out_call-7")
     assert "Full text: handle out_call-7." in shaped
+
+
+def test_the_line_count_of_a_marker_can_be_read_back() -> None:
+    # Eviction (LH-404) names the lines of the whole output in its stub, and the marker is the
+    # one place that still knows them once the middle is cut.
+    shaped = shape_output(numbered_lines(10_000), CAP, HANDLE)
+    assert marker_line_count(shaped) == 10_000
+    assert marker_line_count(shape_output(numbered_lines(1_000), 500, HANDLE)) == 1_000
+
+
+def test_output_that_was_not_cut_has_no_marker_line_count() -> None:
+    assert marker_line_count("a\nb\n") is None
+    assert marker_line_count("") is None
+    # Text that only mentions a marker in the middle of a line is not one.
+    assert (
+        marker_line_count("see [output truncated: 5 lines, 1 byte. Full text: handle x.]") is None
+    )
+
+
+def test_a_marker_for_one_line_is_read_too() -> None:
+    assert marker_line_count(marker(1, "2.9 KB")) == 1

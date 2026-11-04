@@ -177,6 +177,21 @@ def test_model_calls_go_on_the_cost_ledger(tmp_path: Path) -> None:
     assert isinstance(llm._ledger, SqlLedger)
 
 
+def test_the_model_turns_and_the_compactor_follow_the_context_settings(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    (llm,) = [fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "llm_turn"]
+    (compactor,) = [
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "compact"
+    ]
+    assert llm._context == CONFIG.context
+    assert compactor._context == CONFIG.context
+    # Compactor calls are priced and ledgered like any other call (I6).
+    assert isinstance(compactor._ledger, SqlLedger)
+    # Both estimate with one meter per task, so the tokens in a compaction event and the
+    # projections of the model turns come from the same ratio.
+    assert compactor._meters is llm._meters
+
+
 def test_a_model_without_a_price_stops_the_worker_before_it_starts(tmp_path: Path) -> None:
     config = CONFIG.model_copy(
         update={"models": CONFIG.models.model_copy(update={"coder": "claude-opus-9"})}

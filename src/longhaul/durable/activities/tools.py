@@ -12,6 +12,10 @@ text of each result from its blob and gives the model that text when it is withi
 Then it applies the pairing rules of turns.py (D9) and stores the new transcript. It also adds
 the harness text, such as the nudge, which goes after the results.
 
+`append_results` also writes the `results` part of the turn to the log of the task (context/log.py),
+with the text the model was given, so the log holds the whole transcript while the view that the
+next call reads is elided and compacted (LH-404).
+
 The cut is made in append_results and not in tool_exec, for three reasons. It is a plain
 function of the stored text and the cap, so a retried append_results builds the same transcript
 and no second blob has to be kept in step with the first. What the model reads can be as long as
@@ -68,6 +72,7 @@ from longhaul.agent.turns import (
     validate_pairs,
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key, call_slug
+from longhaul.context.log import added_messages, append_to_log
 from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
@@ -317,7 +322,13 @@ class ToolActivities:
         ) as exc:  # TranscriptError: retrying with the same input fails the same way
             raise not_retried(exc) from exc
         key = blob_key(inp.task_id, "turns", inp.turn_index, "transcript-next.json")
-        return small(await self._blobs.put_json(grown, key))
+        ref = small(await self._blobs.put_json(grown, key))
+        # The same step for the log, as the part of the turn it belongs to. A retry writes the
+        # same part again.
+        await append_to_log(
+            self._blobs, inp.task_id, inp.turn_index, "results", added_messages(transcript, grown)
+        )
+        return ref
 
     async def _result(self, summary: acts.ToolResultSummary) -> ToolResult:
         if summary.output_ref is not None:

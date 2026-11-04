@@ -31,6 +31,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from longhaul.agent.rules import BAD_FINISH, MAX_PAUSES, NUDGE
+from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -38,6 +39,7 @@ from longhaul.contracts import (
     Outcome,
     OutcomeKind,
     Phase,
+    ProgressNotes,
     RepoSettings,
     StopDetails,
     StopReason,
@@ -118,6 +120,9 @@ class Stubs:
         self.workflow_ids: set[str] = set()
         self.turn_runs: dict[int, str] = {}
         self.fails: dict[str, ApplicationError] = {}
+        self.decisions: dict[int, Decision] = {}
+        self.overflow: dict[int, int] = {}
+        self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -130,6 +135,7 @@ class Stubs:
             self.cleanup,
             self.bundle_checkpoint,
             self.record_event,
+            self.compact,
         ]
 
     def hold(self, name: str) -> None:
@@ -178,12 +184,18 @@ class Stubs:
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
         self.turn_runs[inp.turn_index] = activity.info().workflow_run_id
         await self._enter(acts.LLM_TURN.name, inp, gate=self.turn_gates.get(inp.turn_index))
+        if self.overflow.get(inp.turn_index, 0) > 0:
+            self.overflow[inp.turn_index] -= 1
+            raise ApplicationError(
+                "prompt is too long", type="context_too_long", non_retryable=True
+            )
         return acts.LlmTurnOutput(
             transcript_ref=ref(f"turns/{inp.turn_index:04d}/assistant.json"),
             tool_call_summaries=self.script(inp.turn_index),
             stop_reason="tool_use",
             usage=Usage(),
             cost_usd=self.cost_usd,
+            context_decision=self.decisions.get(inp.turn_index, "ok"),
         )
 
     @activity.defn(name=acts.ENSURE_SANDBOX.name)
@@ -234,6 +246,38 @@ class Stubs:
         await self._enter(acts.RECORD_EVENT.name, inp)
         if acts.RECORD_EVENT.name in self.fails:
             raise self.fails[acts.RECORD_EVENT.name]
+
+    @activity.defn(name=acts.COMPACT.name)
+    async def compact(self, inp: acts.CompactInput) -> acts.CompactOutput:
+        await self._enter(acts.COMPACT.name, inp)
+        if acts.COMPACT.name in self.fails:
+            raise self.fails[acts.COMPACT.name]
+        return self.compaction(inp)
+
+
+NOTES = ProgressNotes(
+    goal="fix add()",
+    plan_status=[],
+    files_touched=["calc.py"],
+    decisions=[],
+    failing_tests=[],
+    open_hypotheses=[],
+    tried_and_failed=["swapping the operands"],
+    covers_turns_up_to=1,
+)
+
+
+def compacted(inp: acts.CompactInput) -> acts.CompactOutput:
+    """The default compaction: a new view named for the turn, and the notes above."""
+    return acts.CompactOutput(
+        transcript_ref=ref(f"turns/{inp.turn_index:04d}/compacted.json"),
+        notes=NOTES,
+        status="ok",
+        tokens_before=5_000,
+        tokens_after=2_000,
+        folded_turns=4,
+        cost_usd=0.25,
+    )
 
 
 @pytest.fixture
@@ -1635,3 +1679,340 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
     )
     for history in histories:
         await replayer.replay_workflow(history)
+
+
+# ---------- context: the compact activity and the retry after an overflow (LH-404) ----------
+def reads_then_finishes(last_turn: int) -> Script:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        if turn == last_turn:
+            return [finish()]
+        return [call("read_file", f"read-{turn}", path="calc.py")]
+
+    return script
+
+
+def compactions(stubs: Stubs) -> list[acts.CompactInput]:
+    return stubs.payloads(acts.COMPACT.name)
+
+
+def events_of(stubs: Stubs, event_type: str) -> list[dict[str, Any]]:
+    return [e.payload for e in stubs.payloads(acts.RECORD_EVENT.name) if e.type == event_type]
+
+
+async def test_a_compact_decision_compacts_the_view_before_the_next_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    # The turn ends with its results in the view, and then the view is compacted.
+    assert stubs.names() == [
+        "prepare_workspace",
+        *["llm_turn", "tool_exec", "append_results"],
+        "compact",
+        "record_event",
+        *["llm_turn", "tool_exec", "append_results"],
+        *["llm_turn", "append_results"],
+    ]
+    (request,) = compactions(stubs)
+    assert request.task_id == spec.task_id
+    assert request.turn_index == 0
+    assert request.forced is False
+    assert request.transcript_ref == ref("turns/0000/results.json")
+    assert request.notes is None
+    assert request.spec == spec
+
+
+async def test_the_next_turn_starts_from_the_compacted_view_with_the_notes(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    await play(env, stubs, spec)
+
+    first, second, third = stubs.payloads(acts.LLM_TURN.name)
+    assert first.notes is None
+    assert second.transcript_ref == ref("turns/0000/compacted.json")
+    assert second.notes == NOTES
+    # The notes stay with the task: the turn after has them too.
+    assert third.notes == NOTES
+
+
+async def test_a_force_decision_compacts_with_the_forced_flag(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.decisions[0] = "force"
+    await play(env, stubs, spec)
+
+    (request,) = compactions(stubs)
+    assert request.forced is True
+
+
+async def test_a_later_round_hands_the_earlier_notes_to_the_compactor(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.decisions[0] = "compact"
+    stubs.decisions[1] = "compact"
+    await play(env, stubs, spec)
+
+    first, second = compactions(stubs)
+    assert first.notes is None
+    assert second.notes == NOTES
+    assert second.transcript_ref == ref("turns/0001/results.json")
+
+
+async def test_the_compaction_is_an_event_with_the_tokens_before_and_after(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.decisions[0] = "compact"
+    await play(env, stubs, spec)
+
+    assert events_of(stubs, "compaction") == [
+        {
+            "turn_index": 0,
+            "forced": False,
+            "status": "ok",
+            "tokens_before": 5_000,
+            "tokens_after": 2_000,
+            "folded_turns": 4,
+        }
+    ]
+
+
+async def test_what_the_compactor_cost_is_added_to_the_cost_of_the_task(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1), cost_usd=0.5)
+    stubs.decisions[0] = "compact"
+    _, final = await play(env, stubs, spec)
+
+    assert final.cost_usd == pytest.approx(0.5 + 0.5 + 0.25)  # two model turns and one compaction
+
+
+async def test_an_ok_decision_compacts_nothing(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    await play(env, stubs, spec)
+
+    assert acts.COMPACT.name not in stubs.names()
+    assert events_of(stubs, "compaction") == []
+
+
+async def test_a_turn_that_finishes_the_task_does_not_compact(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(0))
+    stubs.decisions[0] = "force"
+    await play(env, stubs, spec)
+
+    assert acts.COMPACT.name not in stubs.names()
+
+
+async def test_a_turn_without_tool_calls_is_compacted_after_its_nudge(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(lambda turn: [] if turn == 0 else [finish()])
+    stubs.decisions[0] = "compact"
+    await play(env, stubs, spec)
+
+    assert stubs.names()[:5] == [
+        "prepare_workspace",
+        "llm_turn",
+        "append_results",
+        "compact",
+        "record_event",
+    ]
+    (request,) = compactions(stubs)
+    assert request.transcript_ref == ref("turns/0000/results.json")
+
+
+async def test_a_compaction_that_fails_for_good_fails_the_workflow(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    stubs.fails[acts.COMPACT.name] = ApplicationError(
+        "no price for this model", type="PricingError", non_retryable=True
+    )
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+
+async def test_an_event_that_cannot_be_written_does_not_stop_a_compaction(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.decisions[0] = "compact"
+    stubs.fails[acts.RECORD_EVENT.name] = ApplicationError("db down", non_retryable=True)
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert stubs.payloads(acts.LLM_TURN.name)[1].transcript_ref == ref("turns/0000/compacted.json")
+
+
+async def test_compact_gets_the_timeout_and_retries_of_section_3_7(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.decisions[0] = "compact"
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await result_of(handle)
+        sched = scheduled_options(await handle.fetch_history())
+
+    attributes = sched[acts.COMPACT.name]
+    assert timeouts(attributes) == (10 * 60, 30)
+    assert attributes.retry_policy.maximum_attempts == 5
+    assert {"invalid_request", "auth", "context_too_long"} <= set(
+        attributes.retry_policy.non_retryable_error_types
+    )
+
+
+# ---------- F6: a prompt over the window ----------
+async def test_a_prompt_over_the_window_is_compacted_and_asked_again_once(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.overflow[1] = 1
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert stubs.names() == [
+        "prepare_workspace",
+        *["llm_turn", "tool_exec", "append_results"],
+        "llm_turn",  # turn 1 is too long
+        "compact",
+        "record_event",
+        *["llm_turn", "tool_exec", "append_results"],  # and goes through the second time
+        *["llm_turn", "append_results"],
+    ]
+    (request,) = compactions(stubs)
+    assert request.forced is True
+    assert request.turn_index == 1
+    assert request.transcript_ref == ref("turns/0000/results.json")
+    retry = stubs.payloads(acts.LLM_TURN.name)[2]
+    assert (retry.turn_index, retry.transcript_ref, retry.notes) == (
+        1,
+        ref("turns/0001/compacted.json"),
+        NOTES,
+    )
+    assert final.turn_index == 3
+    assert events_of(stubs, "compaction")[0]["forced"] is True
+
+
+async def test_a_second_overflow_ends_the_run_as_it_did_before(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.overflow[1] = 2
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
+    assert len(compactions(stubs)) == 1  # one forced compaction, and no second
+    assert stubs.names().count(acts.LLM_TURN.name) == 3
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 2)
+
+
+async def test_the_one_retry_belongs_to_the_turn(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.overflow[1] = 1
+    stubs.overflow[2] = 1
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert [c.turn_index for c in compactions(stubs)] == [1, 2]
+
+
+async def test_an_overflow_with_nothing_to_cut_ends_the_run_without_asking_again(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def nothing(inp: acts.CompactInput) -> acts.CompactOutput:
+        return acts.CompactOutput(
+            transcript_ref=inp.transcript_ref,
+            notes=inp.notes,
+            status="unchanged",
+            tokens_before=900,
+            tokens_after=900,
+            folded_turns=0,
+        )
+
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.overflow[1] = 1
+    stubs.compaction = nothing
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
+    assert stubs.names().count(acts.LLM_TURN.name) == 2  # turn 1 was not asked a second time
+
+
+async def test_a_compaction_that_changed_nothing_is_not_an_event(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def nothing(inp: acts.CompactInput) -> acts.CompactOutput:
+        return acts.CompactOutput(
+            transcript_ref=inp.transcript_ref,
+            notes=inp.notes,
+            status="unchanged",
+            tokens_before=900,
+            tokens_after=900,
+            folded_turns=0,
+        )
+
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    stubs.compaction = nothing
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert events_of(stubs, "compaction") == []
+    assert stubs.payloads(acts.LLM_TURN.name)[1].transcript_ref == ref("turns/0000/results.json")
+
+
+async def test_an_overflow_that_gets_a_forced_compaction_keeps_the_compaction_cost(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.overflow[1] = 1
+    _, final = await play(env, stubs, spec)
+
+    assert final.cost_usd == pytest.approx(0.25)
+
+
+async def test_notes_and_the_compacted_view_cross_a_hand_over(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.decisions[0] = "compact"
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=acts.Tuning(continue_as_new_every_turns=2)
+        )
+        await result_of(handle)
+
+    # Turn 2 is the first turn of the second run. It still has the notes.
+    turn_two = stubs.payloads(acts.LLM_TURN.name)[2]
+    assert (turn_two.turn_index, turn_two.notes) == (2, NOTES)
+    assert turn_two.transcript_ref == ref("turns/0001/results.json")
+
+
+async def test_histories_with_a_compaction_replay(env: WorkflowEnvironment) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.decisions[0] = "compact"
+    stubs.overflow[2] = 1
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, make_spec("lh-acme-calc-7"), task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=pydantic_data_converter,
+    )
+    await replayer.replay_workflow(history)

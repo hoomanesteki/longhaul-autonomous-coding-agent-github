@@ -236,3 +236,39 @@ def test_different_odd_ids_do_not_share_a_name() -> None:
     first = support.call_slug("functions.get:0")
     second = support.call_slug("functions.get:1")
     assert first != second
+
+
+# ---------- the meters of the tasks a worker is running (LH-404) ----------
+def test_a_task_gets_the_same_meter_every_time() -> None:
+    meters = support.Meters()
+
+    assert meters.for_task("lh-a") is meters.for_task("lh-a")
+    assert meters.for_task("lh-a") is not meters.for_task("lh-b")
+
+
+def test_a_new_meter_starts_from_the_default_rule() -> None:
+    assert support.Meters().for_task("lh-a").observations == 0
+
+
+def test_the_meters_of_the_oldest_tasks_are_dropped_first() -> None:
+    meters = support.Meters(capacity=2)
+    first = meters.for_task("lh-a")
+    meters.for_task("lh-b")
+    meters.for_task("lh-c")
+
+    assert meters.for_task("lh-a") is not first  # it was dropped and starts over
+
+
+def test_asking_for_a_meter_keeps_it_among_the_newest() -> None:
+    meters = support.Meters(capacity=2)
+    first = meters.for_task("lh-a")
+    meters.for_task("lh-b")
+    meters.for_task("lh-a")  # lh-a is in use again, so lh-b is the oldest
+    meters.for_task("lh-c")
+
+    assert meters.for_task("lh-a") is first
+
+
+def test_a_meter_cache_needs_room_for_a_task() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        support.Meters(capacity=0)

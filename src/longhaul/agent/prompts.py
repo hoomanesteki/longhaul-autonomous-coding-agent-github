@@ -69,8 +69,9 @@ _TOOL_GUIDE = (
     "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. Use "
     "`run_command` for any other shell command. It runs in /workspace.",
     "- Look at `git_diff` before you finish, to check that the change is what you meant.",
-    "- A long result is cut to its first and last lines and ends with a handle. Read the "
-    "rest with `read_output`: give it that `handle`, a range with `start_line` and "
+    "- A long result is cut to its first and last lines and ends with a handle. An old result "
+    "is replaced by one line that starts with [elided: and names its handle. Read the rest, or "
+    "the old text, with `read_output`: give it that `handle`, a range with `start_line` and "
     "`end_line`, or a `pattern` to get only the lines that contain some text. Do not run "
     "the command again to see more of its output.",
     "- Independent tool calls can go in one reply. Send `finish` on its own.",
@@ -99,7 +100,7 @@ def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = N
     sections = [
         "\n".join([format_role_line(role), "", intro, "", RULES_HEADING, *rules]),
         "\n".join([TOOLS_HEADING, *_TOOL_GUIDE]),
-        _task_statement(spec),
+        task_statement(spec),
     ]
     facts = _clean(memory_block or "")
     if facts:
@@ -107,7 +108,8 @@ def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = N
     return "\n\n".join(sections)
 
 
-def _task_statement(spec: TaskSpec) -> str:
+def task_statement(spec: TaskSpec) -> str:
+    """The task block of the prompt. The compactor gets the same text on its first round."""
     command = spec.settings.test_command
     issue = _clean(spec.title)
     lines = [

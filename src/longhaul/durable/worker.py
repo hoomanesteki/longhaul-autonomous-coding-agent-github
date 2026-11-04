@@ -32,6 +32,10 @@ What it is built from, and why each piece is what it is:
   worker for local runs needs none. A poll on it fails with the name of the setting, and the
   Temporal UI shows that. The Schedule that triggers the polls is made by `longhaul poller
   install` and not by the worker.
+* The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
+  tool outputs and decides when the view must be compacted, and `compact` does it with the
+  compactor model. They share one set of token meters, so both count with the ratio that the
+  replies of a task taught. The compactor's calls are on the cost ledger one by one (I6).
 
 Stopping. SIGTERM and SIGINT start a graceful stop: the worker polls no more, waits up to
 GRACEFUL_SHUTDOWN_S for the activities that are running, and cancels the rest. A cancelled
@@ -65,9 +69,11 @@ from longhaul.cost.pricing import load_pricing
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
+from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.activity_log import ActivityLogInterceptor
@@ -156,8 +162,26 @@ def build_parts(
     def config_for(role: Role) -> LoopConfig:
         return LoopConfig.from_config(cfg, role)
 
+    provider = build_provider(settings)
+    meters = Meters()
     llm = LlmActivities(
-        build_provider(settings), blobs, recorder, registry.specs(), config_for, ledger=ledger
+        provider,
+        blobs,
+        recorder,
+        registry.specs(),
+        config_for,
+        ledger=ledger,
+        context=cfg.context,
+        meters=meters,
+    )
+    compactor = ContextActivities(
+        provider,
+        blobs,
+        registry.specs(),
+        config_for,
+        cfg.context,
+        ledger=ledger,
+        meters=meters,
     )
     tools = ToolActivities(
         registry,
@@ -188,6 +212,7 @@ def build_parts(
     return WorkerParts(
         activities=[
             *llm.activities,
+            *compactor.activities,
             *tools.activities,
             *workspace.activities,
             *events.activities,

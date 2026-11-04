@@ -196,6 +196,19 @@ SELECT ts, payload FROM events WHERE task_id = 'lh-local-calc-1a2b3c4d' AND type
 
 The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` and a `results.json` for each turn. `longhaul.context.log.read_log(blobs, task_id)` joins them into one transcript. It is never elided or compacted, so a report can say what the agent did in turn 3 of 150. The view of a task is the `transcript_ref` of the workflow state, under `tasks/<task id>/turns/`.
 
+### The prompt cache
+
+Every request of a task starts with the same bytes: the tool list, then the system prompt (the role and rules, the tool guide, the task statement and the memory block). The plan and the progress notes are in the first user message, behind that prefix, so a plan update or a compaction does not touch it (ADR-0013). The Anthropic provider marks up to four places in the request for the cache: the last tool, the end of the system prompt, the last assistant turn that has a message after it, and the newest message that holds an elided result.
+
+The `turns` table has the result for every model call. `cache_ratio` is `cache_read_tokens / (input_tokens + cache_read_tokens)`, so 0.9 means that nine tenths of the input tokens, not counting the ones just written to the cache, were read from it:
+
+```sql
+SELECT turn_index, input_tokens, cache_read_tokens, cache_write_tokens, round(cache_ratio::numeric, 2)
+FROM turns WHERE task_id = 'lh-local-calc-1a2b3c4d' ORDER BY turn_index, attempt;
+```
+
+The first turn writes the prefix and reads nothing. From the second turn on the ratio should be well above 0.5. A ratio of 0 on every turn means the prefix changes between requests, or that it is shorter than the model's minimum for caching: 512 tokens on the 5.5 models, up to 4,096 on older ones. A model that is under its minimum is not told, and `cache_write_tokens` stays 0. A drop on one turn is normal after a compaction or a plan update, which write the conversation again. To check the cache against the real API, run `uv run pytest -m live tests/live/test_cache_live.py` with `ANTHROPIC_API_KEY` set. It makes four small requests.
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from longhaul.memory.commands import DISCOVERY_BUDGET_S
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -28,7 +30,14 @@ from longhaul.agent.workspace import SetupCommandError, collect_source_files, de
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.checkpoints.snapshot import snapshot_folder
-from longhaul.contracts import ExecResult, RepoSettings, Sandbox, SandboxLimits, TaskSpec
+from longhaul.contracts import (
+    ExecResult,
+    MemoryItem,
+    RepoSettings,
+    Sandbox,
+    SandboxLimits,
+    TaskSpec,
+)
 from longhaul.db.records import EventRecord, MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.workspace import (
@@ -55,6 +64,9 @@ VENV = "python -m venv"
 SETUP = "mkdir -p .venv && echo ran >> .venv/setup-log"
 # Every script of the checkpoint store defines the same git wrapper, which contains this.
 STORE_SCRIPT = "core.hooksPath=/dev/null"
+# The command that the calc fixture's pytest config gives, and what it prints at the base commit.
+PYTEST = "pytest -q"
+PYTEST_SUMMARY = ".F.\n1 failed, 2 passed in 0.03s\n"
 
 
 def host_git(*args: str) -> str:
@@ -85,6 +97,12 @@ class Box(FakeSandbox):
             self.commands.append((cmd, self.host.network[self.id]))
         if cmd.startswith(VENV):
             return ExecResult(exit_code=0, stdout="", stderr="", timed_out=False, duration_ms=0)
+        if cmd == PYTEST:
+            # The calc fixture has a failing test, so the real run ends like this. The fake
+            # answers without starting pytest, which the machine may not have on its PATH.
+            return ExecResult(
+                exit_code=1, stdout=PYTEST_SUMMARY, stderr="", timed_out=False, duration_ms=0
+            )
         return await super().exec(cmd, timeout_s=timeout_s, env=env)
 
 
@@ -672,3 +690,172 @@ async def test_the_default_setup_is_read_from_the_workspace_at_head_sha(rig: Rig
 
     ((command, network_on),) = rig.box(new_id).commands
     assert command.endswith("-e . pytest") and network_on
+
+
+# ---------- command discovery (LH-603) ----------
+class Notes:
+    """The part of PgMemoryStore that prepare_workspace uses, kept in a list."""
+
+    def __init__(self) -> None:
+        self.added: list[tuple[MemoryItem, str]] = []
+        self.failure: Exception | None = None
+
+    async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str:
+        if self.failure is not None:
+            raise self.failure
+        self.added.append((item, source_ref))
+        return f"item-{len(self.added)}"
+
+    @property
+    def commands(self) -> list[str]:
+        return [item.content for item, _ in self.added]
+
+
+def learning(rig: Rig, notes: Notes) -> WorkspaceActivities:
+    """The activities of the rig, with a memory store to keep the verified commands in."""
+    return WorkspaceActivities(
+        rig.host, rig.store, rig.recorder, image=IMAGE, limits=LIMITS, memory=notes
+    )
+
+
+async def prepare_with(
+    rig: Rig, notes: Notes, spec: TaskSpec | None = None, **kwargs: Any
+) -> acts.PrepareWorkspaceOutput:
+    env = rig.environment(**kwargs)
+    out: acts.PrepareWorkspaceOutput = await env.run(
+        learning(rig, notes).prepare_workspace, spec or rig.spec()
+    )
+    return out
+
+
+def make_target(rig: Rig, recipe: str) -> None:
+    """A Makefile for the folder, with a test target that runs `recipe`."""
+    (rig.source / "Makefile").write_text(f"test:\n\t{recipe}\n")
+
+
+async def test_without_a_memory_store_no_command_is_run_to_find_out_how_to_test(rig: Rig) -> None:
+    make_target(rig, "echo '1 passed in 0.01s'")
+
+    out = await rig.prepare()
+
+    assert [cmd for cmd, _ in rig.box(out.sandbox_id).commands] == [SETUP]
+
+
+async def test_a_command_that_works_is_kept_as_verified_at_the_base_commit(rig: Rig) -> None:
+    notes = Notes()
+
+    out = await prepare_with(rig, notes)
+
+    [(item, source_ref)] = notes.added
+    assert item == MemoryItem(
+        id="",
+        repo=rig.spec().repo,
+        kind="command",
+        content=PYTEST,
+        status="approved",
+        source="default_branch",
+    )
+    assert source_ref == out.base_sha
+    # It ran once, after the setup, and with the network cut: repo code gets no network here.
+    assert rig.box(out.sandbox_id).commands == [(SETUP, True), (PYTEST, False)]
+
+
+async def test_every_candidate_runs_and_only_those_with_a_summary_are_kept(rig: Rig) -> None:
+    (rig.source / "Makefile").write_text(
+        "test:\n\t@echo '4 passed in 0.01s'\nlint:\n\t@echo nothing to say\n"
+    )
+    notes = Notes()
+
+    out = await prepare_with(rig, notes)
+
+    assert notes.commands == [PYTEST, "make test"]
+    ran = [cmd for cmd, _ in rig.box(out.sandbox_id).commands]
+    assert ran == [SETUP, PYTEST, "make test", "make lint"]
+
+
+async def test_a_repo_without_candidates_runs_nothing_more(rig: Rig) -> None:
+    (rig.source / "pyproject.toml").write_text('[project]\nname = "calc"\nversion = "0.1.0"\n')
+    notes = Notes()
+
+    out = await prepare_with(rig, notes, rig.spec(setup_command=SETUP))
+
+    assert notes.added == []
+    assert [cmd for cmd, _ in rig.box(out.sandbox_id).commands] == [SETUP]
+
+
+async def test_the_workspace_is_the_base_commit_again_after_the_commands_ran(rig: Rig) -> None:
+    # A target that edits a tracked file and leaves a new one, as a formatter or a build can.
+    make_target(rig, f"echo drift >> {MODULE}; echo x > junk.txt; echo '1 passed in 0.01s'")
+    notes = Notes()
+
+    out = await prepare_with(rig, notes)
+
+    assert "make test" in notes.commands
+    box = rig.box(out.sandbox_id)
+    assert await sh(box, "git status --porcelain") == ""
+    assert await sh(box, "git rev-parse HEAD") == out.base_sha == out.head_sha
+    assert not (box.root / "junk.txt").exists()
+    assert "drift" not in (await box.read_file(MODULE)).decode()
+    # The venv that the setup built is not the commands' to undo.
+    assert setup_runs(box) == 1
+
+
+async def test_a_retry_finds_the_same_commands_again(rig: Rig) -> None:
+    notes = Notes()
+
+    first = await prepare_with(rig, notes)
+    second = await prepare_with(rig, notes)
+
+    assert first.base_sha == second.base_sha
+    # The store de-duplicates, so the second attempt names the same items and adds nothing.
+    assert [(i.content, ref) for i, ref in notes.added] == [(PYTEST, first.base_sha)] * 2
+    assert rig.host.live(TASK) == [second.sandbox_id]
+
+
+async def test_a_store_that_fails_does_not_fail_the_preparation(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    notes = Notes()
+    notes.failure = ConnectionError("the database is gone")
+
+    with caplog.at_level(logging.WARNING, logger="longhaul.durable.activities.workspace"):
+        out = await prepare_with(rig, notes)
+
+    assert rig.host.live(TASK) == [out.sandbox_id]
+    assert rig.host.network[out.sandbox_id] is False
+    assert "the database is gone" in caplog.text
+    assert TASK in caplog.text
+
+
+async def test_the_activity_heartbeats_while_it_runs_the_commands(rig: Rig) -> None:
+    make_target(rig, "sleep 0.7; echo '1 passed in 0.01s'")
+    notes = Notes()
+
+    await prepare_with(rig, notes, rig.spec(setup_command=SETUP), heartbeat_timeout_s=0.3)
+
+    assert "make test" in notes.commands
+    assert len(rig.beats) >= 4
+
+
+async def test_a_cancel_during_the_commands_removes_what_the_preparation_made(rig: Rig) -> None:
+    make_target(rig, "touch started && sleep 30")
+    env = rig.environment(heartbeat_timeout_s=0.3)
+    task = asyncio.ensure_future(env.run(learning(rig, Notes()).prepare_workspace, rig.spec()))
+    await until(
+        lambda: any((b.root / "started").exists() for b in rig.host.boxes.values()),
+        "the command to start",
+    )
+
+    env.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+
+    assert rig.host.of(TASK) == []
+    assert not rig.store.has_repo(TASK)
+
+
+def test_the_setup_and_the_commands_together_fit_in_the_activity() -> None:
+    # The commands start after the setup, and the whole preparation has to end inside the
+    # time limit of the activity or Temporal cancels it.
+    total = timedelta(seconds=SETUP_TIMEOUT_S + DISCOVERY_BUDGET_S)
+    assert total < acts.PREPARE_WORKSPACE.start_to_close

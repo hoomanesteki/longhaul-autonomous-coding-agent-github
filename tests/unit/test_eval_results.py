@@ -27,6 +27,8 @@ def make_result(task_id: str = "calc-01", **changes: Any) -> TaskResult:
         "config": "full",
         "model": "claude-sonnet-5-5",
         "git_sha": "f" * 40,
+        "provider": None,
+        "scripted": False,
         "outcome": "pr_opened",
         "outcome_summary": "Changed add().",
         "resolved": True,
@@ -88,6 +90,22 @@ def test_the_file_names_every_field_the_plan_asks_for() -> None:
         "stuck_reasons",
         "intervention_needed",
     } <= names
+
+
+def test_a_result_says_where_its_answers_came_from() -> None:
+    # A scripted run is free and always right. Nothing in the file may pass it off as a real one.
+    real = make_result()
+    assert (real.provider, real.scripted) == (None, False)
+    played = make_result(provider="scripted", scripted=True)
+    dumped = played.model_dump(mode="json")
+    assert (dumped["provider"], dumped["scripted"]) == ("scripted", True)
+
+
+def test_a_result_must_say_whether_it_was_scripted() -> None:
+    values = make_result().model_dump()
+    del values["scripted"]
+    with pytest.raises(ValueError, match="scripted"):
+        TaskResult(**values)
 
 
 def test_a_result_is_never_overwritten(tmp_path: Path) -> None:
@@ -178,6 +196,21 @@ def test_the_summary_names_the_run_and_its_tasks() -> None:
     assert summary.model == "claude-sonnet-5-5"
     assert summary.tasks == ["a", "b"]
     assert summary.wall_time_s == 300.0
+
+
+def test_the_summary_says_where_the_answers_came_from() -> None:
+    real = summary_of(make_result("a"))
+    assert (real.provider, real.scripted) == (None, False)
+    played = summary_of(
+        make_result("a", provider="scripted", scripted=True),
+        make_result("b", provider="scripted", scripted=True),
+    )
+    assert (played.provider, played.scripted) == ("scripted", True)
+
+
+def test_scripted_and_real_results_are_not_mixed_in_one_summary() -> None:
+    with pytest.raises(ValueError, match="scripted"):
+        summary_of(make_result("a"), make_result("b", provider="scripted", scripted=True))
 
 
 def test_an_empty_run_has_no_summary() -> None:

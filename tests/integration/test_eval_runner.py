@@ -229,6 +229,8 @@ async def test_dry_run_writes_results(stack: EvalStack) -> None:
         assert result.run_id == stack.run_id
         assert result.workflow_id == f"{stack.prefix}{result.task_id}"
         assert (result.task_set, result.config) == ("custom", "full")
+        # Free, always-right answers: the file must say so, or it could pass for a real run.
+        assert (result.provider, result.scripted) == ("scripted", True)
         assert result.model == load_config(config_path(stack.settings)).models.coder
         assert result.outcome == "pr_opened"
         # The scripts fix the bug, and the grader ran the hidden tests on the patch.
@@ -253,6 +255,7 @@ async def test_dry_run_writes_results(stack: EvalStack) -> None:
     assert on_disk == summary
     assert (summary.attempted, summary.resolved, summary.resolve_rate) == (2, 2, 1.0)
     assert summary.tasks == ["calc-01", "calc-02"]
+    assert (summary.provider, summary.scripted) == ("scripted", True)
     assert summary.intervention_needed == 0
 
 

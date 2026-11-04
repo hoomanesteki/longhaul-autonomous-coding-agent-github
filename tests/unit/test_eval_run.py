@@ -5,13 +5,15 @@ one-minute pause timeout costs no time. The runner against the real stack is in
 tests/integration/test_eval_runner.py.
 """
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from temporalio.service import RPCError, RPCStatusCode
 
-from eval import custom_tasks, run
+from eval import custom_tasks, results, run
 from eval.grade_custom import GradeResult
 from eval.results import TaskResult, Tokens
 from eval.run import RunOptions
@@ -139,6 +141,19 @@ def test_a_script_alone_means_the_scripted_provider(tmp_path: Path) -> None:
     assert run.parse_args([*BASE_ARGS, "--script", str(script)]).provider == "scripted"
 
 
+def test_a_run_with_a_script_is_scripted(tmp_path: Path) -> None:
+    script = tmp_path / "fix.yaml"
+    script.write_text("steps: []\n", encoding="utf-8")
+    options = run.parse_args([*BASE_ARGS, "--script", str(script)])
+    assert (options.provider, options.scripted) == ("scripted", True)
+
+
+def test_a_run_without_a_script_is_not_scripted() -> None:
+    assert run.parse_args(BASE_ARGS).scripted is False
+    options = run.parse_args([*BASE_ARGS, "--provider", "anthropic"])
+    assert (options.provider, options.scripted) == ("anthropic", False)
+
+
 def test_a_script_that_does_not_exist_is_refused(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--script" in refuses(capsys, [*BASE_ARGS, "--script", "/nowhere/fix.yaml"])
 
@@ -236,9 +251,51 @@ def test_a_run_id_with_results_is_not_used_twice(tmp_path: Path) -> None:
         run.claim_run_dir(tmp_path, "try1")
 
 
-def test_an_empty_run_folder_can_be_used_again(tmp_path: Path) -> None:
+def test_a_run_folder_without_results_is_not_used_again_either(tmp_path: Path) -> None:
+    # A run that was interrupted leaves such a folder, and it has started workflows under this
+    # run id. Temporal refuses a second start of those ids, so the run id cannot work again.
     run.claim_run_dir(tmp_path, "try1")
-    assert run.claim_run_dir(tmp_path, "try1") == tmp_path / "try1"
+    with pytest.raises(ValueError, match="try1"):
+        run.claim_run_dir(tmp_path, "try1")
+
+
+# ---------- workflow ids of a run ----------
+class FakeServer:
+    """The part of the Temporal client that get_task uses, with some workflows already there."""
+
+    def __init__(self, existing: set[str], error: RPCStatusCode | None = None) -> None:
+        self.existing = existing
+        self.error = error
+        self.asked: list[str] = []
+
+    def get_workflow_handle_for(self, _run: object, workflow_id: str) -> SimpleNamespace:
+        async def describe() -> object:
+            self.asked.append(workflow_id)
+            if self.error is not None:
+                raise RPCError("the server failed", self.error, b"")
+            if workflow_id not in self.existing:
+                raise RPCError("workflow not found", RPCStatusCode.NOT_FOUND, b"")
+            return object()
+
+        return SimpleNamespace(describe=describe)
+
+
+async def test_workflow_ids_that_nobody_used_are_free() -> None:
+    server = FakeServer(set())
+    await run.check_workflow_ids_free(server, ["lh-eval-r-calc-01", "lh-eval-r-calc-02"])  # type: ignore[arg-type]
+    assert server.asked == ["lh-eval-r-calc-01", "lh-eval-r-calc-02"]
+
+
+async def test_a_workflow_id_that_exists_already_stops_the_run_before_any_start() -> None:
+    server = FakeServer({"lh-eval-r-calc-02"})
+    with pytest.raises(ValueError, match=r"lh-eval-r-calc-02.*run id"):
+        await run.check_workflow_ids_free(server, ["lh-eval-r-calc-01", "lh-eval-r-calc-02"])  # type: ignore[arg-type]
+
+
+async def test_a_server_that_cannot_answer_is_not_taken_for_a_free_id() -> None:
+    server = FakeServer(set(), error=RPCStatusCode.UNAVAILABLE)
+    with pytest.raises(ConnectionError, match="lh-eval-r-calc-01"):
+        await run.check_workflow_ids_free(server, ["lh-eval-r-calc-01"])  # type: ignore[arg-type]
 
 
 # ---------- watching a task ----------
@@ -542,6 +599,8 @@ def test_the_progress_line_names_the_task_the_outcome_and_the_verdict() -> None:
         config="full",
         model="m",
         git_sha="f" * 40,
+        provider=None,
+        scripted=False,
         outcome="pr_opened",
         outcome_summary="done",
         resolved=None,
@@ -557,3 +616,207 @@ def test_the_progress_line_names_the_task_the_outcome_and_the_verdict() -> None:
     assert run.describe(result) == (
         "calc-01: pr_opened, not graded, $0.5000, 5 turns, 60 s (the grader failed: boom)"
     )
+
+
+# ---------- a task that the runner could not finish ----------
+class Remover:
+    def __init__(self) -> None:
+        self.removed: list[str] = []
+
+    async def cleanup_task(self, task_id: str) -> None:
+        self.removed.append(task_id)
+
+
+def run_context(tmp_path: Path, *extra: str) -> run.RunContext:
+    options = run.parse_args([*BASE_ARGS, "--results-dir", str(tmp_path), *extra])
+    return SimpleNamespace(  # type: ignore[return-value]
+        options=options,
+        settings=SimpleNamespace(task_queue="q"),
+        client=None,
+        blobs=None,
+        store=Remover(),
+        sandboxes=Remover(),
+        sessions=None,
+        model="claude-sonnet-5-5",
+        commit="f" * 40,
+        folder=tmp_path,
+    )
+
+
+def fail_to_start(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    async def start_task(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    async def upload_script(*_args: object, **_kwargs: object) -> str:
+        return "the-script-ref"
+
+    monkeypatch.setattr(run, "start_task", start_task)
+    monkeypatch.setattr(run, "upload_script", upload_script)
+
+
+def ledger_says(monkeypatch: pytest.MonkeyPatch, usd: float, tokens: Tokens) -> None:
+    async def ledger_totals(*_args: object) -> tuple[float, Tokens]:
+        return usd, tokens
+
+    monkeypatch.setattr(run, "ledger_totals", ledger_totals)
+
+
+async def test_a_task_that_the_runner_cannot_run_becomes_an_error_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fail_to_start(monkeypatch, RuntimeError("the database is down"))
+    ledger_says(monkeypatch, 0.0, Tokens())
+    ctx = run_context(tmp_path)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved) == ("error", None)
+    assert "the database is down" in result.outcome_summary
+    assert "the database is down" in result.grading
+    assert (result.run_id, result.task_id) == ("try1", "calc-01")
+    assert result.workflow_id == "lh-eval-try1-calc-01"
+    assert (result.model, result.git_sha) == ("claude-sonnet-5-5", "f" * 40)
+    assert result.ended_at >= result.started_at
+    # The result is on disk like any other, and what the task left behind is removed.
+    assert results.read_results(tmp_path) == [result]
+    assert ctx.sandboxes.removed == ["lh-eval-try1-calc-01"]  # type: ignore[attr-defined]
+    assert ctx.store.removed == ["lh-eval-try1-calc-01"]  # type: ignore[attr-defined]
+
+
+async def test_an_error_result_keeps_the_cost_that_was_spent_before_the_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fail_to_start(monkeypatch, RuntimeError("boom"))
+    ledger_says(monkeypatch, 0.75, Tokens(input=100, output=20, cache_read=300))
+
+    result = await run.run_one(run_context(tmp_path), first_task())
+
+    assert result.cost_usd == 0.75
+    assert result.tokens == Tokens(input=100, output=20, cache_read=300)
+    assert result.cache_ratio == 0.75
+
+
+async def test_an_error_result_is_written_even_when_the_ledger_is_the_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fail_to_start(monkeypatch, RuntimeError("boom"))
+
+    async def broken_ledger(*_args: object) -> tuple[float, Tokens]:
+        raise RuntimeError("the ledger is unreachable")
+
+    monkeypatch.setattr(run, "ledger_totals", broken_ledger)
+
+    result = await run.run_one(run_context(tmp_path), first_task())
+
+    assert (result.outcome, result.cost_usd, result.tokens) == ("error", 0.0, Tokens())
+    assert "boom" in result.outcome_summary
+
+
+async def test_an_error_result_says_where_the_answers_came_from(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fail_to_start(monkeypatch, RuntimeError("boom"))
+    ledger_says(monkeypatch, 0.0, Tokens())
+    script = tmp_path / "calc-01.yaml"
+    script.write_text("steps: []\n", encoding="utf-8")
+
+    played = await run.run_one(run_context(tmp_path / "a", "--script", str(script)), first_task())
+    real = await run.run_one(run_context(tmp_path / "b"), first_task())
+
+    assert (played.provider, played.scripted) == ("scripted", True)
+    assert (real.provider, real.scripted) == (None, False)
+
+
+async def test_a_stop_of_the_whole_run_is_not_turned_into_a_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Ctrl-C ends the run. That is not a failure of one task, and no result is written for it.
+    fail_to_start(monkeypatch, asyncio.CancelledError())
+    ledger_says(monkeypatch, 0.0, Tokens())
+    with pytest.raises(asyncio.CancelledError):
+        await run.run_one(run_context(tmp_path), first_task())
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def result_for(task: custom_tasks.CustomTask) -> TaskResult:
+    now = datetime(2026, 11, 4, tzinfo=UTC)
+    return TaskResult(
+        run_id="try1",
+        task_id=task.id,
+        workflow_id=f"lh-eval-try1-{task.id}",
+        task_set="custom",
+        config="full",
+        model="claude-sonnet-5-5",
+        git_sha="f" * 40,
+        provider=None,
+        scripted=False,
+        outcome="pr_opened",
+        outcome_summary="done",
+        resolved=True,
+        grading="all tests passed",
+        cost_usd=0.1,
+        tokens=Tokens(),
+        cache_ratio=0.0,
+        started_at=now,
+        ended_at=now,
+        wall_time_s=1.0,
+        turns=5,
+    )
+
+
+async def test_one_task_that_fails_does_not_stop_the_others(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tasks = custom_tasks.load_tasks()[:3]
+    finished: list[str] = []
+
+    async def execute_task(
+        _ctx: object, task: custom_tasks.CustomTask, _started_at: datetime
+    ) -> TaskResult:
+        if task is tasks[1]:
+            raise RuntimeError("the status query failed")
+        await asyncio.sleep(0.05)  # still running when the second task fails
+        finished.append(task.id)
+        return result_for(task)
+
+    monkeypatch.setattr(run, "execute_task", execute_task)
+    ledger_says(monkeypatch, 0.0, Tokens())
+    ctx = run_context(tmp_path, "--concurrency", "3")
+
+    found = await run.run_tasks(ctx, tasks)
+
+    assert [r.task_id for r in found] == [t.id for t in tasks]
+    assert finished == [tasks[0].id, tasks[2].id]
+    assert [r.outcome for r in found] == ["pr_opened", "error", "pr_opened"]
+    # The summary can be written for what ran, with the failed task counted and not graded.
+    summary = results.summarize(found, started_at=found[0].started_at, ended_at=found[0].ended_at)
+    assert (summary.attempted, summary.resolved, summary.ungraded) == (3, 2, 1)
+
+
+def main_with_a_stub(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *flags: str
+) -> str:
+    """Run main() with a stub in place of the run, and return what it wrote to stderr."""
+    task = first_task()
+    done = result_for(task)
+
+    async def run_eval(_options: RunOptions, _settings: object) -> results.Summary:
+        return results.summarize([done], started_at=done.started_at, ended_at=done.ended_at)
+
+    monkeypatch.setattr(run, "run_eval", run_eval)
+    assert run.main([*BASE_ARGS, *flags]) == 0
+    return capsys.readouterr().err
+
+
+def test_a_provider_the_runner_cannot_apply_is_noted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    err = main_with_a_stub(monkeypatch, capsys, "--provider", "anthropic")
+    assert "--provider" in err
+    assert "worker" in err
+
+
+def test_a_run_with_the_defaults_has_nothing_to_note(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main_with_a_stub(monkeypatch, capsys) == ""

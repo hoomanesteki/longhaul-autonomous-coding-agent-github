@@ -645,3 +645,57 @@ def test_an_absolute_config_path_is_used_as_it_is(
     named = tmp_path / "mine.yaml"
     monkeypatch.setenv("LONGHAUL_CONFIG", str(named))
     assert config_path(EnvSettings(_env_file=None)) == named
+
+
+# ---------- LH-407: a window of the run's own ----------
+def test_a_smaller_window_shrinks_the_cap_for_one_result_with_it() -> None:
+    # The cap of the example config is 4,000 tokens, and a window of 8,000 cannot hold that
+    # for each result of a turn. A result may take 1/32 of the window at most.
+    policy = load_config(EXAMPLE).context
+
+    small = policy.for_window(8_000)
+
+    assert small.window_tokens == 8_000
+    assert small.tool_output_max_tokens == 250
+
+
+def test_a_smaller_window_changes_nothing_but_those_two_numbers() -> None:
+    policy = load_config(EXAMPLE).context
+
+    small = policy.for_window(8_000)
+
+    restored = small.model_copy(
+        update={
+            "window_tokens": policy.window_tokens,
+            "tool_output_max_tokens": policy.tool_output_max_tokens,
+        }
+    )
+    assert restored == policy
+
+
+def test_a_window_with_room_for_the_configured_cap_keeps_it() -> None:
+    policy = load_config(EXAMPLE).context
+
+    large = policy.for_window(400_000)
+
+    assert large.window_tokens == 400_000
+    assert large.tool_output_max_tokens == policy.tool_output_max_tokens
+
+
+def test_no_window_leaves_the_policy_as_it_is() -> None:
+    policy = load_config(EXAMPLE).context
+
+    assert policy.for_window(None) is policy
+
+
+def test_the_cap_is_never_below_one_token() -> None:
+    assert load_config(EXAMPLE).context.for_window(10).tool_output_max_tokens == 1
+
+
+def test_the_policy_is_not_changed_by_asking_for_a_window() -> None:
+    policy = load_config(EXAMPLE).context
+    before = policy.model_copy()
+
+    policy.for_window(8_000)
+
+    assert policy == before

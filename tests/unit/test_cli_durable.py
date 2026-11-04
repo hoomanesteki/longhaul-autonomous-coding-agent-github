@@ -293,6 +293,54 @@ def test_the_script_is_uploaded_under_the_task_and_named_in_the_memo(
     assert stack.blobs.objects[ref.key] == SCRIPT.read_bytes()
 
 
+def test_a_window_goes_to_the_worker_in_the_tuning_of_the_task(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--window", "8000"))
+    assert result.exit_code == 0, result.output
+
+    memo = stack.start_kwargs["memo"]
+    assert set(memo) == {acts.SCRIPT_MEMO_KEY, acts.TUNING_MEMO_KEY}
+    assert memo[acts.TUNING_MEMO_KEY] == acts.Tuning(window_tokens=8_000)
+
+
+def test_the_header_says_which_window_the_run_asked_for(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack_for(happy())
+    result = invoke(run_args("--window", "8000"))
+    assert "context window 8000 tokens" in result.stdout
+
+
+def test_a_run_without_a_window_has_no_tuning_and_the_worker_config_decides(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args())
+    assert acts.TUNING_MEMO_KEY not in stack.start_kwargs["memo"]
+    assert "context window" not in result.stdout
+
+
+def test_a_window_works_with_a_provider_of_the_worker(stack_for: Callable[..., Stack]) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--provider", "anthropic", "--window", "50000", script=None))
+    assert result.exit_code == 0, result.output
+    assert stack.start_kwargs["memo"] == {acts.TUNING_MEMO_KEY: acts.Tuning(window_tokens=50_000)}
+
+
+@pytest.mark.parametrize("window", ["0", "-1", "many"])
+def test_a_window_that_cannot_work_stops_the_command_before_anything_starts(
+    stack_for: Callable[..., Stack], window: str
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--window", window))
+
+    assert result.exit_code == 2
+    assert "--window" in result.output
+    assert stack.temporal.started == [] and stack.blobs.objects == {}
+
+
 def test_the_script_and_the_provider_can_come_from_the_environment(
     stack_for: Callable[..., Stack], monkeypatch: pytest.MonkeyPatch
 ) -> None:

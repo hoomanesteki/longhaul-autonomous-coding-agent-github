@@ -1013,6 +1013,47 @@ async def test_the_script_and_the_tuning_can_ride_in_the_same_memo(
     assert timeouts(sched["llm_turn"]) == (10 * 60, 2)
 
 
+# ---------- a window of the run's own (LH-407) ----------
+async def test_the_window_in_the_tuning_goes_to_every_activity_that_counts_tokens(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        return [call("read_file", f"c{turn}", path="calc.py")] if turn < 2 else [finish()]
+
+    stubs = Stubs(script)
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=acts.Tuning(window_tokens=8_000)
+        )
+        await result_of(handle)
+
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    tools = stubs.payloads(acts.TOOL_EXEC.name)
+    appended = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert (len(turns), len(tools), len(appended)) == (3, 2, 3)
+    assert [i.window_tokens for i in (*turns, *tools, *appended)] == [8_000] * 8
+
+
+async def test_a_run_without_a_window_sends_none_to_the_activities(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(
+        lambda turn: [call("read_file", "c0", path="calc.py")] if turn < 1 else [finish()]
+    )
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=acts.Tuning(heartbeat_timeout_s=30)
+        )
+        await result_of(handle)
+
+    payloads = [
+        *stubs.payloads(acts.LLM_TURN.name),
+        *stubs.payloads(acts.TOOL_EXEC.name),
+        *stubs.payloads(acts.APPEND_RESULTS.name),
+    ]
+    assert payloads and {i.window_tokens for i in payloads} == {None}
+
+
 # ---------- sandbox recovery (LH-206) ----------
 def resumed(spec: TaskSpec) -> CarryState:
     """What a run starts from when an earlier run already prepared a sandbox."""

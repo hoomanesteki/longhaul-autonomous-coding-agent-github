@@ -1135,6 +1135,60 @@ async def test_the_cap_is_the_one_the_activities_were_built_with(sandbox: FakeSa
     assert "Full text: handle out_toolu_1." in answer.content
 
 
+async def test_a_run_with_a_small_window_has_its_results_cut_to_a_share_of_it(
+    sandbox: FakeSandbox,
+) -> None:
+    # The cap of the worker is 4,000 tokens. The run's window of 3,200 lets a result take 1/32 of
+    # it, which is 100 tokens (longhaul.settings.Context.for_window).
+    rig = Rig(sandbox)
+    result = await rig.exec(exec_input("run_command", command=noisy_command(40)))
+    ref = await rig.put_json(
+        "t.json", calls_transcript(call_block("toolu_1", "run_command", command="noisy"))
+    )
+
+    out_ref = await rig.append(
+        append_input(ref, acts.summarize_result(result), window_tokens=3_200)
+    )
+
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+    assert estimate_tokens(answer.content) <= 100
+    assert "Full text: handle out_toolu_1." in answer.content
+
+
+async def test_a_window_with_room_for_the_cap_of_the_worker_leaves_the_cap_alone(
+    sandbox: FakeSandbox,
+) -> None:
+    rig = Rig(sandbox, tool_output_max_tokens=100)
+    result = await rig.exec(exec_input("run_command", command=noisy_command(40)))
+    ref = await rig.put_json(
+        "t.json", calls_transcript(call_block("toolu_1", "run_command", command="noisy"))
+    )
+
+    out_ref = await rig.append(
+        append_input(ref, acts.summarize_result(result), window_tokens=200_000)
+    )
+
+    (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
+    assert estimate_tokens(answer.content) <= 100
+    assert answer.content == shape_output(
+        (await rig.blobs.get(result.output_ref)).decode(), 100, "out_toolu_1"
+    )
+
+
+async def test_a_page_of_read_file_fits_the_cap_of_the_run(sandbox: FakeSandbox) -> None:
+    lines = [f"line {n}: {'x' * 30}" for n in range(300)]
+    await sandbox.write_file("big.txt", "\n".join(lines).encode())
+    rig = Rig(sandbox)
+    read = exec_input("read_file", path="big.txt")
+
+    whole = await rig.exec(read)
+    small = await rig.exec(read.model_copy(update={"window_tokens": 3_200}))
+
+    assert len(small.output) < len(whole.output) / 10
+    # The page is cut by the cap of the run, plus the line that says where to go on.
+    assert estimate_tokens(small.output) <= 100 + 60
+
+
 async def test_a_result_that_no_tool_made_is_not_shaped() -> None:
     # The answer to a finish without a summary is short and travels inline.
     rig = Rig(None, tool_output_max_tokens=1)

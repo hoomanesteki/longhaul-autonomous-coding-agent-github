@@ -48,7 +48,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-206 | Sandbox recovery and retry-safe tool execution | 5 | Done | merge | 2026-11-03 |
 | LH-207 | Continue-As-New | 3 | Done | merge | 2026-11-04 |
 | LH-208 | Worker process and run CLI | 3 | Done | merge | 2026-11-04 |
-| LH-209 | Chaos test v1 | 5 | Todo | | |
+| LH-209 | Chaos test v1 | 5 | Done | merge | 2026-11-04 |
 
 ## Phase 3: GitHub integration (tag v0.3.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -59,7 +59,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-304 | Idempotent side-effect activities | 5 | Done | merge | 2026-10-31 |
 | LH-305 | Clone from GitHub and push from the host | 5 | Done | merge | 2026-11-04 |
 | LH-306 | PR creation and label lifecycle | 3 | Todo | | |
-| LH-307 | Poller workflow on a Temporal Schedule | 5 | Todo | | |
+| LH-307 | Poller workflow on a Temporal Schedule | 5 | Done | merge | 2026-11-04 |
 | LH-308 | Comment commands and issue-to-PR e2e | 5 | Todo | | |
 
 ## Phase 4: Context engineering (tag v0.4.0)

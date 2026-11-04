@@ -82,7 +82,7 @@ The plan summary of this ADR said "a Docker volume". It is a host folder here, b
 
 **To watch**
 
-- LH-305 pushes with a token from the host. It must not trust this repo's config for that: push from a host-private repo, or pass the URL and the auth header on the command line with the same git switches. The sandbox can edit `config` here.
+- The push to GitHub (LH-305, ADR-0009) does not trust this repo's config, because the sandbox can edit `config` here. It runs from an empty scratch repo that borrows this repo's objects through `objects/info/alternates`, and names the URL and the auth header on the command line with the same git switches. Any later host-side command that signs in must do the same.
 - If the worker runs in a container, the root must be a bind mount that has the same path on the host, because the Docker daemon resolves mount sources on the host.
 - Moving the repo into a volume or a network share later changes the permission story above. Redo the Linux check then.
 - If the shared writable repo ever becomes a problem, the fallback is to pull each change out of the container as an archive and apply it on the host, with no writable mount.

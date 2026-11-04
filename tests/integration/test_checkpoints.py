@@ -31,7 +31,7 @@ from temporalio.testing import ActivityEnvironment
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore, bundle_key
 from longhaul.contracts import Sandbox, SandboxLimits
-from longhaul.db.records import SqlRecorder
+from longhaul.db.records import MemoryRecorder, SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.activities.tools import ToolActivities
@@ -380,6 +380,57 @@ async def recorder(database: Scratch) -> AsyncIterator[SqlRecorder]:
         yield SqlRecorder(async_sessionmaker[AsyncSession](engine, expire_on_commit=False))
     finally:
         await engine.dispose()
+
+
+async def test_a_command_that_commits_by_itself_is_checkpointed_and_kept(task: Task) -> None:
+    """The image sets a git identity, so `git commit` works inside run_command.
+
+    The commit moves HEAD and leaves the tree clean against it. The work must still reach a
+    checkpoint on top of pre_sha, or the next call would restore pre_sha and undo it. A revert
+    and a reset are saved the same way.
+    """
+    tools = ToolActivities(
+        default_registry(test_command="true"),
+        task.manager,
+        task.blobs,
+        MemoryRecorder(),
+        checkpoints=task.store,
+    )
+    steps = [
+        ("perl -pi -e 's/return a - b/return a + b/' src/calc/__init__.py && git commit -qam fix"),
+        "git revert --no-edit HEAD",
+        "git reset -q --hard HEAD~1",
+    ]
+    head = task.base_sha
+    shas = [head]
+    for turn, step in enumerate(steps):
+        inp = acts.ToolExecInput(
+            task_id=task.task_id,
+            turn_index=turn,
+            call=acts.ToolCallSummary(
+                id=f"toolu_{turn}", name="run_command", input={"command": step}
+            ),
+            pre_sha=head,
+            sandbox_id=task.sandbox.id,
+        )
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(env.info, attempt=1)
+        result = await env.run(tools.tool_exec, inp)
+        assert result.ok and result.post_sha is not None, f"{step}: {result.output}"
+        assert task.bare("rev-parse", f"{result.post_sha}^") == head
+        head = result.post_sha
+        shas.append(head)
+        # The next call restores pre_sha first when the workspace is not on it. It is on it.
+        assert (await task.sh("git rev-parse HEAD")).strip() == head
+        assert await task.store.is_at(task.sandbox, head)
+
+    fixed, reverted, reset = shas[1:]
+    assert "return a + b" in task.bare("show", f"{fixed}:{MODULE}")
+    assert "return a - b" in task.bare("show", f"{reverted}:{MODULE}")
+    # The reset goes back to the first checkpoint, which had the fix.
+    assert "return a + b" in task.bare("show", f"{reset}:{MODULE}")
+    assert task.branch_head() == head
+    assert task.bare("rev-list", "--count", f"refs/heads/{task.branch}") == "4"
 
 
 async def test_every_mutation_checkpointed(

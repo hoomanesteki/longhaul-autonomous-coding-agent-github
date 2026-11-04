@@ -17,9 +17,20 @@ middle of it:
    already there is left alone, because a restore also deletes the ignored files that the agent
    made on purpose, such as the output of a build.
 2. The tool runs.
-3. If the tool mutates, or it runs a shell command (SHELL_TOOLS), `commit` saves the tree. A
-   clean tree gives no commit and no `post_sha`. Otherwise `post_sha` is the new commit, and a
-   `checkpoints` row of kind `tool` names it.
+3. If the tool mutates, or it runs a shell command (SHELL_TOOLS), `commit` saves the tree as a
+   child of `pre_sha`. A tree equal to `pre_sha` gives no commit and no `post_sha`. Otherwise
+   `post_sha` is the new commit, and a `checkpoints` row of kind `tool` names it. The tree is
+   compared with `pre_sha` and not with HEAD, because a shell command can make commits of its
+   own, or revert or reset, and the work would then look clean against the new HEAD and be
+   undone by the next restore.
+
+The rows are written after the commit, the `tool_calls` row first and the `checkpoints` row
+last. A worker that dies between the commit and the rows leaves a commit that nothing names,
+and its retry writes the rows for the commit it makes. A worker that dies after the last write,
+before Temporal has the result, leaves a `checkpoints` row for a commit that the retry replaces
+on the branch. That commit can still be restored by its sha, and the `tool_calls` row and the
+result name the commit that counts. The row means "this commit was saved", not "this commit is
+on the branch".
 
 A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
 finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
@@ -73,11 +84,17 @@ class SandboxLookup(Protocol):
 
 
 class WorkspaceCheckpoints(CheckpointStore, Protocol):
-    """A CheckpointStore that can also say whether the workspace already is at a commit.
+    """A CheckpointStore that can also say whether the workspace already is at a commit, and
+    that can build a commit on a named parent.
 
-    GitCheckpointStore has `is_at`. The contracts do not, and they stay as they are, so the
-    question is added here, where it is asked.
+    GitCheckpointStore has `is_at` and the `parent` argument of `commit`. The contracts do not,
+    and they stay as they are, so what tool_exec needs beyond them is added here, where it is
+    used.
     """
+
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None: ...
 
     async def is_at(self, sandbox: Sandbox, sha: str) -> bool: ...
 
@@ -92,7 +109,9 @@ class NoCheckpoints:
     async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
         return base_sha
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         return None  # the tree counts as clean
 
     async def restore(self, sandbox: Sandbox, sha: str) -> None:
@@ -197,6 +216,13 @@ class ToolActivities:
                 post_sha=post_sha,
             )
         )
+        # Last, so that a checkpoint row is written only for a commit the call row names. A
+        # worker that dies before this line leaves a commit and no row, and its retry writes the
+        # one row for the commit it makes.
+        if post_sha is not None:
+            await self._recorder.record_checkpoint(
+                CheckpointRecord(inp.task_id, post_sha, "tool", inp.turn_index)
+            )
         return small(returned)
 
     async def _sandbox(self, sandbox_id: str) -> Sandbox:
@@ -224,17 +250,17 @@ class ToolActivities:
             await self._checkpoints.restore(sandbox, pre_sha)
 
     async def _save(self, sandbox: Sandbox, inp: acts.ToolExecInput, call: ToolCall) -> str | None:
-        """Commit what the call changed and record the checkpoint. None when it changed nothing."""
+        """Commit what the call changed. None when it changed nothing since `pre_sha`.
+
+        The commit builds on `pre_sha` and not on wherever HEAD is: a shell command can commit,
+        revert or reset on its own, and the tree is then clean against the new HEAD while the
+        work is still unsaved. The checkpoint row is written later, once the call row is.
+        """
         tool = self._registry.get(call.name)
         if not (tool is not None and tool.mutates) and call.name not in SHELL_TOOLS:
             return None
         message = f"lh: {call.name} turn {inp.turn_index} call {call_slug(call.id)}"
-        sha = await self._checkpoints.commit(sandbox, message)
-        if sha is not None:
-            await self._recorder.record_checkpoint(
-                CheckpointRecord(inp.task_id, sha, "tool", inp.turn_index)
-            )
-        return sha
+        return await self._checkpoints.commit(sandbox, message, parent=inp.pre_sha)
 
     async def _call(self, inp: acts.ToolExecInput) -> tuple[ToolCall, BlobRef | None]:
         """The call with its arguments, and the ref they came from when they were held by ref."""

@@ -6,9 +6,10 @@ The design and the reasons are in ADR-0006. In short:
   longhaul/<issue> at the base commit. No token, URL or host path is written into the repo.
 * The sandbox gets that folder read-write at /ckpt (DockerSandboxManager.create(mounts=...)).
   `attach` clones it into /workspace, so every later step needs nothing but the sandbox.
-* `commit` snapshots the workspace as a commit and pushes it to /ckpt. `restore` puts the
-  workspace back on any commit, byte for byte, so a retried tool call never runs on a half
-  changed tree.
+* `commit` snapshots the workspace as a commit and pushes it to /ckpt. Given a parent, it saves
+  what differs from that commit, so commits the agent made itself do not hide its work.
+  `restore` puts the workspace back on any commit, byte for byte, so a retried tool call never
+  runs on a half changed tree.
 * `bundle` and `restore_from_bundle` move a task to another host through the blob store.
 
 The agent can write to /ckpt, so the host treats everything in that repo as untrusted: it runs
@@ -369,8 +370,15 @@ if [ "$AT" = 1 ]; then echo LH-AT; else echo LH-MOVED; fi
 # HEAD goes back to the task branch first: the agent may have switched branches, and the
 # snapshot has to be a child of the branch the checkpoints live on. A failed push takes the
 # commit back, so the changes are still pending and the next call tries again.
+#
+# PARENT is the commit the caller expects the snapshot to build on, or empty. A shell command can
+# make commits of its own (git commit, revert, reset), which move HEAD and leave the tree clean
+# against the new HEAD. With a parent, the branch is first moved back to it with a soft reset,
+# which keeps the files, so "clean" means "equal to the parent" and the work becomes one commit
+# on top of the parent. Without a parent, the tree is compared with wherever HEAD is.
 _COMMIT = r"""
 MSG=@MSG@
+EXPECT=@PARENT@
 [ -d .git ] || {
   echo "the workspace is not a git repository; restore it first" >&2
   exit 4
@@ -381,6 +389,15 @@ g rev-parse -q --verify HEAD >/dev/null || {
   echo "the workspace has no commit to build on; restore it first" >&2
   exit 4
 }
+if [ -n "$EXPECT" ]; then
+  g cat-file -e "${EXPECT}^{commit}" 2>/dev/null ||
+    g fetch -q --no-tags "$CKPT" "$EXPECT" 2>/dev/null || true
+  g cat-file -e "${EXPECT}^{commit}" 2>/dev/null || {
+    echo "commit $EXPECT is not in the checkpoint repository" >&2
+    exit 6
+  }
+  g reset -q --soft "$EXPECT"
+fi
 g add -A
 if g diff --cached --quiet; then
   echo LH-CLEAN
@@ -590,14 +607,22 @@ class GitCheckpointStore(CheckpointStore):
             task=shlex.quote(task_id),
         )  # fmt: skip
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         """Save the workspace as a commit on the task branch and return its sha.
 
         Returns None, and creates nothing, when the tree matches the last commit.
+
+        `parent` names the commit the new one has to build on. Give it when the commands that ran
+        may have made commits of their own: the tree is then compared with `parent`, not with
+        HEAD, and the new commit holds the net change since `parent` whatever happened to HEAD.
+        When nothing differs from `parent`, HEAD is put back on it and the answer is None.
         """
         out = await self._in_sandbox(
             sandbox, _COMMIT, "commit the workspace", COMMIT_TIMEOUT_S,
             msg=shlex.quote(_commit_message(message)),
+            parent=shlex.quote(check_sha(parent) if parent is not None else ""),
         )  # fmt: skip
         lines = out.strip().splitlines()
         found = _OUTPUT.fullmatch(lines[-1]) if lines else None

@@ -284,6 +284,7 @@ async def test_the_null_checkpoint_store_stores_nothing(sandbox: FakeSandbox) ->
     # real store.
     store = NoCheckpoints()
     assert await store.commit(sandbox, "lh: edit_file turn 0 call toolu_1") is None
+    assert await store.commit(sandbox, "lh: edit_file turn 0 call toolu_1", parent=SHA) is None
     assert await store.restore(sandbox, SHA) is None
     assert await store.is_at(sandbox, SHA)  # nothing to restore, so it never asks for a restore
 
@@ -314,12 +315,14 @@ class Spy:
     async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
         return await self.store.init_task(task_id, clone_url, base_sha)
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         self.commits.append(message)
         if self.dies == "before":
             self.dies = None
             raise RuntimeError("the worker was killed")
-        sha = await self.store.commit(sandbox, message)
+        sha = await self.store.commit(sandbox, message, parent=parent)
         if self.dies == "after":
             self.dies = None
             raise RuntimeError("the worker was killed")

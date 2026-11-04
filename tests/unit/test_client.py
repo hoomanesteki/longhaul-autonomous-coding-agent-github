@@ -4,7 +4,7 @@ A fake client records the call. The integration tests start real workflows again
 server; this file pins the arguments, which are the part a typo can break quietly.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
@@ -15,10 +15,17 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
-from longhaul.contracts import CarryState, Phase, RepoSettings, TaskSpec
+from longhaul.contracts import BlobRef, CarryState, Phase, RepoSettings, TaskSpec, TaskStatus
 from longhaul.durable import client as durable_client
-from longhaul.durable.acts import TUNING_MEMO_KEY, Tuning
-from longhaul.durable.client import DEFAULT_TASK_QUEUE, connect, start_task
+from longhaul.durable.acts import SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.client import (
+    DEFAULT_TASK_QUEUE,
+    cancel_task,
+    connect,
+    get_task,
+    read_status,
+    start_task,
+)
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.settings import EnvSettings
 from longhaul.telemetry import otel
@@ -172,3 +179,87 @@ async def test_connect_registers_the_tracing_interceptor_when_tracing_is_on(
 
     (interceptor,) = seen["interceptors"]
     assert isinstance(interceptor, TracingInterceptor)
+
+
+# ---------- LH-208: a script in the memo, and the handle calls of the CLI ----------
+SCRIPT = BlobRef(key="tasks/lh-acme-calc-42/script.yaml", sha256="1" * 64, size=12)
+
+
+async def test_start_task_passes_the_script_in_the_memo(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, script=SCRIPT)
+    assert fake.calls[0][1]["memo"] == {SCRIPT_MEMO_KEY: SCRIPT}
+
+
+async def test_start_task_passes_the_script_and_the_tuning_together(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    tuning = Tuning(heartbeat_timeout_s=2)
+    await start_task(cast(Client, fake), spec, tuning=tuning, script=SCRIPT)
+    assert fake.calls[0][1]["memo"] == {TUNING_MEMO_KEY: tuning, SCRIPT_MEMO_KEY: SCRIPT}
+
+
+class FakeHandle:
+    def __init__(self) -> None:
+        self.queries: list[tuple[Any, dict[str, Any]]] = []
+        self.signals: list[tuple[Any, Any]] = []
+
+    async def query(self, query: Any, **kwargs: Any) -> TaskStatus:
+        self.queries.append((query, kwargs))
+        return TaskStatus(
+            task_id="lh-acme-calc-42",
+            phase=Phase.CODING,
+            turn_index=3,
+            cost_usd=0.0,
+            last_checkpoint=None,
+            plan_version=None,
+        )
+
+    async def signal(self, signal: Any, *, args: Any) -> None:
+        self.signals.append((signal, args))
+
+
+class FakeLookup:
+    def __init__(self) -> None:
+        self.handle = FakeHandle()
+        self.asked: list[tuple[Any, str]] = []
+
+    def get_workflow_handle_for(self, workflow: Any, workflow_id: str) -> FakeHandle:
+        self.asked.append((workflow, workflow_id))
+        return self.handle
+
+
+def test_get_task_finds_the_workflow_by_its_task_id() -> None:
+    fake = FakeLookup()
+    handle = get_task(cast(Client, fake), "lh-acme-calc-42")
+    assert handle is fake.handle
+    assert fake.asked == [(TaskWorkflow.run, "lh-acme-calc-42")]
+
+
+async def test_read_status_queries_the_workflow_with_a_deadline() -> None:
+    fake = FakeLookup()
+    status = await read_status(cast(Any, fake.handle), timeout_s=3)
+
+    assert status.turn_index == 3
+    ((query, kwargs),) = fake.handle.queries
+    assert query == TaskWorkflow.status
+    assert kwargs == {"rpc_timeout": timedelta(seconds=3)}
+
+
+async def test_cancel_task_signals_who_asked_and_why() -> None:
+    fake = FakeLookup()
+    await cancel_task(cast(Client, fake), "lh-acme-calc-42", by="cli", reason="wrong repo")
+
+    assert fake.asked == [(TaskWorkflow.run, "lh-acme-calc-42")]
+    assert fake.handle.signals == [(TaskWorkflow.cancel, ["cli", "wrong repo"])]
+
+
+async def test_connect_names_the_address_when_the_server_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def refuse(address: str, **kwargs: Any) -> str:
+        raise RuntimeError("Failed client connect: connection refused")
+
+    monkeypatch.setattr(durable_client.Client, "connect", refuse)
+
+    with pytest.raises(ConnectionError, match="cannot reach Temporal at localhost:1"):
+        await connect("localhost:1")

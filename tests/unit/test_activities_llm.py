@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -41,6 +42,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
+from longhaul.durable.scripts import script_key, upload_script
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -635,3 +637,101 @@ async def test_the_activity_heartbeats_while_the_model_thinks() -> None:
     await rig.run(turn_input(), heartbeat_timeout_s=0.3)
     # One at once and one every 0.1 s: the event loop is free while the call waits.
     assert len(rig.beats) >= 4
+
+
+# ---------- LH-208: a script that travels with the task ----------
+CALC_FIX = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "scripts" / "calc_fix.yaml"
+
+
+class CountingBlobs(MemoryBlobStore):
+    """A memory store that counts reads, to show that a task's script is fetched once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    async def get(self, ref: BlobRef) -> bytes:
+        self.reads.append(ref.key)
+        return await super().get(ref)
+
+
+def scripted_worker(provider: FakeProvider | None) -> tuple[LlmActivities, CountingBlobs]:
+    blobs = CountingBlobs()
+    activities = LlmActivities(
+        provider,  # type: ignore[arg-type]
+        blobs,
+        MemoryRecorder(),
+        TOOLS,
+        lambda role: CFG,
+    )
+    return activities, blobs
+
+
+async def run_turn(activities: LlmActivities, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+    return await ActivityEnvironment().run(activities.llm_turn, inp)
+
+
+async def test_a_task_script_answers_instead_of_the_provider_of_the_worker() -> None:
+    worker_provider = FakeProvider()  # no steps: any call to it fails the test
+    activities, blobs = scripted_worker(worker_provider)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    out = await run_turn(activities, turn_input(script_ref=ref))
+
+    assert [s.name for s in out.tool_call_summaries] == ["list_dir"]  # the first step of calc_fix
+    assert worker_provider.calls == []
+
+
+async def test_a_worker_without_a_provider_still_plays_the_script_of_a_task() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    out = await run_turn(activities, turn_input(script_ref=ref))
+    assert [s.name for s in out.tool_call_summaries] == ["list_dir"]
+
+
+async def test_the_script_of_a_task_is_fetched_once_and_then_kept() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    first = await run_turn(activities, turn_input(script_ref=ref))
+    await run_turn(activities, turn_input(script_ref=ref, turn_index=1))
+
+    assert blobs.reads.count(script_key(SPEC.task_id)) == 1
+    assert first.tool_call_summaries
+
+
+async def test_a_task_without_a_script_uses_the_provider_of_the_worker() -> None:
+    worker_provider = FakeProvider(reply("end_turn", TextBlock(text="Done.")))
+    activities, _ = scripted_worker(worker_provider)
+
+    await run_turn(activities, turn_input())
+    assert len(worker_provider.calls) == 1
+
+
+async def test_a_worker_with_no_provider_refuses_a_task_without_a_script_for_good() -> None:
+    activities, _ = scripted_worker(None)
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input())
+    assert caught.value.non_retryable
+    assert "script" in str(caught.value)
+
+
+async def test_a_script_that_cannot_be_read_fails_for_good() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await blobs.put(b"steps: 3\n", key=script_key(SPEC.task_id))
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input(script_ref=ref))
+    assert caught.value.non_retryable
+    assert "invalid script" in str(caught.value)
+
+
+async def test_a_script_that_is_missing_from_the_store_fails_for_good() -> None:
+    activities, _ = scripted_worker(None)
+    ref = BlobRef(key=script_key(SPEC.task_id), sha256="0" * 64, size=1)
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input(script_ref=ref))
+    assert caught.value.non_retryable

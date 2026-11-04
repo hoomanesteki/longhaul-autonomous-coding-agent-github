@@ -1,66 +1,102 @@
 """The `longhaul` command line.
 
-Today it has one command, `run-local`: copy a folder into a Docker sandbox, let the agent work
-on the issue in a text file, and print what it did. No Temporal and no database are involved,
-so it is the quickest way to watch the agent work.
+Five commands. `run-local` copies a folder into a Docker sandbox, lets the agent work on the
+issue in a text file, and prints what it did. No Temporal and no database are involved, so it is
+the quickest way to watch the agent work.
 
-What it prints, on stdout in this order: a header with the task id, the repo, the provider and
-the model; one line per turn; one line for how the run ended; and the final `git_diff`.
-Progress notes, warnings and errors go to stderr, so the output can be piped on.
+The other four use the durable stack that `make up` starts. `worker` runs the process that does
+the work (durable/worker.py). `run` starts a task for a folder on that stack and follows it
+until it ends. `status` and `cancel` ask about a task by its id, or stop it. They are separate
+commands because a task outlives `run`: Ctrl-C ends the command and the task goes on.
+
+What `run-local` prints, on stdout in this order: a header with the task id, the repo, the
+provider and the model; one line per turn; one line for how the run ended; and the final
+`git_diff`. Progress notes, warnings and errors go to stderr, so the output can be piped on.
+`run` prints a header, a status line each time the status of the task changes, the outcome and
+the final diff, in the same shape.
 
 Exit codes. 0: the agent called `finish`. 2: the run failed or ended in error (turn limit, no
 tool calls, a refusal, a failing setup, a provider error, a missing Docker or image), or it
 was interrupted. Bad options exit 2 as well, which is what Typer does for usage errors. An
 unexpected exception is a bug in longhaul and exits 1 with its traceback.
 
-The sandbox is removed at the end, together with its volume, whatever happened: a finish, an
-error, a bug, Ctrl-C, SIGTERM or SIGHUP. Only SIGKILL and a crash of the machine leave one
-behind. Its container and volume carry the task id, which the header line prints.
+`run-local` removes the sandbox at the end, together with its volume, whatever happened: a
+finish, an error, a bug, Ctrl-C, SIGTERM or SIGHUP. Only SIGKILL and a crash of the machine
+leave one behind. Its container and volume carry the task id, which the header line prints.
+`run` removes the sandbox of a task that has ended and leaves a task that is still running alone.
 """
 
 import asyncio
+import logging
 import re
 import signal
+import sys
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 import yaml
 from docker.errors import DockerException, ImageNotFound
+from temporalio.client import (
+    Client,
+    WorkflowExecutionStatus,
+    WorkflowFailureError,
+    WorkflowHandle,
+    WorkflowQueryFailedError,
+)
+from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.service import RPCError, RPCStatusCode
 
 from longhaul.agent.loop import CallEvent, LoopConfig, TurnEvent, run_loop
 from longhaul.agent.workspace import (
+    DEFAULT_TEST_COMMAND,
     WorkspaceError,
     WorkspaceManager,
     default_setup_command,
     prepare_local_workspace,
 )
+from longhaul.blobs.base import BlobError, BlobStoreBase
+from longhaul.blobs.s3 import S3BlobStore
+from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore
 from longhaul.contracts import (
+    BlobRef,
     Budgets,
     LLMProvider,
+    Outcome,
     OutcomeKind,
     ProviderError,
     RepoSettings,
     Role,
     Sandbox,
     TaskSpec,
+    TaskStatus,
     ToolCall,
     ToolContext,
 )
+from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
+from longhaul.durable.scripts import upload_script
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, load_config
+from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
+from longhaul.tools.git import NO_CHANGES
 from longhaul.tools.registry import ToolRegistry, default_registry
 
-DEFAULT_TEST_COMMAND = "python -m pytest -q"
 DIFF_HEADING = "final diff against base:"
 EXIT_ERROR = 2
 
-# longhaul/cli.py -> longhaul -> src -> the checkout.
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# How often `run` asks the workflow for its status, and how long it waits for an answer. A query
+# is answered by a worker, so with no worker running it would otherwise wait for the server's own
+# limit, and `run` would show nothing for that long.
+POLL_S = 2.0
+STATUS_TIMEOUT_S = 5.0
+
+# A workflow in one of these states can still change. CONTINUED_AS_NEW is the end of a run and
+# the start of the next one in the same workflow id, so the task is not over yet.
+OPEN_STATES = frozenset({WorkflowExecutionStatus.RUNNING, WorkflowExecutionStatus.CONTINUED_AS_NEW})
 
 # Failures of the machine, the config or the run, which the command reports in one line. Any
 # other exception is a bug and keeps its traceback.
@@ -73,6 +109,8 @@ RUN_ERRORS = (
     NotImplementedError,
     yaml.YAMLError,
 )
+# The same for the durable commands, which also talk to Temporal and the stores.
+DURABLE_ERRORS = (*RUN_ERRORS, RPCError, WorkflowAlreadyStartedError, BlobError, CheckpointError)
 
 app = typer.Typer(
     name="longhaul",
@@ -192,6 +230,121 @@ def run_local(
         raise typer.Exit(code)
 
 
+@app.command("worker")
+def worker_command() -> None:
+    """Run a worker: the process that does the work of the tasks.
+
+    It polls the task queue on Temporal until it gets Ctrl-C or SIGTERM, then waits a short time
+    for the activities that are running and stops. It needs the stack from `make up`, the sandbox
+    image from `make sandbox-image`, and the LONGHAUL_* settings of .env.example.
+    """
+    # Imported here: the worker pulls in SQLAlchemy, boto3 and every activity, which the other
+    # commands do not need.
+    from longhaul.durable import worker
+
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    try:
+        asyncio.run(worker.main())
+    except DURABLE_ERRORS as exc:
+        typer.echo(f"error: {describe(exc)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+@app.command("run")
+def run(
+    path: Annotated[
+        Path,
+        typer.Option(
+            "--path",
+            help="Folder with the repo. The worker copies it and never changes it. It has to "
+            "be on the machine of the worker.",
+            exists=True,
+            file_okay=False,
+            resolve_path=True,
+        ),
+    ],
+    issue_file: Annotated[
+        Path,
+        typer.Option(
+            "--issue-file",
+            help="Text or Markdown file with the task. Its first line is the title.",
+            exists=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ],
+    provider: Annotated[
+        ProviderName | None,
+        typer.Option(
+            "--provider",
+            help="With `scripted` the task brings its script. Any other value changes nothing: "
+            "the worker answers with its own LONGHAUL_PROVIDER. Default: LONGHAUL_PROVIDER.",
+        ),
+    ] = None,
+    script: Annotated[
+        Path | None,
+        typer.Option(
+            "--script",
+            help="YAML script for the scripted provider. It is sent to the worker with the "
+            "task. Default: LONGHAUL_SCRIPT.",
+            exists=True,
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+) -> None:
+    """Start a task on the durable stack and follow it until it ends.
+
+    Prints the status each time it changes, then the outcome and the final diff. Exits 0 when
+    the agent finishes and 2 when the run fails. Ctrl-C stops the command and not the task.
+    """
+    options = DurableOptions(path, issue_file, provider, script)
+    try:
+        code = asyncio.run(submit(options))
+    except DURABLE_ERRORS as exc:
+        typer.echo(f"error: {describe(exc)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        raise typer.Exit(EXIT_ERROR) from None  # submit() has said what to do next
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command("status")
+def status(
+    task_id: Annotated[str, typer.Argument(help="The task id that `longhaul run` printed.")],
+) -> None:
+    """Show where a task stands: its state, its status, and its outcome once it has ended."""
+    try:
+        asyncio.run(show_status(task_id))
+    except DURABLE_ERRORS as exc:
+        typer.echo(f"error: {describe(exc, task_id)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+@app.command("cancel")
+def cancel(
+    task_id: Annotated[str, typer.Argument(help="The task id that `longhaul run` printed.")],
+    reason: Annotated[
+        str, typer.Option("--reason", help="Why. It goes into the outcome of the task.")
+    ] = "",
+) -> None:
+    """Stop a running task. The workflow removes its sandbox and ends as cancelled.
+
+    The command returns when the signal is sent. Follow the end with `longhaul status`.
+    """
+    try:
+        asyncio.run(send_cancel(task_id, reason))
+    except DURABLE_ERRORS as exc:
+        typer.echo(f"error: {describe(exc, task_id)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(f"cancel sent to task {task_id}")
+
+
 # ---------- the run ----------
 def make_manager() -> WorkspaceManager:
     """The sandbox manager. A function of its own so that unit tests can replace it."""
@@ -225,7 +378,7 @@ async def execute(options: RunOptions) -> int:
     try:
         return await run_task(manager, run)
     finally:
-        await remove_sandbox(manager, run.task_id)
+        await remove_sandbox(lambda: manager, run.task_id)
 
 
 def stop_on_signals() -> None:
@@ -270,10 +423,14 @@ async def run_task(manager: WorkspaceManager, run: Run) -> int:
     return 0 if outcome.kind is OutcomeKind.PR_OPENED else EXIT_ERROR
 
 
-async def remove_sandbox(manager: WorkspaceManager, task_id: str) -> None:
-    """Remove the container and the volume. A failure is reported and changes no result."""
+async def remove_sandbox(make: Callable[[], WorkspaceManager], task_id: str) -> None:
+    """Remove the container and the volume. A failure is reported and changes no result.
+
+    The manager is built inside the guard: DockerSandboxManager() connects to the daemon, so a
+    Docker that is down fails there and not in cleanup_task.
+    """
     try:
-        await manager.cleanup_task(task_id)
+        await make().cleanup_task(task_id)
     except Exception as exc:
         typer.echo(f"warning: could not remove the sandbox of task {task_id}: {exc}", err=True)
 
@@ -290,20 +447,204 @@ async def print_final_diff(
     typer.echo(diff.output)
 
 
-# ---------- inputs ----------
-def config_path(settings: EnvSettings) -> Path:
-    """The config file: the one named by LONGHAUL_CONFIG, found from any working directory.
+# ---------- the durable commands ----------
+@dataclass(frozen=True)
+class DurableOptions:
+    path: Path
+    issue_file: Path
+    provider: ProviderName | None
+    script: Path | None
 
-    The default is a path relative to the repo root. Run from another folder it would be
-    missing, so the checkout this package lives in is tried next.
+
+async def open_client(settings: EnvSettings) -> Client:
+    """The Temporal client. A function of its own so that unit tests can replace it."""
+    return await connect(settings.temporal_address, namespace=settings.temporal_namespace)
+
+
+def make_blobs(settings: EnvSettings) -> BlobStoreBase:
+    """The blob store that the worker shares, which is also where the script of a task goes."""
+    try:
+        return S3BlobStore.from_settings(settings)
+    except RuntimeError as exc:  # a setting is unset; the command reports it in one line
+        raise ValueError(str(exc)) from exc
+
+
+def make_store(blobs: BlobStoreBase, settings: EnvSettings) -> GitCheckpointStore:
+    """The checkpoint store, for reading the diff. It is the folder the worker writes to."""
+    return GitCheckpointStore(blobs, root=settings.ckpt_dir)
+
+
+async def pause(seconds: float) -> None:
+    """Wait between two polls. A function of its own so that unit tests need not wait."""
+    await asyncio.sleep(seconds)
+
+
+def resolve_script(options: DurableOptions, settings: EnvSettings) -> Path | None:
+    """The script to send with the task, or None when the worker's own provider answers.
+
+    Only the scripted provider has a script. For any other provider the worker uses the one in
+    its own settings, and a script on the command line would be silently ignored, so it is an
+    error.
     """
-    path = settings.config
-    if path.is_absolute() or path.exists():
-        return path
-    bundled = PROJECT_ROOT / path
-    return bundled if bundled.exists() else path
+    name = options.provider.value if options.provider is not None else settings.provider
+    if name != ProviderName.SCRIPTED.value:
+        if options.script is not None:
+            raise ValueError("--script only goes with the scripted provider")
+        return None
+    script = options.script or settings.script
+    if script is None:
+        raise ValueError(
+            "the scripted provider needs a script: pass --script FILE or set LONGHAUL_SCRIPT"
+        )
+    return script
 
 
+def durable_spec(path: Path, task_id: str, title: str, body: str) -> TaskSpec:
+    # The worker reads the folder through this path, so it has to be the absolute one. The model
+    # sees the folder name only (agent/prompts.py).
+    repo = f"local:{path}"
+    return TaskSpec(
+        task_id=task_id,
+        repo=repo,
+        issue_number=None,
+        title=title,
+        body=body,
+        settings=RepoSettings(repo=repo, test_command=DEFAULT_TEST_COMMAND),
+    )
+
+
+async def submit(options: DurableOptions) -> int:
+    """Check every input, start the task and follow it. Nothing is started before the checks."""
+    settings = EnvSettings()
+    title, body = read_issue(options.issue_file)
+    script = resolve_script(options, settings)
+    blobs = make_blobs(settings)
+    task_id = new_task_id(options.path)
+    spec = durable_spec(options.path, task_id, title, body)
+    script_ref: BlobRef | None = None
+    if script is not None:
+        script_ref = await upload_script(blobs, task_id, script)
+    client = await open_client(settings)
+    handle = await start_task(client, spec, task_queue=settings.task_queue, script=script_ref)
+
+    who = "provider scripted" if script is not None else "provider of the worker"
+    typer.echo(f"task {task_id}: {title}")
+    typer.echo(f"repo {spec.repo}, {who}, task queue {settings.task_queue}")
+    try:
+        outcome = await follow(handle)
+    except asyncio.CancelledError:
+        typer.echo(
+            f"interrupted. Task {task_id} is still running: follow it with "
+            f"`longhaul status {task_id}` or stop it with `longhaul cancel {task_id}`",
+            err=True,
+        )
+        raise
+    except WorkflowFailureError as exc:
+        typer.echo(f"error: the workflow failed: {failure_text(exc)}", err=True)
+        await remove_sandbox(make_manager, task_id)
+        return EXIT_ERROR
+
+    final = await try_status(handle)
+    typer.echo(outcome_line(outcome.kind, final.turn_index if final else None, outcome.summary))
+    await print_task_diff(make_store(blobs, settings), task_id, final)
+    # A finished workflow leaves its sandbox until LH-507 makes it destroy it. The cleanup is
+    # safe to run twice, so this keeps working after that.
+    await remove_sandbox(make_manager, task_id)
+    return 0 if outcome.kind is OutcomeKind.PR_OPENED else EXIT_ERROR
+
+
+async def follow(handle: WorkflowHandle[Any, Outcome]) -> Outcome:
+    """Print the status of the task each time it changes, until the workflow ends.
+
+    The end is read from the server (`describe`), which needs no worker. The status is read with
+    a query, which does, so the line says when no worker answers. A worker that was stopped and
+    started again is therefore visible here, and the run goes on.
+    """
+    last: str | None = None
+    while (await handle.describe()).status in OPEN_STATES:
+        line = status_line(await try_status(handle))
+        if line != last:
+            typer.echo(line)
+            last = line
+        await pause(POLL_S)
+    return await handle.result()
+
+
+async def try_status(handle: WorkflowHandle[Any, Outcome]) -> TaskStatus | None:
+    """status() of the workflow, or None when no worker answers within STATUS_TIMEOUT_S."""
+    try:
+        return await read_status(handle, timeout_s=STATUS_TIMEOUT_S)
+    except (RPCError, WorkflowQueryFailedError):
+        return None
+
+
+async def print_task_diff(
+    store: GitCheckpointStore, task_id: str, final: TaskStatus | None
+) -> None:
+    """The diff of the run, read from the bare repo at the checkpoint the workflow ended on."""
+    if final is None or final.last_checkpoint is None:
+        typer.echo(
+            "could not read the final diff: the workflow did not say where it ended", err=True
+        )
+        return
+    try:
+        patch = await store.diff(task_id, final.last_checkpoint)
+    except (CheckpointError, ValueError) as exc:
+        typer.echo(f"could not read the final diff: {exc}", err=True)
+        return
+    typer.echo(DIFF_HEADING)
+    typer.echo(patch.rstrip("\n") if patch else NO_CHANGES)
+
+
+async def show_status(task_id: str) -> None:
+    handle = get_task(await open_client(EnvSettings()), task_id)
+    state = (await handle.describe()).status
+    name = state.name.lower().replace("_", " ") if state is not None else "in an unknown state"
+    typer.echo(f"task {task_id}: {name}")
+    current = await try_status(handle)
+    if current is not None or state in OPEN_STATES:
+        typer.echo(status_line(current))
+    if state in OPEN_STATES:
+        return
+    try:
+        outcome = await handle.result()
+    except WorkflowFailureError as exc:
+        typer.echo(f"failed: {failure_text(exc)}")
+        return
+    turns = current.turn_index if current is not None else None
+    typer.echo(outcome_line(outcome.kind, turns, outcome.summary))
+
+
+async def send_cancel(task_id: str, reason: str) -> None:
+    await cancel_task(await open_client(EnvSettings()), task_id, by="cli", reason=reason)
+
+
+def status_line(current: TaskStatus | None) -> str:
+    """For example `status: coding, 3 turns done, cost $0.0000, checkpoint 1a2b3c4`."""
+    if current is None:
+        return "status: waiting for a worker to answer"
+    turns = f"{current.turn_index} {'turn' if current.turn_index == 1 else 'turns'} done"
+    line = f"status: {current.phase.value}, {turns}, cost ${current.cost_usd:.4f}"
+    if current.last_checkpoint is not None:
+        line += f", checkpoint {current.last_checkpoint[:7]}"
+    return line
+
+
+def failure_text(exc: BaseException) -> str:
+    """The messages of an error and its causes, outermost first, as one line.
+
+    Temporal wraps the error of an activity in an ActivityError whose own message says only that
+    an activity failed. The reason is in the causes.
+    """
+    parts: list[str] = []
+    error: BaseException | None = exc.cause if isinstance(exc, WorkflowFailureError) else exc
+    while error is not None and len(parts) < 5:
+        parts.append(str(error) or type(error).__name__)
+        error = getattr(error, "cause", None)
+    return ": ".join(parts)
+
+
+# ---------- inputs ----------
 def loop_config(cfg: AppConfig, options: RunOptions) -> LoopConfig:
     turns = options.max_turns or Budgets().task_turns
     loop_cfg = LoopConfig.from_config(cfg, Role.CODER, max_turns=turns)
@@ -377,13 +718,22 @@ def print_turn(event: TurnEvent) -> None:
     typer.echo(format_turn(event))
 
 
-def outcome_line(kind: OutcomeKind, turns: int, summary: str) -> str:
+def outcome_line(kind: OutcomeKind, turns: int | None, summary: str) -> str:
+    """For example `finished after 5 turns: Changed add()`. `turns` is None when it is not known."""
     verb = "finished" if kind is OutcomeKind.PR_OPENED else "stopped"
+    if turns is None:
+        return f"{verb}: {summary}"
     return f"{verb} after {turns} {'turn' if turns == 1 else 'turns'}: {summary}"
 
 
-def describe(exc: Exception) -> str:
+def describe(exc: Exception, task_id: str | None = None) -> str:
     """One message for an error of the run. Whoever reads it is at a terminal, not in a log."""
+    if isinstance(exc, RPCError):
+        if exc.status is RPCStatusCode.NOT_FOUND and task_id is not None:
+            return f"task {task_id} was not found, or it has already ended"
+        return f"temporal: {exc.message}"
+    if isinstance(exc, WorkflowAlreadyStartedError):
+        return f"task {exc.workflow_id} already exists on this Temporal server"
     if isinstance(exc, ProviderError):
         return f"the model provider failed ({exc.kind.value}): {exc.message}"
     if isinstance(exc, ImageNotFound):

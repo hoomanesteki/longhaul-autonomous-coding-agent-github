@@ -22,6 +22,10 @@ ends the run.
 The workflow keeps `state.head_sha` equal to the latest `post_sha` and passes it as `pre_sha` to
 every `tool_exec`, so each call starts from the checkpoint the one before it left (ADR-0006).
 
+A task started with a script in its memo (acts.SCRIPT_MEMO_KEY, from `longhaul run --script`)
+hands that ref to every `llm_turn`, and the activity plays it instead of the provider of the
+worker. The workflow only passes the ref on. Reading it is the activity's job.
+
 A sandbox that goes away (failure mode F3). A `tool_exec` that finds its container gone fails
 with SandboxGoneError, which the activity does not retry. The workflow calls `ensure_sandbox`
 with the latest `head_sha`, stores the id it returns and runs the same call again from the same
@@ -467,6 +471,7 @@ class TaskWorkflow:
                         hints=list(state.hints),
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
+                        script_ref=self._script(),
                     ),
                 )
             except ActivityError as err:
@@ -606,6 +611,9 @@ class TaskWorkflow:
 
     def _tuning(self) -> acts.Tuning | None:
         return workflow.memo_value(acts.TUNING_MEMO_KEY, None, type_hint=acts.Tuning)
+
+    def _script(self) -> BlobRef | None:
+        return workflow.memo_value(acts.SCRIPT_MEMO_KEY, None, type_hint=BlobRef)
 
     def _sandbox_id(self) -> str:
         sandbox_id = self.state.sandbox_id

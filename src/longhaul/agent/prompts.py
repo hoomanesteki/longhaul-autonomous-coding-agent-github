@@ -29,6 +29,10 @@ SECTION_HEADINGS = (RULES_HEADING, TOOLS_HEADING, TASK_HEADING, FACTS_HEADING)
 # starts the work and repeats the one rule the loop depends on.
 FIRST_USER_MESSAGE = "Start on the task in your instructions. Call `finish` once the tests pass."
 
+# The prefix of a repo that is a folder on the worker's machine (github.intake.LOCAL_PREFIX, which
+# is not imported here because it pulls in SQLAlchemy). A unit test keeps the two equal.
+LOCAL_PREFIX = "local:"
+
 NO_DESCRIPTION = "(no description)"
 NO_TEST_COMMAND = "Test command: not configured (use `run_command` to run tests)"
 
@@ -105,7 +109,7 @@ def _task_statement(spec: TaskSpec) -> str:
     issue = _clean(spec.title)
     lines = [
         TASK_HEADING,
-        f"Repository: {spec.repo}",
+        f"Repository: {_repo_label(spec.repo)}",
         f"Base branch: {spec.base_branch}",
         f"Test command: {command}" if command else NO_TEST_COMMAND,
         "",
@@ -119,6 +123,15 @@ def _task_statement(spec: TaskSpec) -> str:
         numbered = [f"{n}. {_clean(text)}" for n, text in enumerate(spec.comments, start=1)]
         lines += ["", "Comments on the issue:", *numbered]
     return "\n".join(lines)
+
+
+def _repo_label(repo: str) -> str:
+    """The repo as the model sees it. A local folder shows its name only: the absolute path holds
+    the user name and the directory layout, and the prompt goes to the provider."""
+    if not repo.startswith(LOCAL_PREFIX):
+        return repo
+    name = repo.removeprefix(LOCAL_PREFIX).rstrip("/").rsplit("/", 1)[-1]
+    return f"{LOCAL_PREFIX}{name}"
 
 
 def _clean(text: str) -> str:

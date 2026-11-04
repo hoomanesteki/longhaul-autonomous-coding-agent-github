@@ -41,6 +41,9 @@ GIT_TIMEOUT_S = 120
 CHMOD_BATCH = 50  # paths per command, so a big tree stays under the argument size limit
 # Long enough for a cold pip install of a real project over a slow link.
 DEFAULT_SETUP_TIMEOUT_S = 900
+# How the agent runs the repo's tests when the repo names no command. The setup command puts the
+# project and pytest in .venv, and the sandbox puts .venv/bin first on the PATH.
+DEFAULT_TEST_COMMAND = "python -m pytest -q"
 
 OUTPUT_TAIL_LINES = 40
 OUTPUT_TAIL_CHARS = 4_000

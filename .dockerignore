@@ -1,0 +1,19 @@
+# The build context of docker/worker/Dockerfile is the repo root. It needs pyproject.toml,
+# uv.lock, src/ and config/, and nothing else.
+.git
+.github
+.venv
+.env
+.env.*
+!.env.example
+.pytest_cache
+.mypy_cache
+.ruff_cache
+__pycache__
+*.pyc
+docs
+site
+spikes
+tests
+scripts
+eval

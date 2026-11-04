@@ -11,6 +11,7 @@ The design and the reasons are in ADR-0006. In short:
   `restore` puts the workspace back on any commit, byte for byte, so a retried tool call never
   runs on a half changed tree.
 * `bundle` and `restore_from_bundle` move a task to another host through the blob store.
+* `diff` reads the work of a task on the host, for the command that reports a finished run.
 
 The agent can write to /ckpt, so the host treats everything in that repo as untrusted: it runs
 git with hooks switched off, and only for a few read-only or ref-only commands.
@@ -181,9 +182,16 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
 
 
 async def _run_git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    strip: bool = True,
 ) -> tuple[int, str, str]:
-    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit."""
+    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit.
+
+    stdout is stripped unless `strip` is False. A patch needs it as git wrote it: a hunk can end
+    on a context line that holds one space, and stripping drops that line.
+    """
     where = ("--git-dir", str(git_dir)) if git_dir is not None else ()
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -203,14 +211,18 @@ async def _run_git(
     except BaseException:
         await _kill(proc)  # a cancelled activity must not leave git running
         raise
-    return proc.returncode or 0, out.decode(errors="replace").strip(), err.decode(errors="replace")
+    text = out.decode(errors="replace")
+    return proc.returncode or 0, text.strip() if strip else text, err.decode(errors="replace")
 
 
 async def git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    strip: bool = True,
 ) -> str:
     """Like _run_git, but a failure raises CheckpointError and the result is stdout."""
-    code, out, err = await _run_git(*args, git_dir=git_dir, timeout_s=timeout_s)
+    code, out, err = await _run_git(*args, git_dir=git_dir, timeout_s=timeout_s, strip=strip)
     if code != 0:
         raise CheckpointError(f"git {args[0]} failed (exit {code}): {_tail(err or out)}")
     return out
@@ -660,6 +672,27 @@ class GitCheckpointStore(CheckpointStore):
             sandbox, _ENSURE_REPO + _RESTORE, "restore the workspace", RESTORE_TIMEOUT_S,
             sha=shlex.quote(check_sha(sha)), keep=keep,
         )  # fmt: skip
+
+    # -- reading the work --
+
+    async def diff(self, task_id: str, head_sha: str) -> str:
+        """The patch from the `base` tag to a checkpoint, read on the host. "" when nothing changed.
+
+        The text is git's own, not stripped, so that `git apply` accepts it.
+
+        The checkpoint is named by the caller and not read from the branch, because an attempt
+        that died can leave a commit on the branch that the workflow never learned about. The
+        agent can write the config of this repo, so an external diff program or a text
+        conversion that it names must not run here.
+        """
+        repo = self._require_repo(task_id)
+        patch = await git(
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+            f"refs/tags/{BASE_TAG}", check_sha(head_sha), "--",
+            git_dir=repo, strip=False,
+        )  # fmt: skip
+        # Git ends every line with a newline. The check is for a git that does not.
+        return patch if not patch or patch.endswith("\n") else f"{patch}\n"
 
     # -- bundles --
 

@@ -275,7 +275,7 @@ async def until(condition: Callable[[], bool], what: str, wait_s: float = 15.0) 
 
 async def test_the_activities_list_what_a_worker_registers(rig: Rig) -> None:
     names = sorted(a.__name__ for a in rig.activities.activities)
-    assert names == ["bundle_checkpoint", "ensure_sandbox", "prepare_workspace"]
+    assert names == ["bundle_checkpoint", "cleanup", "ensure_sandbox", "prepare_workspace"]
 
 
 def test_the_setup_has_less_time_than_the_activity_that_runs_it() -> None:
@@ -752,3 +752,73 @@ async def test_a_bundle_that_is_too_large_files_no_row(rig: Rig) -> None:
         await rig.environment().run(activities.bundle_checkpoint, inp)
 
     assert rig.recorder.checkpoints == []
+
+
+# ---------- cleanup (LH-208) ----------
+async def clean(rig: Rig, task_id: str = TASK, sandbox_id: str | None = None) -> None:
+    inp = acts.CleanupInput(task_id=task_id, sandbox_id=sandbox_id, reason="cancelled by alice")
+    await rig.environment().run(rig.activities.cleanup, inp)
+
+
+async def test_cleanup_removes_the_container_the_volume_and_the_repo_of_a_task(rig: Rig) -> None:
+    out = await rig.prepare()
+    assert rig.host.live(TASK) and rig.store.has_repo(TASK)
+
+    await clean(rig, sandbox_id=out.sandbox_id)
+
+    assert rig.host.of(TASK) == []
+    assert TASK not in rig.host.volumes
+    assert not rig.store.has_repo(TASK)
+
+
+async def test_cleanup_without_a_sandbox_id_finds_the_containers_by_their_task(rig: Rig) -> None:
+    # The workflow stops before it learns the id when a task is cancelled during the preparation.
+    await rig.prepare()
+    await clean(rig, sandbox_id=None)
+    assert rig.host.of(TASK) == []
+    assert not rig.store.has_repo(TASK)
+
+
+async def test_cleanup_twice_is_safe(rig: Rig) -> None:
+    out = await rig.prepare()
+    await clean(rig, sandbox_id=out.sandbox_id)
+    await clean(rig, sandbox_id=out.sandbox_id)
+    assert rig.host.of(TASK) == []
+
+
+async def test_cleanup_of_a_task_that_never_existed_does_nothing(rig: Rig) -> None:
+    await clean(rig, "lh-acme-calc-99")
+    assert rig.host.log == [
+        "remove containers of lh-acme-calc-99",
+        "remove volume of lh-acme-calc-99",
+    ]
+
+
+async def test_cleanup_leaves_the_other_tasks_alone(rig: Rig) -> None:
+    await rig.prepare()
+    other = await rig.host.create("lh-acme-calc-7", IMAGE, LIMITS, network=False)
+
+    await clean(rig)
+
+    assert rig.host.of(TASK) == []
+    assert rig.host.live("lh-acme-calc-7") == [other.id]
+
+
+@pytest.mark.parametrize("task_id", ["../elsewhere", "a/b", ""])
+async def test_cleanup_refuses_a_task_id_that_is_not_a_safe_name_for_good(
+    rig: Rig, task_id: str
+) -> None:
+    # The id names a folder that gets deleted, so a bad one must never get that far.
+    with pytest.raises(ApplicationError) as caught:
+        await clean(rig, task_id)
+    assert caught.value.non_retryable
+    assert rig.host.log == []
+
+
+async def test_a_failed_cleanup_is_retried_by_temporal(rig: Rig) -> None:
+    async def broken(task_id: str) -> None:
+        raise OSError("docker went away")
+
+    rig.host.cleanup_task = broken  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="docker went away"):
+        await clean(rig)

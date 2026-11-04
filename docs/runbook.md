@@ -76,6 +76,10 @@ uv run longhaul memory list --repo acme/inventory --kind repo_map    # one item 
 
 A file that does not parse, or is over 200 KB, is left out of the map and named in it as "Not parsed", and the worker logs it as a warning. A map that cannot be built at all is logged and the task goes on without one.
 
+A big repo is not cut at a path. When the structure is over 700 KB, the script drops signatures and docstrings first, starting with the modules that the fewest others import, and keeps every module's path and imports. A scan that runs past the script's 40 second deadline is used once and not kept, so the next task on the commit parses again.
+
+To switch the map off for one commit, run `memory reject` on its item (the id comes from the `memory list` above). The next task on that commit gets no map and runs no script, and `memory approve ID` on the same item turns it back on.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.

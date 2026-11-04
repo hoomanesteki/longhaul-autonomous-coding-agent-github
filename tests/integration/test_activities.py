@@ -72,7 +72,7 @@ from longhaul.providers.scripted import ScriptedProvider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.settings import EnvSettings, get_settings
-from longhaul.tools.registry import ToolRegistry, default_registry
+from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
@@ -295,10 +295,11 @@ async def running(
     recorder: SqlRecorder,
     sandboxes: SandboxLookup,
     workspace: Workspace,
-    registry: ToolRegistry | None = None,
+    test_command: str | None = None,
 ) -> AsyncIterator[Run]:
     """A worker with the real activities. Yields the task queue it polls."""
-    toolbox = registry or default_registry()
+    # The tools read their output handles from the store the activities write to.
+    toolbox = default_registry(test_command=test_command, blobs=blobs)
     llm = LlmActivities(provider, blobs, recorder, toolbox.specs(), lambda role: CFG)
     tools = SpyTools(toolbox, sandboxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
@@ -388,7 +389,7 @@ async def test_workflow_fixes_calc_via_activities(
             recorder=recorder,
             sandboxes=manager,
             workspace=workspace,
-            registry=default_registry(test_command=PYTEST),
+            test_command=PYTEST,
         ) as run:
             handle = await start_task(
                 env.client, spec, task_queue=run.queue, tuning=SHORT_HEARTBEAT

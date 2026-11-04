@@ -281,7 +281,7 @@ async def running(
     env: WorkflowEnvironment, stack: Stack, provider: ScriptedProvider
 ) -> AsyncIterator[str]:
     """A worker for the workflow and the real activities. Yields the task queue it polls."""
-    registry = default_registry(test_command=PYTEST)
+    registry = default_registry(test_command=PYTEST, blobs=stack.blobs)
     llm = LlmActivities(provider, stack.blobs, stack.recorder, registry.specs(), lambda role: CFG)
     tools = ToolActivities(
         registry, stack.manager, stack.blobs, stack.recorder, checkpoints=stack.checkpoints

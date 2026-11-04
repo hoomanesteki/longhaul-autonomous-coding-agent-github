@@ -390,7 +390,7 @@ async def test_a_command_that_commits_by_itself_is_checkpointed_and_kept(task: T
     and a reset are saved the same way.
     """
     tools = ToolActivities(
-        default_registry(test_command="true"),
+        default_registry(test_command="true", blobs=task.blobs),
         task.manager,
         task.blobs,
         MemoryRecorder(),
@@ -443,7 +443,7 @@ async def test_every_mutation_checkpointed(
     because it failed, has none of the three.
     """
     tools = ToolActivities(
-        default_registry(test_command="true"),
+        default_registry(test_command="true", blobs=task.blobs),
         task.manager,
         task.blobs,
         recorder,

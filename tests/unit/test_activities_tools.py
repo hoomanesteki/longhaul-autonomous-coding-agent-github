@@ -105,7 +105,7 @@ class Rig:
         sandbox: Sandbox | None,
         *,
         checkpoints: WorkspaceCheckpoints | None = None,
-        registry: ToolRegistry | None = None,
+        test_command: str = "pytest -q",
         recorder: MemoryRecorder | None = None,
         tool_output_max_tokens: int = 4000,
     ) -> None:
@@ -113,7 +113,8 @@ class Rig:
         self.recorder = recorder or MemoryRecorder()
         self.lookup = Lookup(sandbox)
         self.activities = ToolActivities(
-            registry or default_registry(test_command="pytest -q", blobs=self.blobs),
+            # The registry reads handles from the store the activities write to.
+            default_registry(test_command=test_command, blobs=self.blobs),
             self.lookup,
             self.blobs,
             self.recorder,
@@ -363,11 +364,13 @@ class Repo:
     def rig(
         self,
         *,
-        registry: ToolRegistry | None = None,
+        test_command: str = "pytest -q",
         spy: Spy | None = None,
         recorder: MemoryRecorder | None = None,
     ) -> Rig:
-        return Rig(self.box, checkpoints=spy or self.store, registry=registry, recorder=recorder)
+        return Rig(
+            self.box, checkpoints=spy or self.store, test_command=test_command, recorder=recorder
+        )
 
     async def text(self, path: str = MODULE) -> str:
         return (await self.box.read_file(path)).decode()
@@ -476,9 +479,9 @@ async def test_a_command_that_changes_files_is_saved_and_one_that_does_not_is_no
 
 
 async def test_a_test_run_that_writes_files_is_saved_and_a_clean_one_is_not(repo: Repo) -> None:
-    dirty = repo.rig(registry=default_registry(test_command="echo report > report.txt"))
+    dirty = repo.rig(test_command="echo report > report.txt")
     wrote = await dirty.exec(exec_input("run_tests", pre_sha=repo.base_sha))
-    clean = repo.rig(registry=default_registry(test_command="true"))
+    clean = repo.rig(test_command="true")
     quiet = await clean.exec(exec_input("run_tests", "toolu_2", pre_sha=wrote.post_sha))
 
     assert wrote.post_sha is not None
@@ -1140,3 +1143,54 @@ async def test_a_result_that_no_tool_made_is_not_shaped() -> None:
     )
     (answer,) = result_blocks((await rig.blobs.get_json(out_ref, list[Message]))[-1])
     assert answer.content == BAD_FINISH
+
+
+def build_activities(registry: ToolRegistry, blobs: MemoryBlobStore) -> ToolActivities:
+    return ToolActivities(
+        registry, Lookup(None), blobs, MemoryRecorder(), checkpoints=NoCheckpoints()
+    )
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [
+        pytest.param(default_registry(), id="the default registry's own store"),
+        pytest.param(default_registry(blobs=MemoryBlobStore()), id="another store"),
+        pytest.param(ToolRegistry(), id="a bare registry"),
+    ],
+)
+def test_a_registry_on_another_blob_store_is_refused(registry: ToolRegistry) -> None:
+    # read_output reads the registry's store and the activities write to theirs. With two
+    # stores every handle is unknown, so the mismatch has to stop the worker from starting.
+    with pytest.raises(ValueError, match="blob store"):
+        build_activities(registry, MemoryBlobStore())
+
+
+def test_a_registry_on_the_same_blob_store_is_accepted() -> None:
+    blobs = MemoryBlobStore()
+    activities = build_activities(default_registry(blobs=blobs), blobs)
+    assert sorted(a.__name__ for a in activities.activities) == ["append_results", "tool_exec"]
+
+
+async def test_a_call_id_used_in_two_turns_never_reaches_the_model_twice(
+    sandbox: FakeSandbox,
+) -> None:
+    # The handle index is named by the call id alone, so a second call with the same id
+    # replaces the index of the first. That cannot mislead the model: append_results refuses a
+    # transcript that uses a tool_use id twice, the task stops, and no later model call reads
+    # the replaced handle.
+    rig = Rig(sandbox)
+    await rig.exec(exec_input("run_command", turn=3, command="echo first"))
+    second = await rig.exec(exec_input("run_command", turn=7, command="echo second"))
+    assert second.output_ref is not None
+    transcript = [
+        FIRST,
+        Message(role="assistant", content=[call_block("toolu_1", "run_command", command="a")]),
+        Message(role="user", content=[ToolResultBlock(tool_use_id="toolu_1", content="first")]),
+        Message(role="assistant", content=[call_block("toolu_1", "run_command", command="b")]),
+    ]
+    ref = await rig.put_json("t.json", transcript)
+    with pytest.raises(ApplicationError, match="reuses tool_use ids") as caught:
+        await rig.append(append_input(ref, acts.summarize_result(second)))
+    assert caught.value.type == "TranscriptError"
+    assert caught.value.non_retryable

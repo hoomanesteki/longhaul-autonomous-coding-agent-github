@@ -41,7 +41,8 @@ repo_map) before the commands run, while the workspace is still the base commit 
 written to it. The parsed structure is cached by base sha as an approved item, so a second task
 on the same commit does not parse again. The map itself depends on the issue, so each task
 gets its own, in the blob store, and `repo_map_ref` in the output names it for the prompt
-builder (LH-604). A map that cannot be built is logged, and the task goes on without one.
+builder (LH-604). A map that cannot be built is logged, and the task goes on without one. A
+person who rejected the map of the base commit also leaves the task without one.
 """
 
 from __future__ import annotations

@@ -11,7 +11,8 @@ ADR-0010 are kept here, at the one place that writes the table:
 * `search` returns approved items unless it is asked for the others (invariant I7), and counts
   each use of what it returns.
 * `get_verified` finds the approved item that Longhaul checked at one sha, which is how the repo
-  map of a commit is found again without reading the maps of the others.
+  map of a commit is found again without reading the maps of the others. `is_rejected` says
+  whether a person turned that item down, which switches the map off for that commit.
 
 The same note is stored once per repo and kind. Case and spacing are folded before the note is
 hashed, so "Run pytest -q" and "run  PYTEST -q" are one note. The hash is a column of its own
@@ -192,6 +193,26 @@ class PgMemoryStore:
         async with self._sessions() as session:
             row = (await session.scalars(stmt)).first()
         return None if row is None else _entry_of(row)
+
+    async def is_rejected(self, repo: str, kind: str, source_ref: str) -> bool:
+        """Whether a person turned down the default-branch item of `repo` checked at `source_ref`.
+
+        `get_verified` skips a rejected item, so a caller that must not rebuild what a person
+        refused asks here when `get_verified` finds nothing (the repo map, LH-602).
+        """
+        stmt = (
+            select(MemoryItemRow.id)
+            .where(
+                MemoryItemRow.repo == repo,
+                MemoryItemRow.kind == kind,
+                MemoryItemRow.source_ref == source_ref,
+                MemoryItemRow.status == "rejected",
+                MemoryItemRow.source == "default_branch",
+            )
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            return (await session.scalars(stmt)).first() is not None
 
     # ---------- writing ----------
     async def add_candidate(self, item: MemoryItem, *, source_ref: str | None = None) -> str:

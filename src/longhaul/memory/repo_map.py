@@ -32,6 +32,16 @@ tells a cache hit from a rebuild.
 The cache is an extra. A store that is down, a row that cannot be read and a failure to write one
 are logged, and the map is built from a fresh run of the script. Only a script that fails raises
 RepoMapError.
+
+Two cases are not a plain hit or miss.
+
+* A structure that the script's deadline cut short is used for the task that built it and is not
+  kept. Whether a scan finishes in time depends on how busy the worker is, and a row for the sha
+  would hand the same partial map to every later task, even on an idle worker.
+* A person can reject the repo_map item of a sha (`longhaul memory reject`). That turns the map
+  off for that commit (ADR-0010): the cache finds the rejected row, runs nothing, and `build`
+  returns an empty map. Without this, the rejection would only cost a script run per task, since
+  the map would be built and shown all the same. Approving the item again brings the map back.
 """
 
 from __future__ import annotations
@@ -130,13 +140,19 @@ class ClassInfo(BaseModel):
 
 
 class ModuleInfo(BaseModel):
-    """One parsed file. `imports` holds the paths of the files of the repo that it imports."""
+    """One parsed file. `imports` holds the paths of the files of the repo that it imports.
+
+    A big repo does not fit the script's output in full, so the script keeps the names of the
+    symbols of some modules and nothing else about them. Such a module has `names` and no
+    `classes`, `functions` or `doc`.
+    """
 
     path: str
     module: str = ""
     doc: str = ""
     classes: list[ClassInfo] = []
     functions: list[FunctionInfo] = []
+    names: list[str] = []
     imports: list[str] = []
 
 
@@ -153,6 +169,7 @@ class RepoStructure(BaseModel):
     modules: list[ModuleInfo] = []
     skipped: list[SkippedFile] = []
     omitted: int = 0  # files left out because the repo was too big for the script's limits
+    out_of_time: bool = False  # the script's deadline ended the scan: a faster run reads more
 
 
 async def run_script(sandbox: Sandbox) -> RepoStructure:
@@ -199,7 +216,7 @@ def _symbol_names(module: ModuleInfo) -> list[str]:
     for cls in module.classes:
         names.append(cls.name)
         names += [m.name for m in cls.methods]
-    return names
+    return [*names, *module.names]
 
 
 def _in_degrees(modules: list[ModuleInfo]) -> Counter[str]:
@@ -276,7 +293,10 @@ def _names(module: ModuleInfo) -> list[str]:
 
 def _tiers(module: ModuleInfo) -> list[list[str]]:
     """The ways to write a module, from the fullest to the shortest, without repeats."""
-    options = [_full(module), _names(module), [_line(module.path)]]
+    if module.names:  # the script kept no more than the names, so the full text is the path
+        options = [_names(module), [_line(module.path)]]
+    else:
+        options = [_full(module), _names(module), [_line(module.path)]]
     return [block for i, block in enumerate(options) if block not in options[:i]]
 
 
@@ -359,6 +379,8 @@ class StructureMemory(Protocol):
 
     async def get_verified(self, repo: str, kind: str, source_ref: str) -> CachedItem | None: ...
 
+    async def is_rejected(self, repo: str, kind: str, source_ref: str) -> bool: ...
+
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str: ...
 
 
@@ -381,19 +403,49 @@ class RepoMapCache:
         issue_text: str,
         max_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> str:
-        """The map of `repo` at `sha` for this issue. The workspace must be at `sha`."""
+        """The map of `repo` at `sha` for this issue. The workspace must be at `sha`.
+
+        The empty string means that the map of this sha was rejected, or that there is nothing
+        to show.
+        """
         structure = await self.structure_at(sandbox, repo, sha)
+        if structure is None:
+            return ""
         return render_repo_map(structure, issue_text, max_tokens)
 
-    async def structure_at(self, sandbox: Sandbox, repo: str, sha: str) -> RepoStructure:
-        """The structure of the repo at `sha`, from memory if it is there, else from the script."""
+    async def structure_at(self, sandbox: Sandbox, repo: str, sha: str) -> RepoStructure | None:
+        """The structure of the repo at `sha`, from memory if it is there, else from the script.
+
+        None means that a person rejected the map of this sha, and nothing was run.
+        """
         cached = await self._read(repo, sha)
         if cached is not None:
             return cached
+        if await self._rejected(repo, sha):
+            log.info("the repo map of %s at %s was rejected, so the task gets none", repo, sha)
+            return None
         self.script_runs += 1  # counted before the run: a script that fails was run all the same
         structure = (await run_script(sandbox)).model_copy(update={"sha": sha})
-        await self._write(repo, sha, structure)
+        if structure.out_of_time:
+            log.warning(
+                "the repo map script of %s at %s ran out of time with %d files unread: "
+                "this task uses the partial map and the next one parses again",
+                repo,
+                sha,
+                structure.omitted,
+            )
+        else:
+            await self._write(repo, sha, structure)
         return structure
+
+    async def _rejected(self, repo: str, sha: str) -> bool:
+        try:
+            return await self._memory.is_rejected(repo, KIND, sha)
+        except Exception as exc:  # not knowing is not a rejection
+            log.warning(
+                "could not tell if the repo map of %s at %s was rejected: %s", repo, sha, exc
+            )
+            return False
 
     async def _read(self, repo: str, sha: str) -> RepoStructure | None:
         try:

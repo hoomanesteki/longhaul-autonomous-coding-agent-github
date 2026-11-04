@@ -18,10 +18,18 @@ What it does:
    `imports` lists the paths a module imports, once each. Ranking is left to the caller, which
    knows the issue text.
 
-The output is one line of JSON: `version`, `modules`, `skipped` and `omitted`. `omitted` counts
-the files that were left out for lack of time or room, in path order from the end, so the map
-of a huge repo is cut at a point and not at random. The limits below keep the output under the
-1 MB that a sandbox command may print. repo_map.RepoStructure reads the same shape.
+The output is one line of JSON: `version`, `modules`, `skipped` and `omitted`, and `out_of_time`
+when the deadline stopped the scan. The limits below keep the output under the 1 MB that a
+sandbox command may print. repo_map.RepoStructure reads the same shape.
+
+When the modules together are over the output limit, detail goes before modules do. Every module
+starts as its path, its name and its imports (the "bare" form). The modules that the most others
+import then get their symbol names (the "names" form), and after that the same modules get the
+full text, signatures and docstrings, while there is room. The script cannot know the issue, and
+the import count is the part of the ranking that it can compute. So a late path in a big repo
+still has its place in the map, and the caller's ranking by the issue's words still sees it.
+Only a repo whose bare forms alone are over the limit loses modules, and it loses the ones that
+the fewest others import. `omitted` counts those, and the files that the deadline left unread.
 
 Module names. A file's importable name comes from the `__init__.py` files above it, so
 `src/inventory/store.py` is `inventory.store`: the folder `src` has no `__init__.py`, which makes
@@ -37,6 +45,7 @@ import json
 import os
 import sys
 import time
+from collections import Counter
 from typing import Any
 
 VERSION = 1
@@ -49,6 +58,7 @@ MAX_SIGNATURE_CHARS = 200
 MAX_DOC_CHARS = 120
 MAX_BASE_CHARS = 60
 MAX_DECORATOR_CHARS = 40
+MAX_NAMES = 200  # symbol names kept in the names form
 # The output as a whole. The sandbox keeps 1 MB of what a command prints and drops the middle.
 MAX_OUTPUT_BYTES = 700_000
 MAX_SKIPPED = 200
@@ -79,6 +89,23 @@ def present(fields: dict[str, Any]) -> dict[str, Any]:
     """The fields that say something. An empty docstring or list is the reader's default, and
     leaving it out keeps a repo of thousands of functions well inside the output limit."""
     return {name: value for name, value in fields.items() if value}
+
+
+def clean(value: Any) -> Any:
+    """The value with every string made valid UTF-8.
+
+    A docstring can hold a lone surrogate (written as "\\udc80" in the source), and os.walk
+    decodes a file name of other bytes with surrogateescape. JSON can carry them as escapes, but
+    the reader's JSON parser refuses them, and one odd file would then cost the map of the whole
+    repo. They become "?".
+    """
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, list):
+        return [clean(item) for item in value]
+    if isinstance(value, dict):
+        return {key: clean(item) for key, item in value.items()}
+    return value
 
 
 # ---------- step 1: the files ----------
@@ -284,6 +311,72 @@ def resolve_imports(
     return sorted(targets)
 
 
+# ---------- fitting the output ----------
+def size_of(value: Any) -> int:
+    """The bytes that `value` takes in the output, with the comma after it in a list.
+
+    The output is ASCII, because json.dumps escapes everything else, so characters are bytes.
+    """
+    return len(json.dumps(value, separators=(",", ":"))) + 1
+
+
+def names_of(entry: dict[str, Any]) -> list[str]:
+    """The public names of a module's functions, classes and methods, in the order the map shows."""
+    names = [f["name"] for f in entry.get("functions", [])]
+    for cls in entry.get("classes", []):
+        names.append(cls["name"])
+        names += [m["name"] for m in cls.get("methods", [])]
+    # The map leaves private names out, so they would only take room here.
+    return [n for n in dict.fromkeys(names) if not n.startswith("_")][:MAX_NAMES]
+
+
+def bare_form(entry: dict[str, Any]) -> dict[str, Any]:
+    """The path, the module name and the imports of a module, which is what the graph needs."""
+    return {k: v for k, v in entry.items() if k in ("path", "module", "imports")}
+
+
+def names_form(entry: dict[str, Any]) -> dict[str, Any]:
+    """The bare form with the names of the module's symbols, but no signatures or docstrings."""
+    return present({**bare_form(entry), "names": names_of(entry)})
+
+
+def fit_modules(
+    entries: list[tuple[str, list[str], dict[str, Any]]], budget: int
+) -> tuple[list[dict[str, Any]], int]:
+    """The module entries to print, in path order, and how many modules had to be dropped.
+
+    Each entry is (path, imports, full entry). The forms are tried from the cheapest, in the
+    order of how many modules import the module and then of the path, so that detail is spent
+    where the caller's ranking is most likely to look first.
+    """
+    forms = [(entry, names_form(entry), bare_form(entry)) for _, _, entry in entries]
+    sizes = [[size_of(form) for form in group] for group in forms]
+    known = {path for path, _, _ in entries}
+    in_degree: Counter[str] = Counter()
+    for _, imports, _ in entries:
+        in_degree.update(target for target in imports if target in known)
+    order = sorted(range(len(entries)), key=lambda i: (-in_degree[entries[i][0]], entries[i][0]))
+
+    form_of: dict[int, int] = {}  # index into forms: 0 full, 1 names, 2 bare
+    used = 0
+    for i in order:
+        if used + sizes[i][2] > budget:
+            break  # the rest import the fewest others
+        form_of[i] = 2
+        used += sizes[i][2]
+    for target in (1, 0):
+        for i in order:
+            current = form_of.get(i)
+            if current is None or current <= target:
+                continue
+            extra = sizes[i][target] - sizes[i][current]
+            if used + extra <= budget:
+                form_of[i] = target
+                used += extra
+    kept = [forms[i][form_of[i]] for i in range(len(entries)) if i in form_of]
+    return kept, len(entries) - len(kept)
+
+
 # ---------- putting it together ----------
 def scan(root: str = ".", deadline_s: float = DEADLINE_S) -> dict[str, Any]:
     """The structure of the Python files under root, as the dict that main prints."""
@@ -300,9 +393,11 @@ def scan(root: str = ".", deadline_s: float = DEADLINE_S) -> dict[str, Any]:
     parsed: list[tuple[str, dict[str, Any], list[tuple[int, str, list[str]]]]] = []
     skipped: list[dict[str, str]] = []
     omitted = 0
+    out_of_time = False
     for position, path in enumerate(paths):
         if time.monotonic() - started > deadline_s:
             omitted = len(paths) - position
+            out_of_time = True
             break
         try:
             entry, raw = read_module(path, root)
@@ -319,20 +414,24 @@ def scan(root: str = ".", deadline_s: float = DEADLINE_S) -> dict[str, Any]:
             continue
         parsed.append((path, entry, raw))
 
-    modules: list[dict[str, Any]] = []
-    size = 0
+    entries: list[tuple[str, list[str], dict[str, Any]]] = []
     for path, entry, raw in parsed:
+        imports = resolve_imports(raw, packages_of[path], index, path)
         entry["path"] = path
         entry["module"] = module_names(path, packages)[0]
-        imports = resolve_imports(raw, packages_of[path], index, path)
         if imports:
             entry["imports"] = imports
-        size += len(json.dumps(entry, separators=(",", ":")))
-        if size > MAX_OUTPUT_BYTES:
-            omitted += len(parsed) - len(modules)
-            break
-        modules.append(entry)
-    return {"version": VERSION, "modules": modules, "skipped": skipped, "omitted": omitted}
+        entries.append((path, imports, clean(entry)))
+    kept, dropped = fit_modules(entries, MAX_OUTPUT_BYTES - size_of(clean(skipped)))
+    found: dict[str, Any] = {
+        "version": VERSION,
+        "modules": kept,
+        "skipped": clean(skipped),
+        "omitted": omitted + dropped,
+    }
+    if out_of_time:
+        found["out_of_time"] = True
+    return found
 
 
 def main(argv: list[str]) -> int:

@@ -131,6 +131,25 @@ async def test_an_outcome_event_counts_the_task_and_ends_its_activity(counters: 
     assert [e.type for e in recorder.events] == [acts.OUTCOME_EVENT]
 
 
+async def test_an_outcome_event_is_counted_when_its_row_cannot_be_written(
+    counters: Metrics,
+) -> None:
+    # The outcome is the end of the task, and the database being down is one of the ways a task
+    # ends. The dashboard has to show that error, so the count does not wait for the row.
+    counters.task_started(TASK)
+    inp = acts.RecordEventInput(
+        task_id=TASK, type=acts.OUTCOME_EVENT, payload={"kind": "error", "repo": "acme/calc"}
+    )
+    activities = EventActivities(DownRecorder())
+    for _ in range(3):
+        with pytest.raises(ConnectionError):
+            await in_run("run-1").run(activities.record_event, inp)
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_tasks_total", {"outcome": "error", "repo": "acme/calc"}) == 1
+    assert reading("longhaul_active_tasks") == 0
+
+
 async def test_the_same_run_is_counted_once_when_its_workflow_task_is_retried(
     counters: Metrics,
 ) -> None:

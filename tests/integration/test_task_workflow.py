@@ -119,6 +119,11 @@ class Stubs:
     The GitHub activities of LH-306 (acts.GITHUB) are logged in `github_log` and in `every`, the
     order of all activities, and not in `log`. `names()` therefore lists the loop's activities
     only, and `github_names()` the others.
+
+    The note that a run makes at its end (acts.OUTCOME_EVENT, LH-704) goes in `outcomes`, with
+    the run that made it. It does not wait at a gate and is not in `log`, so the order of the
+    other calls stays what each test below says. An error in `fails` for record_event is raised
+    for it as well, after it is noted.
     """
 
     MUTATING = frozenset({"edit_file", "write_file"})
@@ -143,6 +148,7 @@ class Stubs:
         self.decisions: dict[int, Decision] = {}
         self.overflow: dict[int, int] = {}
         self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
+        self.outcomes: list[tuple[str, acts.RecordEventInput]] = []
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -275,6 +281,11 @@ class Stubs:
 
     @activity.defn(name=acts.RECORD_EVENT.name)
     async def record_event(self, inp: acts.RecordEventInput) -> None:
+        if inp.type == acts.OUTCOME_EVENT:
+            self.outcomes.append((activity.info().workflow_run_id, inp))
+            if acts.RECORD_EVENT.name in self.fails:
+                raise self.fails[acts.RECORD_EVENT.name]
+            return
         await self._enter(acts.RECORD_EVENT.name, inp)
         if acts.RECORD_EVENT.name in self.fails:
             raise self.fails[acts.RECORD_EVENT.name]
@@ -2342,3 +2353,93 @@ async def test_the_helpers_for_a_pause_and_a_resume_are_workflow_methods(
     # that lifecycle gives, as activities, so there is nothing else to wire.
     assert callable(TaskWorkflow._needs_human)
     assert callable(TaskWorkflow._human_done)
+
+
+# ---------- the note at the end of a run (LH-704) ----------
+# The workflow cannot count a finished task, because counting is I/O. It asks the worker to,
+# with a record_event local activity when run() ends, and the worker counts it from there.
+async def test_the_end_of_a_run_is_noted_once_with_its_outcome(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(cost_usd=0.25)
+    outcome, final = await play(env, stubs, spec)
+
+    ((run_id, note),) = stubs.outcomes
+    assert note.task_id == spec.task_id and note.type == acts.OUTCOME_EVENT
+    assert note.payload["kind"] == outcome.kind.value == "pr_opened"
+    assert note.payload["repo"] == "acme/calc"
+    assert note.payload["turns"] == final.turn_index == 1
+    assert note.payload["cost_usd"] == pytest.approx(0.25)
+    assert run_id == stubs.run_ids[-1]
+
+
+async def test_the_note_of_an_error_outcome_names_the_kind(
+    env: WorkflowEnvironment,
+) -> None:
+    stubs = Stubs(never_finishes)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, make_spec(task_turns=2), task_queue=queue)
+        await result_of(handle)
+
+    ((_, note),) = stubs.outcomes
+    assert note.payload["kind"] == "error"
+    assert note.payload["summary"] == "turn limit"
+
+
+async def test_a_cancelled_run_is_noted_after_its_cleanup(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.hold(acts.LLM_TURN.name)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=SHORT_HEARTBEAT)
+        await wait_until(lambda: acts.LLM_TURN.name in stubs.names(), "the turn to start")
+        assert stubs.outcomes == []
+        await handle.signal("cancel", args=["alice", "changed my mind"])
+        await result_of(handle)
+
+    assert stubs.names()[-1] == acts.CLEANUP.name
+    ((_, note),) = stubs.outcomes
+    assert note.payload["kind"] == "cancelled"
+    assert "alice" in note.payload["summary"]
+
+
+async def test_a_hand_over_is_not_an_end(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    # Four runs hand over to one another, and only the last one ends. Counting the others
+    # would count the task three times and take it out of the active tasks too soon.
+    stubs = Stubs(edits_then_finishes(9))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == 4
+    ((run_id, _),) = stubs.outcomes
+    assert run_id == stubs.run_ids[-1]
+
+
+async def test_a_run_that_fails_for_good_notes_an_error_and_still_fails(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    refused = ApplicationError("bad request", type="invalid_request", non_retryable=True)
+    stubs = Replying(refused)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+    ((_, note),) = stubs.outcomes
+    assert note.payload["kind"] == "error"
+    assert note.payload["repo"] == "acme/calc"
+
+
+async def test_a_note_that_cannot_be_written_does_not_change_the_outcome(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {acts.RECORD_EVENT.name: ApplicationError("database is down", type="Down")}
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert final.phase is Phase.DONE
+    # The same retries as every record_event: it is a log line, and a local activity.
+    assert len(stubs.outcomes) == acts.RECORD_EVENT.retry.maximum_attempts

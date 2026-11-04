@@ -32,6 +32,11 @@ What it is built from, and why each piece is what it is:
   LONGHAUL_GIT_AUTHOR, and the body of the pull request comes from the templates folder
   (LONGHAUL_TEMPLATES_DIR). Without the token none of them is registered, and a task of an
   issue could not have been prepared in the first place.
+* Metrics are served at /metrics on LONGHAUL_METRICS_PORT (default 9464, which Prometheus in
+  docker/prometheus/prometheus.yml scrapes) from before the worker connects until it stops. The
+  activities update them (telemetry/metrics.py), and the interceptor that `serve` gives the
+  worker counts the retries of every activity. A port that is taken stops the worker at the
+  start, with the name of the setting to change.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
@@ -96,6 +101,7 @@ from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
 
@@ -280,7 +286,7 @@ async def serve(
         activities=activities,
         workflow_runner=workflow_runner(),
         graceful_shutdown_timeout=grace,
-        interceptors=[ActivityLogInterceptor()],
+        interceptors=[ActivityLogInterceptor(), metrics.RetryCounter()],
     )
     running = asyncio.create_task(worker.run())
     stopping = asyncio.create_task(stop.wait())
@@ -303,7 +309,10 @@ async def main() -> None:
     tracer = setup_tracing(settings, cfg.telemetry)
     stop = asyncio.Event()
     install_signal_handlers(stop)  # before the connection, so an early stop is not a crash
+    endpoint: metrics.MetricsServer | None = None
     try:
+        endpoint = metrics.serve(settings.metrics_port, settings.metrics_host)
+        log.info("metrics on http://%s:%d/metrics", settings.metrics_host, endpoint.port)
         client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)
         log.info(
             "worker running on task queue %s at %s (namespace %s)",
@@ -314,6 +323,8 @@ async def main() -> None:
         await serve(client, settings.task_queue, parts.activities, stop)
         log.info("worker stopped")
     finally:
+        if endpoint is not None:
+            endpoint.stop()
         await parts.close()
         if tracer is not None:
             tracer.shutdown()  # sends the spans that are still queued

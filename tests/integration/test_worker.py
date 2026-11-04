@@ -15,6 +15,7 @@ from datetime import timedelta
 import pytest
 from temporalio import activity
 from temporalio.contrib.pydantic import pydantic_data_converter
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
 from longhaul.contracts import RepoSettings, TaskSpec
@@ -22,6 +23,7 @@ from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.worker import serve
 from longhaul.durable.workflows.poller import PollerWorkflow
+from longhaul.telemetry.metrics import Metrics
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
@@ -156,3 +158,39 @@ async def test_serve_runs_the_poller_workflow_beside_the_task_workflow(
             await serving
 
     assert result == acts.PollResult(repos=1, issues=2, started=2)
+
+
+async def test_serve_counts_the_retries_of_the_activities_it_runs(
+    env: WorkflowEnvironment, counters: Metrics
+) -> None:
+    """The worker that `serve` builds carries the retry counter (LH-704)."""
+    tries: list[int] = []
+
+    class Flaky:
+        @activity.defn(name=acts.PREPARE_WORKSPACE.name)
+        async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
+            tries.append(activity.info().attempt)
+            if len(tries) == 1:
+                raise ApplicationError("the docker daemon is busy", type="DockerException")
+            return acts.PrepareWorkspaceOutput(
+                sandbox_id="sbx-1", base_sha="b" * 40, head_sha="b" * 40
+            )
+
+    stop = asyncio.Event()
+    queue = f"lh-test-{uuid.uuid4().hex[:8]}"
+    stub = Flaky()
+    serving = asyncio.create_task(serve(env.client, queue, [stub.prepare_workspace], stop))
+    handle = await start_task(env.client, spec(), task_queue=queue)
+    async with asyncio.timeout(WAIT_S):
+        while len(tries) < 2:
+            await asyncio.sleep(0.05)
+
+    assert tries == [1, 2]
+    retries = counters.registry.get_sample_value(
+        "longhaul_activity_retries_total", {"activity": "prepare_workspace"}
+    )
+    assert retries == 1
+    stop.set()
+    async with asyncio.timeout(WAIT_S):
+        await serving
+    await handle.terminate()

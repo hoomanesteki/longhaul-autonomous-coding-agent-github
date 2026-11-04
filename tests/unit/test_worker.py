@@ -9,6 +9,9 @@ Temporal test server, and tests/e2e/test_durable_run.py starts the real process.
 import asyncio
 import os
 import signal
+import socket
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,7 @@ from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
+from longhaul.telemetry import metrics
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -381,3 +385,98 @@ def test_a_commit_author_git_would_misread_stops_the_worker_before_it_starts(
     )
     with pytest.raises(ValueError, match="LONGHAUL_GIT_AUTHOR"):
         worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
+
+
+# ---------- the metrics endpoint (LH-704) ----------
+class FakeParts:
+    """What build_parts returns, for a main() that connects to nothing."""
+
+    activities: list[Any] = []
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def scrape(port: int) -> str:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10) as reply:
+        return str(reply.read().decode())
+
+
+@pytest.fixture
+def serving_endpoints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    """main() with its connections replaced. The servers it starts are collected for the test."""
+    monkeypatch.chdir(tmp_path)  # a .env in the folder must not change the settings
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", "0")
+    monkeypatch.setenv("LONGHAUL_METRICS_HOST", "127.0.0.1")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(ROOT / "config" / "longhaul.example.yaml"))
+    monkeypatch.setattr(worker, "DockerSandboxManager", FakeManager)
+    monkeypatch.setattr(worker, "build_parts", lambda *args: FakeParts())
+    monkeypatch.setattr(worker, "install_signal_handlers", lambda stop: None)
+    servers: list[Any] = []
+    real = metrics.serve
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        servers.append(real(*args, **kwargs))
+        return servers[-1]
+
+    monkeypatch.setattr(worker.metrics, "serve", spy)
+    return servers
+
+
+async def test_the_worker_serves_its_metrics_while_it_runs_and_stops_them_after(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    seen: list[str] = []
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        return object()
+
+    async def serve(client: Any, queue: str, activities: Any, stop: asyncio.Event) -> None:
+        seen.append(scrape(serving_endpoints[0].port))
+
+    monkeypatch.setattr(worker, "connect", connect)
+    monkeypatch.setattr(worker, "serve", serve)
+
+    await worker.main()
+
+    assert "# TYPE longhaul_active_tasks gauge" in seen[0]
+    with pytest.raises(urllib.error.URLError):
+        scrape(serving_endpoints[0].port)
+
+
+async def test_the_endpoint_stops_when_the_worker_fails(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    async def connect(address: str, **kwargs: Any) -> object:
+        raise ConnectionError("temporal is down")
+
+    monkeypatch.setattr(worker, "connect", connect)
+
+    with pytest.raises(ConnectionError):
+        await worker.main()
+
+    with pytest.raises(urllib.error.URLError):
+        scrape(serving_endpoints[0].port)
+
+
+async def test_a_taken_metrics_port_stops_the_worker_before_it_connects(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    connected: list[str] = []
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        connected.append(address)
+        return object()
+
+    monkeypatch.setattr(worker, "connect", connect)
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        monkeypatch.setenv("LONGHAUL_METRICS_PORT", str(taken.getsockname()[1]))
+        with pytest.raises(ValueError, match="LONGHAUL_METRICS_PORT"):
+            await worker.main()
+    assert connected == []

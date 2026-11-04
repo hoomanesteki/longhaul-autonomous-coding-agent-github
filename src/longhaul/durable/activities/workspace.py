@@ -41,6 +41,10 @@ workflow calls it when a task is cancelled. It finds the containers by the task 
 run twice and for a task that has nothing left, since Temporal retries it and the task may have
 been cleaned by hand. A Docker or disk error fails the attempt, and Temporal tries again.
 
+Two metrics follow these activities (LH-704). A task is active from the end of prepare_workspace,
+or from the first ensure_sandbox of a run that starts with a sandbox, and each rebuild counts in
+longhaul_sandbox_recreated_total. The end of the task is counted by record_event.
+
 The setup command is `spec.settings.setup_command`, or the default of `longhaul run-local` when
 there is none. The default is read from the pyproject.toml of the workspace, so a recovery sets
 up what the workspace holds at `head_sha` and does not depend on the folder the task started
@@ -96,6 +100,7 @@ from longhaul.github.intake import LOCAL_PREFIX, is_local
 from longhaul.github.remote import GitHubRemote
 from longhaul.memory.commands import discover_commands
 from longhaul.memory.repo_map import RepoMapCache, StructureMemory
+from longhaul.telemetry import metrics
 
 log = logging.getLogger(__name__)
 
@@ -226,6 +231,7 @@ class WorkspaceActivities:
             except BaseException:  # also a cancel: a task that is cancelled must leave nothing
                 await self._discard(task_id)
                 raise
+        metrics.current().task_started(task_id)
         return acts.PrepareWorkspaceOutput(
             sandbox_id=sandbox.id, base_sha=base_sha, head_sha=head_sha, repo_map_ref=repo_map_ref
         )
@@ -359,12 +365,17 @@ class WorkspaceActivities:
     @activity.defn(name=acts.ENSURE_SANDBOX.name)
     async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
         inp = small(inp)
+        # Every run that starts with a sandbox calls this first, after a hand-over or a restart of
+        # the worker. The task runs on this worker from here on, whatever is found below.
+        metrics.current().task_started(inp.task_id)
         running = await self._sandboxes.get(inp.sandbox_id) if inp.sandbox_id else None
         if running is not None:
             return running.id
         self._require_repo(inp.task_id, "its sandbox cannot be recreated")
         async with heartbeating():
             sandbox = await self._rebuild(inp)
+        # Counted before the event is written, so a failing database does not hide a rebuild.
+        metrics.current().count_sandbox_recreated()
         await self._recorder.record_event(
             inp.task_id,
             SANDBOX_RECREATED,

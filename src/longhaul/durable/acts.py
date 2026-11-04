@@ -124,6 +124,13 @@ TUNING_MEMO_KEY = "tuning"
 # survives a replay and carries over Continue-As-New.
 SCRIPT_MEMO_KEY = "script"
 
+# The `type` of the record_event call that a run makes when it ends (LH-704). The worker counts
+# the task from it: the workflow cannot, because counting is I/O. A hand-over to a new run
+# (Continue-As-New) is not an end and makes no such call. The payload holds `kind` (an
+# OutcomeKind value), `repo`, `turns`, `cost_usd` and a `summary` cut to OUTCOME_SUMMARY_CHARS.
+OUTCOME_EVENT = "outcome"
+OUTCOME_SUMMARY_CHARS = 500
+
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
 # sees the type in the cause of the ActivityError, recreates the sandbox with ensure_sandbox and

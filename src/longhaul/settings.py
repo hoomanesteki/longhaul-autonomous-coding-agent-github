@@ -76,6 +76,12 @@ class EnvSettings(BaseSettings):
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )
+    # Where the worker serves its Prometheus metrics (telemetry/metrics.py). The port is the one
+    # docker/prometheus/prometheus.yml scrapes. The host keeps the endpoint on this machine; a
+    # Prometheus in Docker on Linux reaches the host through the docker bridge and needs
+    # 0.0.0.0 (docs/runbook.md). Port 0 lets the system choose a free port.
+    metrics_port: int = Field(default=9464, ge=0, le=65535)
+    metrics_host: str = "127.0.0.1"
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.

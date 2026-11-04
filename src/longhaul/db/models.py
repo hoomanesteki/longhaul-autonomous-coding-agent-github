@@ -284,6 +284,15 @@ class MemoryItemRow(Base):
             postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # The same note is stored once per repo and kind (LH-603). Rows without a hash are
+        # not compared, because NULLs differ from each other in a unique index.
+        Index(
+            "uq_memory_items_repo_kind_content_hash",
+            "repo",
+            "kind",
+            "content_hash",
+            unique=True,
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -307,3 +316,6 @@ class MemoryItemRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    # sha256 of the content with its case and spacing normalized, as hex. The store sets it
+    # (longhaul.memory.store.content_hash). A row that something else wrote has none.
+    content_hash: Mapped[str | None] = mapped_column(Text)

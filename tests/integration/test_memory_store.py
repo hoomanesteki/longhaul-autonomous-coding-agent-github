@@ -18,11 +18,6 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from longhaul.memory.store import (
-    DEFAULT_BRANCH_APPROVER,
-    MemoryItemNotFoundError,
-    PgMemoryStore,
-)
 from pgvector import Vector
 from psycopg import sql
 from sqlalchemy import func, select
@@ -33,6 +28,11 @@ from longhaul.contracts import MemoryItem
 from longhaul.db.models import MemoryItemRow
 from longhaul.db.session import make_engine, to_async_url
 from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.store import (
+    DEFAULT_BRANCH_APPROVER,
+    MemoryItemNotFoundError,
+    PgMemoryStore,
+)
 from longhaul.settings import EnvSettings, get_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase6]
@@ -65,6 +65,10 @@ class Scratch:
     def query(self, statement: LiteralString, *params: Any) -> list[tuple[Any, ...]]:
         with psycopg.connect(self.url) as conn:
             return conn.execute(statement, params).fetchall()
+
+    def execute(self, statement: LiteralString) -> None:
+        with psycopg.connect(self.url) as conn:
+            conn.execute(statement)
 
 
 @pytest.fixture
@@ -312,11 +316,15 @@ async def test_a_search_asks_for_at_least_one_item(store: PgMemoryStore) -> None
 
 @pytest.fixture
 async def indexed_sessions(scratch: Scratch) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Sessions that never scan the table in order, so Postgres answers from the HNSW index.
+    """Sessions on a table where Postgres can only answer a nearest-neighbour query from HNSW.
 
-    With a few hundred rows the planner would otherwise read the whole table and return the
-    right rows, which hides the problem that the store has to solve at a larger scale.
+    A table of a few hundred rows is not the table that has the problem. The planner reads it
+    whole, or finds the rows of one repo through the unique index, and returns the right rows
+    either way. On a table of millions it picks the vector index, and so it does here once the
+    other ways are closed: sequential scans are switched off for the sessions, and the unique
+    index is dropped from this throwaway database. The search does not use it.
     """
+    scratch.execute("DROP INDEX uq_memory_items_repo_kind_content_hash")
     engine = create_async_engine(
         to_async_url(scratch.url), connect_args={"server_settings": {"enable_seqscan": "off"}}
     )
@@ -326,29 +334,30 @@ async def indexed_sessions(scratch: Scratch) -> AsyncIterator[async_sessionmaker
         await engine.dispose()
 
 
-async def test_a_filtered_search_returns_k_items_when_the_repo_is_a_small_part_of_the_table(
+async def test_a_filtered_search_returns_k_items_when_few_rows_pass_the_filter(
     indexed_sessions: async_sessionmaker[AsyncSession],
 ) -> None:
-    # The index reads the nearest 40 rows of the whole table, and WHERE repo = ... is applied
-    # to those afterwards. Here 300 rows of another repo are nearer to the question than the 6
-    # of this repo, so a plain query finds none of them (ADR-0010, "To watch").
+    # The index reads the nearest 40 rows of the table, and WHERE status = 'approved' is applied
+    # to those afterwards. Here 300 candidates are nearer to the question than the 6 approved
+    # notes, so a plain query finds none of them (ADR-0010, "To watch"). That is the shape of a
+    # real repo: many proposals, few approvals.
     embedder = HashEmbedder()
     crowd = [
         f"Remove raises an error for a missing item in the inventory, case {i}." for i in range(300)
     ]
-    mine = [f"Format the widget code with ruff, rule {i}." for i in range(6)]
+    approved = [f"Format the widget code with ruff, rule {i}." for i in range(6)]
     async with indexed_sessions.begin() as session:
-        for repo, texts in ((OTHER_REPO, crowd), (REPO, mine)):
+        for status, texts in (("candidate", crowd), ("approved", approved)):
             for text, vector in zip(texts, embedder.embed(texts), strict=True):
                 session.add(
                     MemoryItemRow(
-                        repo=repo,
+                        repo=REPO,
                         kind="lesson",
                         content=text,
                         embedding=vector,
-                        status="approved",
+                        status=status,
                         source="human",
-                        approved_by="alice",
+                        approved_by="alice" if status == "approved" else None,
                     )
                 )
 
@@ -366,8 +375,8 @@ async def test_a_filtered_search_returns_k_items_when_the_repo_is_a_small_part_o
     found = await PgMemoryStore(indexed_sessions, embedder).search(REPO, QUERY, k=5)
 
     assert len(found) == 5
-    assert {item.repo for item in found} == {REPO}
-    assert all(item.content in mine for item in found)
+    assert {item.status for item in found} == {"approved"}
+    assert all(item.content in approved for item in found)
 
 
 # ---------- approval ----------

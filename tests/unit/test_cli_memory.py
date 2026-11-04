@@ -13,11 +13,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from longhaul.memory.store import MemoryEntry, MemoryItemNotFoundError
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner, Result
 
 from longhaul import cli
+from longhaul.memory.store import MemoryEntry, MemoryItemNotFoundError
 from longhaul.settings import get_settings
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
@@ -153,7 +153,8 @@ def test_list_refuses_a_value_the_table_does_not_have(
 ) -> None:
     result = run("list", "--repo", REPO, option, value)
     assert result.exit_code == 2
-    assert choices in result.output
+    # The error box wraps its lines, so each choice is looked for on its own.
+    assert all(choice in result.output for choice in choices.split(", "))
     assert store.calls == []
 
 

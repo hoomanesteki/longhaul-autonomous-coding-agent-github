@@ -27,6 +27,14 @@ there is none. The default is read from the pyproject.toml of the workspace, so 
 up what the workspace holds at `head_sha` and does not depend on the folder the task started
 from. Its time limit is shorter than the activity's, so a setup that hangs fails with its own
 output tail instead of as a timeout.
+
+prepare_workspace also works out how the repo runs its tests (LH-603), when it is given a memory
+store. After the setup and with the network cut, it reads the files that name commands, runs
+each candidate once at the base commit and keeps the ones that printed a test or lint summary,
+as approved items of the default branch (longhaul.memory.commands). The agent then starts with
+commands that were seen to work and does not guess. The commands may write files, so the
+workspace is put back on the base commit afterwards. Memory is an extra: a failure to find or to
+store the commands is logged and the task goes on without them. Without a store nothing is run.
 """
 
 from __future__ import annotations
@@ -51,11 +59,12 @@ from longhaul.agent.workspace import (
 )
 from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError, check_task_id
 from longhaul.checkpoints.snapshot import snapshot_folder
-from longhaul.contracts import Sandbox, SandboxLimits, TaskSpec
+from longhaul.contracts import MemoryItem, Sandbox, SandboxLimits, TaskSpec
 from longhaul.db.records import Recorder
 from longhaul.durable import acts
 from longhaul.durable.activities.support import heartbeating, not_retried, small
 from longhaul.github.intake import LOCAL_PREFIX, is_local
+from longhaul.memory.commands import discover_commands
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +96,12 @@ class WorkspaceHost(Protocol):
     async def cleanup_task(self, task_id: str) -> None: ...
 
 
+class CommandMemory(Protocol):
+    """The part of PgMemoryStore that prepare_workspace uses."""
+
+    async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str: ...
+
+
 @dataclass(frozen=True)
 class LocalFolder:
     """A folder to commit as the base of a task, and the files of it that go in."""
@@ -100,7 +115,9 @@ class WorkspaceActivities:
 
     `image` and `limits` are `sandbox.image` and `sandbox.limits` of the config, which the
     workflow cannot read. `checkpoints` is the store that tool_exec uses, because the repo that
-    this class creates is the one that tool_exec saves into.
+    this class creates is the one that tool_exec saves into. `memory` is where the verified
+    commands of a repo are kept. Without it, prepare_workspace does not look for them, which is
+    how a run or a test without a database works.
     """
 
     def __init__(
@@ -112,6 +129,7 @@ class WorkspaceActivities:
         image: str,
         limits: SandboxLimits,
         setup_timeout_s: int = SETUP_TIMEOUT_S,
+        memory: CommandMemory | None = None,
     ) -> None:
         self._sandboxes = sandboxes
         self._store = checkpoints
@@ -119,6 +137,7 @@ class WorkspaceActivities:
         self._image = image
         self._limits = limits
         self._setup_timeout_s = setup_timeout_s
+        self._memory = memory
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -138,6 +157,7 @@ class WorkspaceActivities:
                 sandbox = await self._boot(task_id)
                 await self._set_up(sandbox, spec)
                 await self._sandboxes.set_network(sandbox.id, False)
+                await self._learn_commands(sandbox, spec, base_sha)
                 head_sha = await self._store.head(task_id)
             except BaseException:  # also a cancel: a task that is cancelled must leave nothing
                 await self._discard(task_id)
@@ -182,6 +202,34 @@ class WorkspaceActivities:
         finally:
             await asyncio.to_thread(shutil.rmtree, scratch, True)
         return base_sha
+
+    async def _learn_commands(self, sandbox: Sandbox, spec: TaskSpec, base_sha: str) -> None:
+        """Keep the commands that run this repo's tests, as seen working at the base commit.
+
+        A retried attempt runs this again and stores the same items, which the store
+        de-duplicates. `source_ref` is the base sha, the commit the commands were checked at.
+        """
+        if self._memory is None:
+            return
+        try:
+            for command in await discover_commands(sandbox):
+                item = MemoryItem(
+                    id="",  # the store makes the id
+                    repo=spec.repo,
+                    kind="command",
+                    content=command,
+                    status="approved",
+                    source="default_branch",
+                )
+                await self._memory.add_verified(item, source_ref=base_sha)
+        except Exception as exc:  # a cancel is not an Exception and passes through
+            log.warning(
+                "could not keep the commands of %s for task %s: %s", spec.repo, spec.task_id, exc
+            )
+        # Whatever the commands wrote must not reach the agent: a formatter in a lint target
+        # edits tracked files, and a build leaves new ones. The venv of the setup is kept.
+        if not await self._store.is_at(sandbox, base_sha):
+            await self._store.restore(sandbox, base_sha)
 
     # ---------- ensure_sandbox ----------
     @activity.defn(name=acts.ENSURE_SANDBOX.name)

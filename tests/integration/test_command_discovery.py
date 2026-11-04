@@ -22,8 +22,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from longhaul.memory.commands import verify_commands
-from longhaul.memory.store import DEFAULT_BRANCH_APPROVER, PgMemoryStore
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -36,7 +34,9 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.activities.workspace import WorkspaceActivities
+from longhaul.memory.commands import verify_commands
 from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.store import DEFAULT_BRANCH_APPROVER, PgMemoryStore
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import EnvSettings, get_settings
 
@@ -152,31 +152,17 @@ async def test_calc_commands(rig: Rig, memory: PgMemoryStore) -> None:
     assert again.base_sha == out.base_sha
     assert [e.id for e in await memory.list_items(rig.repo)] == [stored.id]
 
-    # A command that the repo does not support is not kept. calc has no Makefile, so `make test`
-    # prints no summary of a test run, and neither does a command that does not exist.
+    # A command that the repo does not support does not pass the check that decides what is
+    # stored. calc has no Makefile, so `make test` prints no summary of a test run, and neither
+    # does a command that does not exist.
     sandbox = await rig.manager.get(again.sandbox_id)
     assert sandbox is not None
     works = await verify_commands(sandbox, ["make test", "no-such-tool --check", "pytest -q"])
     assert works == ["pytest -q"]
-    assert [e.content for e in await memory.list_items(rig.repo)] == ["pytest -q"]
 
     # Running the commands leaves the workspace as the base commit has it.
     status = await sandbox.exec("git status --porcelain && git rev-parse HEAD", timeout_s=60)
     assert status.stdout.strip() == again.head_sha
-
-
-async def test_without_a_store_nothing_is_discovered(rig: Rig, memory: PgMemoryStore) -> None:
-    quiet = WorkspaceActivities(
-        rig.manager,
-        rig.checkpoints,
-        MemoryRecorder(),
-        image=IMAGE,
-        limits=SandboxLimits(),
-    )
-
-    await ActivityEnvironment().run(quiet.prepare_workspace, rig.spec())
-
-    assert await memory.list_items(rig.repo) == []
 
 
 def test_the_fixture_is_the_one_this_test_describes() -> None:

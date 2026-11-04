@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.memory.commands import DISCOVERY_BUDGET_S
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -45,6 +44,7 @@ from longhaul.durable.activities.workspace import (
     SETUP_TIMEOUT_S,
     WorkspaceActivities,
 )
+from longhaul.memory.commands import DISCOVERY_BUDGET_S
 from longhaul.sandbox.local_manager import FakeSandbox
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -728,6 +728,11 @@ async def prepare_with(
     return out
 
 
+def ran(box: Box) -> list[tuple[str, bool]]:
+    """The commands the box ran, with its network state, but not the look into the CI folder."""
+    return [(cmd, network) for cmd, network in box.commands if not cmd.startswith("ls -1 .github")]
+
+
 def make_target(rig: Rig, recipe: str) -> None:
     """A Makefile for the folder, with a test target that runs `recipe`."""
     (rig.source / "Makefile").write_text(f"test:\n\t{recipe}\n")
@@ -757,7 +762,7 @@ async def test_a_command_that_works_is_kept_as_verified_at_the_base_commit(rig: 
     )
     assert source_ref == out.base_sha
     # It ran once, after the setup, and with the network cut: repo code gets no network here.
-    assert rig.box(out.sandbox_id).commands == [(SETUP, True), (PYTEST, False)]
+    assert ran(rig.box(out.sandbox_id)) == [(SETUP, True), (PYTEST, False)]
 
 
 async def test_every_candidate_runs_and_only_those_with_a_summary_are_kept(rig: Rig) -> None:
@@ -769,8 +774,12 @@ async def test_every_candidate_runs_and_only_those_with_a_summary_are_kept(rig: 
     out = await prepare_with(rig, notes)
 
     assert notes.commands == [PYTEST, "make test"]
-    ran = [cmd for cmd, _ in rig.box(out.sandbox_id).commands]
-    assert ran == [SETUP, PYTEST, "make test", "make lint"]
+    assert [cmd for cmd, _ in ran(rig.box(out.sandbox_id))] == [
+        SETUP,
+        PYTEST,
+        "make test",
+        "make lint",
+    ]
 
 
 async def test_a_repo_without_candidates_runs_nothing_more(rig: Rig) -> None:
@@ -780,7 +789,7 @@ async def test_a_repo_without_candidates_runs_nothing_more(rig: Rig) -> None:
     out = await prepare_with(rig, notes, rig.spec(setup_command=SETUP))
 
     assert notes.added == []
-    assert [cmd for cmd, _ in rig.box(out.sandbox_id).commands] == [SETUP]
+    assert [cmd for cmd, _ in ran(rig.box(out.sandbox_id))] == [SETUP]
 
 
 async def test_the_workspace_is_the_base_commit_again_after_the_commands_ran(rig: Rig) -> None:

@@ -80,9 +80,10 @@ TOOL_TIMEOUT_S = 600
 
 # The turns one run of TaskWorkflow takes before it hands over to a new run (Continue-As-New).
 # The workflow cannot read the config file, so the number is copied from
-# `loop.continue_as_new_every_turns`. A unit test keeps the two equal. A turn adds about 24
-# history events, so 40 turns stay far under the 4096 at which the server suggests a hand-over
-# (ADR-0004, appendix section 4). That suggestion is the safety net for a turn with many calls.
+# `loop.continue_as_new_every_turns`. A unit test keeps the two equal. A turn with one tool call
+# adds 18 history events and one with three calls adds 30, so 40 turns come to 720 to 1,200, well
+# under the 4,096 at which the server suggests a hand-over (ADR-0004, appendix section 4). That
+# suggestion is the safety net for a turn with many calls.
 CONTINUE_AS_NEW_EVERY_TURNS = 40
 
 # The workflow memo key under which a run carries its Tuning.
@@ -146,11 +147,13 @@ class LlmTurnInput(BaseModel):
     # The system prompt is built from it, in the same bytes on every call of a transcript (D7).
     spec: TaskSpec
     transcript_ref: BlobRef | None  # None before the first turn
-    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6, and
-    # a hint reaches it with the pause and hint flow of LH-506.
+    # Not used yet: the notes, the plan and the memory block reach the model in Phases 4 to 6.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
     memory_ref: BlobRef | None = None
+    # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
+    # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
+    # LH-506 builds on this.
     hints: list[str] = Field(default_factory=list)
     # D8: the one retry of a turn that stopped on max_tokens runs at the higher cap. The
     # activity maps this to the number in the config, which the workflow cannot read.

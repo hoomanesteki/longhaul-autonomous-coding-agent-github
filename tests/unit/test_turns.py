@@ -19,6 +19,7 @@ from longhaul.agent.turns import (
     append_tool_results,
     append_user_text,
     llm_step,
+    show_hints,
     tool_step,
     validate_pairs,
 )
@@ -445,6 +446,67 @@ def test_blank_text_is_refused(blank: str) -> None:
     # A blank text block is a 400, and render.py would drop it and leave an empty message.
     with pytest.raises(ValueError, match="blank"):
         append_user_text([user(text("go"))], blank)
+
+
+# ---------- show_hints ----------
+def test_a_hint_goes_after_the_tool_results_as_text_from_its_author() -> None:
+    transcript = [user(text("go")), assistant(use("t1")), user(res("t1"))]
+    before = copy.deepcopy(transcript)
+    out = show_hints(transcript, ["alice: use pytest -x"])
+    assert out[-1] == user(res("t1"), text("Hint from alice: use pytest -x"))
+    assert len(out) == len(transcript)
+    assert transcript == before
+    validate_pairs(out)
+
+
+def test_hints_are_shown_in_the_order_they_came() -> None:
+    out = show_hints([user(text("go"))], ["alice: one", "bob: two"])
+    assert out == [user(text("go"), text("Hint from alice: one"), text("Hint from bob: two"))]
+
+
+def test_a_hint_that_the_transcript_holds_is_not_shown_again() -> None:
+    shown = show_hints([user(text("go"))], ["alice: one"])
+    again = [*shown[:-1], user(*shown[-1].content)]  # the same message, rebuilt
+    assert show_hints(again, ["alice: one"]) == again
+
+
+def test_only_the_new_hints_are_added_to_a_transcript_that_has_some() -> None:
+    transcript = [
+        user(text("go")),
+        assistant(use("t1")),
+        user(res("t1"), text("Hint from alice: one")),
+        assistant(use("t2")),
+        user(res("t2")),
+    ]
+    out = show_hints(transcript, ["alice: one", "bob: two"])
+    assert out[:-1] == transcript[:-1]  # the earlier messages stay as they were, for the cache
+    assert out[-1] == user(res("t2"), text("Hint from bob: two"))
+
+
+def test_the_same_hint_sent_twice_is_shown_twice() -> None:
+    once = show_hints([user(text("go"))], ["alice: retry"])
+    twice = show_hints(once, ["alice: retry", "alice: retry"])
+    texts = [b.text for b in twice[-1].content if isinstance(b, TextBlock)]
+    assert texts.count("Hint from alice: retry") == 2
+    assert show_hints(twice, ["alice: retry", "alice: retry"]) == twice
+
+
+def test_a_hint_is_found_only_in_the_text_of_the_user() -> None:
+    # The model may quote a hint back. That is not the harness having shown it.
+    transcript = [user(text("go")), assistant(text("Hint from alice: one"))]
+    out = show_hints(transcript, ["alice: one"])
+    assert out[-1] == user(text("Hint from alice: one"))
+
+
+def test_no_hints_leave_the_transcript_alone() -> None:
+    transcript = [user(text("go"))]
+    assert show_hints(transcript, []) == transcript
+
+
+def test_a_hint_cannot_come_before_tool_results() -> None:
+    transcript = [user(text("go")), assistant(use("t1"))]
+    with pytest.raises(TranscriptError, match="tool"):
+        show_hints(transcript, ["alice: one"])
 
 
 # ---------- validate_pairs ----------

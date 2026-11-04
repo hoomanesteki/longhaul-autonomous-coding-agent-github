@@ -14,8 +14,10 @@ construction and `validate_pairs` checks it (D9):
   follows it;
 - a control tool, which the loop handles itself and never runs, gets a short ok result;
 - a call that did not run gets an error result that says so;
-- harness text, such as a nudge, goes after the results and never in front of them.
+- harness text, such as a nudge or a hint, goes after the results and never in front of them.
 """
+
+from collections import Counter
 
 from longhaul.agent.rules import SKIPPED_AFTER_FINISH
 from longhaul.contracts import (
@@ -38,6 +40,8 @@ from longhaul.tools.registry import ToolRegistry
 
 CONTROL_RESULT = "ok"
 DEFAULT_NOT_RUN_REASON = "no result was recorded for this call"
+# How a hint from a person reads to the model: "Hint from alice: use pytest -x".
+HINT_PREFIX = "Hint from "
 
 
 class TranscriptError(ValueError):
@@ -154,6 +158,36 @@ def append_user_text(transcript: list[Message], text: str) -> list[Message]:
             "be added before any text"
         )
     return [*transcript, Message(role="user", content=[block])]
+
+
+def show_hints(transcript: list[Message], hints: list[str]) -> list[Message]:
+    """Add the hints that the transcript does not hold yet, each as text from the user.
+
+    `hints` are the "<by>: <text>" strings that the workflow keeps for the whole task, so the
+    same ones come with every call. The transcript is the record of what the model has read: a
+    hint whose text is already in a user message is not added again, and one that is not is
+    added after the tool results, where `append_user_text` puts harness text. Nothing before the
+    last message changes, so the cached prefix of the prompt stays valid (D7). The same text
+    sent twice counts twice.
+
+    A story that compacts old messages has to keep these texts, or to stop passing the hints
+    that the summary already covers. Otherwise the hints are shown again.
+    """
+    held = Counter(
+        block.text
+        for message in transcript
+        if message.role == "user"
+        for block in message.content
+        if isinstance(block, TextBlock)
+    )
+    grown = list(transcript)
+    for hint in hints:
+        text = f"{HINT_PREFIX}{hint}"
+        if held[text] > 0:
+            held[text] -= 1
+        else:
+            grown = append_user_text(grown, text)
+    return grown
 
 
 def validate_pairs(transcript: list[Message]) -> None:

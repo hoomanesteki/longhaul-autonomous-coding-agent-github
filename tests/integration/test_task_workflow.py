@@ -1297,8 +1297,18 @@ async def test_continue_as_new_preserves_state(env: WorkflowEnvironment, spec: T
         }
         for n in (3, 6, 9)
     ]
+    # Each run asks about the sandbox the one before it ended with, and the stub answers with a
+    # new id every time, so the id travels across the hand-overs as well.
     ensured = stubs.payloads(acts.ENSURE_SANDBOX.name)
-    assert [(e.head_sha, e.sandbox_id) for e in ensured] == [(sha(n), "sbx-1") for n in (3, 6, 9)]
+    assert [(e.head_sha, e.sandbox_id) for e in ensured] == [
+        (sha(3), "sbx-1"),
+        (sha(6), "sbx-2"),
+        (sha(9), "sbx-3"),
+    ]
+    tools = stubs.payloads(acts.TOOL_EXEC.name)
+    assert [(t.turn_index, t.sandbox_id) for t in tools] == [
+        (n, f"sbx-{n // 3 + 1}") for n in range(9)
+    ]
 
     # The turns after the hint all carry it, and the turn that was running when it came does not.
     inputs = stubs.payloads(acts.LLM_TURN.name)
@@ -1413,6 +1423,24 @@ async def test_a_cancel_that_arrives_during_the_hand_over_still_cancels(
     # The bundle is stopped before the clean-up starts, and no second run is made.
     assert stubs.names()[-3:] == ["bundle_checkpoint", "bundle_checkpoint:cancelled", "cleanup"]
     assert acts.RECORD_EVENT.name not in stubs.names()
+    assert len(stubs.run_ids) == 1
+
+
+async def test_a_cancel_while_the_hand_over_event_is_written_still_cancels(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The event is a local activity, which has its own way to be stopped.
+    stubs = Stubs(never_finishes)
+    stubs.hold(acts.RECORD_EVENT.name)  # never opened
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: acts.RECORD_EVENT.name in stubs.names(), "the hand-over event")
+
+        await handle.signal("cancel", args=["alice", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+    assert stubs.names()[-3:] == ["record_event", "record_event:cancelled", "cleanup"]
     assert len(stubs.run_ids) == 1
 
 

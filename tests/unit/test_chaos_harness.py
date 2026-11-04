@@ -1,17 +1,36 @@
 """The parts of the chaos harness that need no stack: kill points, kill plans and the chain check.
 
 The harness decides whether a chaos run counts as passed, so the rules it applies are tested
-here without Docker or Temporal.
+here without Docker or Temporal. The kill that follows a worker's progress is tested against a
+real process and a log file that grows on a timer, at the pace of the reference and at half and
+twice that pace.
 """
+
+import contextlib
+import subprocess
+import sys
+import threading
+import time
+from collections.abc import Iterator
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from tests.chaos import harness
 from tests.chaos.harness import (
+    ANY_ENDED,
+    ANY_STARTED,
     BETWEEN,
     KINDS,
     STARTUP,
+    WINDOW_SHARE,
+    Activity,
     CallRow,
+    Kill,
     Run,
+    Stack,
+    Worker,
+    activities_of,
     chain_problems,
     kill_point,
     kills_in_run,
@@ -22,6 +41,7 @@ from tests.chaos.harness import (
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
 STAMP = "2026-11-04 08:00:00,000 INFO longhaul.durable.activity_log:"
+BEGAN = datetime(2026, 11, 4, 8, 0, 0)
 
 
 def line(name: str, event: str, detail: str = "") -> str:
@@ -65,31 +85,253 @@ def test_the_kinds_the_story_names() -> None:
     assert KINDS == ("llm_turn", "tool_exec", BETWEEN)
 
 
+# ---------- a reference run, and workers that follow it ----------
+# The reference runs at this pace. A worker that is twice as fast or twice as slow keeps its
+# activities in the same order and scales every time.
+UNIT_S = 0.05
+FIRST_TURN_NTH = 2  # prepare_workspace is the first activity, the first model turn the second
+
+
+def timed(when: datetime, name: str, event: str, detail: str = "") -> str:
+    stamp = f"{when:%Y-%m-%d %H:%M:%S},{when.microsecond // 1000:03d}"
+    where = f"task lh-t-1, attempt 1{detail}"
+    return f"{stamp} INFO longhaul.durable.activity_log: activity {name} {event}: {where}"
+
+
+def run_events(unit_s: float) -> list[tuple[float, str]]:
+    """The log of a run as (seconds from its start, line).
+
+    The run prepares its workspace (3 units), then makes ten turns of a model call (2 units) and
+    an edit (1 unit). That is 21 activities, one after the other.
+    """
+    steps = [("prepare_workspace", "", 3)]
+    for turn in range(10):
+        steps.append(("llm_turn", f", turn {turn}", 2))
+        steps.append(("tool_exec", f", turn {turn}, edit_file", 1))
+    events: list[tuple[float, str]] = []
+    clock = 0.0
+    for name, detail, units in steps:
+        for event, offset in (("started", 0.0), ("ended", units * unit_s)):
+            at = clock + offset
+            events.append((at, timed(BEGAN + timedelta(seconds=at), name, event, detail)))
+        clock += units * unit_s
+    return events
+
+
+def log_of(events: list[tuple[float, str]]) -> str:
+    return "".join(f"{text}\n" for _, text in events)
+
+
+REFERENCE = activities_of(log_of(run_events(UNIT_S)))
+# The first kill may wait for the k-th started activity: from the first model turn to the last
+# one that leaves the final share of the run to do.
+NTH_CHOICES = range(FIRST_TURN_NTH, int(WINDOW_SHARE * len(REFERENCE)) + 1)
+
+
+# ---------- the activities of a log ----------
+def test_a_log_gives_its_activities_in_the_order_they_started() -> None:
+    names = [a.name for a in REFERENCE]
+    assert names == ["prepare_workspace"] + ["llm_turn", "tool_exec"] * 10
+
+
+def test_an_activity_took_the_time_between_its_started_and_ended_lines() -> None:
+    assert REFERENCE[0].took_s == pytest.approx(3 * UNIT_S, abs=0.002)
+    assert REFERENCE[1].took_s == pytest.approx(2 * UNIT_S, abs=0.002)
+    assert REFERENCE[2].took_s == pytest.approx(UNIT_S, abs=0.002)
+
+
+def test_an_activity_keeps_its_started_line_without_the_time() -> None:
+    assert REFERENCE[2].line == (
+        "activity tool_exec started: task lh-t-1, attempt 1, turn 0, edit_file"
+    )
+
+
+def test_a_failed_activity_took_the_time_until_it_failed() -> None:
+    log = "\n".join(
+        [
+            timed(BEGAN, "llm_turn", "started", ", turn 3"),
+            timed(BEGAN + timedelta(seconds=1.5), "llm_turn", "failed", ", turn 3 (ProviderError)"),
+        ]
+    )
+    (only,) = activities_of(log)
+    assert only.took_s == pytest.approx(1.5, abs=0.002)
+
+
+def test_an_activity_that_never_ended_took_no_time() -> None:
+    (only,) = activities_of(timed(BEGAN, "tool_exec", "started", ", turn 8, run_command"))
+    assert only.took_s == 0.0
+
+
+def test_lines_that_are_not_activity_lines_are_not_activities() -> None:
+    noisy = [text for _, text in run_events(UNIT_S)]
+    noisy.insert(3, "worker running on task queue q")
+    noisy.insert(8, f"{STAMP} cleaning up task lh-t-1: cancelled")
+    assert activities_of("\n".join(noisy)) == REFERENCE
+
+
 # ---------- kill plans ----------
 def test_a_seed_is_a_repeatable_plan() -> None:
-    assert plan_kills(7, 3, 30.0) == plan_kills(7, 3, 30.0)
-    assert plan_kills(7, 3, 30.0) != plan_kills(8, 3, 30.0)
+    assert plan_kills(7, 3, REFERENCE) == plan_kills(7, 3, REFERENCE)
 
 
-def test_delays_stay_between_half_a_second_and_the_expected_duration() -> None:
-    for seed in range(50):
-        for kill in plan_kills(seed, 3, 20.0):
-            assert 0.5 <= kill.delay_s <= 20.0 * harness.WINDOW_SHARE
+def test_different_seeds_make_different_plans() -> None:
+    plans = {tuple(plan_kills(seed, 3, REFERENCE)) for seed in range(1, 21)}
+    assert len(plans) == 20
 
 
-def test_a_short_expected_duration_still_gives_a_window() -> None:
-    for kill in plan_kills(1, 5, 0.1):
-        assert 0.5 <= kill.delay_s <= 1.5
+def test_a_plan_depends_only_on_the_seed_and_the_activities_of_the_reference() -> None:
+    # The same activities from another run: other times, and lines of other kinds in between.
+    later = [(at, text.replace("08:00:", "09:30:")) for at, text in run_events(UNIT_S)]
+    log = log_of(later).replace("\n", "\nworker running on task queue q\n", 4)
+    assert plan_kills(5, 3, activities_of(log)) == plan_kills(5, 3, REFERENCE)
 
 
-def test_the_first_kill_waits_for_the_first_model_turn_and_later_ones_for_finished_work() -> None:
-    first, second, third = plan_kills(3, 3, 20.0)
-    assert first.after is harness.FIRST_TURN
-    assert second.after is third.after is harness.ANY_ENDED
+def test_a_slower_reference_changes_the_pauses_and_not_the_activity_the_kill_waits_for() -> None:
+    slower = activities_of(log_of(run_events(UNIT_S * 4)))
+    for seed in range(1, 21):
+        (fast,) = plan_kills(seed, 1, REFERENCE)
+        (slow,) = plan_kills(seed, 1, slower)
+        assert fast.nth == slow.nth
+        assert slow.delay_s >= fast.delay_s
+
+
+def test_the_first_kill_waits_for_a_started_activity_after_the_first_model_turn() -> None:
+    for seed in range(1, 201):
+        (kill,) = plan_kills(seed, 1, REFERENCE)
+        assert kill.after is ANY_STARTED
+        assert kill.nth in NTH_CHOICES, (seed, kill.nth)
+
+
+def test_the_first_kill_can_wait_for_every_activity_in_its_window() -> None:
+    drawn = {plan_kills(seed, 1, REFERENCE)[0].nth for seed in range(1, 401)}
+    assert drawn == set(NTH_CHOICES)
+
+
+def test_the_last_share_of_the_activities_is_left_to_run_after_the_kill() -> None:
+    assert max(NTH_CHOICES) < len(REFERENCE)
+    assert len(REFERENCE) - max(NTH_CHOICES) >= (1 - WINDOW_SHARE) * len(REFERENCE) - 1
+
+
+def test_the_pause_of_the_first_kill_is_no_longer_than_its_activity_took() -> None:
+    for seed in range(1, 201):
+        (kill,) = plan_kills(seed, 1, REFERENCE)
+        assert 0 <= kill.delay_s <= REFERENCE[kill.nth - 1].took_s
+
+
+def test_a_later_kill_waits_for_the_new_worker_to_finish_an_activity() -> None:
+    first, second, third = plan_kills(3, 3, REFERENCE)
+    assert first.after is ANY_STARTED
+    assert second.after is third.after is ANY_ENDED
+    assert second.nth == third.nth == 1
+
+
+def test_the_pause_of_a_later_kill_is_no_longer_than_the_longest_activity() -> None:
+    longest = max(a.took_s for a in REFERENCE)
+    for seed in range(1, 51):
+        for kill in plan_kills(seed, 3, REFERENCE)[1:]:
+            assert 0 <= kill.delay_s <= longest
 
 
 def test_every_plan_has_the_count_it_was_given() -> None:
-    assert [len(plan_kills(1, n, 20.0)) for n in (1, 2, 3)] == [1, 2, 3]
+    assert [len(plan_kills(1, n, REFERENCE)) for n in (1, 2, 3)] == [1, 2, 3]
+
+
+def test_a_reference_with_one_model_turn_still_gives_a_kill() -> None:
+    only = [Activity("llm_turn", "activity llm_turn started: task t, attempt 1, turn 0", 0.5)]
+    (kill,) = plan_kills(1, 1, only)
+    assert kill.nth == 1
+
+
+def test_a_reference_without_a_model_turn_cannot_be_aimed_at() -> None:
+    with pytest.raises(ValueError, match="model turn"):
+        plan_kills(1, 1, [a for a in REFERENCE if a.name != "llm_turn"])
+    with pytest.raises(ValueError, match="model turn"):
+        plan_kills(1, 1, [])
+
+
+def test_a_kill_waits_for_at_least_the_first_match() -> None:
+    with pytest.raises(ValueError, match="nth"):
+        Kill(after=ANY_STARTED, nth=0)
+
+
+# ---------- a kill follows the progress of its worker ----------
+@contextlib.contextmanager
+def worker_logging(
+    folder: Path, events: list[tuple[float, str]]
+) -> Iterator[tuple[Worker, threading.Event]]:
+    """A worker that is a real process, with a log that gains each line at its time offset.
+
+    The event is set when the last line is written. The process only sleeps: the kill goes to a
+    pid and reads the log, and that is all the kill does.
+    """
+    log = folder / "worker-1.log"
+    log.write_text("worker running on task queue q\n", encoding="utf-8")
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    finished, abandon = threading.Event(), threading.Event()
+
+    def write() -> None:
+        began = time.monotonic()
+        with log.open("a", encoding="utf-8") as out:
+            for at, text in events:
+                if abandon.wait(max(0.0, began + at - time.monotonic())):
+                    return
+                out.write(text + "\n")
+                out.flush()
+        finished.set()
+
+    writer = threading.Thread(target=write, daemon=True)
+    writer.start()
+    try:
+        yield Worker(proc, log), finished
+    finally:
+        abandon.set()
+        writer.join()
+        proc.kill()
+        proc.wait()
+
+
+def kill_it(
+    kill: Kill, worker: Worker, stop: threading.Event | None = None
+) -> harness.KillPoint | None:
+    stack = Stack(worker.log.parent / "stack", "postgresql://unused")
+    return stack._kill_one(kill, worker, "lh-t-1", time.monotonic(), stop or threading.Event())
+
+
+@pytest.mark.parametrize("pace", [0.5, 2.0], ids=["twice as fast", "twice as slow"])
+@pytest.mark.parametrize("seed", [9, 19])
+def test_a_kill_meets_a_run_that_is_faster_or_slower_than_the_reference(
+    tmp_path: Path, seed: int, pace: float
+) -> None:
+    (kill,) = plan_kills(seed, 1, REFERENCE)
+
+    with worker_logging(tmp_path, run_events(UNIT_S * pace)) as (worker, finished):
+        point = kill_it(kill, worker)
+        ended_first = finished.is_set()
+        started = len(ANY_STARTED.findall(worker.text()))
+
+    assert point is not None
+    assert not ended_first, "the log had ended before the kill"
+    assert started >= kill.nth
+    assert worker.proc.poll() is not None, "the worker is still running"
+    assert point.kind != STARTUP
+
+
+@pytest.mark.parametrize(("lines", "killed"), [(2, False), (3, True)])
+def test_a_kill_waits_for_the_nth_match_in_the_log_of_its_worker(
+    tmp_path: Path, lines: int, killed: bool
+) -> None:
+    events = [(0.0, timed(BEGAN, "llm_turn", "started", f", turn {n}")) for n in range(lines)]
+    # A kill that is never due waits until the test says there is nothing left to kill.
+    stopped = threading.Event()
+    giving_up = threading.Timer(0.5, stopped.set)
+    giving_up.start()
+    try:
+        with worker_logging(tmp_path, events) as (worker, _):
+            point = kill_it(Kill(after=ANY_STARTED, nth=3), worker, stopped)
+            assert (point is not None) is killed
+            assert (worker.proc.poll() is not None) is killed
+    finally:
+        giving_up.cancel()
 
 
 def test_a_full_chaos_run_has_one_to_three_kills_and_all_three_counts_occur() -> None:
@@ -161,7 +403,7 @@ def make_run(**changes: object) -> Run:
         "ledger_attempts": {},
         "kills": [harness.KillPoint("tool_exec", "line", 3.0)],
         "planned_kills": 1,
-        "work_s": 10.0,
+        "activities": REFERENCE,
     }
     return Run(**{**values, **changes})  # type: ignore[arg-type]
 

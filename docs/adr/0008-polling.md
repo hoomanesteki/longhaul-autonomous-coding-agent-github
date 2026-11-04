@@ -45,7 +45,17 @@ Install can be run again at any time. It creates the Schedule when it is missing
 
 **The row is written after the start.** The other order loses a task when the poll dies in between: the row would say the task is known, the next poll would skip it, and no workflow would exist. In this order the worst case is a workflow with no row, and the next poll repairs it. A row, once it exists, is never put back to `queued`: a poll that meets it again updates only the title and the settings, which come from the issue.
 
-**The poller only reads from GitHub.** It posts no comment and sets no label. The task owns its side effects, and its first activity writes the "Picked up" comment and the `longhaul:working` label with idempotency keys (LH-306, invariant I4). `start_task` opens a new trace for each task, so a task does not join the trace of the poll that started it.
+**The poller reads from GitHub and writes one thing.** It sets no label and posts no "Picked up" comment. The task owns those side effects, and its first activity writes them with idempotency keys (LH-306, invariant I4). The one write of the poller is the reply to a command from someone who may not steer a task (see the next section). `start_task` opens a new trace for each task, so a task does not join the trace of the poll that started it.
+
+**Commands in the comments (LH-308).** After the new tasks are started, the poll reads the new comments of every open labeled issue that has a task, and carries out the slash commands in them (`/longhaul approve`, `reject`, `hint`, `budget`, `cancel`, `status` and `retry`, parsed by `github/commands.py`). The rules, in `durable/activities/steering.py`:
+
+- **Who.** The author needs admin, maintain or write permission, read from the collaborator permission endpoint each time a poll meets a command from them. Unknown means no. A person without it gets one reply for each task, posted with an idempotency key that holds their login, "Only maintainers can steer this task", and the command is dropped. This is the one place where the poller writes, because no task owns the answer to a stranger. Comments of bots and comments with our marker are never commands.
+- **Which comments.** Each `tasks` row keeps a cursor: the time and the id of the newest comment handled (`last_comment_at` and `last_comment_id`, migration 0012). The time is for the `since` of the request, and the id decides, because GitHub stamps a comment to the second and two comments of one second could not be told apart by time. A new task starts at the newest comment its spec was built from, so a comment from before the label is never a command.
+- **Once.** The cursor moves after the signal was sent, comment by comment. A poll that fails halfway and is retried by Temporal sends the commands it had not sent. A worker that dies between the signal and the write of the cursor sends that one command again. Of the six signals only `budget` and `hint` do harm when repeated, a second addition and a second hint, and the next status shows both. Signalling twice with the same Temporal request id would close the window, but the SDK does not expose the id and the raw call would bypass the data converter and the interceptors, so it is not worth the price.
+- **Ended tasks.** A signal to a closed workflow fails with NOT_FOUND, and the command is dropped. `retry` is the exception: on a task that has ended it starts the attempt `<task id>-a2` (`-a3` and so on) from the issue as it is now, writing the row after the start as for any task. On a task that still runs it does nothing. Later commands go to the latest attempt.
+- **Failures.** An issue that fails does not stop the next one. The poll fails after the last issue, like a repo that cannot be read.
+
+`status` is the signal `report_status`. The task posts the answer itself, through `post_comment` with the key `status:<n>`, where n counts the requests in the workflow state and in the memo across a Continue-As-New.
 
 **Failures.** A repo that GitHub cannot read is logged, and the poll goes on with the next repo. At the end the activity fails, so a broken repo shows as a failed poll in the Temporal UI for as long as it is broken, without stopping the repos that work.
 
@@ -79,7 +89,7 @@ Harder:
 Watch from now on:
 
 - The number of repos against the rate limit. If it gets close, send `If-None-Match` with the last ETag of each list: GitHub answers 304 and does not count it against the limit.
-- LH-308 adds comment commands to `poll_once`. The poll then reads comments of active tasks as well, and the call count grows with the number of active tasks.
+- Comment commands (LH-308) make the poll read the new comments of every open labeled issue that has a task, one call for each. With 20 such issues that is 1,200 calls an hour, about a quarter of the limit of a token, besides the list calls. A command also costs one permission call for its author. The `If-None-Match` idea above would help here too, by asking for the issue list once and reading comments only on the issues whose `updated_at` moved.
 - The `tasks` table is the long term record of what was started. Its status and phase are written by the stories that follow the task; the poller writes `active` and `queued` once.
 
 ## Alternatives

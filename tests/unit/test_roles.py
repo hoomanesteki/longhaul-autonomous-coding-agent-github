@@ -177,7 +177,7 @@ def test_a_plan_that_breaks_a_rule_is_refused_with_the_rule(
 ) -> None:
     got = planner.read_plan(arguments)
     assert isinstance(got, list)
-    assert problem in got
+    assert any(problem in item for item in got), got
 
 
 def test_every_problem_of_a_plan_is_listed_so_one_repair_can_fix_them_all() -> None:

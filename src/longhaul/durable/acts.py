@@ -36,6 +36,13 @@ boundary (CONTRIBUTING.md rule 5). `build_pr_branch` has the 5 minutes and 3 att
 does what create_pr does, so it gets 10 minutes, a heartbeat that a killed worker is noticed by in
 a minute, and 5 attempts with the backoff of the writes.
 
+The planner (LH-501) adds two activities that are not in the table. `store_plan` writes one row
+of the `plans` table, so it is sized like `append_results` and every worker registers it.
+`post_plan` renders the plan as a checklist from a template and posts it with the idempotent
+`post_comment` of github/side_effects.py, under the key `<task>:plan_comment:<version>`. It is a
+GitHub write with the policy of `post_comment`, and it sits in `GITHUB` with them. The template is
+read inside the activity, so the workflow, which may not read files, passes the plan itself.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -115,8 +122,18 @@ CONTINUE_AS_NEW_EVERY_TURNS = 40
 # `context.keep_recent_turns`, which the workflow cannot read, so the activity reads it.
 FORCED_KEEP_RECENT_TURNS = 2
 
+# The turns the planner gets to submit its plan (LH-501). The workflow cannot read the config
+# file, so the number is copied from `loop.planner_max_turns`. A unit test keeps the two equal.
+PLANNER_MAX_TURNS = 20
+
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
+# The workflow memo key that switches planning on for a task (LH-501). A task started with
+# `start_task(plan=True)` runs the planner before the coder, and one started without it goes
+# straight to coding, as every task did before the planner existed. It is in the memo for the
+# reasons the tuning and the script are: it reaches a worker in another process, survives a
+# replay and carries over Continue-As-New, so the plan is not made again after a hand-over.
+PLAN_MEMO_KEY = "plan"
 # The workflow memo key under which a run carries the BlobRef of its script. The scripted
 # provider runs in the worker, and a worker is started once for many tasks, so the script has to
 # travel with the task. `longhaul run --script` uploads it and the workflow hands the ref to every
@@ -272,6 +289,9 @@ class ToolExecInput(BaseModel):
     call: ToolCallSummary
     pre_sha: str | None  # the checkpoint the call must start from
     sandbox_id: str
+    # A call of the planning phase (LH-501). The activity runs it, and then puts the tree back on
+    # `pre_sha` if it changed anything, and saves no checkpoint. The default is the coder's call.
+    read_only: bool = False
 
 
 class ToolResultSummary(BaseModel):
@@ -411,6 +431,28 @@ class PrBranchOutput(BaseModel):
     base_sha: str
     base_branch: str
     title: str
+
+
+class StorePlanInput(BaseModel):
+    """What store_plan needs: a version of the plan of a task, for the `plans` table."""
+
+    task_id: str
+    version: int = Field(ge=1)
+    plan: Plan
+
+
+class PostPlanInput(BaseModel):
+    """What post_plan needs: the plan, to render as a checklist, and the issue to post it on.
+
+    The idempotency key is built by the activity from the task id and the version, so a retry
+    and a run after a Continue-As-New send the same one.
+    """
+
+    task_id: str
+    repo: str
+    number: int  # the issue
+    version: int = Field(ge=1)
+    plan: Plan
 
 
 class DeliverInput(BaseModel):
@@ -616,6 +658,14 @@ CREATE_PR = Act(
     retry=_github_write(10, _GITHUB_ERRORS),
 )
 
+POST_PLAN = Act(
+    "post_plan",
+    PostPlanInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
 BUILD_PR_BRANCH = Act(
     "build_pr_branch",
     BuildPrBranchInput,
@@ -636,6 +686,14 @@ DELIVER = Act(
     retry=_github_write(5, [*_GITHUB_ERRORS, FORBIDDEN_BRANCH]),
 )
 
+STORE_PLAN = Act(
+    "store_plan",
+    StorePlanInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -647,6 +705,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     RECORD_EVENT,
     POLL_ONCE,
     COMPACT,
+    STORE_PLAN,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -657,6 +716,7 @@ GITHUB: tuple[Act[Any, Any], ...] = (
     CREATE_PR,
     BUILD_PR_BRANCH,
     DELIVER,
+    POST_PLAN,
 )
 
 

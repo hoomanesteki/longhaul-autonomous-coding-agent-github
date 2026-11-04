@@ -620,11 +620,12 @@ async def test_a_transcript_the_api_would_reject_fails_without_a_retry_and_witho
 
 
 async def test_a_role_without_a_prompt_fails_without_a_retry() -> None:
+    # The verifier gets its prompt in LH-504. The planner got its own in LH-501.
     rig = Rig()
     with pytest.raises(ApplicationError) as caught:
-        await rig.run(turn_input(role=Role.PLANNER))
+        await rig.run(turn_input(role=Role.VERIFIER))
     assert caught.value.non_retryable
-    assert "planner" in str(caught.value)
+    assert "verifier" in str(caught.value)
     assert rig.provider.calls == []
 
 

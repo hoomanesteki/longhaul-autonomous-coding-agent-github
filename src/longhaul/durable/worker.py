@@ -34,6 +34,11 @@ What it is built from, and why each piece is what it is:
   issue could not have been prepared in the first place.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
+* The planner (LH-501) gets its own tool list from the same registry: the read and run tools and
+  `submit_plan`, and none that writes a file (roles/planner.py). `store_plan` writes the plans
+  table and every worker registers it. With the GitHub token the worker also registers
+  `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
+  Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. Without a token the worker still starts and still registers `poll_once`, so a
   worker for local runs needs none. A poll on it fails with the name of the setting, and the
@@ -81,6 +86,7 @@ from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -94,6 +100,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
+from longhaul.roles import planner
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.telemetry.otel import setup_tracing
@@ -183,6 +190,7 @@ def build_parts(
         ledger=ledger,
         context=cfg.context,
         meters=meters,
+        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
     )
     compactor = ContextActivities(
         provider,
@@ -216,6 +224,7 @@ def build_parts(
         github=remote,
     )
     events = EventActivities(recorder)
+    plans = PlanActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
@@ -235,6 +244,7 @@ def build_parts(
                 author=settings.git_author,
                 templates=templates_path(settings),
             ).activities,
+            *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
         ]
     return WorkerParts(
         activities=[
@@ -243,6 +253,7 @@ def build_parts(
             *tools.activities,
             *workspace.activities,
             *events.activities,
+            *plans.activities,
             *poller.activities,
             *delivery,
         ],

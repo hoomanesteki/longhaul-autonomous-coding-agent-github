@@ -1,11 +1,12 @@
 """TaskWorkflow: the one durable owner of a task.
 
 It holds the task's CarryState, answers `status()`, takes the signals that steer a task, and
-drives the phases through activities: PREPARING, a CODING loop, then DONE. The task of an issue
-goes through DELIVERING before DONE (see "A task of an issue" below). All I/O happens in
-activities, which this module calls by name through longhaul.durable.acts. It imports no I/O
-library (invariant I1, checked by tests/unit/test_invariants.py), reads time only through
-workflow.now() (it needs none yet), and uses no random numbers.
+drives the phases through activities: PREPARING, PLANNING when the task asks for it, a CODING loop,
+then DONE. The task of an issue goes through DELIVERING before DONE (see "A task of an issue"
+below). All I/O happens in activities, which this module calls by name through
+longhaul.durable.acts. It imports no I/O library (invariant I1, checked by
+tests/unit/test_invariants.py), reads time only through workflow.now() (it needs none yet), and
+uses no random numbers.
 
 The CODING loop applies the same turn rules as the in-process loop. The decisions are in
 longhaul.agent.rules, which both call, so they cannot drift (tests/integration/test_parity.py
@@ -38,6 +39,31 @@ has no tool_use without a tool_result. A run that starts with a sandbox id, beca
 run prepared it and handed over (see Continue-As-New below), calls `ensure_sandbox` before its
 first turn, since the container may be gone by then.
 
+The planning phase (LH-501, ADR-0007). A task started with the plan switch (acts.PLAN_MEMO_KEY)
+runs the planner between PREPARING and CODING, in the same workflow, the same sandbox and the same
+blob store as the coder. The planner has a role prompt, a tool list and a transcript of its own, so
+the coder starts a fresh transcript and sees none of the planner's reading. The turn index goes on
+counting, because turn rows and blobs are keyed by it. A task without the switch goes straight to
+coding.
+
+1. Phase PLANNING. Each turn is a `llm_turn` with `Role.PLANNER`. Its tool calls run through
+   `tool_exec` marked read-only: the activity puts the tree back on the checkpoint after any call
+   that changed it, so the coder starts from the tree the task began with. A call to a tool outside
+   the planner's set is answered without running (roles/planner.py).
+2. The planner ends by calling `submit_plan`. The workflow judges the call itself with the rules of
+   roles/planner.py, as it does `finish`. A plan that is not valid gets one repair turn with the
+   validation error in front of the planner (F14), and a second failure ends the task with ERROR
+   "planner submitted an invalid plan twice: ...". A planner that has not submitted after
+   acts.PLANNER_MAX_TURNS turns ends it with ERROR "planner submitted no plan in 20 turns", and the
+   turn budget of the task applies to the planner's turns as to the coder's.
+3. A plan that is accepted is stored as version 1 by the `store_plan` activity, and a task of an
+   issue posts it as a checklist with `post_plan` (key `<task>:plan_comment:1`). Then it is in
+   `state.plan` and `state.plan_version`, and `status()` shows the version. The phase moves on to
+   CODING, with a new transcript.
+
+A run that starts with a plan, because an earlier run made it and handed over, does not plan
+again.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -69,10 +95,14 @@ can tell them apart without reading prose:
 - the other ends of agent/rules.py: "no tool calls", "output limit", "model declined (...)",
   "context limit", "pause limit" and "unexpected stop reason: ...".
 
-Not here yet, each in its own story: the planner and verifier phases (Phase 5), budget
-enforcement and pauses (Phase 7), clean-up and a final outcome for runs that end any way but a
-cancel (LH-507). An activity that fails for good, after its retries, fails the workflow with that
-error. A prompt over the context window is the exception, and it is handled as described next.
+The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
+ERROR "planner submitted no plan in 20 turns".
+
+Not here yet, each in its own story: the plan gate, the coder's use of the plan and the verifier
+phase (Phase 5), budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs
+that end any way but a cancel (LH-507). An activity that fails for good, after its retries, fails
+the workflow with that error. A prompt over the context window is the exception, and it is
+handled as described next.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -157,6 +187,7 @@ with workflow.unsafe.imports_passed_through():
         Outcome,
         OutcomeKind,
         Phase,
+        Plan,
         ProviderErrorKind,
         Role,
         TaskStatus,
@@ -164,6 +195,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from longhaul.durable import acts
     from longhaul.github import lifecycle
+    from longhaul.roles import planner
 
 
 @dataclass(frozen=True)
@@ -314,6 +346,10 @@ class TaskWorkflow:
         try:
             await self._pick_up()
             await self._prepare()
+            if self._plans():
+                ended = await self._plan()
+                if ended is not None:
+                    return ended
             outcome = await self._code()
             if self.state.phase is Phase.DELIVERING:
                 outcome = await self._deliver(outcome)
@@ -360,6 +396,140 @@ class TaskWorkflow:
             ),
         )
 
+    # ---------- the planning phase ----------
+    def _plans(self) -> bool:
+        """True when the task plans before it codes and has no plan yet."""
+        if self.state.plan is not None:
+            return False
+        return bool(workflow.memo_value(acts.PLAN_MEMO_KEY, False, type_hint=bool))
+
+    async def _plan(self) -> Outcome | None:
+        """Run the planner until it submits a plan. Returns None once the plan is in place.
+
+        An outcome means the task ends here: the planner failed its repair turn, used up its
+        turns, ran out of the task's turn budget, or was stopped by one of the ends that the coder
+        shares (a refusal, a full window, a lost sandbox).
+        """
+        state = self.state
+        state.phase = Phase.PLANNING
+        failures = 0  # plans that were not valid so far, for the one repair turn (F14)
+        idle = 0  # replies in a row that ended without a tool call
+        for _ in range(acts.PLANNER_MAX_TURNS):
+            if self._out_of_turns():
+                return self._end(rules.turn_limit_outcome(), Phase.FAILED)
+            index = state.turn_index
+            sampled = await self._sample(index, Role.PLANNER)
+            if isinstance(sampled, Outcome):
+                state.turn_index = index + 1
+                return self._end(sampled, Phase.FAILED)
+            calls = rules.runnable_calls(sampled, sampled.tool_call_summaries)
+            if not calls:
+                verdict = rules.idle_turn(idle)
+                idle = verdict.count
+                ended = await self._planner_idle(index, sampled, verdict)
+                if ended is not None:
+                    return ended
+                continue
+
+            idle = 0
+            ran = await self._planner_calls(index, sampled, calls, failures)
+            if isinstance(ran, Outcome):
+                return ran  # the sandbox was lost for good
+            failures = ran.failures
+            if ran.outcome is not None:
+                return self._end(ran.outcome, Phase.FAILED)
+            if ran.plan is not None:
+                await self._accept(ran.plan)
+                return None
+            await self._relieve(index, sampled.context_decision, Role.PLANNER)
+        return self._end(planner.no_plan_outcome(acts.PLANNER_MAX_TURNS), Phase.FAILED)
+
+    async def _planner_calls(
+        self,
+        index: int,
+        reply: acts.LlmTurnOutput,
+        calls: list[acts.ToolCallSummary],
+        failures: int,
+    ) -> planner.PlanCalls | Outcome:
+        """Run the calls of one planner turn and answer them all in the transcript.
+
+        Every call is answered, the submission included, so the stored transcript is paired
+        whether the planning goes on or ends here. A sandbox that is lost for good ends the run,
+        and the outcome is returned.
+        """
+        state = self.state
+        finished: list[ToolResult] = []  # kept for the transcript if a call loses the sandbox
+
+        async def run(call: acts.ToolCallSummary) -> ToolResult:
+            result = await self._run_tool(index, call, read_only=True)
+            finished.append(result)
+            return result
+
+        try:
+            ran = await planner.run_calls(calls, run, failures)
+        except _SandboxLost as lost:
+            return await self._end_lost(index, reply.transcript_ref, calls, finished, lost)
+        state.transcript_ref = await self._call(
+            acts.APPEND_RESULTS,
+            acts.AppendResultsInput(
+                task_id=state.spec.task_id,
+                turn_index=index,
+                transcript_ref=reply.transcript_ref,
+                results=[acts.summarize_result(r) for r in ran.results],
+            ),
+        )
+        state.turn_index = index + 1
+        return ran
+
+    async def _planner_idle(
+        self, index: int, reply: acts.LlmTurnOutput, verdict: rules.Idle
+    ) -> Outcome | None:
+        """A planner reply with no tool calls. The first gets a nudge, and a second ends the run."""
+        state = self.state
+        if verdict.outcome is not None:
+            state.turn_index = index + 1
+            return self._end(verdict.outcome, Phase.FAILED)
+        state.transcript_ref = await self._call(
+            acts.APPEND_RESULTS,
+            acts.AppendResultsInput(
+                task_id=state.spec.task_id,
+                turn_index=index,
+                transcript_ref=reply.transcript_ref,
+                results=[],
+                user_text=planner.NUDGE,
+            ),
+        )
+        state.turn_index = index + 1
+        await self._relieve(index, reply.context_decision, Role.PLANNER)
+        return None
+
+    async def _accept(self, plan: Plan) -> None:
+        """Keep the plan the planner submitted and get ready for the coder.
+
+        The plan is written to the `plans` table and, for a task of an issue, posted on the issue,
+        before it is in `state`: `status()` shows a plan version only once the plan is stored and
+        out. The coder starts a transcript of its own, with no notes of the planner's.
+        """
+        state = self.state
+        version = state.plan_version + 1
+        task_id = state.spec.task_id
+        await self._call(
+            acts.STORE_PLAN, acts.StorePlanInput(task_id=task_id, version=version, plan=plan)
+        )
+        issue = state.spec.issue_number
+        if issue is not None and lifecycle.is_github_task(state.spec):
+            await self._call(
+                acts.POST_PLAN,
+                acts.PostPlanInput(
+                    task_id=task_id, repo=state.spec.repo, number=issue, version=version, plan=plan
+                ),
+            )
+        state.plan = plan
+        state.plan_version = version
+        state.transcript_ref = None
+        state.notes = None
+
+    # ---------- the coding phase ----------
     async def _code(self) -> Outcome:
         state = self.state
         state.phase = Phase.CODING
@@ -520,7 +690,7 @@ class TaskWorkflow:
         state.turn_index = index + 1
         return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
 
-    async def _sample(self, index: int) -> acts.LlmTurnOutput | Outcome:
+    async def _sample(self, index: int, role: Role = Role.CODER) -> acts.LlmTurnOutput | Outcome:
         """Call the model until one reply can be used, or the run has to end (D8, D9).
 
         A prompt that is over the window is compacted down to the last two turns, and the turn
@@ -538,7 +708,7 @@ class TaskWorkflow:
                     acts.LlmTurnInput(
                         task_id=state.spec.task_id,
                         turn_index=index,
-                        role=Role.CODER,
+                        role=role,
                         spec=state.spec,
                         transcript_ref=state.transcript_ref,
                         notes=state.notes,
@@ -555,7 +725,7 @@ class TaskWorkflow:
                     and not compacted
                 ):
                     compacted = True
-                    if await self._compact(index, forced=True):
+                    if await self._compact(index, forced=True, role=role):
                         continue
                 outcome = _ended_by(err)
                 if outcome is None:
@@ -575,16 +745,16 @@ class TaskWorkflow:
                 return reply
 
     # ---------- the context tiers ----------
-    async def _relieve(self, index: int, decision: Decision) -> None:
+    async def _relieve(self, index: int, decision: Decision, role: Role = Role.CODER) -> None:
         """Compact the view when the model turn that just ended said the next request needs it.
 
         This runs when the turn is over and its results are in the view, so a hand-over that
         follows carries the compacted view and its notes.
         """
         if decision != "ok":
-            await self._compact(index, forced=decision == "force")
+            await self._compact(index, forced=decision == "force", role=role)
 
-    async def _compact(self, index: int, *, forced: bool) -> bool:
+    async def _compact(self, index: int, *, forced: bool, role: Role = Role.CODER) -> bool:
         """Fold the older turns of the view into notes. True when the view changed.
 
         The compactor is paid for either way, so its cost is added before anything else. A view
@@ -600,7 +770,7 @@ class TaskWorkflow:
             acts.CompactInput(
                 task_id=state.spec.task_id,
                 turn_index=index,
-                role=Role.CODER,
+                role=role,
                 spec=state.spec,
                 transcript_ref=state.transcript_ref,
                 notes=state.notes,
@@ -648,7 +818,10 @@ class TaskWorkflow:
         await self._relieve(index, reply.context_decision)
         return None
 
-    async def _run_tool(self, index: int, call: acts.ToolCallSummary) -> ToolResult:
+    async def _run_tool(
+        self, index: int, call: acts.ToolCallSummary, *, read_only: bool = False
+    ) -> ToolResult:
+        """Run one tool call. `read_only` is for the planning phase: the tree is put back after."""
         state = self.state
         recreated = 0
         while True:
@@ -663,6 +836,7 @@ class TaskWorkflow:
                         # recreation it is the same one, and the new sandbox is at it.
                         pre_sha=state.head_sha,
                         sandbox_id=self._sandbox_id(),
+                        read_only=read_only,
                     ),
                 )
                 break

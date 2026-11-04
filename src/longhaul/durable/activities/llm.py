@@ -59,12 +59,18 @@ workflow's own copy and is not used to build the request.
 
 Without a `context` policy the activity elides nothing, projects nothing and always says "ok".
 The log is written either way.
+
+Roles (LH-501). Each role has its own system prompt, first message and tool list. The prompt and
+the first message come from agent/prompts.py, and the tool list from `role_tools`, which maps a
+role to the tools it is offered. A role without an entry gets `tools`, so a worker that was built
+before the planner existed keeps working. The list of a role is as fixed as the prompt for the
+life of its transcript (D7).
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -75,7 +81,7 @@ from temporalio import activity
 
 from longhaul.agent import rules
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import build_system_prompt, first_user_message
 from longhaul.agent.turns import (
     TranscriptError,
     append_assistant,
@@ -169,6 +175,9 @@ class LlmActivities:
     activity runs as it did before LH-404: nothing is elided and no request is projected.
     `meters` holds the token meter of each task, and the compact activity of the same worker
     shares it, so both count with the ratio the replies taught.
+
+    `role_tools` gives a role the tools it is offered when they are not `tools`. The planner has
+    its own (roles/planner.py).
     """
 
     def __init__(
@@ -182,12 +191,14 @@ class LlmActivities:
         ledger: Ledger | None = None,
         context: Context | None = None,
         meters: Meters | None = None,
+        role_tools: Mapping[Role, Sequence[ToolSpec]] | None = None,
     ) -> None:
         self._provider = provider
         self._scripts = TaskProviders(blobs)
         self._blobs = blobs
         self._recorder = recorder
         self._tools = list(tools)
+        self._role_tools = {role: list(specs) for role, specs in (role_tools or {}).items()}
         self._config_for = config_for
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
         self._context = context
@@ -199,10 +210,15 @@ class LlmActivities:
         """What to register on a worker."""
         return [self.llm_turn]
 
+    def tools_for(self, role: Role) -> list[ToolSpec]:
+        """The tools that `role` is offered with every call."""
+        return self._role_tools.get(role, self._tools)
+
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
         inp = small(inp)
         cfg = self._config_for(inp.role)
+        tools = self.tools_for(inp.role)
         try:
             system = build_system_prompt(inp.role, inp.spec)
             stored = await self._transcript(inp)
@@ -216,13 +232,13 @@ class LlmActivities:
         # The text of a paused reply goes back as the last message, which the API continues.
         request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         meter = self._meters.for_task(inp.task_id)
-        projected = await self._preflight(provider, cfg, system, request, meter)
+        projected = await self._preflight(provider, cfg, system, request, tools, meter)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
         began = time.monotonic()
-        resp, cost = await self._ask(provider, inp, cfg, system, request, attempt, started)
+        resp, cost = await self._ask(provider, inp, cfg, system, request, tools, attempt, started)
         if self._context is not None:
-            meter.observe(resp.usage, count_request_chars(system, request, self._tools))
+            meter.observe(resp.usage, count_request_chars(system, request, tools))
         latency_ms = resp.latency_ms or int((time.monotonic() - began) * 1000)
         view = _View(
             before=stored if inp.transcript_ref is not None else [],
@@ -230,7 +246,7 @@ class LlmActivities:
             sent=transcript,
             paused=paused,
         )
-        out = await self._store(inp, resp, view, attempt, cost, system, meter, projected)
+        out = await self._store(inp, resp, view, attempt, cost, system, tools, meter, projected)
         await self._recorder.record_turn(
             TurnRecord(
                 task_id=inp.task_id,
@@ -252,7 +268,7 @@ class LlmActivities:
     # ----- the request -----
     async def _transcript(self, inp: acts.LlmTurnInput) -> list[Message]:
         if inp.transcript_ref is None:
-            return append_user_text([], FIRST_USER_MESSAGE)
+            return append_user_text([], first_user_message(inp.role))
         return await self._blobs.get_json(inp.transcript_ref, list[Message])
 
     async def _paused(self, ref: BlobRef | None) -> list[Block]:
@@ -277,6 +293,7 @@ class LlmActivities:
         cfg: LoopConfig,
         system: str,
         request: list[Message],
+        tools: list[ToolSpec],
         meter: TokenMeter,
     ) -> int:
         """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
@@ -288,9 +305,9 @@ class LlmActivities:
         budget = self._budget
         if budget is None:
             return 0
-        tokens = meter.projected(system, request, self._tools)
+        tokens = meter.projected(system, request, tools)
         if budget.needs_exact_count(tokens):
-            tokens = await self._exact_count(provider, cfg, system, request) or tokens
+            tokens = await self._exact_count(provider, cfg, system, request, tools) or tokens
         if budget.decide(tokens) == "force":
             limit = int(budget.window * budget.hard_limit)
             raise provider_failure(
@@ -303,7 +320,12 @@ class LlmActivities:
         return tokens
 
     async def _exact_count(
-        self, provider: LLMProvider, cfg: LoopConfig, system: str, request: list[Message]
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        request: list[Message],
+        tools: list[ToolSpec],
     ) -> int | None:
         """The provider's count of the request, or None to keep the estimate.
 
@@ -317,7 +339,7 @@ class LlmActivities:
                     model=cfg.model,
                     system=system,
                     messages=request,
-                    tools=self._tools,
+                    tools=tools,
                     options=_options(cfg),
                 )
         except ProviderError:
@@ -328,6 +350,7 @@ class LlmActivities:
         self,
         meter: TokenMeter,
         system: str,
+        tools: list[ToolSpec],
         view: list[Message],
         calls: list[ToolCall],
     ) -> Decision:
@@ -343,7 +366,7 @@ class LlmActivities:
             return "ok"
         upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
         pending = sum(1 for call in calls if not is_control_tool(call.name))
-        tokens = meter.projected(system, upcoming, self._tools)
+        tokens = meter.projected(system, upcoming, tools)
         return budget.decide(tokens + pending * policy.tool_output_max_tokens)
 
     # ----- the call -----
@@ -354,6 +377,7 @@ class LlmActivities:
         cfg: LoopConfig,
         system: str,
         request: list[Message],
+        tools: list[ToolSpec],
         attempt: int,
         started: datetime,
     ) -> tuple[LLMResponse, Decimal]:
@@ -375,9 +399,7 @@ class LlmActivities:
                 messages=request,
             ) as span:
                 async with heartbeating():
-                    resp = await llm_step(
-                        provider, cfg.model, system, request, self._tools, cap, options
-                    )
+                    resp = await llm_step(provider, cfg.model, system, request, tools, cap, options)
                 cost = await self._charge(inp, cfg.model, resp.usage)
                 span.record(resp, cost_usd=float(cost))
             return resp, cost
@@ -428,6 +450,7 @@ class LlmActivities:
         attempt: int,
         cost: Decimal,
         system: str,
+        tools: list[ToolSpec],
         meter: TokenMeter,
         projected: int,
     ) -> acts.LlmTurnOutput:
@@ -474,7 +497,7 @@ class LlmActivities:
             raw_stop_reason=resp.raw_stop_reason,
             response_ref=response_ref,
             paused_ref=paused_ref,
-            context_decision=self._decide(meter, system, grown, calls),
+            context_decision=self._decide(meter, system, tools, grown, calls),
             request_tokens=projected,
         )
 

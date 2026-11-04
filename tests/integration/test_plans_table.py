@@ -18,7 +18,6 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from longhaul.durable.activities.plan import PlanActivities
 from psycopg import errors, sql
 from psycopg.types.json import Jsonb
 from sqlalchemy.engine import make_url
@@ -29,6 +28,7 @@ from longhaul.contracts import Plan, PlanStep
 from longhaul.db.records import PlanRecord, SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.plan import PlanActivities
 from longhaul.settings import EnvSettings, get_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase5]
@@ -93,9 +93,15 @@ def scratch(monkeypatch: pytest.MonkeyPatch) -> Iterator[Scratch]:
 
 
 @pytest.fixture
-async def recorder(scratch: Scratch) -> AsyncIterator[SqlRecorder]:
+def migrated(scratch: Scratch) -> Scratch:
+    # Alembic starts its own event loop, so it runs here and not inside an async fixture.
     command.upgrade(scratch.config(), "head")
-    engine = make_engine(scratch.url)
+    return scratch
+
+
+@pytest.fixture
+async def recorder(migrated: Scratch) -> AsyncIterator[SqlRecorder]:
+    engine = make_engine(migrated.url)
     try:
         yield SqlRecorder(async_sessionmaker[AsyncSession](engine, expire_on_commit=False))
     finally:
@@ -172,10 +178,10 @@ def test_any_other_state_is_refused(scratch: Scratch) -> None:
 
 
 # ---------- the recorder ----------
-async def test_a_plan_round_trips_as_json(scratch: Scratch, recorder: SqlRecorder) -> None:
+async def test_a_plan_round_trips_as_json(migrated: Scratch, recorder: SqlRecorder) -> None:
     await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
 
-    ((task_id, version, plan, status, decided_by, decided_at),) = scratch.rows(
+    ((task_id, version, plan, status, decided_by, decided_at),) = migrated.rows(
         "SELECT task_id, version, plan, status, decided_by, decided_at FROM plans"
     )
     assert (task_id, version, status, decided_by, decided_at) == (TASK, 1, "proposed", None, None)
@@ -183,28 +189,28 @@ async def test_a_plan_round_trips_as_json(scratch: Scratch, recorder: SqlRecorde
 
 
 async def test_recording_a_plan_again_keeps_one_row(
-    scratch: Scratch, recorder: SqlRecorder
+    migrated: Scratch, recorder: SqlRecorder
 ) -> None:
     await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
     await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
-    assert scratch.rows("SELECT count(*) FROM plans") == [(1,)]
+    assert migrated.rows("SELECT count(*) FROM plans") == [(1,)]
 
 
 async def test_a_row_that_has_been_decided_keeps_its_decision(
-    scratch: Scratch, recorder: SqlRecorder
+    migrated: Scratch, recorder: SqlRecorder
 ) -> None:
     # LH-502 approves a plan. A late retry of store_plan must not undo that.
     await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
-    with psycopg.connect(scratch.url) as conn:
+    with psycopg.connect(migrated.url) as conn:
         conn.execute("UPDATE plans SET status = 'approved', decided_by = 'alice'")
     await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
 
-    assert scratch.rows("SELECT status, decided_by FROM plans") == [("approved", "alice")]
+    assert migrated.rows("SELECT status, decided_by FROM plans") == [("approved", "alice")]
 
 
-async def test_store_plan_writes_to_postgres(scratch: Scratch, recorder: SqlRecorder) -> None:
+async def test_store_plan_writes_to_postgres(migrated: Scratch, recorder: SqlRecorder) -> None:
     await ActivityEnvironment().run(
         PlanActivities(recorder).store_plan,
         acts.StorePlanInput(task_id=TASK, version=1, plan=PLAN),
     )
-    assert scratch.rows("SELECT task_id, version FROM plans") == [(TASK, 1)]
+    assert migrated.rows("SELECT task_id, version FROM plans") == [(TASK, 1)]

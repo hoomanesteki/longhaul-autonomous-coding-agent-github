@@ -8,10 +8,10 @@ github/side_effects.py refuses when the text differs, so the same plan has to gi
 from pathlib import Path
 
 import pytest
-from longhaul.github.plan_comment import render_plan_comment
 
 from longhaul.contracts import Plan, PlanStep
 from longhaul.github import plan_comment
+from longhaul.github.plan_comment import render_plan_comment
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 

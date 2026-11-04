@@ -20,14 +20,13 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import docker
 import pytest
 import yaml
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from temporalio import activity
 from temporalio.client import WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -61,6 +60,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.durable.activities.tools import PLANNING_NOTE, NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
@@ -89,6 +89,9 @@ WAIT_S = 60.0
 DOCKER_WAIT_S = 600.0
 TOKEN = "ghp_planner_test_token_0123456789abcdef"
 CFG = LoopConfig(model="test-model", max_turns=30, max_tokens_per_turn=1000, max_tokens_retry=5000)
+# A cancel reaches a running activity at its next heartbeat. The timeouts of section 3.7 would
+# make each test that cancels a held model call wait ten seconds or more.
+SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=2)
 
 PLAN_INPUT: dict[str, Any] = {
     "summary": "add() subtracts. Change the operator, then cover negative numbers.",
@@ -228,14 +231,27 @@ class Boxes:
             await box.destroy()
 
 
+class SpyLlm(LlmActivities):
+    """llm_turn that keeps the turn index and the role of every call it gets."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.asked: list[tuple[int, Role]] = []
+
+    @activity.defn(name=acts.LLM_TURN.name)
+    async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+        self.asked.append((inp.turn_index, inp.role))
+        return await super().llm_turn(inp)
+
+
 @dataclass
 class World:
     queue: str
     provider: Gated
+    llm: SpyLlm
     recorder: MemoryRecorder
     fake: FakeGitHub
     blobs: MemoryBlobStore
-    opened: list[str] = field(default_factory=list)
 
     def plan_comments(self, number: int) -> list[str]:
         return [b for b in self.fake.comment_bodies(REPO, number) if "## Plan, version" in b]
@@ -293,7 +309,7 @@ async def running(
     recorder = MemoryRecorder()
     provider = Gated(script, gates)
     registry = default_registry(test_command=PYTEST, blobs=blobs)
-    llm = LlmActivities(
+    llm = SpyLlm(
         provider,
         blobs,
         recorder,
@@ -325,7 +341,7 @@ async def running(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield World(queue, provider, recorder, fake, blobs)
+            yield World(queue, provider, llm, recorder, fake, blobs)
     finally:
         await boxes.destroy_all()
         await client.aclose()
@@ -380,7 +396,9 @@ async def test_plan_stored_and_posted(
     spec = github_spec(number)
     holds = {"coder": asyncio.Event()}  # keeps the workflow in CODING, so it can be looked at
     async with running(env, write_script(tmp_path, planning_steps()), fake, gates=holds) as world:
-        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        handle = await start_task(
+            env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
+        )
         coding = await wait_for_phase(handle, Phase.CODING)
         await wait_until(lambda: world.provider.of("coder"), "the first model call of the coder")
 
@@ -410,11 +428,19 @@ async def test_plan_stored_and_posted(
         assert [m.role for m in world.provider.of("coder")[0].messages] == ["user"]
         assert last_text(world.provider.of("coder")[0].messages) == FIRST_USER_MESSAGE
 
-        # Every turn is a row with its role, numbered on from the planner's turns to the coder's.
-        roles = [(t.turn_index, t.role) for t in world.recorder.turns]
-        assert roles == [(0, "planner"), (1, "planner"), (2, "planner"), (3, "coder")]
+        # Every turn has a role, and the numbering goes on from the planner's turns to the coder's.
+        assert world.llm.asked == [
+            (0, Role.PLANNER),
+            (1, Role.PLANNER),
+            (2, Role.PLANNER),
+            (3, Role.CODER),
+        ]
+        assert [(t.turn_index, t.role) for t in world.recorder.turns] == [
+            (0, "planner"),
+            (1, "planner"),
+            (2, "planner"),
+        ]
 
-        holds["coder"].set()
         outcome = await cancel(handle)
 
     assert outcome.kind is OutcomeKind.CANCELLED
@@ -429,7 +455,9 @@ async def test_the_phase_is_planning_until_the_plan_is_stored(
     spec = github_spec(number)
     holds = {"planner": asyncio.Event(), "coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, planning_steps()), fake, gates=holds) as world:
-        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        handle = await start_task(
+            env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
+        )
         planning = await wait_for_phase(handle, Phase.PLANNING)
         await wait_until(lambda: world.provider.of("planner"), "the first call of the planner")
 
@@ -442,7 +470,6 @@ async def test_the_phase_is_planning_until_the_plan_is_stored(
         coding = await wait_for_phase(handle, Phase.CODING)
         assert coding.plan_version == 1
 
-        holds["coder"].set()
         await cancel(handle)
 
 

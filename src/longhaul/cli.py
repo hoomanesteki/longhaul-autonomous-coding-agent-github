@@ -336,13 +336,21 @@ def run(
             resolve_path=True,
         ),
     ] = None,
+    plan: Annotated[
+        bool,
+        typer.Option(
+            "--plan",
+            help="Have the planner write a plan before the coder starts. The script then needs "
+            "steps for the planner role as well.",
+        ),
+    ] = False,
 ) -> None:
     """Start a task on the durable stack and follow it until it ends.
 
     Prints the status each time it changes, then the outcome and the final diff. Exits 0 when
     the agent finishes and 2 when the run fails. Ctrl-C stops the command and not the task.
     """
-    options = DurableOptions(path, issue_file, provider, script)
+    options = DurableOptions(path, issue_file, provider, script, plan)
     try:
         code = asyncio.run(submit(options))
     except DURABLE_ERRORS as exc:
@@ -653,6 +661,7 @@ class DurableOptions:
     issue_file: Path
     provider: ProviderName | None
     script: Path | None
+    plan: bool = False
 
 
 async def open_client(settings: EnvSettings) -> Client:
@@ -724,7 +733,9 @@ async def submit(options: DurableOptions) -> int:
     if script is not None:
         script_ref = await upload_script(blobs, task_id, script)
     client = await open_client(settings)
-    handle = await start_task(client, spec, task_queue=settings.task_queue, script=script_ref)
+    handle = await start_task(
+        client, spec, task_queue=settings.task_queue, script=script_ref, plan=options.plan
+    )
 
     who = "provider scripted" if script is not None else "provider of the worker"
     typer.echo(f"task {task_id}: {title}")
@@ -859,11 +870,13 @@ async def trigger_poller_schedule() -> None:
 
 
 def status_line(current: TaskStatus | None) -> str:
-    """For example `status: coding, 3 turns done, cost $0.0000, checkpoint 1a2b3c4`."""
+    """For example `status: coding, 3 turns done, cost $0.0000, plan v1, checkpoint 1a2b3c4`."""
     if current is None:
         return "status: waiting for a worker to answer"
     turns = f"{current.turn_index} {'turn' if current.turn_index == 1 else 'turns'} done"
     line = f"status: {current.phase.value}, {turns}, cost ${current.cost_usd:.4f}"
+    if current.plan_version is not None:
+        line += f", plan v{current.plan_version}"
     if current.last_checkpoint is not None:
         line += f", checkpoint {current.last_checkpoint[:7]}"
     return line

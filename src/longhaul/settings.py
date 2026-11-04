@@ -167,6 +167,9 @@ class Loop(StrictModel):
     max_tokens_per_turn: int
     # The cap for the one retry of a turn that stopped on max_tokens.
     max_tokens_retry: int
+    # The turns the planner gets to submit its plan. The workflow keeps a copy of the number in
+    # acts.PLANNER_MAX_TURNS, because it cannot read this file, and a unit test keeps them equal.
+    planner_max_turns: int = Field(ge=1)
 
     @model_validator(mode="after")
     def _retry_cap_is_not_below_the_first_cap(self) -> Self:

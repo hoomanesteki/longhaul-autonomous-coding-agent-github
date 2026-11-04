@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
@@ -20,6 +19,7 @@ from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 from longhaul.contracts import Plan, PlanStep
 from longhaul.db.records import MemoryRecorder, PlanRecord
 from longhaul.durable import acts
+from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, effect_key, marker
 

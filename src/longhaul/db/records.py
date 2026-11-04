@@ -1,23 +1,25 @@
-"""The rows that activities write: one per model call, tool call, checkpoint and event.
+"""The rows that activities write: one per model call, tool call, checkpoint, event and plan.
 
 `Recorder` is the small interface the activities use, so a unit test can run them without
-Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints` and `events` tables and
-`MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a tool
-(`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in the
-`Recorder` protocol: only the delivery activities read rows, and they name what they need.
+Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints`, `events` and `plans`
+tables and `MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a
+tool (`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in
+the `Recorder` protocol: only the delivery activities read rows, and they name what they need.
 tests/integration/test_records.py runs the cases of tests/unit/test_records.py against both.
 
 Temporal runs an activity again after a crash or a timeout, and the second run writes what the
 first run may already have written. A turn, a tool call and a checkpoint are therefore written
 once, however often they are recorded: the first two as upserts on their key, the checkpoint by
 looking for the same sha first, because its table has no natural key. An event is a log line.
-The same event twice means that the thing happened twice, so it is written every time.
+The same event twice means that the thing happened twice, so it is written every time. A plan is
+an upsert on its task and version, and it only ever rewrites the plan itself: the status and the
+decision of a row that someone has already decided on are left as they are.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
@@ -26,8 +28,8 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from longhaul.contracts import BlobRef, Usage
-from longhaul.db.models import Checkpoint, Event, ToolCallRow, Turn
+from longhaul.contracts import BlobRef, Plan, Usage
+from longhaul.db.models import Checkpoint, Event, PlanRow, ToolCallRow, Turn
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,19 @@ class EventRecord:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class PlanRecord:
+    """One version of the plan of a task, as store_plan writes it (LH-501).
+
+    A plan starts as `proposed`. Approving and rejecting it is the plan gate (LH-502).
+    """
+
+    task_id: str
+    version: int
+    plan: Plan
+    status: str = "proposed"
+
+
 class Recorder(Protocol):
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         """The attempt number for the next model call of a turn: one more than the rows so far.
@@ -111,6 +126,10 @@ class Recorder(Protocol):
         """Add an event to the log of the task. The payload must be JSON."""
         ...
 
+    async def record_plan(self, record: PlanRecord) -> None:
+        """Save a version of the plan. Saving the same version again rewrites only its plan."""
+        ...
+
 
 class MemoryRecorder:
     """The rows in memory, for tests. Public, so that a test can read what was written."""
@@ -120,6 +139,7 @@ class MemoryRecorder:
         self.tool_calls: dict[str, ToolCallRecord] = {}
         self.checkpoints: list[CheckpointRecord] = []
         self.events: list[EventRecord] = []
+        self.plans: dict[tuple[str, int], PlanRecord] = {}
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -141,6 +161,12 @@ class MemoryRecorder:
 
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         self.events.append(EventRecord(task_id, type, dict(payload)))
+
+    async def record_plan(self, record: PlanRecord) -> None:
+        key = (record.task_id, record.version)
+        kept = self.plans.get(key)
+        # A row that has a status already keeps it, as the SQL upsert does.
+        self.plans[key] = record if kept is None else replace(kept, plan=record.plan)
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
@@ -206,6 +232,22 @@ class SqlRecorder:
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         async with self._sessions.begin() as session:
             session.add(Event(task_id=task_id, type=type, payload=dict(payload)))
+
+    async def record_plan(self, record: PlanRecord) -> None:
+        values = {
+            "task_id": record.task_id,
+            "version": record.version,
+            "plan": record.plan.model_dump(mode="json"),
+            "status": record.status,
+        }
+        stmt = insert(PlanRow).values(values)
+        # A retry writes the same plan again. The status and the decision are not touched, so a
+        # plan that has been approved in the meantime stays approved.
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["task_id", "version"], set_={"plan": stmt.excluded.plan}
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(stmt)
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         """The call of this tool in the latest turn, or None if the task never used it.

@@ -111,3 +111,44 @@ With `capture_content: true`, these attributes are added, each cut at 16,000 cha
 | `execute_tool <name>` | `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result` |
 
 `tests/integration/test_tracing.py` checks both settings: it puts a marker into the issue text, a tool's arguments, a tool's output and the model's reply, and looks for each marker in every attribute and event.
+
+## Logs
+
+Every log line the worker writes is one JSON object on stderr. `src/longhaul/telemetry/logging.py` holds all of it, and the rest of the code calls three things: `setup_logging()`, `interceptors()` and `redact(text)`.
+
+```json
+{"timestamp": "2026-11-04T13:22:06.955917Z", "level": "info", "logger": "longhaul.durable.activities.llm", "event": "calling the model", "task_id": "lh-acme-calc-42", "turn_index": 3, "activity": "llm_turn", "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}
+```
+
+`timestamp` (UTC), `level`, `logger` and `event` are on every line, and the fields of the call follow them. The rest are there when they apply.
+
+| Field | Where it comes from |
+|---|---|
+| `task_id`, `turn_index` | The input of the running activity. `interceptors()` reads them from the model the activity was called with, so an activity whose input has no `task_id` (the poller) logs without one. |
+| `activity` | `temporalio.activity.info().activity_type`, bound by the same interceptor. |
+| `trace_id` | The current OpenTelemetry span, read when the line is written. It is the id that Jaeger shows for the `RunActivity` span, and it is left out when no span is open. |
+
+### Where it is wired
+
+- `setup_logging()` configures structlog and replaces the handlers of the root logger with one that writes JSON. Standard library records, from the modules of this repo (`logging.getLogger(__name__)`) and from temporalio, go through the same processors as structlog events, so they get the same fields and the same redaction. Calling it twice does not write a line twice.
+- `interceptors()` is a Temporal client and worker interceptor. It belongs on the client next to `otel.interceptors()`, and the worker takes it from there. Registering it on the worker as well would run it twice. Each activity runs in a task of its own, so the fields stay on the lines of that activity only, including the "Completing activity as failed" warning that temporalio writes after the activity raised.
+- The worker module (LH-208) is built next to this story. The change that brings it in calls `setup_logging()` first, in place of `logging.basicConfig`, before `setup_tracing` and `connect`, and `durable.client.connect` passes `interceptors()` along with `otel.interceptors()`. Until then a worker logs without the task fields.
+- The lines that temporalio writes outside an activity, such as "Beginning worker shutdown", carry none of the four fields.
+
+### Redaction
+
+`redact(text)` replaces these with `[redacted]`:
+
+| Pattern | What it catches |
+|---|---|
+| `sk-[A-Za-z0-9_-]{20,}` | OpenAI and Anthropic keys. It must start a word, so `lh-acme-my-task-tracker-pro-edition-5` is left alone. |
+| `ghp_[A-Za-z0-9]{30,}` | GitHub personal access tokens |
+| `github_pat_[A-Za-z0-9_]{30,}` | Fine-grained GitHub tokens |
+| `AKIA[0-9A-Z]{16}` | AWS access key ids |
+| `-----BEGIN [A-Z ]*PRIVATE KEY-----` | A PEM private key, from the header through its END line. A key that was cut off before its END line is redacted to the end of the text. |
+
+The logging pipeline applies it last, just before the JSON is written, to the event text, every field (inside dicts and lists too), the formatted exception, and the repr of any value that JSON cannot encode. A secret in a traceback is caught as well as one in a field. The run report (LH-705) and the console view of stored tool outputs (Phase 8) call `redact` on their own text.
+
+Redaction matches patterns, so it does not catch a secret of another shape, such as a password in a connection string. Keep those out of log calls.
+
+`tests/unit/test_redaction.py` has a case for each pattern and for text that must stay as it is. The fake secrets in the tests are put together at run time, because CI runs gitleaks over the whole history.

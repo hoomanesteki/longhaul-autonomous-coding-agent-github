@@ -500,6 +500,25 @@ async def test_get_verified_ignores_what_a_person_turned_down(store: PgMemorySto
     assert await store.get_verified(REPO, "repo_map", SHA) is None
 
 
+async def test_is_rejected_is_true_only_while_a_person_has_turned_the_item_down(
+    store: PgMemoryStore,
+) -> None:
+    item_id = await store.add_verified(
+        note("{}", kind="repo_map", status="approved", source="default_branch"), source_ref=SHA
+    )
+    assert not await store.is_rejected(REPO, "repo_map", SHA)
+
+    await store.reject(item_id, "alice")
+
+    assert await store.is_rejected(REPO, "repo_map", SHA)
+    # Another sha, repo and kind are not affected.
+    assert not await store.is_rejected(REPO, "repo_map", "b" * 40)
+    assert not await store.is_rejected(OTHER_REPO, "repo_map", SHA)
+    assert not await store.is_rejected(REPO, "command", SHA)
+    await store.promote(item_id, "alice")
+    assert not await store.is_rejected(REPO, "repo_map", SHA)
+
+
 async def test_get_verified_returns_the_newest_of_two_items_at_one_sha(
     store: PgMemoryStore,
 ) -> None:

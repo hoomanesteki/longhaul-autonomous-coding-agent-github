@@ -240,3 +240,21 @@ async def test_syntax_error_skipped(rig: Rig, caplog: pytest.LogCaptureFixture) 
     assert entry is not None
     skipped = json.loads(entry.content)["skipped"]
     assert [item["path"] for item in skipped] == [BROKEN]
+
+
+async def test_rejected_map_is_not_built_again(rig: Rig) -> None:
+    first = await rig.prepare()
+    maps = rig.activities.repo_maps
+    assert maps is not None
+    runs = maps.script_runs
+    [item] = await rig.memory.list_items(rig.repo, kind="repo_map")
+    await rig.memory.reject(item.id, "alice")
+
+    # The person turned the map of this commit down: the task gets none, and nothing is parsed.
+    again = await rig.prepare()
+
+    assert again.base_sha == first.base_sha
+    assert again.repo_map_ref is None
+    assert maps.script_runs == runs
+    items = await rig.memory.list_items(rig.repo, kind="repo_map")
+    assert [(i.id, i.status) for i in items] == [(item.id, "rejected")]

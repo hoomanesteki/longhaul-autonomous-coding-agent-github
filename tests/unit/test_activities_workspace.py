@@ -901,6 +901,7 @@ class MapNotes(Notes):
     def __init__(self) -> None:
         super().__init__()
         self.by_ref: dict[tuple[str, str, str], str] = {}
+        self.rejected: set[tuple[str, str, str]] = set()
 
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str:
         item_id = await super().add_verified(item, source_ref=source_ref)
@@ -910,6 +911,9 @@ class MapNotes(Notes):
     async def get_verified(self, repo: str, kind: str, source_ref: str) -> Any:
         content = self.by_ref.get((repo, kind, source_ref))
         return None if content is None else type("Row", (), {"content": content})()
+
+    async def is_rejected(self, repo: str, kind: str, source_ref: str) -> bool:
+        return (repo, kind, source_ref) in self.rejected
 
     @property
     def maps(self) -> list[str]:
@@ -988,6 +992,30 @@ async def test_a_second_task_on_the_same_commit_parses_nothing_and_still_gets_it
     assert activities.repo_maps.script_runs == 1
     assert script_runs(rig.box(again.sandbox_id)) == []
     assert await text_of(blobs, again) == await text_of(blobs, first)
+
+
+async def test_a_commit_whose_map_was_rejected_gets_no_map_and_no_script_run(rig: Rig) -> None:
+    notes = MapNotes()
+    blobs = MemoryBlobStore()
+    activities = mapping(rig, notes, blobs)
+    assert activities.repo_maps is not None
+    spec = rig.spec()
+    first = await prepare_mapped(rig, activities, spec)
+    # A person rejects the item: the lookup of approved rows no longer finds it.
+    notes.by_ref.clear()
+    notes.rejected.add((spec.repo, "repo_map", first.base_sha))
+    runs = activities.repo_maps.script_runs
+
+    again = await prepare_mapped(rig, activities, rig.spec())
+
+    assert again.base_sha == first.base_sha
+    assert again.repo_map_ref is None
+    assert activities.repo_maps.script_runs == runs
+    assert script_runs(rig.box(again.sandbox_id)) == []
+    # The person turned down the map and nothing else: no new map is kept, and the commands
+    # are still looked for.
+    assert len(notes.maps) == 1
+    assert notes.added[-1][0].kind == "command"
 
 
 async def test_without_a_blob_store_there_is_no_map_and_no_script_run(rig: Rig) -> None:

@@ -191,7 +191,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below) |
-| `e2e` | builds the sandbox image, then runs the end-to-end tests: `longhaul run-local` on the `calc` fixture with the scripted provider, on a real sandbox (see "Run the agent on a local folder") |
+| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |

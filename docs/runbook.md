@@ -196,6 +196,8 @@ The service builds `docker/worker/Dockerfile` and mounts two things from the hos
 
 The folder that `--path` names has to exist inside the worker container to be read, and the example folders do not. For local folders use the worker from `uv run`, and use the container for a worker that fixes cloned repos (Phase 3).
 
+The same image runs on AWS. `docs/deploy-aws.md` describes the Terraform that puts workers on ECS with EC2 capacity, because a Fargate task cannot run the Docker daemon that the sandboxes need.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -210,6 +212,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
+| `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 
 The required check is `ci`. Branch protection points at that one name, so a new job must be added to the `needs` list of `ci`. `tests/unit/test_ci_config.py` fails if any job is missing from that list.

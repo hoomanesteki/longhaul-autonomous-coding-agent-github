@@ -296,6 +296,27 @@ jobs:
       - name: Render the docs site
         run: quarto render site
 
+  # Checks the Terraform in deploy/terraform/aws without an AWS account: the format, then
+  # `init -backend=false` (the providers, no state) and `validate`. Nothing here makes a plan or
+  # applies anything, because CI holds no cloud credentials. Applying is manual and is followed
+  # by a teardown (docs/deploy-aws.md). The Terraform version is the one in versions.tf.
+  terraform:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: deploy/terraform/aws
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.0
+          # The wrapper replaces the terraform binary with a script that captures its output.
+          terraform_wrapper: false
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false -input=false -lockfile=readonly
+      - run: terraform validate
+
   security:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -328,7 +349,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, types, unit, integration, e2e, security, compose, docs]
+    needs: [lint, types, unit, integration, e2e, security, compose, docs, terraform]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

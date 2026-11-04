@@ -23,3 +23,15 @@ updates:
       python:
         patterns: ["*"]
         update-types: [minor, patch]
+  # The AWS provider and the Terraform lock file. A bump also needs its row in ADR-0002, which
+  # tests/unit/test_deploy_aws.py checks. Terraform itself is pinned in versions.tf and in the
+  # terraform job of ci.yml, which dependabot does not read, so a new release is a manual
+  # change to both and to the ADR.
+  - package-ecosystem: terraform
+    directory: /deploy/terraform/aws
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      terraform:
+        patterns: ["*"]

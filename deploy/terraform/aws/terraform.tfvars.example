@@ -1,0 +1,23 @@
+# Copy to terraform.tfvars and edit. terraform.tfvars is ignored by git.
+# Only the first block has to be set for the first apply. The second block is for later.
+
+# --- Temporal ---
+# cloud: Temporal Cloud. Put the PEM client certificate and its key into two Secrets Manager
+# secrets first, and give their ARNs here.
+temporal_mode      = "cloud"
+temporal_endpoint  = "my-namespace.a1b2c.tmprl.cloud:7233"
+temporal_namespace = "my-namespace.a1b2c"
+
+temporal_client_cert_secret_arn = "arn:aws:secretsmanager:us-east-1:111122223333:secret:temporal-client-cert-AbCdEf"
+temporal_client_key_secret_arn  = "arn:aws:secretsmanager:us-east-1:111122223333:secret:temporal-client-key-GhIjKl"
+
+# self_hosted: a Temporal server that you run and that the VPC can reach. No certificates.
+# temporal_mode      = "self_hosted"
+# temporal_endpoint  = "temporal.internal.example.com:7233"
+# temporal_namespace = "default"
+
+# --- after the images are pushed and the secrets are filled ---
+# services_enabled = true
+# image_tag        = "v0.1.0"
+# llm_provider     = "anthropic"
+# worker_count     = 1

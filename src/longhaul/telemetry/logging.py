@@ -2,10 +2,12 @@
 
 Two parts, small enough for the rest of the code to use without knowing structlog:
 
-- `setup_logging()` is the one call the worker makes at startup. After it, every log line the
-  process writes is one JSON object on stderr: structlog events, the standard library
+- `setup_logging()` is the one call the worker makes at startup. After it, every log line
+  that Python code writes is one JSON object on stderr: structlog events, the standard library
   records of this repo's modules, and temporalio's own loggers. All of them pass through the
-  same processors, so they carry the same fields and the same redaction.
+  same processors, so they carry the same fields and the same redaction. Temporal Core (the Rust
+  library under the SDK) is not Python code. It writes its WARN and ERROR lines to stderr in its
+  own format unless the worker's Runtime forwards them (docs/architecture.md, "Logs").
 - `redact(text)` is the redaction itself. Run reports (LH-705) and the console (Phase 8) call it
   on text that does not go through a logger, so one function decides what counts as a secret.
 
@@ -14,8 +16,9 @@ three are bound for the task of an activity by `interceptors()`, which reads the
 type from `activity.info()` and the ids from the input the activity handles (every task
 activity takes a model with a `task_id`, and the per-turn ones a `turn_index` too). The
 `trace_id` is read from the current OpenTelemetry span at the moment of the log call, so it
-matches the `RunActivity` span in Jaeger without any binding. A line from outside an activity
-has none of the four unless a caller binds them with structlog.contextvars.
+matches the `RunActivity` span in Jaeger. `interceptors()` binds the same id as well, for the one
+line the SDK writes after that span has closed. A line from outside an activity has none of
+the four unless a caller binds them with structlog.contextvars.
 
 Redaction runs last, just before the JSON is written, over the event text, every field (nested
 dicts and lists too), the formatted exception, and the repr of any value JSON cannot encode.
@@ -25,7 +28,8 @@ caught, and a field added later is covered without anyone remembering to.
 `sk-` has to start a word. Without that, any text with "sk-" inside a longer word and 20 more
 characters after it would be cut, and the workflow id `lh-acme-my-task-tracker-pro-edition-5`
 is one: "task-tracker-pro-edition-5" is `sk-` plus 25. A real key follows a space, a quote, an
-equals sign or the start of the line.
+equals sign, the start of the line, or an escaped newline, tab or carriage return (`\\n` as two
+characters, which is how a repr and JSON show a line break).
 """
 
 from __future__ import annotations
@@ -47,6 +51,11 @@ from temporalio import activity
 
 REDACTED = "[redacted]"
 
+# Where "sk-" may begin a key: after anything but a letter or digit, or after an escaped newline,
+# tab or carriage return. A repr, a %r argument, str() of a list and JSON all write those as a
+# backslash and a letter, so the character before the key is the n, t or r of the escape.
+_WORD_START = r"(?:(?<![A-Za-z0-9])|(?<=\\[nrt]))"
+
 # The private key comes first and ends at its END line. A key that was cut off (a tool output
 # is truncated, a log line is clipped) has no END line, and then everything after the header is
 # the key, so the match runs to the end of the text.
@@ -55,7 +64,7 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
         re.DOTALL,
     ),
-    re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(_WORD_START + r"sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"ghp_[A-Za-z0-9]{30,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{30,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
@@ -107,10 +116,17 @@ def _encode_other(value: object) -> str:
 
 
 # ---------- context ----------
-def _add_trace_id(_logger: WrappedLogger, _method: str, event_dict: EventDict) -> EventDict:
+def _current_trace_id() -> str | None:
     context = trace.get_current_span().get_span_context()
-    if context.is_valid:  # without a tracer provider every span is invalid, and there is no id
-        event_dict.setdefault("trace_id", format(context.trace_id, "032x"))
+    # Without a tracer provider every span is invalid, and there is no id to give.
+    return format(context.trace_id, "032x") if context.is_valid else None
+
+
+def _add_trace_id(_logger: WrappedLogger, _method: str, event_dict: EventDict) -> EventDict:
+    # An open span wins over an id bound earlier (see _ActivityContext), so a line written
+    # inside a child trace is not pinned to the trace of the activity.
+    if (trace_id := _current_trace_id()) is not None:
+        event_dict["trace_id"] = trace_id
     return event_dict
 
 
@@ -131,7 +147,12 @@ class _ActivityContext(temporalio.worker.ActivityInboundInterceptor):
         # task of its own, so nothing leaks to the next activity, and the SDK writes "Completing
         # activity as failed" in that task after the activity raised. That line is the one
         # an operator looks for first, and it needs the task id.
-        bind_contextvars(**_activity_fields(input.args))
+        fields = _activity_fields(input.args)
+        # This runs inside the RunActivity span of the tracing interceptor, which is closed by
+        # the time the SDK writes that warning. The bound id is what the warning carries.
+        if (trace_id := _current_trace_id()) is not None:
+            fields["trace_id"] = trace_id
+        bind_contextvars(**fields)
         return await super().execute_activity(input)
 
 

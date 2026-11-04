@@ -1,5 +1,6 @@
 import json
 import re
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -285,14 +286,13 @@ def test_bad_script_names_the_key(tmp_path: Path) -> None:
         ScriptedProvider(_write(tmp_path, "steps:\n  - respnd: {text: hi}\n"))
 
 
-def test_get_provider_scripted_and_unimplemented() -> None:
+def test_get_provider_scripted_needs_a_script() -> None:
     scripted = get_provider(EnvSettings(provider="scripted"), script_path=SCRIPT)
     assert scripted.name == "scripted"
     with pytest.raises(ValueError, match="script_path"):
         get_provider(EnvSettings(provider="scripted", _env_file=None))
-    # anthropic left this list with LH-104. Its factory tests are in test_anthropic_provider.py.
-    with pytest.raises(NotImplementedError, match="LH-209"):
-        get_provider(EnvSettings(provider="replay"))
+    # The other providers have their factory tests next to them: anthropic in
+    # test_anthropic_provider.py and replay in test_replay_provider.py.
 
 
 def test_get_provider_reads_the_script_from_settings(
@@ -1212,3 +1212,55 @@ def test_get_provider_passes_base_url_only_when_it_is_set(
         {"api_key": "sk-test"},
         {"api_key": "sk-test", "base_url": "http://localhost:9/v1"},
     ]
+
+
+# ---------- delay_s ----------
+DELAYED = "steps:\n  - respond: {text: hi, delay_s: 0.2}\n"
+
+
+async def test_a_reply_waits_for_delay_s_before_it_answers(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, DELAYED))
+
+    began = time.monotonic()
+    resp = await _call(p, _turns([]))
+
+    assert time.monotonic() - began >= 0.19
+    assert resp.content == [TextBlock(text="hi")]
+
+
+async def test_a_reply_that_waits_is_the_reply_that_does_not(tmp_path: Path) -> None:
+    # The wait models a slow model. It must not change the ids or the usage that a replay and a
+    # comparison with an earlier run depend on.
+    fast = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {text: hi}\n"))
+    slow = ScriptedProvider(_write(tmp_path, DELAYED))
+
+    assert await _call(fast, _turns([])) == await _call(slow, _turns([]))
+
+
+async def test_a_raise_step_can_wait_before_it_raises(tmp_path: Path) -> None:
+    p = ScriptedProvider(
+        _write(tmp_path, "steps:\n  - respond: {raise: overloaded, delay_s: 0.2}\n")
+    )
+
+    began = time.monotonic()
+    with pytest.raises(ProviderError):
+        await _call(p, _turns([]))
+
+    assert time.monotonic() - began >= 0.19
+
+
+async def test_a_step_without_delay_s_does_not_wait(tmp_path: Path) -> None:
+    p = ScriptedProvider(_write(tmp_path, "steps:\n  - respond: {text: hi}\n"))
+
+    began = time.monotonic()
+    await _call(p, _turns([]))
+
+    assert time.monotonic() - began < 0.1
+
+
+@pytest.mark.parametrize(
+    "value", ["-1", ".nan", ".inf", "301", "soon"], ids=["negative", "nan", "inf", "huge", "text"]
+)
+def test_delay_s_must_be_a_number_of_seconds_in_range(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ValueError, match="delay_s"):
+        ScriptedProvider(_write(tmp_path, f"steps:\n  - respond: {{text: hi, delay_s: {value}}}\n"))

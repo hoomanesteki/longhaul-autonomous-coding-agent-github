@@ -22,9 +22,15 @@ MAKEFILE = ROOT / "Makefile"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 RUNBOOK = ROOT / "docs" / "runbook.md"
 
-# A minimum. Later stories add jobs (console, chaos-lite), and the `ci` job has to wait for each
-# of them, which test_ci_has_required_jobs checks against the real file.
+# A minimum. Later stories add jobs (console), and the `ci` job has to wait for each of them,
+# which test_ci_has_required_jobs checks against the real file.
 REQUIRED_JOBS = {"lint", "types", "unit", "integration", "e2e", "security", "compose", "docs", "ci"}
+
+# Jobs that only a schedule or a manual run starts. A push never starts them, and a job that
+# did not run is "skipped", not "success", so the `ci` job must not wait for them. The runs they
+# guard (the chaos runs take many minutes) are checked by the nightly workflow run instead.
+SCHEDULED_ONLY = {"chaos-lite"}
+SCHEDULED_EVENTS = {"schedule", "workflow_dispatch"}
 
 
 def load_workflow() -> dict[str, Any]:
@@ -133,8 +139,9 @@ def test_ci_has_required_jobs() -> None:
     jobs = workflow["jobs"]
     assert set(jobs) >= REQUIRED_JOBS
     # Branch protection requires only `ci`. It has to wait for every other job, including the
-    # ones later stories add, which a fixed list of names would not notice.
-    assert jobs_the_aggregate_ignores(workflow) == set()
+    # ones later stories add, which a fixed list of names would not notice. The jobs that a push
+    # does not start are the one exception, and the next test holds them to it.
+    assert jobs_the_aggregate_ignores(workflow) == SCHEDULED_ONLY
     assert needs_of(jobs["ci"]) <= set(jobs) - {"ci"}, "ci waits for a job that does not exist"
     assert jobs["ci"]["if"] == "always()"
     for name, job in jobs.items():
@@ -154,6 +161,40 @@ def test_aggregate_check_notices_a_job_it_does_not_wait_for() -> None:
     assert jobs_the_aggregate_ignores(workflow) == {"e2e"}
     workflow["jobs"]["ci"]["needs"] = ["lint", "e2e"]
     assert jobs_the_aggregate_ignores(workflow) == set()
+
+
+def events_of(job: dict[str, Any]) -> set[str]:
+    """The events the `if` of a job lets through, when it is made of `event_name == 'x'` tests."""
+    condition = " ".join(str(job.get("if", "")).split())
+    names = re.findall(r"github\.event_name == '(\w+)'", condition)
+    # Only `||` may join them, so that no `&&` or `!=` can change what the names mean.
+    assert re.fullmatch(r"(github\.event_name == '\w+'( \|\| )?)+", condition), condition
+    return set(names)
+
+
+def test_the_jobs_the_aggregate_ignores_start_only_on_a_schedule_or_by_hand() -> None:
+    jobs = load_workflow()["jobs"]
+    for name in SCHEDULED_ONLY:
+        assert events_of(jobs[name]) == SCHEDULED_EVENTS, name
+
+
+def test_a_job_the_aggregate_waits_for_is_not_held_back_by_an_if() -> None:
+    # A skipped job is not a success, so a waited-for job with an `if` would fail `ci` whenever
+    # the condition is false.
+    jobs = load_workflow()["jobs"]
+    for name in set(jobs) - SCHEDULED_ONLY - {"ci"}:
+        assert "if" not in jobs[name], name
+
+
+def test_the_events_check_reads_an_if() -> None:
+    both = {"if": "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'"}
+    assert events_of(both) == SCHEDULED_EVENTS
+    with pytest.raises(AssertionError):
+        events_of({"if": "github.event_name != 'push'"})
+    with pytest.raises(AssertionError):
+        events_of({"if": "github.event_name == 'schedule' && github.ref == 'refs/heads/main'"})
+    with pytest.raises(AssertionError):
+        events_of({})
 
 
 def test_provider_is_scripted() -> None:
@@ -201,7 +242,7 @@ def test_the_e2e_job_runs_the_e2e_tests_only() -> None:
     assert selection is not None and selection.startswith("e2e and ")
 
 
-@pytest.mark.parametrize("job", ["integration", "e2e"])
+@pytest.mark.parametrize("job", ["integration", "e2e", "chaos-lite"])
 def test_jobs_with_a_sandbox_build_the_image_before_the_tests(job: str) -> None:
     # The sandbox tests fail with "image is missing" on a runner that has not built it.
     definition = load_workflow()["jobs"][job]
@@ -226,11 +267,33 @@ def test_the_selection_checks_read_the_makefile_and_a_job() -> None:
     assert step_index(steps, "cargo test") is None
 
 
+def test_chaos_lite_runs_the_short_chaos_tests_on_the_same_services_as_integration() -> None:
+    jobs = load_workflow()["jobs"]
+    chaos, integration = jobs["chaos-lite"], jobs["integration"]
+    assert job_selection(chaos) == "chaos_lite"
+    # The kills need a real worker, a real sandbox, Temporal, Postgres and MinIO, set up the way
+    # the integration job sets them up.
+    assert chaos["services"] == integration["services"]
+    assert chaos["env"] == integration["env"]
+    wanted = [s for s in integration["steps"] if "Temporal" in str(s.get("name", ""))]
+    assert wanted and all(step in chaos["steps"] for step in wanted)
+    assert step_index(chaos, "temporal operator cluster health") is not None
+
+
+def test_a_nightly_schedule_starts_the_workflow() -> None:
+    wf = load_workflow()
+    triggers = wf.get("on", wf.get(True))
+    cron = [entry["cron"] for entry in triggers["schedule"]]
+    assert len(cron) == 1 and len(cron[0].split()) == 5
+    # Every field is a number: once a day, not every minute.
+    assert re.fullmatch(r"\d+ \d+ \* \* \*", cron[0]), cron[0]
+
+
 def test_triggers_and_permissions() -> None:
     wf = load_workflow()
     # PyYAML reads the bare key `on` as the boolean True.
     triggers = wf.get("on", wf.get(True))
-    assert {"pull_request", "push", "workflow_dispatch"} <= set(triggers)
+    assert {"pull_request", "push", "workflow_dispatch", "schedule"} <= set(triggers)
     assert set(triggers["pull_request"]["branches"]) == {"dev", "main"}
     assert wf["permissions"] == {"contents": "read"}
 

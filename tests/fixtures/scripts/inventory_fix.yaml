@@ -1,0 +1,110 @@
+# Fixes tests/fixtures/repos/inventory: remove() allows negative stock. See its ISSUE.md and
+# REFERENCE.patch. The chaos tests (tests/chaos) play this script, so it is long on purpose:
+# eleven turns, with reads, edits, a command and a test run, so that a kill lands in a different
+# place each time.
+#
+# Two steps are there for the chaos tests and do not change what the fix is:
+#
+# * Turn 3 waits 3 s before it answers, as a model does. A kill during that wait is a kill during
+#   llm_turn, and the test does not have to hit a window of a few milliseconds.
+# * Turn 8 is a command that is not safe to run twice. It appends a line to a file, then sleeps.
+#   A tool_exec that is retried after a kill must start from pre_sha (ADR-0006). If it does not,
+#   the line is written twice and the final diff differs from a run with no kill.
+#
+# Turns 0 to 9 have no match, so they run by turn index. The last step also waits for a passing
+# test run ("6 passed" is the whole suite: the five tests of the repo and the one this fix adds),
+# so a broken edit ends with a no-match error instead of a finish call that claims success.
+steps:
+  - respond:
+      text: "Looking at the repo layout."
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: src/inventory/store.py}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: tests/test_store.py}}
+  - respond:
+      text: "remove() needs its own error type. Creating it first."
+      delay_s: 3
+      tool_calls:
+        - name: write_file
+          input:
+            path: src/inventory/errors.py
+            content: |
+              class InventoryError(ValueError):
+                  """Raised when an inventory operation would break a stock rule."""
+  - respond:
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/inventory/store.py
+            old_str: |-
+              class Inventory:
+                  """Tracks the on-hand quantity of each SKU."""
+            new_str: |-
+              from inventory.errors import InventoryError
+
+
+              class Inventory:
+                  """Tracks the on-hand quantity of each SKU."""
+  - respond:
+      text: "Now the check in remove()."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/inventory/store.py
+            old_str: "self._stock[sku] = self.quantity(sku) - quantity"
+            new_str: |-
+              current = self.quantity(sku)
+                      if quantity > current:
+                          raise InventoryError(f"{sku}: cannot remove {quantity}, only {current} in stock")
+                      self._stock[sku] = current - quantity
+  - respond:
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/inventory/__init__.py
+            old_str: |-
+              from inventory.store import Inventory
+
+              __all__ = ["Inventory"]
+            new_str: |-
+              from inventory.errors import InventoryError
+              from inventory.store import Inventory
+
+              __all__ = ["Inventory", "InventoryError"]
+  - respond:
+      tool_calls:
+        - name: write_file
+          input:
+            path: tests/test_errors.py
+            content: |
+              import pytest
+
+              from inventory import Inventory, InventoryError
+
+
+              def test_remove_too_much_raises_inventory_error_and_keeps_stock() -> None:
+                  inv = Inventory()
+                  inv.add("widget", 1)
+                  with pytest.raises(InventoryError):
+                      inv.remove("widget", 2)
+                  assert inv.quantity("widget") == 1
+  - respond:
+      text: "Noting the change in a log file."
+      tool_calls:
+        - name: run_command
+          input:
+            command: 'echo "remove() rejects an overdraft" >> CHANGES.txt && sleep 5'
+  - respond:
+      tool_calls:
+        - {name: run_tests, input: {}}
+  - match:
+      turn_index: 10
+      last_tool_result_contains: "6 passed"
+    respond:
+      tool_calls:
+        - name: finish
+          input: {summary: "remove() raises InventoryError when stock is too low. All tests pass."}

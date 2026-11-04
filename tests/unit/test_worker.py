@@ -13,9 +13,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from longhaul.providers.replay import ReplayProvider
 from temporalio import activity
 
 from longhaul.blobs.s3 import S3BlobStore
+from longhaul.contracts import Message, TextBlock, ToolSpec
 from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
@@ -59,6 +61,53 @@ def test_a_scripted_worker_with_a_script_plays_it(tmp_path: Path) -> None:
 def test_a_scripted_worker_without_a_script_has_no_provider_of_its_own(tmp_path: Path) -> None:
     # Every task then brings its script, which is what `longhaul run --script` does.
     assert worker.build_provider(make_settings(tmp_path, provider="scripted")) is None
+
+
+async def test_a_replay_worker_plays_the_recordings_folder(tmp_path: Path) -> None:
+    folder = tmp_path / "recordings"
+    recorder = ReplayProvider(folder, record_with=ScriptedProvider(CALC_FIX))
+    await recorder.complete(
+        model="m",
+        system="Role: coder",
+        messages=[Message(role="user", content=[TextBlock(text="go")])],
+        tools=[ToolSpec(name="list_dir", description="List.", input_schema={"type": "object"})],
+        max_tokens=100,
+    )
+
+    provider = worker.build_provider(
+        make_settings(tmp_path, provider="replay", recordings_dir=folder)
+    )
+
+    assert isinstance(provider, ReplayProvider)
+    assert provider.name == "replay"
+
+
+def test_a_replay_worker_without_a_recordings_folder_stops_before_it_starts(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="LONGHAUL_RECORDINGS_DIR"):
+        worker.build_provider(make_settings(tmp_path, provider="replay"))
+
+
+def test_a_recording_worker_wraps_its_provider(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        provider="scripted",
+        script=CALC_FIX,
+        record=True,
+        recordings_dir=tmp_path / "recordings",
+    )
+    provider = worker.build_provider(settings)
+    assert isinstance(provider, ReplayProvider)
+    assert provider.name == "scripted"
+
+
+def test_a_scripted_worker_without_a_script_cannot_record(tmp_path: Path) -> None:
+    # The scripts come with the tasks and reach the model through a provider that the worker does
+    # not hold, so there would be nothing to record. Saying so beats a folder that stays empty.
+    settings = make_settings(
+        tmp_path, provider="scripted", record=True, recordings_dir=tmp_path / "recordings"
+    )
+    with pytest.raises(ValueError, match="LONGHAUL_SCRIPT"):
+        worker.build_provider(settings)
 
 
 def test_a_real_provider_without_its_key_stops_the_worker_before_it_starts(tmp_path: Path) -> None:

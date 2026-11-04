@@ -10,6 +10,8 @@ import inspect
 import re
 
 import pytest
+
+from longhaul.contracts import MemoryStore
 from longhaul.memory.store import (
     DEFAULT_BRANCH_APPROVER,
     MemoryItemNotFoundError,
@@ -17,8 +19,6 @@ from longhaul.memory.store import (
     content_hash,
     normalize_content,
 )
-
-from longhaul.contracts import MemoryStore
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 

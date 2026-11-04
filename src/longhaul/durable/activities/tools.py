@@ -8,9 +8,35 @@ the whole text in `output_ref`, so a long test log never sits in the workflow hi
 result's text from its blob, applies the pairing rules of turns.py (D9) and stores the new
 transcript. It also adds the harness text, such as the nudge, which goes after the results.
 
-Restoring the workspace to `pre_sha` before a call and committing it after one are LH-206's
-work. The `CheckpointStore` is taken now so that the worker is wired once, and it is not called
-yet. Until then a call neither moves the workspace head nor leaves a `post_sha`.
+Every `tool_exec` call starts from a known commit and saves what it changed as a new one
+(ADR-0006, failure mode F1), so Temporal can run an attempt again after the worker died in the
+middle of it:
+
+1. If the workspace is not at `pre_sha` with a clean tree, `restore(pre_sha)` puts it there.
+   This is what undoes the edit of an attempt that died after its tool ran. A workspace that is
+   already there is left alone, because a restore also deletes the ignored files that the agent
+   made on purpose, such as the output of a build.
+2. The tool runs.
+3. If the tool mutates, or it runs a shell command (SHELL_TOOLS), `commit` saves the tree as a
+   child of `pre_sha`. A tree equal to `pre_sha` gives no commit and no `post_sha`. Otherwise
+   `post_sha` is the new commit, and a `checkpoints` row of kind `tool` names it. The tree is
+   compared with `pre_sha` and not with HEAD, because a shell command can make commits of its
+   own, or revert or reset, and the work would then look clean against the new HEAD and be
+   undone by the next restore.
+
+The rows are written after the commit, the `tool_calls` row first and the `checkpoints` row
+last. A worker that dies between the commit and the rows leaves a commit that nothing names,
+and its retry writes the rows for the commit it makes. A worker that dies after the last write,
+before Temporal has the result, leaves a `checkpoints` row for a commit that the retry replaces
+on the branch. That commit can still be restored by its sha, and the `tool_calls` row and the
+result name the commit that counts. The row means "this commit was saved", not "this commit is
+on the branch".
+
+A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
+finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
+again from the same `pre_sha`. The error is raised for a container that was gone before the
+call, and also for one that vanished during it, because docker raises various things for that:
+when any step fails and the sandbox is no longer there, the sandbox is the cause.
 """
 
 from __future__ import annotations
@@ -41,13 +67,14 @@ from longhaul.contracts import (
     ToolResult,
     ToolUseBlock,
 )
-from longhaul.db.records import Recorder, ToolCallRecord
+from longhaul.db.records import CheckpointRecord, Recorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import call_slug, heartbeating, not_retried, small
 from longhaul.tools.registry import ToolRegistry
 
-# The error type of a sandbox that is gone. LH-206 recreates the sandbox when it sees this one.
-SANDBOX_GONE = "SandboxGoneError"
+# The two tools that run a shell command. Whether a command changes files is not known in
+# advance, so `mutates` is False for both (tools/exec.py) and the tree is looked at after them.
+SHELL_TOOLS = frozenset({"run_command", "run_tests"})
 
 
 class SandboxLookup(Protocol):
@@ -56,13 +83,35 @@ class SandboxLookup(Protocol):
     async def get(self, sandbox_id: str) -> Sandbox | None: ...
 
 
+class WorkspaceCheckpoints(CheckpointStore, Protocol):
+    """A CheckpointStore that can also say whether the workspace already is at a commit, and
+    that can build a commit on a named parent.
+
+    GitCheckpointStore has `is_at` and the `parent` argument of `commit`. The contracts do not,
+    and they stay as they are, so what tool_exec needs beyond them is added here, where it is
+    used.
+    """
+
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None: ...
+
+    async def is_at(self, sandbox: Sandbox, sha: str) -> bool: ...
+
+
 class NoCheckpoints:
-    """A CheckpointStore that stores nothing, for the worker until LH-206 wires the real one."""
+    """A checkpoint store that stores nothing, for tests of the tools. A worker passes a real one.
+
+    Nothing is ever saved and the workspace always counts as being where it should be, so a
+    call neither restores, commits nor leaves a `post_sha`.
+    """
 
     async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
         return base_sha
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         return None  # the tree counts as clean
 
     async def restore(self, sandbox: Sandbox, sha: str) -> None:
@@ -71,8 +120,25 @@ class NoCheckpoints:
     async def bundle(self, task_id: str) -> BlobRef:
         raise NotImplementedError("there is no checkpoint store to bundle")
 
+    async def is_at(self, sandbox: Sandbox, sha: str) -> bool:
+        return True
+
+
+def _gone(sandbox_id: str) -> ApplicationError:
+    # Asking again finds the same empty place, so the activity does not retry. The workflow
+    # recreates the sandbox and runs the call again.
+    return ApplicationError(
+        f"sandbox {sandbox_id} is gone", type=acts.SANDBOX_GONE, non_retryable=True
+    )
+
 
 class ToolActivities:
+    """The tool_exec and append_results activities, with what they need.
+
+    `checkpoints` has no default on purpose: a worker that forgot it would run every call on
+    whatever the last attempt left, and nothing would say so.
+    """
+
     def __init__(
         self,
         registry: ToolRegistry,
@@ -80,14 +146,14 @@ class ToolActivities:
         blobs: BlobStoreBase,
         recorder: Recorder,
         *,
-        checkpoints: CheckpointStore | None = None,
+        checkpoints: WorkspaceCheckpoints,
         tool_output_max_tokens: int = 4000,
     ) -> None:
         self._registry = registry
         self._sandboxes = sandboxes
         self._blobs = blobs
         self._recorder = recorder
-        self._checkpoints: CheckpointStore = checkpoints or NoCheckpoints()
+        self._checkpoints = checkpoints
         self._output_max_tokens = tool_output_max_tokens
 
     @property
@@ -107,8 +173,15 @@ class ToolActivities:
             blob_prefix=f"tasks/{inp.task_id}",
             output_max_tokens=self._output_max_tokens,
         )
-        async with heartbeating():
-            result = await tool_step(self._registry, sandbox, call, ctx)
+        try:
+            async with heartbeating():
+                await self._start_from(sandbox, inp.pre_sha)
+                result = await tool_step(self._registry, sandbox, call, ctx)
+                post_sha = await self._save(sandbox, inp, call)
+        except Exception as exc:
+            if await self._is_gone(inp.sandbox_id):
+                raise _gone(inp.sandbox_id) from exc
+            raise
         slug = call_slug(call.id)
         output_ref = await self._blobs.put(
             result.output.encode("utf-8", errors="replace"),
@@ -124,6 +197,7 @@ class ToolActivities:
                 "output": _preview(result.output, output_ref),
                 "output_ref": output_ref,
                 "pre_sha": inp.pre_sha,
+                "post_sha": post_sha,
             }
         )
         await self._recorder.record_tool_call(
@@ -139,19 +213,54 @@ class ToolActivities:
                 output_ref=output_ref.key,
                 duration_ms=result.duration_ms,
                 pre_sha=inp.pre_sha,
-                post_sha=returned.post_sha,
+                post_sha=post_sha,
             )
         )
+        # Last, so that a checkpoint row is written only for a commit the call row names. A
+        # worker that dies before this line leaves a commit and no row, and its retry writes the
+        # one row for the commit it makes.
+        if post_sha is not None:
+            await self._recorder.record_checkpoint(
+                CheckpointRecord(inp.task_id, post_sha, "tool", inp.turn_index)
+            )
         return small(returned)
 
     async def _sandbox(self, sandbox_id: str) -> Sandbox:
         sandbox = await self._sandboxes.get(sandbox_id)
         if sandbox is None:
-            # Asking again finds the same empty place. LH-206 recreates the sandbox instead.
-            raise ApplicationError(
-                f"sandbox {sandbox_id} is gone", type=SANDBOX_GONE, non_retryable=True
-            )
+            raise _gone(sandbox_id)
         return sandbox
+
+    async def _is_gone(self, sandbox_id: str) -> bool:
+        """True when the sandbox is not there, so that a failed call can be told to be its fault."""
+        try:
+            return await self._sandboxes.get(sandbox_id) is None
+        except Exception:
+            return False  # no way to tell, so the error of the call stands
+
+    async def _start_from(self, sandbox: Sandbox, pre_sha: str | None) -> None:
+        """Put the workspace on `pre_sha` unless it is there already with nothing to save.
+
+        Reset to pre_sha first so that a retried call never runs on half-applied edits. A run
+        that has no checkpoint yet has nothing to go back to.
+        """
+        if pre_sha is None:
+            return
+        if not await self._checkpoints.is_at(sandbox, pre_sha):
+            await self._checkpoints.restore(sandbox, pre_sha)
+
+    async def _save(self, sandbox: Sandbox, inp: acts.ToolExecInput, call: ToolCall) -> str | None:
+        """Commit what the call changed. None when it changed nothing since `pre_sha`.
+
+        The commit builds on `pre_sha` and not on wherever HEAD is: a shell command can commit,
+        revert or reset on its own, and the tree is then clean against the new HEAD while the
+        work is still unsaved. The checkpoint row is written later, once the call row is.
+        """
+        tool = self._registry.get(call.name)
+        if not (tool is not None and tool.mutates) and call.name not in SHELL_TOOLS:
+            return None
+        message = f"lh: {call.name} turn {inp.turn_index} call {call_slug(call.id)}"
+        return await self._checkpoints.commit(sandbox, message, parent=inp.pre_sha)
 
     async def _call(self, inp: acts.ToolExecInput) -> tuple[ToolCall, BlobRef | None]:
         """The call with its arguments, and the ref they came from when they were held by ref."""

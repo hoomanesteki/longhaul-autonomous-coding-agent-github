@@ -159,6 +159,33 @@ class ToolCallRow(Base):
     )
 
 
+class Event(Base):
+    """One thing that happened to a task, such as a sandbox that had to be recreated (LH-206).
+
+    A log, not a ledger: the same event can be recorded twice when an activity ran twice and did
+    the thing twice. `ts` is when it happened and `created_at` when the row was written, which
+    differ if a writer ever sets `ts` itself. `type` is free text. Section 3.5 lists the first
+    types, and later stories add more (memory_promoted and memory_rejected in LH-606), so a CHECK
+    on it would turn each new type into a migration.
+    """
+
+    __tablename__ = "events"
+    __table_args__ = (Index("ix_events_task_id", "task_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(Text, nullable=False)
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    type: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class SideEffect(Base):
     """One GitHub write that happened, found again by its idempotency key (LH-304).
 

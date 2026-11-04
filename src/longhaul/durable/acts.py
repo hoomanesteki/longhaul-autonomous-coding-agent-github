@@ -8,7 +8,9 @@ import it. The workflow reads the types and the policies. An activity registers 
 
 The policies are the ones in plan section 3.7. Two activities are not in that table and got
 their numbers here: `append_results`, which reads and writes one blob, and `cleanup`. Both are
-sized like `load_memory`.
+sized like `load_memory`. `ensure_sandbox` is in the table with 10 minutes and 5 attempts, and
+has a heartbeat timeout like `prepare_workspace`: it builds a container and runs the setup
+command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -76,12 +78,36 @@ TOOL_TIMEOUT_S = 600
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
 
+# The error type of a tool call that found its sandbox gone. tool_exec raises it as a
+# non-retryable ApplicationError, because asking again finds the same empty place. The workflow
+# sees the type in the cause of the ActivityError, recreates the sandbox with ensure_sandbox and
+# runs the call again from the same pre_sha.
+SANDBOX_GONE = "SandboxGoneError"
+# How often one tool call may find its sandbox gone, and be run again in a new one, before the
+# run ends with an error. A sandbox that dies every time, because the call kills it or because
+# the host is failing, must not make the workflow loop.
+MAX_SANDBOX_RECREATIONS = 2
+
 
 # ---------- payloads ----------
 class PrepareWorkspaceOutput(BaseModel):
     sandbox_id: str
     base_sha: str
     head_sha: str
+
+
+class EnsureSandboxInput(BaseModel):
+    """What ensure_sandbox needs to bring a task's sandbox back.
+
+    `head_sha` is the latest checkpoint the workflow knows, and the new workspace is put exactly
+    there. `sandbox_id` is the container the workflow thinks it has, or None when it has none.
+    The spec is there for the setup command, which runs again in the new container.
+    """
+
+    task_id: str
+    head_sha: str
+    sandbox_id: str | None
+    spec: TaskSpec
 
 
 class ToolCallSummary(BaseModel):
@@ -216,6 +242,15 @@ PREPARE_WORKSPACE = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+ENSURE_SANDBOX = Act(
+    "ensure_sandbox",
+    EnsureSandboxInput,
+    str,  # the id of the sandbox: the one it was given when that runs, else a new one
+    start_to_close=timedelta(minutes=10),
+    heartbeat=timedelta(seconds=60),
+    retry=RetryPolicy(maximum_attempts=5, non_retryable_error_types=[_OVERSIZED]),
+)
+
 LLM_TURN = Act(
     "llm_turn",
     LlmTurnInput,
@@ -263,7 +298,14 @@ CLEANUP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
-ALL: tuple[Act[Any, Any], ...] = (PREPARE_WORKSPACE, LLM_TURN, TOOL_EXEC, APPEND_RESULTS, CLEANUP)
+ALL: tuple[Act[Any, Any], ...] = (
+    PREPARE_WORKSPACE,
+    ENSURE_SANDBOX,
+    LLM_TURN,
+    TOOL_EXEC,
+    APPEND_RESULTS,
+    CLEANUP,
+)
 
 
 # ---------- per-run tuning ----------
@@ -271,9 +313,9 @@ class Tuning(BaseModel):
     """Per-run changes to the section 3.7 timeouts, for tests and chaos runs.
 
     After a hard kill the server notices a dead activity only when its heartbeat timeout
-    passes: up to 60 s for `prepare_workspace`, 30 s for `llm_turn`, 15 s for `tool_exec`
-    (ADR-0004 section 3). A chaos run that kills the worker five times cannot wait that long,
-    so it starts its tasks with a shorter heartbeat timeout.
+    passes: up to 60 s for `prepare_workspace` and `ensure_sandbox`, 30 s for `llm_turn`, 15 s
+    for `tool_exec` (ADR-0004 section 3). A chaos run that kills the worker five times cannot
+    wait that long, so it starts its tasks with a shorter heartbeat timeout.
 
     The value travels in the workflow memo, not in a global, so it works for a worker in
     another process, survives a replay and carries over Continue-As-New. A production run
@@ -298,9 +340,9 @@ def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.Activi
 
     The activity learns about the cancel at its next heartbeat, and the SDK sends at most one
     heartbeat per 0.8 timeouts. A cancel can therefore take up to 48 s while the workspace is
-    prepared, 24 s during a model turn and 12 s during a tool call. If the worker is gone, the
-    heartbeat timeout ends the wait. An activity without a heartbeat timeout cannot be
-    interrupted, so only short ones have none.
+    prepared or the sandbox is recreated, 24 s during a model turn and 12 s during a tool call.
+    If the worker is gone, the heartbeat timeout ends the wait. An activity without a heartbeat
+    timeout cannot be interrupted, so only short ones have none.
 
     A tuning can only shorten a heartbeat timeout. An activity without one keeps none.
     """

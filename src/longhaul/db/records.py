@@ -1,16 +1,20 @@
-"""The rows that activities write: one per model call and one per tool call.
+"""The rows that activities write: one per model call, tool call, checkpoint and event.
 
 `Recorder` is the small interface the activities use, so a unit test can run them without
-Postgres. `SqlRecorder` writes the `turns` and `tool_calls` tables and `MemoryRecorder` keeps
-the same rows in dicts. tests/integration/test_records.py runs the cases of
-tests/unit/test_records.py against both.
+Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints` and `events` tables and
+`MemoryRecorder` keeps the same rows in memory. tests/integration/test_records.py runs the cases
+of tests/unit/test_records.py against both.
 
-Both writes are upserts. Temporal runs an activity again after a crash or a timeout, and the
-second run writes the row the first run may already have written.
+Temporal runs an activity again after a crash or a timeout, and the second run writes what the
+first run may already have written. A turn, a tool call and a checkpoint are therefore written
+once, however often they are recorded: the first two as upserts on their key, the checkpoint by
+looking for the same sha first, because its table has no natural key. An event is a log line.
+The same event twice means that the thing happened twice, so it is written every time.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
@@ -20,8 +24,8 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from longhaul.contracts import Usage
-from longhaul.db.models import ToolCallRow, Turn
+from longhaul.contracts import BlobRef, Usage
+from longhaul.db.models import Checkpoint, Event, ToolCallRow, Turn
 
 
 @dataclass(frozen=True)
@@ -60,6 +64,31 @@ class ToolCallRecord:
     post_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """One saved workspace state: a commit in the task's bare repo (ADR-0006).
+
+    `kind` is one of tool, step, compaction and bundle. tool_exec writes `tool` after each
+    commit. `bundle_ref` is set for a bundle only.
+    """
+
+    task_id: str
+    sha: str
+    kind: str
+    turn_index: int
+    step_id: str | None = None
+    bundle_ref: BlobRef | None = None
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One thing that happened to a task. `type` is one of the names in plan section 3.5."""
+
+    task_id: str
+    type: str
+    payload: dict[str, Any]
+
+
 class Recorder(Protocol):
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         """The attempt number for the next model call of a turn: one more than the rows so far.
@@ -72,6 +101,14 @@ class Recorder(Protocol):
 
     async def record_tool_call(self, record: ToolCallRecord) -> None: ...
 
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        """Save the checkpoint, unless this task already has one with the same sha and kind."""
+        ...
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        """Add an event to the log of the task. The payload must be JSON."""
+        ...
+
 
 class MemoryRecorder:
     """The rows in memory, for tests. Public, so that a test can read what was written."""
@@ -79,6 +116,8 @@ class MemoryRecorder:
     def __init__(self) -> None:
         self.turns: list[TurnRecord] = []
         self.tool_calls: dict[str, ToolCallRecord] = {}
+        self.checkpoints: list[CheckpointRecord] = []
+        self.events: list[EventRecord] = []
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -93,6 +132,17 @@ class MemoryRecorder:
 
     async def record_tool_call(self, record: ToolCallRecord) -> None:
         self.tool_calls[record.id] = record
+
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        if not any(_same_checkpoint(c, record) for c in self.checkpoints):
+            self.checkpoints.append(record)
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        self.events.append(EventRecord(task_id, type, dict(payload)))
+
+
+def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
+    return (a.task_id, a.sha, a.kind) == (b.task_id, b.sha, b.kind)
 
 
 _TURN_KEY = ("task_id", "turn_index", "attempt")
@@ -131,6 +181,23 @@ class SqlRecorder:
         async with self._sessions.begin() as session:
             await session.execute(stmt)
 
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        seen = select(Checkpoint.id).where(
+            Checkpoint.task_id == record.task_id,
+            Checkpoint.sha == record.sha,
+            Checkpoint.kind == record.kind,
+        )
+        async with self._sessions.begin() as session:
+            # No unique key to upsert on, so look first. Two attempts of one activity do not
+            # run at the same moment unless a worker hung past its timeout, and the cost of that
+            # race is one extra row.
+            if (await session.execute(seen.limit(1))).first() is None:
+                await session.execute(insert(Checkpoint).values(_checkpoint_values(record)))
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        async with self._sessions.begin() as session:
+            session.add(Event(task_id=task_id, type=type, payload=dict(payload)))
+
 
 def _turn_values(r: TurnRecord) -> dict[str, Any]:
     return {
@@ -167,4 +234,15 @@ def _tool_call_values(r: ToolCallRecord) -> dict[str, Any]:
         "pre_sha": r.pre_sha,
         "post_sha": r.post_sha,
         "attempt": r.attempt,
+    }
+
+
+def _checkpoint_values(r: CheckpointRecord) -> dict[str, Any]:
+    return {
+        "task_id": r.task_id,
+        "sha": r.sha,
+        "kind": r.kind,
+        "step_id": r.step_id,
+        "turn_index": r.turn_index,
+        "bundle_ref": r.bundle_ref.model_dump(mode="json") if r.bundle_ref is not None else None,
     }

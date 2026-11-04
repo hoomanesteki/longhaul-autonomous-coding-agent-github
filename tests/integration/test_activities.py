@@ -5,8 +5,11 @@ The recorder writes to a throwaway Postgres database (migrated to head, then dro
 blobs go to MemoryBlobStore, or to MinIO when LONGHAUL_BLOB_ENDPOINT is set. A time skipping
 Temporal test server runs the workflow, so a retry's backoff costs no real time.
 
-prepare_workspace and cleanup are test stand-ins here: the real ones belong to LH-206 and
-LH-208. The worker runs under the same sandbox settings as a production worker.
+prepare_workspace and cleanup are test stand-ins here. The test makes its own sandbox, which is
+not a clone of a bare repo, so the tool activities run with NoCheckpoints. The real
+prepare_workspace, ensure_sandbox and checkpoints are run by test_sandbox_recovery.py (LH-206),
+and the real cleanup arrives with the worker (LH-208). The worker runs under the same sandbox
+settings as a production worker.
 """
 
 import asyncio
@@ -60,7 +63,7 @@ from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.support import heartbeating
-from longhaul.durable.activities.tools import SandboxLookup, ToolActivities
+from longhaul.durable.activities.tools import NoCheckpoints, SandboxLookup, ToolActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
 from longhaul.durable.workflow_sandbox import workflow_runner
@@ -159,7 +162,7 @@ def blobs() -> BlobStoreBase:
     return MemoryBlobStore()
 
 
-# ---------- the workspace, which belongs to LH-206 and LH-208 ----------
+# ---------- the workspace stand-ins ----------
 class Workspace:
     """prepare_workspace and cleanup for the tests. `prepare` makes the sandbox."""
 
@@ -297,7 +300,7 @@ async def running(
     """A worker with the real activities. Yields the task queue it polls."""
     toolbox = registry or default_registry()
     llm = LlmActivities(provider, blobs, recorder, toolbox.specs(), lambda role: CFG)
-    tools = SpyTools(toolbox, sandboxes, blobs, recorder)
+    tools = SpyTools(toolbox, sandboxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     async with Worker(
         env.client,

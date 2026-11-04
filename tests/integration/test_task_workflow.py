@@ -2,11 +2,12 @@
 
 The stubs take the place of the activities. They are registered under the names in acts.py, so
 the workflow cannot tell them from the real ones. These tests check what the workflow itself
-does with what an activity returns: the phases, the signals, the order of the calls and how
-each stop reason is handled. tests/integration/test_activities.py runs the real activities, and
-tests/integration/test_parity.py compares the whole loop with the in-process one. Each test
-gets its own server and worker, so nothing is shared between tests. The first run downloads the
-test server (about 65 MB, ADR-0004); after that it starts in under a second.
+does with what an activity returns: the phases, the signals, the order of the calls, how each
+stop reason is handled and how a sandbox that is gone is recreated. test_activities.py runs the
+real activities, test_sandbox_recovery.py runs the recovery on real containers, and
+test_parity.py compares the whole loop with the in-process one. Each test gets its own server
+and worker, so nothing is shared between tests. The first run downloads the test server (about
+65 MB, ADR-0004); after that it starts in under a second.
 
 The worker runs under the same sandbox settings as a production worker (invalid_modules for
 the I/O libraries), so every test here also shows that the workflow loads under them.
@@ -24,7 +25,7 @@ import pytest
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
-from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
@@ -89,6 +90,9 @@ class Stubs:
     long enough to look at it. Gates start open. While a gate is closed the stub heartbeats, as
     a real activity does, because that is how a cancel reaches an activity. When one is
     cancelled it logs "<name>:cancelled".
+
+    `gone` maps a call id to the number of times that call finds its sandbox gone before it
+    runs. `ensure_sandbox` answers with a new id each time: sbx-2, then sbx-3, and so on.
     """
 
     MUTATING = frozenset({"edit_file", "write_file"})
@@ -101,11 +105,14 @@ class Stubs:
         for gate in self.gates.values():
             gate.set()
         self.commits = 0
+        self.gone: dict[str, int] = {}
+        self.recreated = 0
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
         return [
             self.prepare_workspace,
+            self.ensure_sandbox,
             self.llm_turn,
             self.tool_exec,
             self.append_results,
@@ -151,9 +158,21 @@ class Stubs:
             cost_usd=self.cost_usd,
         )
 
+    @activity.defn(name=acts.ENSURE_SANDBOX.name)
+    async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
+        await self._enter(acts.ENSURE_SANDBOX.name, inp)
+        self.recreated += 1
+        return f"sbx-{self.recreated + 1}"
+
     @activity.defn(name=acts.TOOL_EXEC.name)
     async def tool_exec(self, inp: acts.ToolExecInput) -> ToolResult:
         await self._enter(acts.TOOL_EXEC.name, inp)
+        if self.gone.get(inp.call.id, 0) > 0:
+            self.gone[inp.call.id] -= 1
+            # What the real activity raises when the container is not there.
+            raise ApplicationError(
+                f"sandbox {inp.sandbox_id} is gone", type=acts.SANDBOX_GONE, non_retryable=True
+            )
         post_sha = None
         if inp.call.name in self.MUTATING:
             self.commits += 1
@@ -867,11 +886,297 @@ async def test_tuning_shortens_the_heartbeat_timeouts_of_one_run(
     }
 
 
+# ---------- sandbox recovery (LH-206) ----------
+def resumed(spec: TaskSpec) -> CarryState:
+    """What a run starts from when an earlier run already prepared a sandbox."""
+    return initial_state(spec).model_copy(
+        update={"phase": Phase.CODING, "sandbox_id": "sbx-1", "head_sha": sha(7)}
+    )
+
+
+async def start_with(
+    env: WorkflowEnvironment, queue: str, state: CarryState, *, tuning: acts.Tuning | None = None
+) -> WorkflowHandle[Any, Outcome]:
+    return await env.client.start_workflow(
+        TaskWorkflow.run,
+        state,
+        id=state.spec.task_id,
+        task_queue=queue,
+        memo={acts.TUNING_MEMO_KEY: tuning} if tuning is not None else None,
+    )
+
+
+async def test_a_sandbox_that_is_gone_is_recreated_and_the_call_runs_again_from_the_same_sha(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        if turn == 0:
+            return [call("edit_file", "c1"), call("run_tests", "c2")]
+        return [finish()]
+
+    stubs = Stubs(script)
+    stubs.gone["c2"] = 1
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        outcome = await result_of(handle)
+        final = await handle.query(TaskWorkflow.status)
+
+    assert stubs.names() == [
+        "prepare_workspace",
+        "llm_turn",
+        "tool_exec",  # c1 edits and leaves the checkpoint sha(1)
+        "tool_exec",  # c2 finds the sandbox gone
+        "ensure_sandbox",
+        "tool_exec",  # c2 again, in the new sandbox
+        "append_results",
+        "llm_turn",
+        "append_results",
+    ]
+    # The sandbox is rebuilt at the checkpoint of the last call that changed the workspace.
+    assert stubs.payloads(acts.ENSURE_SANDBOX.name) == [
+        acts.EnsureSandboxInput(
+            task_id=spec.task_id, head_sha=sha(1), sandbox_id="sbx-1", spec=spec
+        )
+    ]
+    first, gone, again = stubs.payloads(acts.TOOL_EXEC.name)
+    assert [(t.call.id, t.pre_sha, t.sandbox_id) for t in (first, gone, again)] == [
+        ("c1", BASE, "sbx-1"),
+        ("c2", sha(1), "sbx-1"),
+        ("c2", sha(1), "sbx-2"),
+    ]
+    # The retry is not the activity's: it failed for good, and the workflow chose to go on.
+    appended, _ = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert [r.call_id for r in appended.results] == ["c1", "c2"]
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="fixed add()")
+    assert final.last_checkpoint == sha(1)
+
+
+async def test_every_call_after_a_recreation_runs_in_the_new_sandbox(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        if turn == 0:
+            return [call("read_file", "c1"), call("read_file", "c2")]
+        return [call("read_file", "c3")] if turn == 1 else [finish()]
+
+    stubs = Stubs(script)
+    stubs.gone["c1"] = 1
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert [(t.call.id, t.sandbox_id) for t in stubs.payloads(acts.TOOL_EXEC.name)] == [
+        ("c1", "sbx-1"),
+        ("c1", "sbx-2"),
+        ("c2", "sbx-2"),
+        ("c3", "sbx-2"),
+    ]
+    assert len(stubs.payloads(acts.ENSURE_SANDBOX.name)) == 1
+
+
+async def test_a_sandbox_that_keeps_dying_ends_the_run_with_an_error(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(lambda turn: [call("run_tests", "c1")])
+    stubs.gone["c1"] = 99
+    outcome, final = await play(env, stubs, spec)
+
+    # The call is tried once and again after each of the two recreations, then the run ends.
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="sandbox lost")
+    assert stubs.names() == [
+        "prepare_workspace",
+        "llm_turn",
+        "tool_exec",
+        "ensure_sandbox",
+        "tool_exec",
+        "ensure_sandbox",
+        "tool_exec",
+        # The run ends here, and the transcript still answers the call.
+        "append_results",
+    ]
+    assert acts.MAX_SANDBOX_RECREATIONS == 2
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+    assert final.outcome == outcome
+
+
+async def test_a_run_lost_to_a_dying_sandbox_still_answers_every_call_of_the_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The transcript of a run that ends must stay paired: a later report, resume or retry sends
+    # it to the model again, and the API answers 400 to a tool_use with no tool_result.
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        return [call("read_file", "c1"), call("run_tests", "c2"), finish()]
+
+    stubs = Stubs(script)
+    stubs.gone["c2"] = 99
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="sandbox lost")
+    (appended,) = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert appended.turn_index == 0
+    assert appended.transcript_ref == ref("turns/0000/assistant.json")
+    # One result for each call, in the order of the calls. c1 ran, c2 lost its sandbox for good,
+    # and the finish after it never ran.
+    by_id = {r.call_id: r for r in appended.results}
+    assert list(by_id) == ["c1", "c2", "finish-1"]
+    assert (by_id["c1"].ok, by_id["c1"].output) == (True, "ran read_file")
+    for lost in ("c2", "finish-1"):
+        assert by_id[lost].ok is False
+        assert "sandbox" in (by_id[lost].output or "")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
+
+
+async def test_the_limit_on_recreations_counts_each_call_on_its_own(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(
+        lambda turn: [call("read_file", "c1"), call("read_file", "c2")] if turn == 0 else [finish()]
+    )
+    stubs.gone.update({"c1": 2, "c2": 2})
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert len(stubs.payloads(acts.ENSURE_SANDBOX.name)) == 4
+
+
+async def test_a_tool_failure_that_is_not_a_lost_sandbox_fails_the_workflow(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    class Failing(Stubs):
+        @activity.defn(name=acts.TOOL_EXEC.name)
+        async def tool_exec(self, inp: acts.ToolExecInput) -> ToolResult:
+            await self._enter(acts.TOOL_EXEC.name, inp)
+            raise ApplicationError("the checkpoint push failed", type="CheckpointError")
+
+    stubs = Failing(lambda turn: [call("edit_file", "c1")])
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+    assert acts.ENSURE_SANDBOX.name not in stubs.names()
+    # The activity's own policy retried it, three attempts in all.
+    assert len(stubs.payloads(acts.TOOL_EXEC.name)) == acts.TOOL_EXEC.retry.maximum_attempts
+
+
+async def test_a_run_that_starts_with_a_sandbox_ensures_it_before_the_first_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # A run that carries a sandbox id comes from an earlier run, and the container may be gone.
+    stubs = Stubs(lambda turn: [call("read_file", "c1")] if turn == 0 else [finish()])
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, resumed(spec))
+        outcome = await result_of(handle)
+        final = await handle.query(TaskWorkflow.status)
+
+    assert stubs.names() == [
+        "ensure_sandbox",
+        "llm_turn",
+        "tool_exec",
+        "append_results",
+        "llm_turn",
+        "append_results",
+    ]  # the workspace is not prepared again
+    assert stubs.payloads(acts.ENSURE_SANDBOX.name) == [
+        acts.EnsureSandboxInput(
+            task_id=spec.task_id, head_sha=sha(7), sandbox_id="sbx-1", spec=spec
+        )
+    ]
+    (tool,) = stubs.payloads(acts.TOOL_EXEC.name)
+    assert (tool.pre_sha, tool.sandbox_id) == (sha(7), "sbx-2")
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert final.last_checkpoint == sha(7)
+
+
+async def test_a_run_that_starts_with_a_sandbox_is_preparing_while_it_is_ensured(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.hold(acts.ENSURE_SANDBOX.name)
+    stubs.hold(acts.LLM_TURN.name)
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, resumed(spec))
+        assert (await wait_for_phase(handle, Phase.PREPARING)).last_checkpoint == sha(7)
+        stubs.release(acts.ENSURE_SANDBOX.name)
+        await wait_for_phase(handle, Phase.CODING)
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+
+
+async def test_ensure_sandbox_gets_the_timeout_and_retries_of_section_3_7(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, resumed(spec))
+        await result_of(handle)
+        ensure = scheduled_options(await handle.fetch_history())[acts.ENSURE_SANDBOX.name]
+
+    assert timeouts(ensure) == (10 * 60, 60)
+    assert ensure.retry_policy.maximum_attempts == 5
+
+
+async def test_a_cancel_during_ensure_sandbox_waits_for_it_and_cleans_up(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.hold(acts.ENSURE_SANDBOX.name)  # never opened
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, resumed(spec), tuning=SHORT_HEARTBEAT)
+        await wait_until(lambda: acts.ENSURE_SANDBOX.name in stubs.names(), "ensure to start")
+
+        await handle.signal("cancel", args=["alice", "not needed"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+    assert stubs.names() == ["ensure_sandbox", "ensure_sandbox:cancelled", "cleanup"]
+    (cleanup,) = stubs.payloads(acts.CLEANUP.name)
+    assert cleanup.sandbox_id == "sbx-1"  # the id the run carried: ensure never answered
+
+
+async def test_a_failed_ensure_sandbox_fails_the_workflow_with_its_error(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    class NoRepo(Stubs):
+        @activity.defn(name=acts.ENSURE_SANDBOX.name)
+        async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
+            await self._enter(acts.ENSURE_SANDBOX.name, inp)
+            raise ApplicationError(
+                "no checkpoint repo", type="RepoNotFoundError", non_retryable=True
+            )
+
+    stubs = NoRepo()
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, resumed(spec))
+        with pytest.raises(WorkflowFailureError) as caught:
+            await result_of(handle)
+
+    activity_error = caught.value.cause
+    assert isinstance(activity_error, ActivityError)
+    assert isinstance(activity_error.cause, ApplicationError)
+    assert activity_error.cause.type == "RepoNotFoundError"
+    assert acts.LLM_TURN.name not in stubs.names()
+
+
+async def test_a_run_with_a_sandbox_and_no_checkpoint_cannot_be_recreated(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    state = resumed(spec).model_copy(update={"head_sha": None})
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_with(env, queue, state)
+        with pytest.raises(WorkflowFailureError) as caught:
+            await result_of(handle)
+
+    assert isinstance(caught.value.cause, ApplicationError)
+    assert "no checkpoint" in str(caught.value.cause)
+    assert stubs.names() == []
+
+
 async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
     """The workflow makes the same commands when its own history is replayed (F13).
 
-    One run takes signals and uses a tool before it finishes. The other is cancelled in the
-    middle of a turn.
+    One run takes signals and uses a tool before it finishes. One is cancelled in the middle of
+    a turn. One finds its sandbox gone, recreates it and goes on.
     """
     stubs = Stubs(lambda turn: [call("edit_file", "c1")] if turn == 0 else [finish()])
     async with running(env, stubs) as queue:
@@ -895,7 +1200,20 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
         await cancelled.signal("cancel", args=["alice", "stop"])
         await result_of(cancelled)
 
-        histories = [await done.fetch_history(), await cancelled.fetch_history()]
+        stubs.release(acts.LLM_TURN.name)  # the cancelled run left the gate closed
+        stubs.gone["c1"] = 1
+        recovered = await start_task(env.client, make_spec("lh-acme-calc-3"), task_queue=queue)
+        await result_of(recovered)
+        resumed_run = await start_with(env, queue, resumed(make_spec("lh-acme-calc-4")))
+        await result_of(resumed_run)
+        assert acts.ENSURE_SANDBOX.name in stubs.names()
+
+        histories = [
+            await done.fetch_history(),
+            await cancelled.fetch_history(),
+            await recovered.fetch_history(),
+            await resumed_run.fetch_history(),
+        ]
 
     replayer = Replayer(
         workflows=[TaskWorkflow],

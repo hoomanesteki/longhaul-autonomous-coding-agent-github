@@ -48,6 +48,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     assert sorted(names) == [
         "append_results",
         "cleanup",
+        "ensure_sandbox",
         "llm_turn",
         "prepare_workspace",
         "tool_exec",
@@ -59,6 +60,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     ("act", "arg_type", "result_type"),
     [
         (acts.PREPARE_WORKSPACE, TaskSpec, acts.PrepareWorkspaceOutput),
+        (acts.ENSURE_SANDBOX, acts.EnsureSandboxInput, str),
         (acts.LLM_TURN, acts.LlmTurnInput, acts.LlmTurnOutput),
         (acts.TOOL_EXEC, acts.ToolExecInput, ToolResult),
         (acts.APPEND_RESULTS, acts.AppendResultsInput, BlobRef),
@@ -77,6 +79,10 @@ def test_each_activity_names_its_payload_types(
     ("act", "start_to_close_s", "heartbeat_s", "attempts"),
     [
         pytest.param(acts.PREPARE_WORKSPACE, 15 * 60, 60, 3, id="prepare_workspace"),
+        # Section 3.7 gives ensure_sandbox 10 minutes and 5 attempts. The heartbeat is added: it
+        # builds a container and runs the setup command, so without one a cancel would have to
+        # wait for the activity to end, and a killed worker would be noticed after 10 minutes.
+        pytest.param(acts.ENSURE_SANDBOX, 10 * 60, 60, 5, id="ensure_sandbox"),
         pytest.param(acts.LLM_TURN, 10 * 60, 30, 8, id="llm_turn"),
         pytest.param(acts.TOOL_EXEC, 600 + 60, 15, 3, id="tool_exec"),
         # These two are not in the table. They are small blob and cleanup calls, sized like
@@ -232,6 +238,8 @@ def test_the_cost_of_a_turn_cannot_be_negative() -> None:
 
 SAMPLES: list[BaseModel] = [
     acts.PrepareWorkspaceOutput(sandbox_id="sbx-1", base_sha=SHA, head_sha=SHA),
+    acts.EnsureSandboxInput(task_id="lh-x", head_sha=SHA, sandbox_id="sbx-1", spec=SPEC),
+    acts.EnsureSandboxInput(task_id="lh-x", head_sha=SHA, sandbox_id=None, spec=SPEC),
     acts.LlmTurnInput(
         task_id="lh-x",
         turn_index=3,
@@ -369,3 +377,24 @@ def test_the_inline_limits_leave_room_under_the_payload_limit() -> None:
     assert acts.INLINE_ARGS_TOTAL_BYTES < DEFAULT_LIMIT // 2
     assert acts.INLINE_ARGS_TOTAL_BYTES >= acts.INLINE_LIMIT_BYTES
     assert acts.OUTPUT_PREVIEW_CHARS < acts.INLINE_LIMIT_BYTES
+
+
+# ---------- LH-206: sandbox recovery ----------
+def test_the_workflow_and_tool_exec_agree_on_the_error_type_of_a_lost_sandbox() -> None:
+    # tool_exec raises ApplicationError(type=SANDBOX_GONE), and the workflow reads the same type
+    # from the cause of the ActivityError. The name is also in the plan (section 3.7 story).
+    assert acts.SANDBOX_GONE == "SandboxGoneError"
+
+
+def test_a_sandbox_is_recreated_at_most_twice_for_one_tool_call() -> None:
+    assert acts.MAX_SANDBOX_RECREATIONS == 2
+
+
+@pytest.mark.parametrize("missing", ["task_id", "head_sha", "sandbox_id", "spec"])
+def test_ensure_sandbox_names_every_field_of_its_input(missing: str) -> None:
+    # The spec is there for the setup command. sandbox_id may be None but not absent, so a
+    # caller cannot forget it.
+    fields = {"task_id": "lh-x", "head_sha": SHA, "sandbox_id": "sbx-1", "spec": SPEC}
+    del fields[missing]
+    with pytest.raises(ValidationError):
+        acts.EnsureSandboxInput.model_validate(fields)

@@ -93,6 +93,59 @@ docs/private/**
 
 The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
 
+## Run tasks on the durable stack
+
+`longhaul run-local` runs the agent in one process and forgets it when it ends. The durable commands run the same agent as a Temporal workflow, so a task survives a stopped worker. They use the stack from `make up`: Temporal for the workflow, Postgres for the records, MinIO for the blobs.
+
+```bash
+make up && make sandbox-image && make migrate
+uv run longhaul worker                  # shell 1: stays in the foreground
+uv run longhaul run \                   # shell 2
+  --path tests/fixtures/repos/calc \
+  --issue-file tests/fixtures/repos/calc/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/calc_fix.yaml
+```
+
+`make migrate` creates the tables the worker writes to. Both commands read the `LONGHAUL_*` settings from your shell or from `.env` (copy `.env.example`). The worker needs the database, Temporal, the blob store and, for a real model, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. `run` needs Temporal, the blob store and the checkpoint folder, but not the database.
+
+| Command | What it does |
+|---|---|
+| `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
+| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. |
+| `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow and, once it ended, the outcome. |
+| `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
+
+### What `run` does
+
+1. Builds a task id from the folder name and a random suffix, such as `lh-local-calc-1a2b3c4d`, so a second run of the same folder never meets the rule that a task id is used once.
+2. With the scripted provider, uploads the script to the blob store as `tasks/<task id>/script.yaml` and puts its reference in the workflow memo. The worker is started once and plays many tasks, so a script cannot be a setting of the worker. A worker started with `LONGHAUL_PROVIDER=scripted` and no `LONGHAUL_SCRIPT` plays the script each task brings. With any other provider the worker answers with the provider in its own environment, and `--script` is refused.
+3. Starts the workflow and prints the task id, then one status line whenever the status changes, such as `status: coding, 3 turns done, cost $0.0000, checkpoint 1a2b3c4`. It asks every 2 seconds. When no worker answers, for example while you restart it, it says `status: waiting for a worker to answer` and goes on.
+4. Prints the outcome and the final diff in the shape of `run-local`, and removes the sandbox of the task. The diff is read from the checkpoint repo under `LONGHAUL_CKPT_DIR`, so `run` has to see the same folder as the worker. A workflow does not remove the sandbox of a task that finished yet, so `run` does it.
+
+The task path has to be a folder on the machine of the worker, and the model sees the folder name only. The exit codes are the ones of `run-local`: 0 when the agent called `finish`, 2 for every other end and for a workflow that failed.
+
+Ctrl-C ends `run` and leaves the task running. `longhaul status <id>` shows it and `longhaul cancel <id>` stops it.
+
+### Stopping a worker
+
+SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.
+
+### The worker in Docker
+
+The compose service `worker` is optional. It is in the profile `full`, so `make up` does not start it:
+
+```bash
+echo "LH_CKPT_DIR=$HOME/.longhaul/ckpt" >> .env      # an absolute path that exists on the host
+mkdir -p "$HOME/.longhaul/ckpt"
+docker compose --profile full up -d --build worker
+```
+
+The service builds `docker/worker/Dockerfile` and mounts two things from the host. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
+
+**Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and do not publish a port from it (the service has none). The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
+
+The folder that `--path` names has to exist inside the worker container to be read, and the example folders do not. For local folders use the worker from `uv run`, and use the container for a worker that fixes cloned repos (Phase 3).
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.

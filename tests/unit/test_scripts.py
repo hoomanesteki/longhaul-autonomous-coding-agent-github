@@ -7,11 +7,12 @@ sends a script through the real store and a worker in another process.
 from pathlib import Path
 
 import pytest
-from longhaul.durable.scripts import TaskProviders, script_key, upload_script
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import Message, TextBlock
+from longhaul.durable.scripts import TaskProviders, script_key, upload_script
 from longhaul.providers.scripted import ScriptedProvider
+from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -64,7 +65,8 @@ async def test_the_provider_built_from_a_ref_answers_like_one_built_from_the_fil
     shipped = await TaskProviders(blobs).provider_for(TASK, ref)
     local = ScriptedProvider(CALC_FIX)
 
-    args = {"model": "m", "system": SYSTEM, "messages": FIRST, "tools": [], "max_tokens": 100}
+    tools = default_registry().specs()
+    args = {"model": "m", "system": SYSTEM, "messages": FIRST, "tools": tools, "max_tokens": 100}
     assert (await shipped.complete(**args)).tool_calls == (await local.complete(**args)).tool_calls
 
 

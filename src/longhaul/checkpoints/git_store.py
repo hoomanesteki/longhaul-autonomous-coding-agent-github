@@ -11,6 +11,7 @@ The design and the reasons are in ADR-0006. In short:
   `restore` puts the workspace back on any commit, byte for byte, so a retried tool call never
   runs on a half changed tree.
 * `bundle` and `restore_from_bundle` move a task to another host through the blob store.
+* `diff` reads the work of a task on the host, for the command that reports a finished run.
 
 The agent can write to /ckpt, so the host treats everything in that repo as untrusted: it runs
 git with hooks switched off, and only for a few read-only or ref-only commands.
@@ -660,6 +661,24 @@ class GitCheckpointStore(CheckpointStore):
             sandbox, _ENSURE_REPO + _RESTORE, "restore the workspace", RESTORE_TIMEOUT_S,
             sha=shlex.quote(check_sha(sha)), keep=keep,
         )  # fmt: skip
+
+    # -- reading the work --
+
+    async def diff(self, task_id: str, head_sha: str) -> str:
+        """The patch from the `base` tag to a checkpoint, read on the host. "" when nothing changed.
+
+        The checkpoint is named by the caller and not read from the branch, because an attempt
+        that died can leave a commit on the branch that the workflow never learned about. The
+        agent can write the config of this repo, so an external diff program or a text
+        conversion that it names must not run here.
+        """
+        repo = self._require_repo(task_id)
+        patch = await git(
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+            f"refs/tags/{BASE_TAG}", check_sha(head_sha), "--",
+            git_dir=repo,
+        )  # fmt: skip
+        return f"{patch}\n" if patch else ""
 
     # -- bundles --
 

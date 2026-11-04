@@ -1,4 +1,5 @@
-"""The prepare_workspace and ensure_sandbox activities: a sandbox that can come back.
+"""The prepare_workspace, ensure_sandbox and cleanup activities: a sandbox that can come back,
+and go.
 
 prepare_workspace makes the first sandbox of a task and ensure_sandbox makes another when the
 first is gone (failure mode F3). Both end the same way: a container that has the task's bare
@@ -21,6 +22,12 @@ venv saves the setup, and removes every container of the task before it makes th
 that exactly one is live whatever the state of the old one: running, stopped, paused or gone.
 `DockerSandboxManager.get` answers None for any container that does not run, and that is the
 case this module replaces.
+
+cleanup removes everything of a task: its containers, its workspace volume and its bare repo. The
+workflow calls it when a task is cancelled. It finds the containers by the task label and not by
+`sandbox_id`, because a task cancelled during the preparation never learned the id. It is safe to
+run twice and for a task that has nothing left, since Temporal retries it and the task may have
+been cleaned by hand. A Docker or disk error fails the attempt, and Temporal tries again.
 
 The setup command is `spec.settings.setup_command`, or the default of `longhaul run-local` when
 there is none. The default is read from the pyproject.toml of the workspace, so a recovery sets
@@ -96,7 +103,7 @@ class LocalFolder:
 
 
 class WorkspaceActivities:
-    """prepare_workspace and ensure_sandbox, with what they need.
+    """prepare_workspace, ensure_sandbox and cleanup, with what they need.
 
     `image` and `limits` are `sandbox.image` and `sandbox.limits` of the config, which the
     workflow cannot read. `checkpoints` is the store that tool_exec uses, because the repo that
@@ -123,7 +130,7 @@ class WorkspaceActivities:
     @property
     def activities(self) -> list[Callable[..., Any]]:
         """What to register on a worker."""
-        return [self.prepare_workspace, self.ensure_sandbox]
+        return [self.prepare_workspace, self.ensure_sandbox, self.cleanup]
 
     # ---------- prepare_workspace ----------
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
@@ -243,6 +250,18 @@ class WorkspaceActivities:
             await self._drop_containers(task_id)  # the volume stays for the next attempt
             raise
         return sandbox
+
+    # ---------- cleanup ----------
+    @activity.defn(name=acts.CLEANUP.name)
+    async def cleanup(self, inp: acts.CleanupInput) -> None:
+        inp = small(inp)
+        try:
+            # The id names a folder that is deleted, so a bad one is refused before anything runs.
+            check_task_id(inp.task_id)
+        except ValueError as exc:
+            raise not_retried(exc) from exc
+        log.info("cleaning up task %s: %s", inp.task_id, inp.reason)
+        await self._clear(inp.task_id)
 
     # ---------- what both need ----------
     async def _boot(self, task_id: str) -> Sandbox:

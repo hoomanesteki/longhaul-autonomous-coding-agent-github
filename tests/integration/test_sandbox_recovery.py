@@ -37,7 +37,6 @@ from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from temporalio import activity
 from temporalio.client import WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import ActivityEnvironment, WorkflowEnvironment
@@ -264,18 +263,6 @@ async def stack(tmp_path: Path, recorder: SqlRecorder) -> AsyncIterator[Stack]:
 
 
 # ---------- a worker with the real activities ----------
-class Cleanup:
-    """The cleanup activity of LH-208, as far as these tests need it."""
-
-    def __init__(self, stack: Stack) -> None:
-        self.stack = stack
-
-    @activity.defn(name=acts.CLEANUP.name)
-    async def cleanup(self, inp: acts.CleanupInput) -> None:
-        await self.stack.manager.cleanup_task(inp.task_id)
-        await self.stack.store.cleanup_task(inp.task_id)
-
-
 @asynccontextmanager
 async def running(
     env: WorkflowEnvironment, stack: Stack, provider: ScriptedProvider
@@ -293,8 +280,7 @@ async def running(
         activities=[
             *llm.activities,
             *tools.activities,
-            *stack.workspace.activities,
-            Cleanup(stack).cleanup,
+            *stack.workspace.activities,  # includes the real cleanup
         ],
         workflow_runner=workflow_runner(),
     ):

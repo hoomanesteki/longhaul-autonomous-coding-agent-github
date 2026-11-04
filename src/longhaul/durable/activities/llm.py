@@ -12,6 +12,11 @@ workflow hands it back with the next call.
 
 Every call that was billed has a row in `turns`, also when it failed, so the cost ledger of
 Phase 7 can account for it. A call that failed before it was billed leaves no row.
+
+Who answers. A task that carries a script (`script_ref`, from `longhaul run --script`) is answered
+by a scripted provider built from it, and any other task by the provider of the worker. A worker
+whose provider is the scripted one but that was given no script has none of its own, and refuses
+a task without a script for good, since asking again changes nothing.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ from longhaul.agent.turns import (
     llm_step,
     validate_pairs,
 )
-from longhaul.blobs.base import BlobStoreBase, blob_key
+from longhaul.blobs.base import BlobError, BlobStoreBase, blob_key
 from longhaul.contracts import (
     BlobRef,
     Block,
@@ -58,25 +63,35 @@ from longhaul.durable.activities.support import (
     small,
 )
 from longhaul.durable.payload_guard import json_size
+from longhaul.durable.scripts import TaskProviders
+
+NO_PROVIDER = (
+    "this worker has no model provider of its own: LONGHAUL_PROVIDER is scripted and no script "
+    "is set. Start the task with a script (longhaul run --script FILE) or give the worker "
+    "LONGHAUL_SCRIPT"
+)
 
 
 class LlmActivities:
     """The llm_turn activity and what it needs.
 
-    `config_for` gives the model, the effort and the output caps of a role, which the workflow
-    cannot read. `tools` is the tool list sent with every call: it stays as it is for the life
-    of a transcript, because a change drops the prompt cache (D7, D8).
+    `provider` answers the tasks that carry no script. It is None for a worker that has none, and
+    then only tasks with a script can run. `config_for` gives the model, the effort and the
+    output caps of a role, which the workflow cannot read. `tools` is the tool list sent with
+    every call: it stays as it is for the life of a transcript, because a change drops the prompt
+    cache (D7, D8).
     """
 
     def __init__(
         self,
-        provider: LLMProvider,
+        provider: LLMProvider | None,
         blobs: BlobStoreBase,
         recorder: Recorder,
         tools: Sequence[ToolSpec],
         config_for: Callable[[Role], LoopConfig],
     ) -> None:
         self._provider = provider
+        self._scripts = TaskProviders(blobs)
         self._blobs = blobs
         self._recorder = recorder
         self._tools = list(tools)
@@ -98,10 +113,11 @@ class LlmActivities:
         except ValueError as exc:  # also TranscriptError and a damaged blob
             raise not_retried(exc) from exc
         paused = await self._paused(inp.paused_ref)
+        provider = await self._provider_for(inp)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
         began = time.monotonic()
-        resp = await self._ask(inp, cfg, system, transcript, paused, attempt, started)
+        resp = await self._ask(provider, inp, cfg, system, transcript, paused, attempt, started)
         latency_ms = resp.latency_ms or int((time.monotonic() - began) * 1000)
         out = await self._store(inp, resp, transcript, paused, attempt)
         await self._recorder.record_turn(
@@ -133,9 +149,23 @@ class LlmActivities:
             return []
         return [*await self._blobs.get_json(ref, list[TextBlock])]
 
+    async def _provider_for(self, inp: acts.LlmTurnInput) -> LLMProvider:
+        """The script of the task if it has one, else the provider of the worker."""
+        if inp.script_ref is not None:
+            try:
+                return await self._scripts.provider_for(inp.task_id, inp.script_ref)
+            except (ValueError, BlobError) as exc:
+                # A script that does not load, or that the store no longer has, stays that way.
+                # A store that cannot be reached raises something else, and Temporal retries it.
+                raise not_retried(exc) from exc
+        if self._provider is None:
+            raise not_retried(ValueError(NO_PROVIDER))
+        return self._provider
+
     # ----- the call -----
     async def _ask(
         self,
+        provider: LLMProvider,
         inp: acts.LlmTurnInput,
         cfg: LoopConfig,
         system: str,
@@ -151,7 +181,7 @@ class LlmActivities:
         try:
             async with heartbeating():
                 return await llm_step(
-                    self._provider, cfg.model, system, request, self._tools, cap, options
+                    provider, cfg.model, system, request, self._tools, cap, options
                 )
         except ProviderError as exc:
             if exc.usage is not None:

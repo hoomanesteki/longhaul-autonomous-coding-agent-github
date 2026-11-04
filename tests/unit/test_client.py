@@ -212,3 +212,15 @@ async def test_cancel_task_signals_who_asked_and_why() -> None:
 
     assert fake.asked == [(TaskWorkflow.run, "lh-acme-calc-42")]
     assert fake.handle.signals == [(TaskWorkflow.cancel, ["cli", "wrong repo"])]
+
+
+async def test_connect_names_the_address_when_the_server_cannot_be_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def refuse(address: str, **kwargs: Any) -> str:
+        raise RuntimeError("Failed client connect: connection refused")
+
+    monkeypatch.setattr(durable_client.Client, "connect", refuse)
+
+    with pytest.raises(ConnectionError, match="cannot reach Temporal at localhost:1"):
+        await connect("localhost:1")

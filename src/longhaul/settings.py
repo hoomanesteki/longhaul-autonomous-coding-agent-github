@@ -66,6 +66,23 @@ class EnvSettings(BaseSettings):
     )
 
 
+# longhaul/settings.py -> longhaul -> src -> the checkout.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def config_path(settings: EnvSettings) -> Path:
+    """The config file: the one named by LONGHAUL_CONFIG, found from any working directory.
+
+    The default is a path relative to the repo root. Run from another folder it would be
+    missing, so the checkout this package lives in is tried next.
+    """
+    path = settings.config
+    if path.is_absolute() or path.exists():
+        return path
+    bundled = PROJECT_ROOT / path
+    return bundled if bundled.exists() else path
+
+
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

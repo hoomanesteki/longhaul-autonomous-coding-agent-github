@@ -79,7 +79,7 @@ def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -
 
 def test_a_missing_blob_setting_stops_the_worker_with_the_names_to_set(tmp_path: Path) -> None:
     settings = make_settings(tmp_path, blob_endpoint=None)
-    with pytest.raises(RuntimeError, match="LONGHAUL_BLOB_ENDPOINT"):
+    with pytest.raises(ValueError, match="LONGHAUL_BLOB_ENDPOINT"):
         worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
 
 

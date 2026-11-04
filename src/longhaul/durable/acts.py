@@ -77,6 +77,12 @@ TOOL_TIMEOUT_S = 600
 
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
+# The workflow memo key under which a run carries the BlobRef of its script. The scripted
+# provider runs in the worker, and a worker is started once for many tasks, so the script has to
+# travel with the task. `longhaul run --script` uploads it and the workflow hands the ref to every
+# model turn (LlmTurnInput.script_ref). Like the tuning, it works for a worker in another process,
+# survives a replay and carries over Continue-As-New.
+SCRIPT_MEMO_KEY = "script"
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -147,6 +153,9 @@ class LlmTurnInput(BaseModel):
     high_output_cap: bool = False
     # The text of a reply that stopped on pause_turn, for the call that continues it.
     paused_ref: BlobRef | None = None
+    # The script that answers this task instead of the provider of the worker. It comes from the
+    # memo (SCRIPT_MEMO_KEY) and is the same on every turn of a task.
+    script_ref: BlobRef | None = None
 
 
 class LlmTurnOutput(BaseModel):

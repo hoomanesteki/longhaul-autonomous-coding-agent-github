@@ -398,7 +398,7 @@ async def test_a_worker_stopped_with_sigint_mid_run_is_replaced_and_the_run_comp
     settings = durable.settings
     client = await connect(settings["temporal"], namespace=settings["namespace"])
     handle = get_task(client, task_id)
-    await wait_until_coding_past_the_edit(handle)
+    await wait_until_coding_past_the_edit(handle, durable, run)
 
     first.send_signal(signal.SIGINT)
     stopped = await asyncio.to_thread(first.wait, 180)
@@ -422,11 +422,22 @@ async def test_a_worker_stopped_with_sigint_mid_run_is_replaced_and_the_run_comp
 
 
 async def wait_until_coding_past_the_edit(
-    handle: WorkflowHandle[Any, Any], seconds: float = 600
+    handle: WorkflowHandle[Any, Any],
+    durable: Durable,
+    run: subprocess.Popen[str],
+    seconds: float = 600,
 ) -> None:
-    """Poll status() until the run has done three turns, so the edit is saved and tests are next."""
+    """Poll status() until the run has done three turns, so the edit is saved and tests are next.
+
+    It gives up at once when the run command has ended, which it does when the workflow fails, for
+    example because the sandbox setup could not reach PyPI. Polling a failed workflow would never
+    show the phase change.
+    """
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
+        assert run.poll() is None, (
+            f"the run ended before the worker could be stopped:\n{durable.output_of(run)}"
+        )
         try:
             status = await read_status(handle, timeout_s=5)
         except Exception:

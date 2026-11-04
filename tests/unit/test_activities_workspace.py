@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.github.remote import GitHubRemote
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.calc_remote import REPO, TOKEN, Github, commit_on, github_for, seed_calc
@@ -42,6 +41,7 @@ from longhaul.durable.activities.workspace import (
     WorkspaceActivities,
 )
 from longhaul.github.client import PatAuth
+from longhaul.github.remote import GitHubRemote
 from longhaul.sandbox.local_manager import FakeSandbox
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -745,8 +745,9 @@ async def test_a_github_repo_becomes_a_sandbox_at_the_head_of_its_default_branch
     assert await sh(box, "git rev-parse HEAD") == remote.base_sha
     assert await sh(box, "git status --porcelain") == ""
     assert (box.root / MODULE).is_file()
-    # Continued as for a local repo: set up with the network on, then cut.
-    assert box.commands == [(SETUP, True)]
+    # Continued as for a local repo: set up with the network on, then cut. The probes above are
+    # commands too, so only the first one is the setup.
+    assert box.commands[0] == (SETUP, True)
     assert remote.rig.host.network[out.sandbox_id] is False
 
 
@@ -859,7 +860,12 @@ async def test_a_base_that_the_clone_does_not_hold_is_an_error_and_leaves_nothin
     with pytest.raises(CheckpointError, match="not in the repository"):
         await remote.prepare(activities=activities_with(remote.rig, stale))
 
-    assert remote.untouched()
+    # The clone started, so the host cleared the task first. No container was made, and no
+    # repo or half-built clone is left.
+    store = remote.rig.store
+    assert remote.rig.host.created == []
+    assert not store.has_repo(TASK)
+    assert list(store.root.glob(".*.tmp")) == []
 
 
 async def test_a_retry_starts_from_the_head_the_default_branch_has_by_then(remote: Remote) -> None:

@@ -4,6 +4,7 @@ The design and the reasons are in ADR-0006. In short:
 
 * `init_task` clones the repo into <root>/<task_id>.git on the host and puts the branch
   longhaul/<issue> at the base commit. No token, URL or host path is written into the repo.
+  A GitHub repo is cloned with the token as a setting of that one git process (`git_config`).
 * The sandbox gets that folder read-write at /ckpt (DockerSandboxManager.create(mounts=...)).
   `attach` clones it into /workspace, so every later step needs nothing but the sandbox.
 * `commit` snapshots the workspace as a commit and pushes it to /ckpt. Given a parent, it saves
@@ -27,7 +28,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -59,7 +60,10 @@ MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 MAX_MESSAGE_CHARS = 4000
 
 CLONE_TIMEOUT_S = 900
+PUSH_TIMEOUT_S = 600
 HOST_GIT_TIMEOUT_S = 120
+# A config value shorter than this is not scrubbed from git's output (see _scrub).
+MIN_SECRET_CHARS = 8
 ATTACH_TIMEOUT_S = 900
 RESTORE_TIMEOUT_S = 300
 COMMIT_TIMEOUT_S = 180
@@ -180,14 +184,58 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+def check_git_config(config: Sequence[str]) -> tuple[str, ...]:
+    """Return config if it is pairs of `-c` and `name=value`, else raise ValueError.
+
+    These are settings for one git process, such as the output of git_auth_header. Anything
+    else in that place, such as `-C` or `--exec-path`, would let a caller change what git runs.
+    """
+    words = tuple(config)
+    pairs = zip(words[0::2], words[1::2], strict=False)
+    if len(words) % 2 or not all(flag == "-c" and _is_setting(item) for flag, item in pairs):
+        raise ValueError("git_config takes pairs of '-c' and 'name=value', and nothing else")
+    return words
+
+
+def _is_setting(item: str) -> bool:
+    name, equals, _ = item.partition("=")
+    return bool(equals and name) and not any(ord(c) < 32 or c == "\x7f" for c in item)
+
+
+def _scrub(text: str, config: Sequence[str]) -> str:
+    """Hide the values of `config` in git's own words.
+
+    A verbose git can print the header it sends. The value and its last word, which is the
+    credential in an `AUTHORIZATION: basic <secret>` header, are replaced. A short value is
+    left alone: it is not a credential, and replacing it would garble the message.
+    """
+    secrets: set[str] = set()
+    for item in config:
+        if item != "-c":
+            value = item.partition("=")[2]
+            secrets.update((value, value.rsplit(" ", 1)[-1]))
+    for secret in sorted(secrets, key=len, reverse=True):
+        if len(secret) >= MIN_SECRET_CHARS:
+            text = text.replace(secret, "***")
+    return text
+
+
 async def _run_git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    config: Sequence[str] = (),
 ) -> tuple[int, str, str]:
-    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit."""
+    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit.
+
+    `config` goes before the subcommand and lives for this process only. Its values are
+    removed from the text that comes back, because that text ends up in exceptions.
+    """
     where = ("--git-dir", str(git_dir)) if git_dir is not None else ()
     proc = await asyncio.create_subprocess_exec(
         "git",
         *_HOST_FLAGS,
+        *config,
         *where,
         *args,
         env=_host_env(),
@@ -203,14 +251,21 @@ async def _run_git(
     except BaseException:
         await _kill(proc)  # a cancelled activity must not leave git running
         raise
-    return proc.returncode or 0, out.decode(errors="replace").strip(), err.decode(errors="replace")
+    return (
+        proc.returncode or 0,
+        _scrub(out.decode(errors="replace").strip(), config),
+        _scrub(err.decode(errors="replace"), config),
+    )
 
 
 async def git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    config: Sequence[str] = (),
 ) -> str:
     """Like _run_git, but a failure raises CheckpointError and the result is stdout."""
-    code, out, err = await _run_git(*args, git_dir=git_dir, timeout_s=timeout_s)
+    code, out, err = await _run_git(*args, git_dir=git_dir, timeout_s=timeout_s, config=config)
     if code != 0:
         raise CheckpointError(f"git {args[0]} failed (exit {code}): {_tail(err or out)}")
     return out
@@ -498,16 +553,23 @@ class GitCheckpointStore(CheckpointStore):
 
     # -- the host side --
 
-    async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
+    async def init_task(
+        self, task_id: str, clone_url: str, base_sha: str, *, git_config: Sequence[str] = ()
+    ) -> str:
         """Create the bare repo of a task and return its path, which is what to mount.
 
         It clones `clone_url`, puts the branch longhaul/<issue> and the tag `base` on
         `base_sha`, and keeps nothing of the URL. Called again for a task that has its repo,
         it checks that the base is the same and changes nothing, so a retry is safe.
+
+        A repo that needs a credential gets it in `git_config`: `-c name=value` pairs for the
+        clone process only, such as github/client.py's git_auth_header. They are not written
+        to the repo, and git's own words are scrubbed of them before they reach an error.
         """
         check_task_id(task_id)
         check_sha(base_sha)
         check_clone_url(clone_url)
+        config = check_git_config(git_config)
         final = self.repo_path(task_id)
         if final.exists():
             await self._check_existing(task_id, base_sha)
@@ -517,7 +579,8 @@ class GitCheckpointStore(CheckpointStore):
         try:
             await git(
                 "clone", "--bare", "--no-hardlinks", "--quiet", "--template=", "--",
-                _local_source(clone_url), str(scratch), timeout_s=CLONE_TIMEOUT_S,
+                _local_source(clone_url), str(scratch),
+                timeout_s=CLONE_TIMEOUT_S, config=config,
             )  # fmt: skip
             await self._place_branch(scratch, task_id, base_sha)
             await self._seal(scratch, task_id, base_sha)
@@ -576,6 +639,21 @@ class GitCheckpointStore(CheckpointStore):
         for key, value in settings.items():
             await git("config", key, value, git_dir=repo)
         await asyncio.to_thread(_open_to_sandbox, repo)
+
+    @contextlib.asynccontextmanager
+    async def scratch(self, task_id: str, purpose: str) -> AsyncIterator[Path]:
+        """A path for a short-lived repo of a task, removed afterwards. The path is new.
+
+        It sits in the private root and is named like a half-built clone, so `cleanup_task`
+        also removes one that a killed worker left behind.
+        """
+        check_task_id(task_id)
+        await asyncio.to_thread(self._make_root)
+        path = self.root / f".{task_id}.{purpose}-{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            yield path
+        finally:
+            await asyncio.to_thread(_remove_tree, path)
 
     async def cleanup_task(self, task_id: str) -> None:
         """Remove the bare repo, and any half-built clone, of a task. Safe to call twice."""

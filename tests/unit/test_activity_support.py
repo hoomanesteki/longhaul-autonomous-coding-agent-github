@@ -18,6 +18,7 @@ from longhaul.contracts import ProviderError, ProviderErrorKind
 from longhaul.durable import acts
 from longhaul.durable.activities import support
 from longhaul.durable.payload_guard import PayloadTooLargeError
+from longhaul.github.client import GitHubFatal, GitHubRetryable
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -181,6 +182,27 @@ def test_a_failure_that_is_not_retried_names_the_exception_type() -> None:
     assert failure.non_retryable
     assert failure.type == "ValueError"
     assert "planner" in str(failure)
+
+
+# ---------- GitHub errors (failure mode F10) ----------
+def test_a_github_error_that_can_pass_is_retried_after_the_wait_github_gave() -> None:
+    failure = support.github_failure(GitHubRetryable("rate limited", 403, 90.0))
+    assert not failure.non_retryable
+    assert failure.type == "GitHubRetryable"
+    assert failure.next_retry_delay == timedelta(seconds=90)
+
+
+def test_a_github_error_without_a_wait_leaves_the_delay_to_the_policy() -> None:
+    failure = support.github_failure(GitHubRetryable("bad gateway", 502))
+    assert not failure.non_retryable
+    assert failure.next_retry_delay is None
+
+
+def test_a_github_error_that_asking_again_cannot_fix_is_not_retried() -> None:
+    failure = support.github_failure(GitHubFatal("GitHub GET /repos/a/b returned 404", 404))
+    assert failure.non_retryable
+    assert failure.type == "GitHubFatal"
+    assert "404" in str(failure)
 
 
 # ---------- blob names ----------

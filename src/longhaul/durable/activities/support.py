@@ -19,6 +19,7 @@ from temporalio.exceptions import ApplicationError
 from longhaul.contracts import ProviderError
 from longhaul.durable import acts
 from longhaul.durable.payload_guard import PayloadTooLargeError, assert_small
+from longhaul.github.client import GitHubError, GitHubRetryable
 
 # How often an activity tells the server that it is alive (plan section 3.7 lists 15 to 60
 # second heartbeat timeouts, and the SDK sends at most one heartbeat per 0.8 timeouts).
@@ -94,6 +95,19 @@ def provider_failure(exc: ProviderError) -> ApplicationError:
     return ApplicationError(
         exc.message, type=exc.kind.value, non_retryable=not exc.retryable, next_retry_delay=delay
     )
+
+
+def github_failure(exc: GitHubError) -> ApplicationError:
+    """A GitHub error as the Temporal error that carries its retry advice (failure mode F10).
+
+    GitHubRetryable stays retryable and hands GitHub's own wait to the next attempt. Every
+    other GitHub error is one that asking again cannot fix.
+    """
+    if isinstance(exc, GitHubRetryable):
+        wait = exc.retry_after_s
+        delay = None if wait is None else timedelta(seconds=wait)
+        return ApplicationError(str(exc), type="GitHubRetryable", next_retry_delay=delay)
+    return ApplicationError(str(exc), type=type(exc).__name__, non_retryable=True)
 
 
 def not_retried(exc: Exception) -> ApplicationError:

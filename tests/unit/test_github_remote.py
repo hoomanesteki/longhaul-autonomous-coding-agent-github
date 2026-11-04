@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.github.remote import GitHubRemote, github_clone_url
 from tests.fakes.calc_remote import REPO, TOKEN, Github, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub
 
 from longhaul.github.client import GitHubFatal, GitHubRetryable, PatAuth
+from longhaul.github.remote import GitHubRemote, github_clone_url
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
@@ -46,7 +46,6 @@ def test_the_clone_url_of_a_repo_is_its_https_address_without_credentials(
         "acme/calc#top",
         "user@host/calc",
         "acme:pw/calc",
-        "-acme/calc",
         "acme/calc\n",
         "local:/abs/path",
     ],
@@ -84,6 +83,20 @@ async def test_default_branch_asks_only_for_the_repo(
 
     assert await built.remote.default_branch(REPO) == "trunk"
     assert [r.path for r in fake.requests] == ["/repos/acme/calc"]
+
+
+async def test_a_bad_name_is_refused_before_any_request(
+    github: tuple[FakeGitHub, Github, str],
+) -> None:
+    fake, built, _ = github
+
+    for call in (built.remote.resolve_base, built.remote.default_branch):
+        with pytest.raises(ValueError, match="owner/name"):
+            await call("acme/calc/extra")
+    with pytest.raises(ValueError, match="owner/name"):
+        built.remote.clone_url("acme/calc/extra")
+
+    assert fake.requests == []
 
 
 async def test_github_errors_come_through_as_they_are(

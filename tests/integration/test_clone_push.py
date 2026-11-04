@@ -22,13 +22,13 @@ from pathlib import Path
 
 import docker
 import pytest
-from longhaul.checkpoints.push import ForbiddenBranchError, push_branch
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.calc_remote import REPO, TOKEN, Github, github_for, seed_calc
-from tests.fakes.fake_github import FakeGitHub
+from tests.fakes.fake_github import FakeGitHub, git
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.checkpoints.push import ForbiddenBranchError, push_branch
 from longhaul.contracts import RepoSettings, Sandbox, SandboxLimits, TaskSpec
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
@@ -129,8 +129,11 @@ async def test_prepare_from_remote(world: World) -> None:
     assert await sh(box, "git rev-parse refs/tags/base") == world.base_sha
     assert await sh(box, "git branch --show-current") == world.branch
     assert await sh(box, "git status --porcelain") == ""
-    tracked = (await sh(box, "git ls-files")).splitlines()
-    assert tracked == [".gitignore", "pyproject.toml", "src/calc/__init__.py", "tests/test_calc.py"]
+    # It holds what the remote's commit holds, file for file.
+    remote = Path(world.fake.clone_url(REPO))
+    held = git("ls-tree", "-r", "--name-only", world.base_sha, cwd=remote).splitlines()
+    assert (await sh(box, "git ls-files")).splitlines() == held
+    assert "src/calc/__init__.py" in held
     # The task branch of the bare repo on the host starts at the same commit.
     assert await world.store.head(world.task_id) == world.base_sha
     # Continued as for a local repo: the network is cut once the preparation is done.

@@ -13,10 +13,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from longhaul.github.remote import GitHubRemote
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub, git
 
 from longhaul.github.client import GitHubClient, PatAuth
+from longhaul.github.remote import GitHubRemote
 
 ROOT = Path(__file__).resolve().parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"

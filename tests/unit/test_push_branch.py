@@ -15,15 +15,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.checkpoints.push import push_branch
-from longhaul.github.remote import GitHubRemote
 from tests.fakes.calc_remote import REPO, TOKEN, Github, commit_on, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub, git
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints import git_store
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore, RepoNotFoundError
+from longhaul.checkpoints.push import push_branch
 from longhaul.github.client import PatAuth
+from longhaul.github.remote import GitHubRemote
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
@@ -209,13 +209,13 @@ async def test_a_url_rewrite_in_the_task_repo_config_cannot_redirect_the_push(
 
 
 async def test_a_hook_in_the_task_repo_does_not_run(rig: Rig, tmp_path: Path) -> None:
+    rig.commit()  # first: the helper runs git without the host's switches, and would fire a hook
     mark = tmp_path / "hook-ran"
     hooks = rig.repo / "hooks"
     hooks.mkdir(exist_ok=True)
     for name in ("pre-push", "reference-transaction", "post-checkout"):
         (hooks / name).write_text(f"#!/bin/sh\ntouch {mark}\n")
         (hooks / name).chmod(0o755)
-    rig.commit()
 
     await rig.push("longhaul-pr/42")
 

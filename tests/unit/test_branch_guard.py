@@ -11,12 +11,12 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
-from longhaul.checkpoints.push import ForbiddenBranchError, assert_not_default, push_branch
 from tests.fakes.calc_remote import REPO, Github, commit_on, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.checkpoints.push import ForbiddenBranchError, assert_not_default, push_branch
 from longhaul.github.client import GitHubRetryable
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]

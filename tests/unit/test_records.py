@@ -8,11 +8,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from longhaul.contracts import BlobRef, Usage
+from longhaul.contracts import BlobRef, Plan, PlanStep, Usage
 from longhaul.db.records import (
     CheckpointRecord,
     EventRecord,
     MemoryRecorder,
+    PlanRecord,
     Recorder,
     ToolCallRecord,
     TurnRecord,
@@ -226,3 +227,35 @@ async def test_no_call_of_the_tool_gives_none() -> None:
     await recorder.record_tool_call(named("t2", "run_tests", 1, task_id="lh-other"))
 
     assert await recorder.last_tool_call("lh-x", "run_tests") is None
+
+
+# ---------- LH-501: plans ----------
+def a_plan(summary: str = "add() subtracts") -> Plan:
+    return Plan(
+        summary=summary,
+        steps=[PlanStep(id="s1", description="Fix add()", done_when="the tests pass")],
+        acceptance_checks=["pytest -q"],
+    )
+
+
+async def test_a_plan_is_recorded_as_proposed() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    assert recorder.plans == {("lh-x", 1): PlanRecord("lh-x", 1, a_plan(), status="proposed")}
+
+
+async def test_recording_a_plan_again_keeps_one_row() -> None:
+    # Temporal runs store_plan again after a crash. The second run writes what the first wrote.
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    assert len(recorder.plans) == 1
+
+
+async def test_each_version_of_a_plan_and_each_task_has_a_row_of_its_own() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan("first")))
+    await recorder.record_plan(PlanRecord("lh-x", 2, a_plan("second")))
+    await recorder.record_plan(PlanRecord("lh-y", 1, a_plan("other task")))
+    assert sorted(recorder.plans) == [("lh-x", 1), ("lh-x", 2), ("lh-y", 1)]
+    assert recorder.plans[("lh-x", 2)].plan.summary == "second"

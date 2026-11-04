@@ -43,6 +43,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
 from longhaul.durable.scripts import script_key, upload_script
+from longhaul.roles import planner
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -735,3 +736,69 @@ async def test_a_script_that_is_missing_from_the_store_fails_for_good() -> None:
     with pytest.raises(ApplicationError) as caught:
         await run_turn(activities, turn_input(script_ref=ref))
     assert caught.value.non_retryable
+
+
+# ---------- LH-501: a tool list and a first message for each role ----------
+PLANNER_TOOLS = planner.tool_specs(TOOLS)
+
+
+def planner_rig(*steps: Step) -> Rig:
+    rig = Rig(*steps)
+    rig.activities = LlmActivities(
+        rig.provider,
+        rig.blobs,
+        rig.recorder,
+        TOOLS,
+        lambda role: CFG,
+        role_tools={Role.PLANNER: PLANNER_TOOLS},
+    )
+    return rig
+
+
+async def test_the_planner_is_asked_with_its_own_prompt_tools_and_first_message() -> None:
+    rig = planner_rig(reply("tool_use", use("toolu_1", "list_dir", path=".")))
+    out = await rig.run(turn_input(role=Role.PLANNER))
+
+    (call,) = rig.provider.calls
+    assert call["system"] == build_system_prompt(Role.PLANNER, SPEC)
+    assert call["tools"] == PLANNER_TOOLS
+    assert call["messages"] == [
+        Message(role="user", content=[TextBlock(text=planner.FIRST_USER_MESSAGE)])
+    ]
+    # The first message is the one the planner was asked with, so the stored transcript has it.
+    assert (await rig.transcript(out.transcript_ref))[0] == call["messages"][0]
+
+
+async def test_the_coder_keeps_the_default_tools_when_the_planner_has_its_own() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.CODER))
+
+    (call,) = rig.provider.calls
+    assert call["tools"] == TOOLS
+    assert call["messages"] == [FIRST]
+    assert "submit_plan" not in {tool.name for tool in call["tools"]}
+
+
+async def test_the_planner_is_not_offered_the_tools_that_write() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.PLANNER))
+
+    offered = {tool.name for tool in rig.provider.calls[0]["tools"]}
+    assert offered == {*planner.TOOLS, "submit_plan"}
+    assert not offered & {"edit_file", "write_file", "finish"}
+
+
+async def test_without_role_tools_every_role_gets_the_default_list() -> None:
+    # A worker built before the planner existed passes none, and its roles keep their tools.
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.CODER))
+    assert rig.provider.calls[0]["tools"] == TOOLS
+
+
+async def test_a_submit_plan_call_is_returned_like_any_call() -> None:
+    plan = {"summary": "s", "steps": [], "acceptance_checks": ["pytest -q"]}
+    rig = planner_rig(reply("tool_use", use("toolu_1", "submit_plan", **plan)))
+    out = await rig.run(turn_input(role=Role.PLANNER))
+
+    assert [c.name for c in out.tool_call_summaries] == ["submit_plan"]
+    assert out.tool_call_summaries[0].input == plan

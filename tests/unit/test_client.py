@@ -17,7 +17,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.contracts import BlobRef, CarryState, Phase, RepoSettings, TaskSpec, TaskStatus
 from longhaul.durable import client as durable_client
-from longhaul.durable.acts import SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.acts import PLAN_MEMO_KEY, SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
 from longhaul.durable.client import (
     DEFAULT_TASK_QUEUE,
     cancel_task,
@@ -287,3 +287,29 @@ async def test_connect_names_the_address_when_the_server_cannot_be_reached(
 
     with pytest.raises(ConnectionError, match="cannot reach Temporal at localhost:1"):
         await connect("localhost:1")
+
+
+# ---------- LH-501: planning is switched on per task ----------
+async def test_start_task_does_not_plan_unless_asked(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, plan=False)
+    assert fake.calls[0][1]["memo"] is None
+
+
+async def test_start_task_passes_the_plan_switch_in_the_memo(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, plan=True)
+    assert fake.calls[0][1]["memo"] == {PLAN_MEMO_KEY: True}
+
+
+async def test_start_task_passes_the_plan_switch_with_the_script_and_the_tuning(
+    spec: TaskSpec,
+) -> None:
+    fake = FakeClient()
+    tuning = Tuning(heartbeat_timeout_s=2)
+    await start_task(cast(Client, fake), spec, tuning=tuning, script=SCRIPT, plan=True)
+    assert fake.calls[0][1]["memo"] == {
+        TUNING_MEMO_KEY: tuning,
+        SCRIPT_MEMO_KEY: SCRIPT,
+        PLAN_MEMO_KEY: True,
+    }

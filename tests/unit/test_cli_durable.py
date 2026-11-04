@@ -739,3 +739,26 @@ def test_the_help_lists_every_command() -> None:
     result = invoke(["--help"])
     for name in ("run-local", "worker", "run", "status", "cancel"):
         assert name in result.stdout
+
+
+# ---------- LH-501: the plan ----------
+def test_run_does_not_plan_unless_asked(stack_for: Callable[..., Stack]) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args())
+    assert result.exit_code == 0, result.output
+    assert list(stack.start_kwargs["memo"]) == [acts.SCRIPT_MEMO_KEY]
+
+
+def test_run_plans_first_with_the_plan_flag(stack_for: Callable[..., Stack]) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--plan"))
+    assert result.exit_code == 0, result.output
+    assert stack.start_kwargs["memo"][acts.PLAN_MEMO_KEY] is True
+
+
+def test_the_status_line_shows_the_version_of_the_plan() -> None:
+    planned = status(Phase.CODING, 4).model_copy(update={"plan_version": 1})
+    assert cli.status_line(planned) == (
+        "status: coding, 4 turns done, cost $0.0000, plan v1, checkpoint 1a2b3c4"
+    )
+    assert "plan" not in cli.status_line(status(Phase.CODING, 4))

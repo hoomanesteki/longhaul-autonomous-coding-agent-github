@@ -151,6 +151,7 @@ def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: A
         pytest.param((), "effort", id="effort section"),
         pytest.param(("effort",), "compactor", id="effort.compactor"),
         pytest.param(("loop",), "max_tokens_retry", id="loop.max_tokens_retry"),
+        pytest.param(("loop",), "planner_max_turns", id="loop.planner_max_turns"),
         pytest.param((), "telemetry", id="telemetry section"),
         pytest.param(("telemetry",), "capture_content", id="telemetry.capture_content"),
     ],
@@ -185,6 +186,26 @@ def test_the_retry_cap_cannot_be_below_the_normal_cap(tmp_path: Path, cap: int) 
         load_config(path)
 
     assert "max_tokens_per_turn" in str(excinfo.value)
+
+
+def test_the_planner_gets_twenty_turns_unless_the_config_says_otherwise(tmp_path: Path) -> None:
+    assert load_config(EXAMPLE).loop.planner_max_turns == 20
+    data = _example_data()
+    data["loop"]["planner_max_turns"] = 8
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+    assert load_config(path).loop.planner_max_turns == 8
+
+
+@pytest.mark.parametrize("turns", [0, -3])
+def test_the_planner_needs_at_least_one_turn(tmp_path: Path, turns: int) -> None:
+    data = _example_data()
+    data["loop"]["planner_max_turns"] = turns
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "planner_max_turns")]
 
 
 def test_the_retry_cap_may_equal_the_normal_cap(tmp_path: Path) -> None:

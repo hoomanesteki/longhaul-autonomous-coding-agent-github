@@ -1,0 +1,61 @@
+diff --git a/src/inventory/checks.py b/src/inventory/checks.py
+new file mode 100644
+index 0000000..4ea7f0b
+--- /dev/null
++++ b/src/inventory/checks.py
+@@ -0,0 +1,5 @@
++def validate_quantity(quantity: int) -> int:
++    """Return quantity when it is positive, else raise ValueError."""
++    if quantity <= 0:
++        raise ValueError("quantity must be positive")
++    return quantity
+diff --git a/src/inventory/reservations.py b/src/inventory/reservations.py
+index 527ba2f..1b71489 100644
+--- a/src/inventory/reservations.py
++++ b/src/inventory/reservations.py
+@@ -3,6 +3,7 @@
+ import time
+ from dataclasses import dataclass
+ 
++from inventory.checks import validate_quantity
+ from inventory.store import Inventory
+ 
+ 
+@@ -22,8 +23,7 @@ class Reservations:
+ 
+     def reserve(self, sku: str, quantity: int, ttl_s: float) -> str:
+         """Hold quantity of sku for ttl_s seconds and return the reservation id."""
+-        if quantity <= 0:
+-            raise ValueError("quantity must be positive")
++        validate_quantity(quantity)
+         free = self.available(sku)
+         if quantity > free:
+             raise ValueError(f"{sku}: only {free} available")
+diff --git a/src/inventory/store.py b/src/inventory/store.py
+index b152ae6..48a6a2f 100644
+--- a/src/inventory/store.py
++++ b/src/inventory/store.py
+@@ -1,3 +1,6 @@
++from inventory.checks import validate_quantity
++
++
+ class Inventory:
+     """Tracks the on-hand quantity of each SKU."""
+ 
+@@ -6,14 +9,12 @@ class Inventory:
+ 
+     def add(self, sku: str, quantity: int) -> None:
+         """Increase the stock of sku by quantity."""
+-        if quantity <= 0:
+-            raise ValueError("quantity must be positive")
++        validate_quantity(quantity)
+         self._stock[sku] = self.quantity(sku) + quantity
+ 
+     def remove(self, sku: str, quantity: int) -> None:
+         """Decrease the stock of sku by quantity."""
+-        if quantity <= 0:
+-            raise ValueError("quantity must be positive")
++        validate_quantity(quantity)
+         self._stock[sku] = self.quantity(sku) - quantity
+ 
+     def quantity(self, sku: str) -> int:

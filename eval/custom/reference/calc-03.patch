@@ -1,0 +1,23 @@
+diff --git a/src/calc/__init__.py b/src/calc/__init__.py
+index e4e9e1f..9fa52ad 100644
+--- a/src/calc/__init__.py
++++ b/src/calc/__init__.py
+@@ -1,5 +1,7 @@
+ """Small arithmetic helpers."""
+ 
++from collections.abc import Sequence
++
+ 
+ def add(a: int, b: int) -> int:
+     """Return the sum of a and b."""
+@@ -14,3 +16,10 @@ def multiply(a: int, b: int) -> int:
+ def divide(a: float, b: float) -> float:
+     """Return a divided by b. Dividing by zero raises ZeroDivisionError."""
+     return a // b
++
++
++def mean(values: Sequence[float]) -> float:
++    """Return the arithmetic mean of values. An empty sequence raises ValueError."""
++    if not values:
++        raise ValueError("mean() needs at least one value")
++    return sum(values) / len(values)

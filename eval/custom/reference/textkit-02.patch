@@ -1,0 +1,15 @@
+diff --git a/src/textkit/truncate.py b/src/textkit/truncate.py
+index ab5b3ba..947ecb6 100644
+--- a/src/textkit/truncate.py
++++ b/src/textkit/truncate.py
+@@ -1,5 +1,8 @@
+ def truncate(text: str, width: int, suffix: str = "...") -> str:
+-    """Cut text down to width characters, ending with suffix when something was cut."""
++    """Cut text down to width characters, ending with suffix when something was cut.
++
++    The suffix counts toward the width, so the result is never longer than width.
++    """
+     if len(text) <= width:
+         return text
+-    return text[:width] + suffix
++    return text[: max(width - len(suffix), 0)] + suffix

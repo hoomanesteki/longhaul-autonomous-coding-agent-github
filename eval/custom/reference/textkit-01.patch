@@ -1,0 +1,22 @@
+diff --git a/src/textkit/slug.py b/src/textkit/slug.py
+index 242c110..ee2e27d 100644
+--- a/src/textkit/slug.py
++++ b/src/textkit/slug.py
+@@ -1,8 +1,16 @@
+ import re
++import unicodedata
+ 
+ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+ 
+ 
++def _strip_accents(text: str) -> str:
++    """Drop combining marks, so that "e" with an accent becomes "e"."""
++    decomposed = unicodedata.normalize("NFKD", text)
++    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
++
++
+ def slugify(text: str) -> str:
+     """Turn text into a lowercase, dash-separated slug."""
+-    return _NON_ALNUM.sub("-", text.lower()).strip("-")
++    folded = _strip_accents(text).lower()
++    return _NON_ALNUM.sub("-", folded).strip("-")

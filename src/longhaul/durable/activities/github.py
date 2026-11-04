@@ -26,9 +26,9 @@ nothing: the next poll finds the workflow, writes the row and moves on.
 One repo that fails does not stop the others. A repo that GitHub cannot read (a typo in the
 config, a token without access, a 5xx) is logged, the poll goes on with the next repo, and the
 activity fails at the end, so the Temporal UI shows a failed poll for as long as a repo is
-broken. The failure is retryable when any repo's was, with the longest wait GitHub asked for.
-The retry repeats the work of the repos that went well at the cost of one list call each: their
-issues now have rows.
+broken. The failure is retryable when any repo's was, after the longest wait GitHub asked for, cut
+to the longest backoff of the policy (see _retry_delay). The retry repeats the work of the
+repos that went well at the cost of one list call each: their issues now have rows.
 
 Unknown means no, as in intake.py. The comments of a new issue are filtered by the permission of
 their authors, and a permission that GitHub refuses to tell (a 403 or 404 for that login) counts
@@ -86,12 +86,23 @@ def _config_error(message: str) -> ApplicationError:
 
 
 def _retry_delay(failures: Sequence[tuple[str, Exception]]) -> timedelta | None:
+    """The longest wait that GitHub asked for, but never more than the policy's own backoff.
+
+    A spent primary quota can ask for an hour. The run of a poll ends after POLLER_RUN_TIMEOUT,
+    and the Schedule skips its ticks until then, so a longer wait would end the run by timeout
+    with no GitHub message on it. At the cap the attempts run out and the run fails with the
+    message instead, and the next tick polls again.
+    """
     waits = [
         exc.retry_after_s
         for _, exc in failures
         if isinstance(exc, GitHubRetryable) and exc.retry_after_s is not None
     ]
-    return timedelta(seconds=max(waits)) if waits else None
+    if not waits:
+        return None
+    delay = timedelta(seconds=max(waits))
+    longest = acts.POLL_ONCE.retry.maximum_interval
+    return delay if longest is None else min(delay, longest)
 
 
 def _failed(failures: Sequence[tuple[str, Exception]]) -> ApplicationError:

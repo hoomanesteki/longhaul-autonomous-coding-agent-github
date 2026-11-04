@@ -51,7 +51,7 @@ Install can be run again at any time. It creates the Schedule when it is missing
 
 | Failure | Error type | Retried |
 |---|---|---|
-| 5xx, network, rate limit | `GitHubRetryable`, with the wait GitHub asked for | Yes, 3 attempts, backoff 5 s to 30 s. The next tick is a retry too, so the backoff is short. |
+| 5xx, network, rate limit | `GitHubRetryable`, with the wait GitHub asked for | Yes, 3 attempts, backoff 5 s to 30 s. A longer wait than 30 s is cut to 30 s, so all attempts fit in the 15 minutes of a run. The next tick is a retry too, so the backoff is short. |
 | A repo that does not exist, a token without access, an issue without a usable number | `GitHubFatal` | No. |
 | No `LONGHAUL_GITHUB_TOKEN` on the worker, or an allowlist that `intake.py` refuses | `PollerConfigError` | No. |
 | Temporal unreachable | `RPCError` | Yes. |

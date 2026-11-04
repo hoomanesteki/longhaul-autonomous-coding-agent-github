@@ -1,19 +1,44 @@
-"""The system prompt for an agent role.
+"""The prompt of an agent role: six blocks in a fixed order, and where each one lives (LH-405).
 
-The prompt is one string with four static blocks in a fixed order: role and rules, tool
-usage guide, task statement, repo facts (the memory block). It is built once when a
-transcript starts and never changes, so the cache breakpoint at its end stays valid
-(ADR-0003, D7).
+    1. role and rules     static per role           system prompt
+    2. tool usage guide   static                    system prompt
+    3. task statement     static per task           system prompt
+    4. memory block       static per task           system prompt (empty until Phase 6)
+    5. plan               changes on step updates   first user message
+    6. progress notes     change on compaction      first user message
 
-The build plan also lists the plan and the progress notes as blocks 5 and 6. Both change
-during a task, so they reach the model as messages (Phases 4 and 5). That is why
-`build_system_prompt` takes no `notes` and no `plan`: a prompt that could change mid-task
-would throw away the cache for the whole transcript.
-
-The function is pure. The same arguments give the same bytes: it reads no clock, no
-environment and no random source, and it leaves the task id out, because two tasks on one
-issue should not differ in their first bytes. The first line is the role line from
+The system prompt is blocks 1 to 4. It is built once when a transcript starts and is the same
+bytes in every request of the task, so the cache breakpoint at its end stays valid for the whole
+task, together with the tool list that renders in front of it (ADR-0003, D7; the breakpoints are
+in providers/anthropic.py). The function is pure. The same arguments give the same bytes: it
+reads no clock, no environment and no random source, and it leaves the task id out, because two
+tasks on one issue should not differ in their first bytes. The first line is the role line from
 `providers.base`, which the scripted provider reads to pick its steps.
+
+Blocks 5 and 6 are text blocks of the first user message, in that order, after the line that
+starts the work. Compaction already puts the notes there (`context.compact.apply` keeps the other
+blocks of the message and adds the notes after them), and the plan goes in front of it. They could
+have been the tail of the system prompt instead. Both places leave everything before the
+breakpoint alone, and both lose the cached conversation when the block changes, because the
+system prompt renders before every message. What a change costs is the same, one write of the
+conversation after it, and the plan changes only on a step update and the notes only on a
+compaction. The first message wins on the rest:
+
+- A compaction rewrites the first message anyway, so the notes add nothing to its cost. In the
+  system prompt a compaction would change the prompt as well as the view, and the two would have
+  to be kept in step.
+- The system prompt is one string in the provider contract, with one breakpoint at its end. A tail
+  would need a separator that the provider cuts at, or a change to the contract, so that the
+  breakpoint could sit between block 4 and block 5.
+- `build_system_prompt` takes no plan and no notes, so a prompt that changes in the middle of a
+  task cannot be built by mistake. The test in test_prompt_layout reads the bytes of a whole task.
+
+A step update edits the plan block in place instead of adding a message at the tail. That keeps
+one plan in the conversation, where the model reads it, in the order above. A task has a handful of
+steps, so the rewrite is paid a handful of times.
+
+The tool list is the other half of the prefix. It is the same list in the same order for the life
+of a transcript, because a change to a tool drops every cache (ADR-0003, appendix).
 """
 
 from longhaul.contracts import Role, TaskSpec
@@ -24,6 +49,10 @@ TOOLS_HEADING = "## Tools"
 TASK_HEADING = "## Task"
 FACTS_HEADING = "## Repo facts"
 SECTION_HEADINGS = (RULES_HEADING, TOOLS_HEADING, TASK_HEADING, FACTS_HEADING)
+# The heading of block 5. The plan is rendered into the first user message by the coder story
+# (LH-503), not into the system prompt. The constant is here so that the layout test and that story
+# agree on the line the plan block starts with.
+PLAN_HEADING = "## Plan"
 
 # The first user message. The task itself is in the system prompt (block 3), so this only
 # starts the work and repeats the one rule the loop depends on.

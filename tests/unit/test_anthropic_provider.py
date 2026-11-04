@@ -378,6 +378,8 @@ async def test_tool_use_parsed() -> None:
                     "id": "toolu_01B",
                     "name": "read_file",
                     "input": {"path": "b.py"},
+                    # The conversation breakpoint: the last block of the assistant turn (LH-405).
+                    "cache_control": EPHEMERAL,
                 },
             ],
         },

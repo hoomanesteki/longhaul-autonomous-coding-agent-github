@@ -10,12 +10,43 @@ have retried: connection errors, 408, 409, 429 and 5xx.
 Whatever the API sends back, complete() returns an LLMResponse or raises ProviderError. LH-204
 retries by kind and treats any other exception as a bug.
 
-Requests. The system prompt goes out as one text block. With cache_system set it carries a
-cache_control breakpoint, and so does the last tool, which caches tools and system together.
-The messages get no breakpoint here; LH-405 adds that. ToolSpec.strict is sent when true.
+Requests. The system prompt goes out as one text block. ToolSpec.strict is sent when true.
 CallOptions.effort and output_schema share one output_config. A forced tool choice is refused
 before any HTTP call for the models that answer it with a 400 (ADR-0003, D3). No temperature,
 top_p or top_k is ever sent: API version 2026-10-21 rejects all three (D10).
+
+Cache breakpoints (LH-405). cache_system turns all of them on or off, and a request has four at
+most, the API limit (ADR-0003, appendix). Tools render first, then the system prompt, then the
+messages, and the cache holds a prefix of that order. The breakpoints are:
+
+1. The last tool. It caches the tool list alone.
+2. The system prompt, which is blocks 1 to 4 of the prompt layout and nothing else
+   (agent/prompts.py). The marker sits after block 4 and caches tools and system together. That
+   prefix is the same bytes in every request of a task.
+3. The last block of the previous assistant turn: the last assistant message that another message
+   follows. Each request reads what the one before it wrote, and writes the turn it added. A
+   paused reply at the end of the list is not that turn. Its text is continued by the next call,
+   so it would never be read again.
+4. The last message that holds an elided tool result (context/evict.py). Tier 1 turns one more
+   old result into a stub on every turn. That changes the request after the newest stub and
+   nowhere before it, so the entry that breakpoint 3 wrote on the last turn has a whole result
+   where this request has a stub, and it cannot be read. The prefix up to the newest stub is the
+   longest one that this request and the next share. Without this marker a long task would read
+   the tools and the system prompt and write the whole conversation again on every turn. When
+   nothing is elided there is no fourth.
+
+Caching by model. Nothing in this module depends on the model, but the API does. A prefix under
+the model's minimum is not cached, and no error says so: cache_creation_input_tokens stays 0.
+The minimum is 512 tokens on the 5.5 models and on Opus 5, 1024 on Sonnet 5 and Opus 4.8, 2048
+on Opus 4.7 and 4096 on Opus 4.6 and Haiku 4.5 (the caching guide in the Claude API reference).
+Tools and system prompt come to about 1,800 tokens for the coder, which is over the minimum of
+every model in the example config. On a model with a higher minimum the conversation breakpoints
+start to work once the transcript has grown past it. Thinking blocks are never sent back (D1),
+so the models that drop cached thinking when a plain user message follows tool use lose nothing
+here. A change of effort or of tool_choice between two requests drops the messages cache, and
+the loop holds both fixed for the life of a transcript (ADR-0003). The OpenAI provider has no
+markers and ignores cache_system. That API caches a stable prefix by itself, so the same layout
+serves it.
 
 A reply is streamed when max_tokens is above 16000 and sent plain otherwise. The SDK refuses a
 plain call that may run past ten minutes, and the retry after a max_tokens stop asks for 64000
@@ -53,6 +84,7 @@ from anthropic.types import (
 from anthropic.types import Message as ApiMessage
 
 from longhaul.agent.render import to_anthropic
+from longhaul.context.evict import ELIDED_PREFIX
 from longhaul.contracts import (
     Block,
     CallOptions,
@@ -283,7 +315,7 @@ def _build_request(
     tool_choice = _tool_choice(model, options)
     return _Request(
         model=model,
-        messages=cast(list[MessageParam], to_anthropic(messages)),
+        messages=_messages_param(messages, cache_system),
         system=_system_param(system, cache_system),
         tools=_tool_params(tools, cache_system),
         tool_choice=tool_choice,
@@ -293,6 +325,45 @@ def _build_request(
 
 def _cache_control() -> CacheControlEphemeralParam:
     return {"type": "ephemeral"}
+
+
+def _messages_param(messages: list[Message], cache: bool) -> list[MessageParam]:
+    wire = to_anthropic(messages)
+    if cache:
+        for index in _conversation_breakpoints(wire):
+            # The last block of the message, so the cached text ends where the message does.
+            wire[index]["content"][-1]["cache_control"] = _cache_control()
+    return cast(list[MessageParam], wire)
+
+
+def _conversation_breakpoints(wire: list[dict[str, Any]]) -> list[int]:
+    """The messages that get a breakpoint, oldest first: breakpoints 3 and 4 of the module doc.
+
+    Two at most, so with the last tool and the system prompt a request stays within the limit of
+    four however long the transcript is. The indexes are those of the wire messages, because
+    to_anthropic leaves out messages that have nothing to send.
+    """
+    marked: set[int] = set()
+    # The last message is the newest tool result, or the paused text of the reply being
+    # continued. Neither is a finished turn, so the search starts one before it.
+    for index in range(len(wire) - 2, -1, -1):
+        if wire[index]["role"] == "assistant":
+            marked.add(index)
+            break
+    for index in range(len(wire) - 1, -1, -1):
+        if any(_is_elided_result(block) for block in wire[index]["content"]):
+            marked.add(index)
+            break
+    return sorted(marked)
+
+
+def _is_elided_result(block: dict[str, Any]) -> bool:
+    content = block.get("content")
+    return (
+        block["type"] == "tool_result"
+        and isinstance(content, str)
+        and content.startswith(ELIDED_PREFIX)
+    )
 
 
 def _system_param(system: str, cache: bool) -> list[TextBlockParam] | Omit:

@@ -658,6 +658,106 @@ async def test_a_push_that_is_refused_takes_the_local_commit_back(
     assert env.bare("rev-parse", f"{second}^") == env.base_sha
 
 
+# A shell command can make commits of its own. The tree is then clean against the new HEAD, so a
+# commit that is given its parent compares with the parent instead.
+AGENT_GIT = "git -c user.name=agent -c user.email=agent@example.com"
+
+
+async def test_commit_with_a_parent_builds_on_it_after_the_agent_moved_head(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, f"echo mine > mine.txt && git add mine.txt && {AGENT_GIT} commit -qm own")
+    assert (await sh(box, "git rev-parse HEAD")).strip() != env.base_sha
+    assert (await sh(box, "git status --porcelain")).strip() == ""
+
+    assert (
+        await env.store.commit(box, "lh: run_command turn 1 call c1") is None
+    )  # the old blind spot
+    sha = await env.store.commit(box, "lh: run_command turn 1 call c1", parent=env.base_sha)
+
+    assert sha is not None and env.head() == sha
+    assert env.bare("rev-parse", f"{sha}^") == env.base_sha
+    assert env.bare("show", f"{sha}:mine.txt") == "mine"
+    assert env.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+    assert (await sh(box, "git rev-parse HEAD")).strip() == sha
+
+
+async def test_commit_with_a_parent_on_a_tree_equal_to_it_moves_head_back_and_adds_nothing(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, f"{AGENT_GIT} commit -q --allow-empty -m nothing")
+
+    assert (
+        await env.store.commit(box, "lh: run_command turn 1 call c1", parent=env.base_sha) is None
+    )
+
+    assert (await sh(box, "git rev-parse HEAD")).strip() == env.base_sha
+    assert env.head() == env.base_sha
+    assert env.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "1"
+
+
+async def test_commit_with_a_parent_keeps_the_chain_when_the_agent_resets_past_it(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    first = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert first is not None
+    await sh(box, "git reset -q --hard HEAD~1")
+
+    sha = await env.store.commit(box, "lh: run_command turn 2 call c2", parent=first)
+
+    assert sha is not None and env.bare("rev-parse", f"{sha}^") == first
+    assert env.bare("rev-parse", f"{sha}^{{tree}}") == env.bare(
+        "rev-parse", f"{env.base_sha}^{{tree}}"
+    )
+
+
+async def test_commit_with_a_parent_that_only_the_checkpoint_repo_has_fetches_it(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    replaced = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert replaced is not None
+    await env.store.restore(box, env.base_sha)
+    await box.write_file("other.txt", b"other\n")
+    assert await env.store.commit(box, "lh: write_file turn 1 call c1")
+    # A new container clones the branch and so has the second commit only.
+    fresh_box = FakeSandbox()
+    try:
+        await env.store.attach(fresh_box, TASK)
+        assert await sh(fresh_box, f"git cat-file -t {replaced} 2>/dev/null || echo missing") == (
+            "missing\n"
+        )
+        await fresh_box.write_file("third.txt", b"third\n")
+
+        sha = await env.store.commit(fresh_box, "lh: write_file turn 2 call c2", parent=replaced)
+    finally:
+        await fresh_box.destroy()
+
+    assert sha is not None and env.bare("rev-parse", f"{sha}^") == replaced
+
+
+async def test_commit_with_a_parent_that_does_not_exist_fails_and_changes_nothing(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file("a.txt", b"a\n")
+
+    with pytest.raises(CheckpointError, match="not in the checkpoint repository"):
+        await env.store.commit(box, "lh: write_file turn 1 call c1", parent="c" * 40)
+
+    assert env.head() == env.base_sha
+    assert "a.txt" in await sh(box, "git status --porcelain")
+
+
+@pytest.mark.parametrize("parent", ["", "main", "HEAD~1", "$(touch pwned)", "A" * 40])
+async def test_commit_refuses_a_parent_that_is_not_a_full_sha(
+    plain_store: GitCheckpointStore, empty_box: FakeSandbox, parent: str
+) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await plain_store.commit(empty_box, "lh: write_file turn 1 call c1", parent=parent)
+    assert list(empty_box.root.iterdir()) == [], "nothing ran in the sandbox"
+
+
 # ---------- restore ----------
 
 

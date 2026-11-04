@@ -990,10 +990,39 @@ async def test_a_sandbox_that_keeps_dying_ends_the_run_with_an_error(
         "tool_exec",
         "ensure_sandbox",
         "tool_exec",
+        # The run ends here, and the transcript still answers the call.
+        "append_results",
     ]
     assert acts.MAX_SANDBOX_RECREATIONS == 2
     assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
     assert final.outcome == outcome
+
+
+async def test_a_run_lost_to_a_dying_sandbox_still_answers_every_call_of_the_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The transcript of a run that ends must stay paired: a later report, resume or retry sends
+    # it to the model again, and the API answers 400 to a tool_use with no tool_result.
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        return [call("read_file", "c1"), call("run_tests", "c2"), finish()]
+
+    stubs = Stubs(script)
+    stubs.gone["c2"] = 99
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="sandbox lost")
+    (appended,) = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert appended.turn_index == 0
+    assert appended.transcript_ref == ref("turns/0000/assistant.json")
+    # One result for each call, in the order of the calls. c1 ran, c2 lost its sandbox for good,
+    # and the finish after it never ran.
+    by_id = {r.call_id: r for r in appended.results}
+    assert list(by_id) == ["c1", "c2", "finish-1"]
+    assert (by_id["c1"].ok, by_id["c1"].output) == (True, "ran read_file")
+    for lost in ("c2", "finish-1"):
+        assert by_id[lost].ok is False
+        assert "sandbox" in (by_id[lost].output or "")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
 
 
 async def test_the_limit_on_recreations_counts_each_call_on_its_own(

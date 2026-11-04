@@ -41,7 +41,7 @@ from longhaul.contracts import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from longhaul.db.records import CheckpointRecord, MemoryRecorder
+from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.tools import (
     SHELL_TOOLS,
@@ -101,9 +101,10 @@ class Rig:
         *,
         checkpoints: WorkspaceCheckpoints | None = None,
         registry: ToolRegistry | None = None,
+        recorder: MemoryRecorder | None = None,
     ) -> None:
         self.blobs = MemoryBlobStore()
-        self.recorder = MemoryRecorder()
+        self.recorder = recorder or MemoryRecorder()
         self.lookup = Lookup(sandbox)
         self.activities = ToolActivities(
             registry or default_registry(test_command="pytest -q"),
@@ -349,8 +350,14 @@ class Repo:
     def branch_head(self) -> str:
         return self.bare("rev-parse", f"refs/heads/{BRANCH}")
 
-    def rig(self, *, registry: ToolRegistry | None = None, spy: Spy | None = None) -> Rig:
-        return Rig(self.box, checkpoints=spy or self.store, registry=registry)
+    def rig(
+        self,
+        *,
+        registry: ToolRegistry | None = None,
+        spy: Spy | None = None,
+        recorder: MemoryRecorder | None = None,
+    ) -> Rig:
+        return Rig(self.box, checkpoints=spy or self.store, registry=registry, recorder=recorder)
 
     async def text(self, path: str = MODULE) -> str:
         return (await self.box.read_file(path)).decode()
@@ -592,6 +599,161 @@ async def test_a_retry_after_the_worker_died_after_the_commit_replaces_the_branc
     assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
     assert repo.bare("rev-parse", f"{result.post_sha}^") == repo.base_sha
     assert repo.bare("cat-file", "-t", lost) == "commit"
+
+
+# What the agent does with git itself inside a shell command. The sandbox image sets an
+# identity, and the fake sandbox has none, so the commands name one.
+AGENT_GIT = "git -c user.name=agent -c user.email=agent@example.com"
+
+
+async def test_a_command_that_commits_by_itself_is_saved_on_top_of_pre_sha(repo: Repo) -> None:
+    # The tree is clean against the new HEAD, so only a comparison with pre_sha sees the work.
+    rig = repo.rig()
+    command = f"echo fixed > fix.txt && git add fix.txt && {AGENT_GIT} commit -qm 'my own commit'"
+    result = await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command=command))
+
+    assert result.ok and result.post_sha is not None
+    assert repo.branch_head() == result.post_sha
+    assert repo.bare("rev-parse", f"{result.post_sha}^") == repo.base_sha
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+    assert repo.bare("show", f"{result.post_sha}:fix.txt") == "fixed"
+    assert host_git("-C", str(repo.box.root), "rev-parse", "HEAD") == result.post_sha
+    assert rig.recorder.checkpoints == [CheckpointRecord(TASK, result.post_sha, "tool", 2)]
+
+    # The next call starts from the returned head and still sees the work.
+    read = await rig.exec(
+        exec_input("read_file", "toolu_2", pre_sha=result.post_sha, path="fix.txt")
+    )
+    assert "fixed" in read.output
+
+
+async def test_a_command_that_commits_a_change_to_a_tracked_file_keeps_it(repo: Repo) -> None:
+    command = f"echo '# note' >> {MODULE} && {AGENT_GIT} commit -qam 'fix add'"
+    rig = repo.rig()
+    result = await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command=command))
+    assert result.post_sha is not None
+
+    read = await rig.exec(exec_input("read_file", "toolu_2", pre_sha=result.post_sha, path=MODULE))
+    assert "# note" in read.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    [f"{AGENT_GIT} revert --no-edit HEAD", "git reset -q --hard HEAD~1"],
+    ids=["revert", "reset"],
+)
+async def test_a_command_that_undoes_the_last_checkpoint_is_saved_as_a_new_one(
+    repo: Repo, command: str
+) -> None:
+    rig = repo.rig()
+    first = await rig.exec(edit(repo.base_sha))
+    assert first.post_sha is not None
+
+    undone = await rig.exec(
+        exec_input("run_command", "toolu_2", 3, pre_sha=first.post_sha, command=command)
+    )
+
+    # The chain stays a line that only grows: base, the edit, and a commit that takes it back.
+    assert undone.post_sha is not None and undone.post_sha != first.post_sha
+    assert repo.bare("rev-parse", f"{undone.post_sha}^") == first.post_sha
+    assert repo.branch_head() == undone.post_sha
+    assert repo.bare("rev-parse", f"{undone.post_sha}^{{tree}}") == repo.bare(
+        "rev-parse", f"{repo.base_sha}^{{tree}}"
+    )
+    read = await rig.exec(
+        exec_input("read_file", "toolu_3", 4, pre_sha=undone.post_sha, path=MODULE)
+    )
+    assert "return a - b + 1" not in read.output
+
+
+async def test_a_command_that_commits_nothing_new_leaves_the_workspace_at_pre_sha(
+    repo: Repo,
+) -> None:
+    spy = Spy(repo.store)
+    rig = repo.rig(spy=spy)
+    # An empty commit moves HEAD and changes no file.
+    command = f"{AGENT_GIT} commit -q --allow-empty -m 'nothing'"
+    result = await rig.exec(exec_input("run_command", pre_sha=repo.base_sha, command=command))
+
+    assert result.ok and result.post_sha is None
+    assert repo.branch_head() == repo.base_sha
+    assert rig.recorder.checkpoints == []
+    # HEAD is back on pre_sha, so the next call has nothing to restore.
+    assert await repo.store.is_at(repo.box, repo.base_sha)
+    await rig.exec(exec_input("read_file", "toolu_2", pre_sha=repo.base_sha, path=MODULE))
+    assert spy.restores == []
+
+
+class KilledRecorder(MemoryRecorder):
+    """A recorder whose worker dies once, in one write: before the row is stored or after it."""
+
+    def __init__(self, write: str, *, after: bool) -> None:
+        super().__init__()
+        self.write, self.after, self.armed = write, after, True
+
+    async def _killed(self, name: str, store: Any, record: Any) -> None:
+        dies = self.armed and name == self.write
+        if dies and not self.after:
+            self.armed = False
+            raise RuntimeError("the worker was killed")
+        await store(record)
+        if dies and self.after:
+            self.armed = False
+            raise RuntimeError("the worker was killed")
+
+    async def record_tool_call(self, record: ToolCallRecord) -> None:
+        await self._killed("record_tool_call", super().record_tool_call, record)
+
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        await self._killed("record_checkpoint", super().record_checkpoint, record)
+
+
+async def test_a_retry_after_the_worker_died_before_the_call_row_leaves_one_checkpoint_row(
+    repo: Repo,
+) -> None:
+    recorder = KilledRecorder("record_tool_call", after=False)
+    rig = repo.rig(recorder=recorder)
+
+    with pytest.raises(RuntimeError, match="killed"):
+        await rig.exec(edit(repo.base_sha))
+    lost = repo.branch_head()
+    assert lost != repo.base_sha  # the first attempt pushed its commit
+    await asyncio.sleep(1.1)  # a commit made a second later has another sha
+
+    result = await rig.exec(edit(repo.base_sha), attempt=2)
+
+    assert result.post_sha is not None and result.post_sha != lost
+    # A checkpoint row names a commit that is on the branch: the first attempt wrote none for
+    # `lost`, because its call row did not get stored.
+    assert recorder.checkpoints == [CheckpointRecord(TASK, result.post_sha, "tool", 2)]
+    (row,) = recorder.tool_calls.values()
+    assert row.post_sha == result.post_sha
+    assert repo.branch_head() == result.post_sha
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+
+
+async def test_a_retry_after_the_checkpoint_row_was_stored_keeps_the_old_row(repo: Repo) -> None:
+    # The one window that is left: the worker dies after its last write, before Temporal gets the
+    # result. The row of the replaced commit stays, and the commit stays restorable, because a
+    # checkpoint row means "this commit was saved", not "this commit is on the branch". The call
+    # row and the result name the commit that counts.
+    recorder = KilledRecorder("record_checkpoint", after=True)
+    rig = repo.rig(recorder=recorder)
+
+    with pytest.raises(RuntimeError, match="killed"):
+        await rig.exec(edit(repo.base_sha))
+    lost = repo.branch_head()
+    await asyncio.sleep(1.1)
+
+    result = await rig.exec(edit(repo.base_sha), attempt=2)
+
+    assert result.post_sha is not None and result.post_sha != lost
+    assert [c.sha for c in recorder.checkpoints] == [lost, result.post_sha]
+    assert repo.bare("cat-file", "-t", lost) == "commit"
+    (row,) = recorder.tool_calls.values()
+    assert row.post_sha == result.post_sha == repo.branch_head()
+    assert (await repo.text()).count("+ 1") == 1
+    assert repo.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
 
 
 async def test_an_odd_call_id_makes_a_safe_commit_message(repo: Repo) -> None:

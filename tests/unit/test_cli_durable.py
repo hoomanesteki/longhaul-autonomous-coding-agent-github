@@ -26,6 +26,7 @@ from typer.testing import CliRunner, Result
 from longhaul import cli
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import RepoNotFoundError
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import Outcome, OutcomeKind, Phase, TaskSpec, TaskStatus
 from longhaul.durable import acts
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -301,6 +302,56 @@ def test_the_script_and_the_provider_can_come_from_the_environment(
     monkeypatch.setenv("LONGHAUL_SCRIPT", str(SCRIPT))
     assert invoke(run_args(script=None)).exit_code == 0
     assert list(stack.start_kwargs["memo"]) == [acts.SCRIPT_MEMO_KEY]
+
+
+def test_a_context_mode_goes_into_the_memo_with_the_script(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--context-mode", "no_compaction"))
+    assert result.exit_code == 0, result.output
+
+    memo = stack.start_kwargs["memo"]
+    assert list(memo) == [acts.SCRIPT_MEMO_KEY, acts.CONTEXT_MODE_MEMO_KEY]
+    assert memo[acts.CONTEXT_MODE_MEMO_KEY] is ContextMode.NO_COMPACTION
+
+
+def test_a_context_mode_goes_with_a_provider_of_the_worker_too(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--provider", "anthropic", "--context-mode", "none", script=None))
+    assert result.exit_code == 0, result.output
+    assert stack.start_kwargs["memo"] == {acts.CONTEXT_MODE_MEMO_KEY: ContextMode.NONE}
+
+
+def test_without_a_context_mode_the_worker_config_decides(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    assert invoke(run_args()).exit_code == 0
+    assert acts.CONTEXT_MODE_MEMO_KEY not in stack.start_kwargs["memo"]
+
+
+def test_the_header_names_the_mode_the_run_asked_for(stack_for: Callable[..., Stack]) -> None:
+    stack_for(happy())
+    named = invoke(run_args("--context-mode", "none"))
+    assert "context mode none" in named.output
+
+    stack_for(happy())
+    unnamed = invoke(run_args())
+    assert "context mode" not in unnamed.output
+
+
+def test_a_context_mode_that_does_not_exist_is_a_usage_error_and_starts_nothing(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(happy())
+    result = invoke(run_args("--context-mode", "partial"))
+
+    assert result.exit_code == 2
+    assert "--context-mode" in result.output
+    assert stack.temporal.started == []
 
 
 def test_a_real_provider_uploads_no_script_and_the_worker_uses_its_own(

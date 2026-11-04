@@ -15,6 +15,7 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.workflow import ActivityCancellationType
 
 from longhaul.context import compact
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
     ProgressNotes,
@@ -545,6 +546,42 @@ def test_a_script_ref_survives_the_pydantic_data_converter() -> None:
 def test_the_script_and_the_tuning_have_memo_keys_of_their_own() -> None:
     assert acts.SCRIPT_MEMO_KEY == "script"
     assert acts.SCRIPT_MEMO_KEY != acts.TUNING_MEMO_KEY
+
+
+# ---------- LH-406: the context mode ----------
+def test_a_model_turn_and_a_compaction_name_no_mode_unless_the_run_does() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    compaction = acts.CompactInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=REF
+    )
+    assert turn.context_mode is None
+    assert compaction.context_mode is None
+
+
+def test_a_context_mode_survives_the_pydantic_data_converter() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x",
+        turn_index=0,
+        role=Role.CODER,
+        spec=SPEC,
+        transcript_ref=None,
+        context_mode=ContextMode.NO_COMPACTION,
+    )
+    compaction = acts.CompactInput(
+        task_id="lh-x",
+        turn_index=0,
+        role=Role.CODER,
+        spec=SPEC,
+        transcript_ref=REF,
+        context_mode=ContextMode.NONE,
+    )
+    converter = pydantic_data_converter.payload_converter
+    assert converter.from_payloads(converter.to_payloads([turn]), [acts.LlmTurnInput]) == [turn]
+    assert converter.from_payloads(converter.to_payloads([compaction]), [acts.CompactInput]) == [
+        compaction
+    ]
 
 
 # ---------- LH-307: the poller ----------

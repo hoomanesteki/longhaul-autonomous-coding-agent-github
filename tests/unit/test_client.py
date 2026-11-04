@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.contracts import CarryState, Phase, RepoSettings, TaskSpec
@@ -18,6 +20,7 @@ from longhaul.durable.acts import TUNING_MEMO_KEY, Tuning
 from longhaul.durable.client import DEFAULT_TASK_QUEUE, connect, start_task
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.settings import EnvSettings
+from longhaul.telemetry import otel
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -133,3 +136,23 @@ async def test_connect_defaults_to_the_default_namespace(monkeypatch: pytest.Mon
 
     await connect("localhost:7233")
     assert seen["namespace"] == "default"
+
+
+async def test_connect_registers_the_tracing_interceptor_when_tracing_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker takes its interceptors from its client, so this one registration also covers
+    # the worker's activities.
+    seen: dict[str, Any] = {}
+
+    async def fake_connect(address: str, **kwargs: Any) -> str:
+        seen.update(kwargs)
+        return "client"
+
+    monkeypatch.setattr(durable_client.Client, "connect", fake_connect)
+
+    with otel.configured(TracerProvider()):
+        await connect("localhost:7233")
+
+    (interceptor,) = seen["interceptors"]
+    assert isinstance(interceptor, TracingInterceptor)

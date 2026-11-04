@@ -116,6 +116,11 @@ def test_every_role_has_an_entry_in_models_and_effort(section: type[BaseModel]) 
 
 
 @pytest.mark.parametrize("level", get_args(EffortLevel))
+def test_example_config_keeps_prompts_and_tool_text_out_of_traces() -> None:
+    # Content capture is opt in (plan LH-703): prompts hold code and may hold secrets.
+    assert load_config(EXAMPLE).telemetry.capture_content is False
+
+
 def test_every_effort_level_loads(tmp_path: Path, level: str) -> None:
     data = _example_data()
     data["effort"]["coder"] = level
@@ -143,6 +148,8 @@ def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: A
         pytest.param((), "effort", id="effort section"),
         pytest.param(("effort",), "compactor", id="effort.compactor"),
         pytest.param(("loop",), "max_tokens_retry", id="loop.max_tokens_retry"),
+        pytest.param((), "telemetry", id="telemetry section"),
+        pytest.param(("telemetry",), "capture_content", id="telemetry.capture_content"),
     ],
 )
 def test_new_settings_have_no_silent_default(
@@ -199,6 +206,7 @@ UNKNOWN_KEY_CASES = [
     pytest.param(("context",), "compact_att", id="context"),
     pytest.param(("loop",), "max_verify_round", id="loop"),
     pytest.param(("stuck",), "no_progress_turn", id="stuck"),
+    pytest.param(("telemetry",), "capture_contnt", id="telemetry"),
 ]
 
 

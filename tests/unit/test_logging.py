@@ -48,6 +48,7 @@ def test_a_structlog_event_is_one_json_line(out: Captured) -> None:
     assert line["level"] == "info"
     assert line["logger"] == "longhaul.demo"
     assert line["timestamp"].endswith("Z")  # UTC, so logs from two hosts sort together
+    assert list(line)[:4] == ["timestamp", "level", "logger", "event"]
 
 
 def test_standard_library_records_use_the_same_output(out: Captured) -> None:
@@ -203,7 +204,7 @@ async def test_an_activity_logs_with_its_task_and_turn(out: Captured) -> None:
         assert line["task_id"] == "lh-acme-calc-7"
         assert line["turn_index"] == 2
         assert line["activity"] == "llm_turn"
-    # The binding ends with the activity, so the next one on this worker does not inherit it.
+    # The SDK runs each activity in a task of its own, so the next one does not inherit these.
     assert not {"task_id", "turn_index", "activity"} & set(after)
 
 

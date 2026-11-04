@@ -31,9 +31,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from longhaul.db.tasks import SqlTaskStore
-from longhaul.durable.activities.github import PollerActivities
-from longhaul.durable.workflows.poller import PollerWorkflow
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from temporalio.client import (
@@ -49,9 +46,12 @@ from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.contracts import RepoSettings, TaskSpec
 from longhaul.db.session import make_engine
+from longhaul.db.tasks import SqlTaskStore
 from longhaul.durable import acts, schedule
+from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.client import connect
 from longhaul.durable.workflow_sandbox import workflow_runner
+from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.settings import AppConfig, EnvSettings, RepoEntry, get_settings, load_config
 

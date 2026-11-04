@@ -1,8 +1,8 @@
 """The worker process: `longhaul worker`.
 
-A worker polls one Temporal task queue and runs the activities of TaskWorkflow. It is the only
-process that holds model keys, talks to Docker, and writes the database. The workflow itself runs
-in the worker too, under the sandbox settings of durable/workflow_sandbox.py.
+A worker polls one Temporal task queue and runs the activities of TaskWorkflow and PollerWorkflow.
+It is the only process that holds model keys, talks to Docker, and writes the database. The
+workflows run in the worker too, under the sandbox settings of durable/workflow_sandbox.py.
 
 What it is built from, and why each piece is what it is:
 
@@ -22,6 +22,11 @@ What it is built from, and why each piece is what it is:
   local folders only and still recovers the sandbox of a GitHub task.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
+* The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
+  own queue. Without a token the worker still starts and still registers `poll_once`, so a
+  worker for local runs needs none. A poll on it fails with the name of the setting, and the
+  Temporal UI shows that. The Schedule that triggers the polls is made by `longhaul poller
+  install` and not by the worker.
 
 Stopping. SIGTERM and SIGINT start a graceful stop: the worker polls no more, waits up to
 GRACEFUL_SHUTDOWN_S for the activities that are running, and cancels the rest. A cancelled
@@ -54,12 +59,15 @@ from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import load_pricing
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
+from longhaul.db.tasks import SqlTaskStore
 from longhaul.durable.activities.events import EventActivities
+from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import connect
 from longhaul.durable.workflow_sandbox import workflow_runner
+from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
 from longhaul.github.remote import GitHubRemote
@@ -161,12 +169,16 @@ def build_parts(
         github=remote,
     )
     events = EventActivities(recorder)
+    # The poller reads through the same client that GitHubRemote clones and pushes with, so
+    # WorkerParts.close has one connection pool to close.
+    poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
     return WorkerParts(
         activities=[
             *llm.activities,
             *tools.activities,
             *workspace.activities,
             *events.activities,
+            *poller.activities,
         ],
         blobs=blobs,
         store=store,
@@ -198,7 +210,7 @@ async def serve(
     worker = Worker(
         client,
         task_queue=task_queue,
-        workflows=[TaskWorkflow],
+        workflows=[TaskWorkflow, PollerWorkflow],
         activities=activities,
         workflow_runner=workflow_runner(),
         graceful_shutdown_timeout=grace,

@@ -1,13 +1,19 @@
 """The `longhaul` command line.
 
-Five commands and the `memory` group. `run-local` copies a folder into a Docker sandbox, lets
-the agent work on the issue in a text file, and prints what it did. No Temporal and no database
-are involved, so it is the quickest way to watch the agent work.
+Five commands and two groups, `memory` and `poller`. `run-local` copies a folder into a Docker
+sandbox, lets the agent work on the issue in a text file, and prints what it did. No Temporal
+and no database are involved, so it is the quickest way to watch the agent work.
 
 The other four use the durable stack that `make up` starts. `worker` runs the process that does
 the work (durable/worker.py). `run` starts a task for a folder on that stack and follows it
 until it ends. `status` and `cancel` ask about a task by its id, or stop it. They are separate
 commands because a task outlives `run`: Ctrl-C ends the command and the task goes on.
+
+`poller` is the group that manages the Temporal Schedule which finds labeled GitHub issues and
+starts a task for each one (LH-307, durable/schedule.py). `poller install` creates the Schedule
+or brings it to the interval of `poller.interval_seconds`, and running it again changes nothing.
+`pause`, `resume` and `trigger` act on it. They need Temporal and a config, and no worker: the
+worker is what runs the polls.
 
 What `run-local` prints, on stdout in this order: a header with the task id, the repo, the
 provider and the model; one line per turn; one line for how the run ended; and the final
@@ -37,7 +43,7 @@ import getpass
 import re
 import signal
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -86,6 +92,7 @@ from longhaul.contracts import (
     ToolContext,
 )
 from longhaul.db.session import database_url, make_engine
+from longhaul.durable import acts, schedule
 from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
 from longhaul.durable.scripts import upload_script
 from longhaul.memory.embedder import LocalEmbedder
@@ -145,6 +152,15 @@ memory_app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 app.add_typer(memory_app, name="memory")
+
+
+poller_app = typer.Typer(
+    name="poller",
+    help="Manage the Temporal Schedule that starts a task for each labeled GitHub issue.",
+    no_args_is_help=True,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(poller_app, name="poller")
 
 
 class ProviderName(StrEnum):
@@ -493,6 +509,41 @@ def memory_reject(item_id: ItemId, by: Approver = None) -> None:
     typer.echo(f"rejected {item_id} (by {who})")
 
 
+# ---------- the poller ----------
+@poller_app.command("install")
+def poller_install() -> None:
+    """Create the poller Schedule, or bring it to the interval of the config.
+
+    The interval is `poller.interval_seconds` and the poll runs on the task queue of
+    LONGHAUL_TASK_QUEUE, which is the queue of the worker. Run it again after a change of
+    either: it updates the Schedule when they differ and does nothing when they do not. A
+    paused Schedule stays paused.
+    """
+    run_poller_command(install_poller_schedule())
+
+
+@poller_app.command("pause")
+def poller_pause(
+    note: Annotated[
+        str, typer.Option("--note", help="Why. It shows next to the Schedule in the Temporal UI.")
+    ] = "",
+) -> None:
+    """Stop the polls. A poll that is running finishes. Start them again with `resume`."""
+    run_poller_command(pause_poller_schedule(note))
+
+
+@poller_app.command("resume")
+def poller_resume() -> None:
+    """Start the polls again after a `pause`."""
+    run_poller_command(resume_poller_schedule())
+
+
+@poller_app.command("trigger")
+def poller_trigger() -> None:
+    """Poll GitHub now, without waiting for the next tick. It works on a paused Schedule too."""
+    run_poller_command(trigger_poller_schedule())
+
+
 # ---------- the run ----------
 def make_manager() -> WorkspaceManager:
     """The sandbox manager. A function of its own so that unit tests can replace it."""
@@ -765,6 +816,46 @@ async def show_status(task_id: str) -> None:
 
 async def send_cancel(task_id: str, reason: str) -> None:
     await cancel_task(await open_client(EnvSettings()), task_id, by="cli", reason=reason)
+
+
+# ---------- the poller commands ----------
+def run_poller_command(command: Coroutine[Any, Any, None]) -> None:
+    """Run one poller command and report a failure of the config or of Temporal in a line."""
+    try:
+        asyncio.run(command)
+    except DURABLE_ERRORS as exc:
+        typer.echo(f"error: {describe(exc)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+
+
+async def install_poller_schedule() -> None:
+    settings = EnvSettings()
+    interval = load_config(config_path(settings)).poller.interval_seconds
+    outcome = await schedule.install_poller(
+        await open_client(settings), interval_seconds=interval, task_queue=settings.task_queue
+    )
+    typer.echo(
+        f"poller schedule {acts.POLLER_SCHEDULE_ID} {outcome.value}: a poll every {interval} s "
+        f"on task queue {settings.task_queue}"
+    )
+
+
+async def pause_poller_schedule(note: str) -> None:
+    await schedule.pause_poller(await open_client(EnvSettings()), note=note)
+    typer.echo(f"poller schedule {acts.POLLER_SCHEDULE_ID} paused")
+
+
+async def resume_poller_schedule() -> None:
+    await schedule.resume_poller(await open_client(EnvSettings()))
+    typer.echo(f"poller schedule {acts.POLLER_SCHEDULE_ID} resumed")
+
+
+async def trigger_poller_schedule() -> None:
+    await schedule.trigger_poller(await open_client(EnvSettings()))
+    typer.echo(
+        f"poll requested on schedule {acts.POLLER_SCHEDULE_ID}. "
+        "Nothing happens if a poll is already running"
+    )
 
 
 def status_line(current: TaskStatus | None) -> str:

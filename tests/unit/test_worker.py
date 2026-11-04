@@ -19,6 +19,7 @@ from longhaul.blobs.s3 import S3BlobStore
 from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
+from longhaul.github.client import GitHubClient
 from longhaul.github.remote import GitHubRemote
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
@@ -73,6 +74,52 @@ def test_the_worker_registers_one_activity_for_every_name_the_workflow_calls(
 ) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert names_of(parts) == sorted(act.name for act in acts.ALL)
+
+
+# ---------- the poller (LH-307) ----------
+TOKEN = "ghp_unit_test_token_0123456789abcdef"
+
+
+def poller_of(parts: worker.WorkerParts) -> Any:
+    (poll,) = [fn for fn in parts.activities if getattr(fn, "__name__", "") == "poll_once"]
+    return poll.__self__
+
+
+def test_a_worker_without_a_github_token_still_registers_poll_once(tmp_path: Path) -> None:
+    # A worker for local runs needs no token. A poll on it fails with the name of the setting.
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert parts.github is None
+    assert poller_of(parts)._github is None
+
+
+def test_the_token_of_the_settings_goes_to_the_poller(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, github_token=TOKEN)
+    parts = worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert isinstance(parts.github, GitHubClient)
+    assert poller_of(parts)._github is parts.github
+
+
+def test_tasks_start_on_the_queue_of_the_worker(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, task_queue="lh-queue-of-this-worker")
+    parts = worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert poller_of(parts)._task_queue == "lh-queue-of-this-worker"
+
+
+def test_a_token_that_cannot_be_sent_stops_the_worker_before_it_starts(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, github_token="not a token")
+    with pytest.raises(ValueError, match="GitHub token"):
+        worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
+
+
+async def test_closing_the_parts_closes_the_github_client(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token=TOKEN),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    assert parts.github is not None
+    await parts.close()
+    assert parts.github._http.is_closed
 
 
 def test_model_calls_go_on_the_cost_ledger(tmp_path: Path) -> None:

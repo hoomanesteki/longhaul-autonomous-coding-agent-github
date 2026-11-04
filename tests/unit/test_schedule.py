@@ -11,18 +11,19 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from longhaul.durable.workflows.poller import PollerWorkflow
 from temporalio.client import (
     Client,
     Schedule,
     ScheduleActionStartWorkflow,
     ScheduleAlreadyRunningError,
     ScheduleOverlapPolicy,
+    ScheduleSpec,
     ScheduleState,
 )
 from temporalio.service import RPCError, RPCStatusCode
 
 from longhaul.durable import acts, schedule
+from longhaul.durable.workflows.poller import PollerWorkflow
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
@@ -64,6 +65,11 @@ def test_a_poll_that_is_still_open_makes_the_next_tick_skip() -> None:
     wanted = schedule.poller_schedule(60, QUEUE)
     assert wanted.policy.overlap is ScheduleOverlapPolicy.SKIP
     assert wanted.policy.catchup_window == acts.POLLER_CATCHUP_WINDOW
+
+
+def test_a_schedule_with_another_kind_of_action_never_matches() -> None:
+    other = Schedule(action=object(), spec=ScheduleSpec())  # type: ignore[arg-type]
+    assert schedule.fingerprint(other) != schedule.fingerprint(schedule.poller_schedule(60, QUEUE))
 
 
 def test_a_new_schedule_runs_until_someone_pauses_it() -> None:
@@ -199,7 +205,7 @@ async def test_install_leaves_a_schedule_that_already_matches_alone() -> None:
 
 
 async def test_install_rewrites_a_schedule_whose_interval_changed() -> None:
-    client = FakeClient(current=schedule.poller_schedule(60, QUEUE))
+    client = FakeClient(current=schedule.poller_schedule(60, QUEUE, schedule_id="mine"))
 
     result = await schedule.install_poller(
         cast(Client, client), interval_seconds=45, task_queue=QUEUE, schedule_id="mine"
@@ -207,10 +213,9 @@ async def test_install_rewrites_a_schedule_whose_interval_changed() -> None:
 
     assert result is schedule.Installed.UPDATED
     assert client.handle_ids == ["mine"]
-    ((update,),) = [client.updates]
-    assert schedule.fingerprint(update.schedule) == schedule.fingerprint(
-        schedule.poller_schedule(45, QUEUE)
-    )
+    [update] = client.updates
+    wanted = schedule.poller_schedule(45, QUEUE, schedule_id="mine")
+    assert schedule.fingerprint(update.schedule) == schedule.fingerprint(wanted)
 
 
 async def test_install_checks_its_arguments_before_it_talks_to_the_server() -> None:

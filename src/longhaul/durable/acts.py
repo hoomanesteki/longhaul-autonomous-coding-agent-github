@@ -1,7 +1,7 @@
-"""What TaskWorkflow and its activities agree on: names, payload types and run policies.
+"""What the workflows and their activities agree on: names, payload types and run policies.
 
-The workflow calls every activity by name, with `result_type`, and imports none of the
-activity modules. Those modules reach the Docker SDK, boto3, the model SDKs and SQLAlchemy,
+TaskWorkflow and PollerWorkflow call every activity by name, with `result_type`, and import none
+of the activity modules. Those modules reach the Docker SDK, boto3, the model SDKs and SQLAlchemy,
 which invariant I1 keeps out of workflow code. This module has no I/O, so both sides can
 import it. The workflow reads the types and the policies. An activity registers under
 `Act.name` and takes the input type as its parameter, so the two cannot drift apart.
@@ -14,6 +14,13 @@ command, so a cancel has to reach it and a killed worker has to be noticed in a 
 `bundle_checkpoint` has the table's 5 minutes and 3 attempts and the same kind of heartbeat
 timeout, because it uploads the whole history of a repository. `record_event` is a local
 activity: it is one row insert, and it runs inside the worker that holds the workflow.
+
+`poll_once` belongs to PollerWorkflow and is not in the table either (LH-307). A poll reads a
+page or two of issues for each repo and starts the tasks that are new, so 3 minutes is generous.
+It has a heartbeat timeout because the Schedule skips a tick while a poll is open (ADR-0008): a
+poll on a killed worker must end in 30 seconds and not in 3 minutes. Its backoff is short
+because the next tick is a retry as well. Whatever a poll did before it failed is on record
+(a started task has its row), so a retried poll carries on where the last one stopped.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -105,6 +112,27 @@ SANDBOX_GONE = "SandboxGoneError"
 # run ends with an error. A sandbox that dies every time, because the call kills it or because
 # the host is failing, must not make the workflow loop.
 MAX_SANDBOX_RECREATIONS = 2
+
+# The error types that poll_once raises as ApplicationError. The retry policy names them, so
+# the activity and the policy cannot drift apart. The two GitHub names are the ones that
+# github/side_effects.py gives its errors.
+GITHUB_FATAL = "GitHubFatal"
+GITHUB_RETRYABLE = "GitHubRetryable"
+# A poll that cannot work with the settings it has: the worker has no GitHub token, or the
+# allowlist is not a valid one (github/intake.py). Asking again finds the same settings.
+POLLER_CONFIG = "PollerConfigError"
+
+# The Temporal Schedule of the poller (ADR-0008). `longhaul poller install` makes it and the
+# runs it starts are named "<schedule id>-run" and a time.
+POLLER_SCHEDULE_ID = "longhaul-poller"
+# The longest one run of PollerWorkflow may last. All attempts of poll_once at their longest
+# come to 3 x 180 s and two waits of 5 s and 10 s, which is under 10 minutes. A run that lasts
+# longer has lost its worker, and the Schedule skips ticks for as long as a run is open.
+POLLER_RUN_TIMEOUT = timedelta(minutes=15)
+# What the Schedule does about ticks it missed while the server was away: it catches up on those
+# of the last two minutes and drops the rest. A poll is a full scan, so one poll after an outage
+# is all that is needed.
+POLLER_CATCHUP_WINDOW = timedelta(minutes=2)
 
 
 # ---------- payloads ----------
@@ -260,6 +288,20 @@ class BundleCheckpointInput(BaseModel):
     turn_index: int
 
 
+class PollResult(BaseModel):
+    """What one poll came to, as counts. The task ids are in the log and in Temporal.
+
+    `repos` is the allowlisted repos it looked at, `issues` the open issues it saw with the label,
+    `started` the tasks it started, and `known` the issues it left alone because their task
+    already has a row or a workflow.
+    """
+
+    repos: int = Field(default=0, ge=0)
+    issues: int = Field(default=0, ge=0)
+    started: int = Field(default=0, ge=0)
+    known: int = Field(default=0, ge=0)
+
+
 # ---------- activities ----------
 @dataclass(frozen=True)
 class Act[In, Out]:
@@ -363,6 +405,23 @@ RECORD_EVENT = Act(
     local=True,
 )
 
+# The one activity of PollerWorkflow. It takes no input: the repos, the label and the task queue
+# are the worker's settings.
+POLL_ONCE = Act(
+    "poll_once",
+    NoneType,
+    PollResult,
+    start_to_close=timedelta(minutes=3),
+    heartbeat=timedelta(seconds=30),
+    retry=RetryPolicy(
+        initial_interval=timedelta(seconds=5),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=30),
+        maximum_attempts=3,
+        non_retryable_error_types=[_OVERSIZED, GITHUB_FATAL, POLLER_CONFIG],
+    ),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -372,6 +431,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     CLEANUP,
     BUNDLE_CHECKPOINT,
     RECORD_EVENT,
+    POLL_ONCE,
 )
 
 

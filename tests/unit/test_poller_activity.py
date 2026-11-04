@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from longhaul.db.tasks import ACTIVE, MemoryTaskStore
-from longhaul.durable.activities.github import PollerActivities
 from temporalio.client import Client
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -23,7 +22,9 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.contracts import CarryState, Phase
+from longhaul.db.tasks import ACTIVE, MemoryTaskStore
 from longhaul.durable import acts
+from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.settings import AppConfig, RepoEntry, load_config
@@ -471,3 +472,63 @@ def test_the_activity_is_registered_under_the_name_the_workflow_calls(
 
     (fn,) = poller(github, store).activities
     assert activity._Definition.must_from_callable(fn).name == acts.POLL_ONCE.name
+
+
+# --- the details of a failed poll -------------------------------------------------------------
+
+
+async def test_the_wait_github_asked_for_becomes_the_delay_before_the_retry(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    fake.fail_next(rf"/repos/{REPO}/issues", status=429, headers={"retry-after": "7"})
+
+    with pytest.raises(ApplicationError) as failed:
+        await poll(poller(github, store), temporal)
+
+    assert failed.value.next_retry_delay == timedelta(seconds=7)
+
+
+async def test_the_longest_wait_of_several_failed_repos_wins(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    fake.fail_next(rf"/repos/{REPO}/issues", status=429, headers={"retry-after": "7"})
+    fake.fail_next(rf"/repos/{OTHER}/issues", status=429, headers={"retry-after": "20"})
+
+    with pytest.raises(ApplicationError) as failed:
+        await poll(poller(github, store, config_with(entry(), entry(OTHER))), temporal)
+
+    assert failed.value.next_retry_delay == timedelta(seconds=20)
+    assert REPO in str(failed.value) and OTHER in str(failed.value)
+
+
+async def test_a_failure_message_stays_short_enough_for_the_history(
+    github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    config = config_with(*[entry(f"acme/typo-{n}") for n in range(40)])
+
+    with pytest.raises(ApplicationError) as failed:
+        await poll(poller(github, store, config), temporal)
+
+    assert len(failed.value.message) < 700
+    assert failed.value.message.endswith("...")
+    assert "40 repo" in failed.value.message
+
+
+class PullRequestListing(GitHubClient):
+    """A client whose list holds a pull request, which the real one filters out."""
+
+    async def list_labeled_issues(self, repo: str, label: str) -> list[dict[str, Any]]:
+        return [{"number": 1, "title": "a pull request", "body": "", "pull_request": {}}]
+
+
+async def test_an_item_that_intake_declines_is_skipped_without_a_row(
+    fake: FakeGitHub, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    fake.seed_issue(REPO, "a pull request", labels=[LABEL])
+    async with PullRequestListing(
+        FAKE_BASE_URL, PatAuth(TOKEN), transport=fake.transport()
+    ) as github:
+        result = await poll(poller(github, store), temporal)
+
+    assert temporal.started == [] and store.rows == {}
+    assert result == acts.PollResult(repos=1, issues=1, started=0, known=0)

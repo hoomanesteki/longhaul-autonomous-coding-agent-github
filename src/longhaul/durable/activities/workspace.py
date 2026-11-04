@@ -226,10 +226,11 @@ class WorkspaceActivities:
             log.warning(
                 "could not keep the commands of %s for task %s: %s", spec.repo, spec.task_id, exc
             )
-        # Whatever the commands wrote must not reach the agent: a formatter in a lint target
-        # edits tracked files, and a build leaves new ones. The venv of the setup is kept.
+        # Whatever the commands changed must not reach the agent: a formatter in a lint target
+        # edits tracked files, and a report leaves new ones. What the setup built stays: it is
+        # ignored by git, the network is off by now, and nothing could build it again.
         if not await self._store.is_at(sandbox, base_sha):
-            await self._store.restore(sandbox, base_sha)
+            await self._store.restore(sandbox, base_sha, keep_ignored=True)
 
     # ---------- ensure_sandbox ----------
     @activity.defn(name=acts.ENSURE_SANDBOX.name)

@@ -809,6 +809,27 @@ async def test_the_workspace_is_the_base_commit_again_after_the_commands_ran(rig
     assert setup_runs(box) == 1
 
 
+async def test_what_the_setup_wrote_outside_the_venv_survives_the_commands(rig: Rig) -> None:
+    # An in-place build leaves an ignored file in the tree. The network is already off when the
+    # commands run, so neither the agent nor a retry inside the task could build it again.
+    with (rig.source / ".gitignore").open("a") as ignore:
+        ignore.write("build/\n")
+    setup = f"{SETUP} && mkdir -p build && echo so > build/ext.so"
+    make_target(rig, f"echo drift >> {MODULE}; echo x > report.xml; echo '1 passed in 0.01s'")
+    notes = Notes()
+
+    out = await prepare_with(rig, notes, rig.spec(setup_command=setup))
+
+    assert "make test" in notes.commands
+    box = rig.box(out.sandbox_id)
+    assert (box.root / "build" / "ext.so").read_text() == "so\n"
+    assert (box.root / ".venv" / "setup-log").exists()
+    # The commands' own changes are gone all the same.
+    assert await sh(box, "git status --porcelain") == ""
+    assert not (box.root / "report.xml").exists()
+    assert "drift" not in (await box.read_file(MODULE)).decode()
+
+
 async def test_a_retry_finds_the_same_commands_again(rig: Rig) -> None:
     notes = Notes()
 

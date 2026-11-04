@@ -349,7 +349,7 @@ g cat-file -e "${SHA}^{commit}" 2>/dev/null || {
   exit 6
 }
 g reset -q --hard "$SHA"
-g clean -q -ffdx @KEEP@
+g clean -q @CLEAN@ @KEEP@
 """
 
 # Read only, and it takes no lock: it runs before every tool call, so a stale index.lock from a
@@ -649,16 +649,20 @@ class GitCheckpointStore(CheckpointStore):
             raise CheckpointError(f"checking the workspace gave unexpected output: {_tail(out)}")
         return answer == _AT
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
         """Put the workspace on `sha`, byte for byte: tracked files, no extras, no leftovers.
 
         Everything not in the commit is deleted, ignored files included, except the folders in
         `keep`. The checkpoint branch in /ckpt is not changed.
+
+        With `keep_ignored`, the files that git ignores stay as well. That undoes what a command
+        changed, and not what the setup built: use it where the setup has run and cannot run
+        again, such as after prepare_workspace has cut the network.
         """
-        keep = " ".join(f"-e {shlex.quote(name)}" for name in self._keep)
+        keep = "" if keep_ignored else " ".join(f"-e {shlex.quote(name)}" for name in self._keep)
         await self._in_sandbox(
             sandbox, _ENSURE_REPO + _RESTORE, "restore the workspace", RESTORE_TIMEOUT_S,
-            sha=shlex.quote(check_sha(sha)), keep=keep,
+            sha=shlex.quote(check_sha(sha)), keep=keep, clean="-ffd" if keep_ignored else "-ffdx",
         )  # fmt: skip
 
     # -- bundles --

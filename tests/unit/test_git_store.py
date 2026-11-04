@@ -900,6 +900,29 @@ async def test_restore_keeps_the_directories_named_in_keep(env: Env, tmp_path: P
         await sandbox.destroy()
 
 
+async def test_restore_can_keep_the_files_that_git_ignores(env: Env, box: FakeSandbox) -> None:
+    await sh(box, "echo build/ >> .gitignore")
+    ignore = await env.store.commit(box, "lh: write_file turn 1 call c1")
+    assert ignore is not None
+    await sh(
+        box,
+        "mkdir -p build .venv && echo so > build/ext.so && echo keep > .venv/marker"
+        " && echo drift >> src/calc/__init__.py && echo x > report.xml && mkdir -p out/deep"
+        " && echo y > out/deep/y.txt && rm tests/test_calc.py",
+    )
+
+    await env.store.restore(box, ignore, keep_ignored=True)
+
+    # Only the changes are undone: tracked files, and new files that are not ignored.
+    assert (await sh(box, "git status --porcelain")).strip() == ""
+    assert (await sh(box, "git rev-parse HEAD")).strip() == ignore
+    assert (box.root / "tests" / "test_calc.py").exists()
+    assert not (box.root / "report.xml").exists()
+    assert not (box.root / "out").exists()
+    assert (box.root / "build" / "ext.so").read_text() == "so\n"
+    assert (box.root / ".venv" / "marker").read_text() == "keep\n"
+
+
 async def test_restore_of_an_unknown_commit_names_it(env: Env, box: FakeSandbox) -> None:
     await sh(box, "echo keep >> pyproject.toml")
     with pytest.raises(CheckpointError, match="1" * 40):

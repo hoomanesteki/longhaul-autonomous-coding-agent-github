@@ -47,10 +47,12 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     names = [act.name for act in acts.ALL]
     assert sorted(names) == [
         "append_results",
+        "bundle_checkpoint",
         "cleanup",
         "ensure_sandbox",
         "llm_turn",
         "prepare_workspace",
+        "record_event",
         "tool_exec",
     ]
     assert len(set(names)) == len(names)
@@ -65,6 +67,8 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.TOOL_EXEC, acts.ToolExecInput, ToolResult),
         (acts.APPEND_RESULTS, acts.AppendResultsInput, BlobRef),
         (acts.CLEANUP, acts.CleanupInput, NoneType),
+        (acts.BUNDLE_CHECKPOINT, acts.BundleCheckpointInput, BlobRef),
+        (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -89,6 +93,12 @@ def test_each_activity_names_its_payload_types(
         # load_memory.
         pytest.param(acts.APPEND_RESULTS, 2 * 60, None, 3, id="append_results"),
         pytest.param(acts.CLEANUP, 2 * 60, None, 3, id="cleanup"),
+        # Section 3.7 gives bundle_checkpoint 5 minutes and 3 attempts. The heartbeat is added
+        # for the reason ensure_sandbox has one: it uploads a whole history, and a cancel has to
+        # reach it.
+        pytest.param(acts.BUNDLE_CHECKPOINT, 5 * 60, 60, 3, id="bundle_checkpoint"),
+        # A local activity: 10 seconds, and no heartbeat to set.
+        pytest.param(acts.RECORD_EVENT, 10, None, 3, id="record_event"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -136,6 +146,16 @@ def test_tool_exec_timeout_follows_the_configured_command_timeout() -> None:
     assert config.sandbox.command_timeout_s == acts.TOOL_TIMEOUT_S
 
 
+def test_the_hand_over_interval_follows_the_configured_one() -> None:
+    # Same reason as the tool timeout: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.loop.continue_as_new_every_turns == acts.CONTINUE_AS_NEW_EVERY_TURNS
+
+
+def test_only_record_event_is_local() -> None:
+    assert [act.name for act in acts.ALL if act.local] == ["record_event"]
+
+
 def test_finish_is_the_name_of_the_finish_tool() -> None:
     assert acts.FINISH_TOOL == FINISH
 
@@ -176,10 +196,52 @@ def test_an_empty_tuning_changes_nothing() -> None:
         assert acts.options(act, acts.Tuning()) == acts.options(act, None)
 
 
+def test_a_local_activity_gets_its_timeout_and_retries_but_no_heartbeat() -> None:
+    options = acts.local_options(acts.RECORD_EVENT)
+    assert options["start_to_close_timeout"] == timedelta(seconds=10)
+    assert options["retry_policy"] is acts.RECORD_EVENT.retry
+    assert "heartbeat_timeout" not in options
+    assert options["cancellation_type"] is ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+
+
 @pytest.mark.parametrize("seconds", [0, -1])
 def test_tuning_rejects_a_timeout_that_cannot_work(seconds: float) -> None:
     with pytest.raises(ValidationError):
         acts.Tuning(heartbeat_timeout_s=seconds)
+
+
+@pytest.mark.parametrize("turns", [0, -3])
+def test_tuning_rejects_a_hand_over_interval_that_cannot_work(turns: int) -> None:
+    with pytest.raises(ValidationError):
+        acts.Tuning(continue_as_new_every_turns=turns)
+
+
+def test_the_hand_over_interval_is_the_configured_one_unless_tuned() -> None:
+    assert acts.continue_as_new_every() == acts.CONTINUE_AS_NEW_EVERY_TURNS
+    assert acts.continue_as_new_every(acts.Tuning()) == acts.CONTINUE_AS_NEW_EVERY_TURNS
+    assert acts.continue_as_new_every(acts.Tuning(heartbeat_timeout_s=2)) == 40
+    assert acts.continue_as_new_every(acts.Tuning(continue_as_new_every_turns=3)) == 3
+
+
+@pytest.mark.parametrize(
+    ("turn_index", "every", "expected"),
+    [(0, 3, False), (1, 3, False), (2, 3, False), (3, 3, True), (4, 3, False), (6, 3, True)],
+)
+def test_a_run_hands_over_after_every_nth_turn(turn_index: int, every: int, expected: bool) -> None:
+    tuning = acts.Tuning(continue_as_new_every_turns=every)
+    assert acts.hand_off_due(turn_index, tuning) is expected
+
+
+def test_the_configured_interval_applies_without_a_tuning() -> None:
+    assert not acts.hand_off_due(39)
+    assert acts.hand_off_due(40)
+    assert not acts.hand_off_due(41)
+    assert acts.hand_off_due(80)
+
+
+def test_the_server_can_ask_for_a_hand_over_at_any_turn() -> None:
+    assert acts.hand_off_due(7, suggested=True)
+    assert not acts.hand_off_due(7, suggested=False)
 
 
 def test_tuning_rejects_unknown_fields() -> None:
@@ -291,6 +353,11 @@ SAMPLES: list[BaseModel] = [
     ),
     acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="cancelled by alice"),
     acts.Tuning(heartbeat_timeout_s=2.5),
+    acts.Tuning(continue_as_new_every_turns=3),
+    acts.BundleCheckpointInput(task_id="lh-x", turn_index=40),
+    acts.RecordEventInput(
+        task_id="lh-x", type="continue_as_new", payload={"turn_index": 40, "bundle": None}
+    ),
 ]
 
 

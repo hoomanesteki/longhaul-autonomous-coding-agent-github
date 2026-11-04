@@ -375,6 +375,129 @@ async def test_a_pause_with_no_text_carries_nothing_forward() -> None:
     assert out.paused_ref is None
 
 
+# ---------- hints (LH-207) ----------
+HINT = "alice: use pytest -x"
+HINT_TEXT = "Hint from alice: use pytest -x"
+
+
+async def test_a_hint_reaches_the_model_as_text_after_the_tool_results() -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")))
+    ref = await rig.put("transcript-1.json", answered())
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+
+    (call,) = rig.provider.calls
+    assert call["messages"][:-1] == answered()[:-1]
+    assert call["messages"][-1] == Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_use_id="toolu_1", content="x = 1"),
+            TextBlock(text=HINT_TEXT),
+        ],
+    )
+
+
+async def test_a_hint_does_not_change_the_system_prompt() -> None:
+    # D7: the prompt is the same bytes on every call of a transcript, or the cache is lost.
+    rig = Rig(reply("end_turn"), reply("end_turn"))
+    ref = await rig.put("transcript-1.json", answered())
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref))
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+
+    plain, hinted = rig.provider.calls
+    assert plain["system"] == hinted["system"] == build_system_prompt(Role.CODER, SPEC)
+    assert HINT_TEXT not in hinted["system"]
+    assert hinted["tools"] == plain["tools"]
+
+
+async def test_a_hint_is_stored_in_the_transcript_and_not_sent_again() -> None:
+    # The workflow keeps passing every hint of the task, and the transcript is what tells the
+    # activity which of them the model has read.
+    rig = Rig(
+        reply("tool_use", use("toolu_2", path="b.py")),
+        reply("end_turn", TextBlock(text="Done.")),
+    )
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    stored = await rig.transcript(first.transcript_ref)
+    assert stored[2].content[-1] == TextBlock(text=HINT_TEXT)
+
+    answer = Message(role="user", content=[ToolResultBlock(tool_use_id="toolu_2", content="y")])
+    grown = await rig.put("transcript-2.json", [*stored, answer], turn=1)
+    await rig.run(turn_input(turn_index=2, transcript_ref=grown, hints=[HINT]))
+
+    sent = rig.provider.calls[1]["messages"]
+    texts = [b.text for m in sent for b in m.content if isinstance(b, TextBlock)]
+    assert texts.count(HINT_TEXT) == 1
+    assert sent[-1] == answer
+
+
+async def test_a_second_hint_is_added_beside_the_first_that_is_already_there() -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="a")), reply("end_turn", TextBlock(text="b")))
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    # The reply ended the turn, so the next call starts from a user message again.
+    nudged = [
+        *await rig.transcript(first.transcript_ref),
+        Message(role="user", content=[TextBlock(text="Use tools or call finish.")]),
+    ]
+    again = await rig.put("transcript-2.json", nudged, turn=1)
+    await rig.run(turn_input(turn_index=2, transcript_ref=again, hints=[HINT, "bob: look at b.py"]))
+
+    last = rig.provider.calls[1]["messages"][-1]
+    assert [b.text for b in last.content if isinstance(b, TextBlock)] == [
+        "Use tools or call finish.",
+        "Hint from bob: look at b.py",
+    ]
+
+
+async def test_a_hint_that_came_with_the_start_is_in_the_first_message() -> None:
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    out = await rig.run(turn_input(hints=[HINT]))
+
+    (call,) = rig.provider.calls
+    assert call["messages"] == [
+        Message(
+            role="user", content=[TextBlock(text=FIRST_USER_MESSAGE), TextBlock(text=HINT_TEXT)]
+        )
+    ]
+    stored = await rig.transcript(out.transcript_ref)
+    assert stored[0] == call["messages"][0]
+
+
+async def test_a_reply_that_is_not_stored_keeps_the_hint_for_the_next_call() -> None:
+    # A reply cut off at max_tokens adds nothing to the transcript. The hint goes with it, and
+    # the call that asks again sends it once more, so it is read once and stored once.
+    cut = reply("max_tokens", TextBlock(text="Writing"))
+    rig = Rig(cut, reply("end_turn", TextBlock(text="Done.")))
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    assert first.transcript_ref == ref
+
+    second = await rig.run(
+        turn_input(
+            turn_index=1,
+            transcript_ref=first.transcript_ref,
+            hints=[HINT],
+            high_output_cap=True,
+        )
+    )
+    assert rig.provider.calls[0]["messages"][-1] == rig.provider.calls[1]["messages"][-1]
+    stored = await rig.transcript(second.transcript_ref)
+    texts = [b.text for m in stored for b in m.content if isinstance(b, TextBlock)]
+    assert texts.count(HINT_TEXT) == 1
+
+
+async def test_a_retry_of_the_activity_stores_the_same_transcript() -> None:
+    rig = Rig(
+        reply("end_turn", TextBlock(text="Done.")), reply("end_turn", TextBlock(text="Done."))
+    )
+    ref = await rig.put("transcript-1.json", answered())
+    inp = turn_input(turn_index=1, transcript_ref=ref, hints=[HINT])
+    first = await rig.run(inp)
+    second = await rig.run(inp, attempt=2)
+    assert await rig.transcript(first.transcript_ref) == await rig.transcript(second.transcript_ref)
+
+
 # ---------- the size of what crosses the boundary ----------
 async def test_arguments_over_16_kb_go_by_reference() -> None:
     big = "x" * 20_000

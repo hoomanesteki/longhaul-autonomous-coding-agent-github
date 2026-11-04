@@ -77,6 +77,11 @@ _CI_COMMAND = re.compile(
 )
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# A pytest line counts as a run when at least one test reached a verdict. "N deselected" alone is
+# what `-k` or `-m` prints when nothing matched, and a run with only skips tested nothing either.
+_PYTEST_VERDICT = re.compile(
+    r"\d+ (?:passed|failed|errors?|xfailed|xpassed|subtests (?:passed|failed))"
+)
 _RUFF_COUNT = r"\d+ files? (?:would be reformatted|already formatted|left unchanged)"
 # ruff check ends with one of the first two lines, and ruff format --check with the third.
 _RUFF = re.compile(rf"All checks passed!|Found \d+ errors?\.|{_RUFF_COUNT}(?:, {_RUFF_COUNT})?")
@@ -188,12 +193,14 @@ def summary_of(result: ExecResult) -> str | None:
     """The line that reports the outcome of a pytest, ruff or tox run, or None if there is none.
 
     pytest's line counts what ran ("1 failed, 2 passed"). A run that found no tests prints
-    "no tests ran", which says that the command tests nothing here, so it is not a summary.
+    "no tests ran", and one that deselected every test prints "N deselected" (exit code 5 in
+    both cases). Neither says that the command tests anything here, so neither is a summary.
+    The same goes for a run of skipped tests only.
     """
     texts = [_ANSI.sub("", result.stdout), _ANSI.sub("", result.stderr)]
     for text in texts:
         pytest_line = parse_pytest_summary(text)
-        if pytest_line and pytest_line != "no tests ran":
+        if pytest_line and _PYTEST_VERDICT.search(pytest_line):
             return pytest_line
     for pattern in (_RUFF, _TOX_ENV, _TOX_VERDICT):
         for text in texts:

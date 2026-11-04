@@ -8,6 +8,8 @@ Nothing here needs Docker: the sandbox is a temp folder, as in the other unit te
 from __future__ import annotations
 
 import pytest
+
+from longhaul.contracts import ExecResult
 from longhaul.memory.commands import (
     MAX_CANDIDATES,
     MAX_COMMAND_CHARS,
@@ -16,8 +18,6 @@ from longhaul.memory.commands import (
     summary_of,
     verify_commands,
 )
-
-from longhaul.contracts import ExecResult
 from longhaul.sandbox.local_manager import FakeSandbox
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
@@ -244,6 +244,9 @@ def test_a_summary_line_of_a_tool_counts(stdout: str, summary: str | None) -> No
         "make: *** No targets specified and no makefile found.  Stop.\n",
         "bash: pytest: command not found\n",
         "no tests ran in 0.01s\n",  # pytest found nothing to run, so the command tests nothing
+        "1 deselected in 0.18s\n",  # -k or -m matched nothing: exit code 5, as for "no tests ran"
+        "3 deselected, 1 warning in 0.18s\n",
+        "2 skipped in 0.01s\n",
         "ERROR: usage: pytest [options]\n",
         "ruff: error: unrecognized option\n",
         "Interrupted: 1 error during collection\n",
@@ -253,6 +256,12 @@ def test_a_summary_line_of_a_tool_counts(stdout: str, summary: str | None) -> No
 def test_other_output_is_not_a_summary(text: str) -> None:
     assert summary_of(result(text)) is None
     assert summary_of(result(stderr=text)) is None
+
+
+def test_a_run_that_deselected_some_tests_and_ran_others_is_a_summary() -> None:
+    assert summary_of(result("1 passed, 2 deselected in 0.02s\n")) == "1 passed, 2 deselected"
+    assert summary_of(result("1 xfailed, 1 deselected in 0.02s\n")) == "1 xfailed, 1 deselected"
+    assert summary_of(result("1 error in 0.02s\n")) == "1 error"
 
 
 def test_the_summary_may_be_on_stderr() -> None:

@@ -7,6 +7,7 @@ from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -71,6 +72,24 @@ class Task(Base):
     settings: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    # The context totals of the task (LH-406). Activities write them and the workflow never does.
+    # The three token totals follow the cost ledger rows of the task, the model calls of the
+    # compactor included. They do not overlap: `input_tokens_total` is what the model read that
+    # was not in the prompt cache (input and cache writes), `cache_read_total` what it read from
+    # the cache, so their sum is every prompt token. `compactions` counts the compaction events.
+    # `max_fraction` is the largest share of the context window that one request took, as llm_turn
+    # projected it before sending. 64 bit, because a task re-sends its prompt on every turn.
+    input_tokens_total: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    output_tokens_total: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    cache_read_total: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    compactions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_fraction: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -37,6 +37,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 
 from longhaul.agent.rules import BAD_FINISH, MAX_PAUSES, NUDGE
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
@@ -2443,3 +2444,131 @@ async def test_a_note_that_cannot_be_written_does_not_change_the_outcome(
     assert final.phase is Phase.DONE
     # The same retries as every record_event: it is a log line, and a local activity.
     assert len(stubs.outcomes) == acts.RECORD_EVENT.retry.maximum_attempts
+
+
+# ---------- context modes: what the workflow passes on and what it leaves out (LH-406) ----------
+async def play_in_mode(
+    env: WorkflowEnvironment, stubs: Stubs, spec: TaskSpec, mode: ContextMode | None
+) -> tuple[Outcome, TaskStatus]:
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, context_mode=mode)
+        outcome = await result_of(handle)
+        return outcome, await handle.query(TaskWorkflow.status)
+
+
+@pytest.mark.parametrize("mode", list(ContextMode))
+async def test_the_mode_of_the_run_goes_to_every_model_turn(
+    env: WorkflowEnvironment, spec: TaskSpec, mode: ContextMode
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    await play_in_mode(env, stubs, spec, mode)
+
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 3
+    assert {turn.context_mode for turn in turns} == {mode}
+
+
+async def test_the_mode_of_the_run_goes_to_the_compactor_that_the_full_mode_calls(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    await play_in_mode(env, stubs, spec, ContextMode.FULL)
+
+    (request,) = compactions(stubs)
+    assert request.context_mode is ContextMode.FULL
+
+
+async def test_a_run_that_names_no_mode_passes_none_and_the_worker_config_decides(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    stubs.overflow[1] = 1
+    await play_in_mode(env, stubs, spec, None)
+
+    assert {turn.context_mode for turn in stubs.payloads(acts.LLM_TURN.name)} == {None}
+    # The workflow cannot read the config, so it calls the compactor and the activity decides.
+    assert [request.context_mode for request in compactions(stubs)] == [None, None]
+
+
+@pytest.mark.parametrize("mode", [ContextMode.NO_COMPACTION, ContextMode.NONE])
+async def test_an_overflow_in_a_mode_without_compaction_ends_the_run_at_once(
+    env: WorkflowEnvironment, spec: TaskSpec, mode: ContextMode
+) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.overflow[1] = 1
+    outcome, final = await play_in_mode(env, stubs, spec, mode)
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
+    assert (final.phase, final.turn_index) == (Phase.FAILED, 2)
+    assert compactions(stubs) == []  # the compactor was not called
+    assert events_of(stubs, "compaction") == []
+    assert stubs.names().count(acts.LLM_TURN.name) == 2  # and turn 1 was not asked again
+
+
+@pytest.mark.parametrize("mode", [ContextMode.NO_COMPACTION, ContextMode.NONE])
+async def test_a_compact_decision_is_not_acted_on_in_a_mode_without_compaction(
+    env: WorkflowEnvironment, spec: TaskSpec, mode: ContextMode
+) -> None:
+    # llm_turn says "ok" in these modes, so this is the second guard: a decision that arrives
+    # anyway does not start a compaction.
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.decisions[0] = "compact"
+    stubs.decisions[1] = "force"
+    outcome, _ = await play_in_mode(env, stubs, spec, mode)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert compactions(stubs) == []
+    assert acts.COMPACT.name not in stubs.names()
+
+
+async def test_the_full_mode_still_compacts_after_an_overflow(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.overflow[1] = 1
+    outcome, _ = await play_in_mode(env, stubs, spec, ContextMode.FULL)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert [request.forced for request in compactions(stubs)] == [True]
+
+
+async def test_the_mode_survives_a_hand_over_to_a_new_run(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The memo is carried over Continue-As-New, so the run after the hand-over has the mode too.
+    stubs = Stubs(reads_then_finishes(3))
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client,
+            spec,
+            task_queue=queue,
+            tuning=acts.Tuning(continue_as_new_every_turns=2),
+            context_mode=ContextMode.NONE,
+        )
+        await result_of(handle)
+
+    assert len(set(stubs.run_ids)) > 1
+    assert {turn.context_mode for turn in stubs.payloads(acts.LLM_TURN.name)} == {ContextMode.NONE}
+
+
+async def test_histories_of_a_run_with_a_mode_replay(env: WorkflowEnvironment) -> None:
+    stubs = Stubs(reads_then_finishes(3))
+    stubs.overflow[2] = 1
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client,
+            make_spec("lh-acme-calc-8"),
+            task_queue=queue,
+            context_mode=ContextMode.NO_COMPACTION,
+        )
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=pydantic_data_converter,
+    )
+    await replayer.replay_workflow(history)

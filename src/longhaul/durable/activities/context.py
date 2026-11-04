@@ -12,6 +12,12 @@ view has no turn older than the ones to keep, there is nothing to fold: the acti
 "unchanged" with the view it was given, and makes no model call. The workflow does not ask the
 turn again in that case, since asking cannot help.
 
+The modes (LH-406). Only `full` compacts (longhaul.context.modes). In `no_compaction` and `none`
+the activity answers "unchanged" with the view it was given and makes no model call, whether the
+config says so or the run asked for it in `CompactInput.context_mode`, which wins over the config.
+The workflow skips the call when it knows the run's mode, and asks when it does not (the config is
+the worker's), so a forced compaction after an overflow ends the run at once in those modes.
+
 The compactor is context.compact.compact, with the model and effort of the compactor role. If it
 gives no valid notes twice (F14), the previous notes stay and the cut is halved (halve_cut), so
 fewer turns go without a summary. The previous notes are never dropped: compact() puts back any
@@ -60,6 +66,7 @@ from longhaul.context.compact import (
     halve_cut,
     render_for_compaction,
 )
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     LLMProvider,
     Message,
@@ -134,7 +141,7 @@ class ContextActivities:
         system = build_system_prompt(inp.role, inp.spec)
         meter = self._meters.for_task(inp.task_id)
         before = meter.projected(system, view, self._tools)
-        if cut == 0:
+        if cut == 0 or not self._mode(inp.context_mode).compacts:
             return small(
                 acts.CompactOutput(
                     transcript_ref=inp.transcript_ref,
@@ -202,6 +209,10 @@ class ContextActivities:
                 cost_usd=float(sum(spent, Decimal(0))),
             )
         )
+
+    def _mode(self, asked: ContextMode | None) -> ContextMode:
+        """The mode of this call: the one the run asked for, else the one in the config."""
+        return asked if asked is not None else self._context.mode
 
     @staticmethod
     def _cut_for(view: list[Message], cut: int, result: Compaction) -> int:

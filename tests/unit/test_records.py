@@ -234,3 +234,27 @@ async def test_no_call_of_the_tool_gives_none() -> None:
     await recorder.record_tool_call(named("t2", "run_tests", 1, task_id="lh-other"))
 
     assert await recorder.last_tool_call("lh-x", "run_tests") is None
+
+
+# ---------- the share of the window (LH-406) ----------
+async def test_the_largest_share_of_the_window_is_kept() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.30)
+    await recorder.record_request_fraction("lh-x", 0.55)
+    await recorder.record_request_fraction("lh-x", 0.40)  # a smaller request changes nothing
+    assert recorder.max_fractions == {"lh-x": 0.55}
+
+
+async def test_the_share_is_kept_for_each_task() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-y", 0.20)
+    assert recorder.max_fractions == {"lh-x": 0.50, "lh-y": 0.20}
+
+
+async def test_recording_the_same_share_again_changes_nothing() -> None:
+    # An activity that runs again records what it recorded before.
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-x", 0.50)
+    assert recorder.max_fractions == {"lh-x": 0.50}

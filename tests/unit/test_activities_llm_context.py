@@ -22,6 +22,7 @@ from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
 from longhaul.context.log import read_log
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import count_request_chars
 from longhaul.contracts import (
     BlobRef,
@@ -566,3 +567,175 @@ def test_a_policy_that_never_keeps_a_result_is_refused() -> None:
 def test_thresholds_that_cross_are_refused() -> None:
     with pytest.raises(ValueError, match="compact_at"):
         Rig(policy=context(compact_at=0.9, hard_limit=0.8))
+
+
+# ---------- the modes (LH-406) ----------
+@pytest.mark.parametrize(
+    ("mode", "elided"),
+    [
+        (ContextMode.FULL, True),
+        (ContextMode.NO_COMPACTION, True),
+        (ContextMode.NONE, False),
+    ],
+)
+async def test_the_modes_with_tier_one_elide_and_none_does_not(
+    mode: ContextMode, elided: bool
+) -> None:
+    rig = Rig(reply("tool_use", use("call-9")), policy=context(mode=mode))
+    ref = await rig.put(rounds(8))
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=ref))
+
+    sent = results(rig.provider.calls[0]["messages"])
+    assert results(await rig.view(out.transcript_ref)) == sent
+    assert any(text.startswith(ELIDED_PREFIX) for text in sent) is elided
+    if not elided:
+        assert sent == results(rounds(8))
+
+
+@pytest.mark.parametrize(
+    ("share", "reserve", "full"),
+    [(0.50, 0.15, "compact"), (0.70, 0.20, "force")],
+)
+@pytest.mark.parametrize(
+    ("mode", "wanted"),
+    [(ContextMode.FULL, None), (ContextMode.NO_COMPACTION, "ok"), (ContextMode.NONE, "ok")],
+)
+async def test_only_the_full_mode_asks_for_a_compaction(
+    mode: ContextMode, wanted: str | None, share: float, reserve: float, full: str
+) -> None:
+    # The same request calls for a compaction (or a forced one) in the full mode and for
+    # nothing in the others: a workflow that is told "ok" does not compact.
+    messages = rounds(1, lines=3)
+    window = window_for(messages, share)
+    policy = context(window, tool_output_max_tokens=round(window * reserve), mode=mode)
+    rig = Rig(reply("tool_use", use("c9")), policy=policy)
+
+    out = await rig.run(turn_input(turn_index=1, transcript_ref=await rig.put(messages)))
+
+    assert out.context_decision == (wanted or full)
+
+
+@pytest.mark.parametrize("mode", list(ContextMode))
+async def test_every_mode_refuses_a_request_over_the_hard_limit(mode: ContextMode) -> None:
+    # `none` drops both tiers, and the guard stays: it is what ends the task cleanly.
+    messages = rounds(2, lines=40)
+    rig = Rig(
+        reply("end_turn", TextBlock(text="Done.")),
+        policy=context(window_for(messages, 0.9), mode=mode),
+    )
+
+    with pytest.raises(ApplicationError) as caught:
+        await rig.run(turn_input(turn_index=2, transcript_ref=await rig.put(messages)))
+
+    assert caught.value.type == ProviderErrorKind.CONTEXT_TOO_LONG.value
+    assert caught.value.non_retryable is True
+    assert rig.provider.calls == []
+
+
+@pytest.mark.parametrize(
+    ("config", "asked", "elided"),
+    [
+        (ContextMode.NONE, ContextMode.FULL, True),
+        (ContextMode.NONE, ContextMode.NO_COMPACTION, True),
+        (ContextMode.FULL, ContextMode.NONE, False),
+        (ContextMode.NO_COMPACTION, ContextMode.NONE, False),
+    ],
+)
+async def test_the_mode_of_the_run_wins_over_the_config(
+    config: ContextMode, asked: ContextMode, elided: bool
+) -> None:
+    rig = Rig(reply("tool_use", use("call-9")), policy=context(mode=config))
+    ref = await rig.put(rounds(8))
+
+    await rig.run(turn_input(turn_index=8, transcript_ref=ref, context_mode=asked))
+
+    sent = results(rig.provider.calls[0]["messages"])
+    assert any(text.startswith(ELIDED_PREFIX) for text in sent) is elided
+
+
+async def test_the_mode_of_the_run_decides_whether_the_next_turn_compacts() -> None:
+    messages = rounds(1, lines=3)
+    window = window_for(messages, 0.5)
+    policy = context(window, tool_output_max_tokens=round(window * 0.15), mode=ContextMode.NONE)
+    rig = Rig(reply("tool_use", use("c9")), policy=policy)
+
+    out = await rig.run(
+        turn_input(
+            turn_index=1,
+            transcript_ref=await rig.put(messages),
+            context_mode=ContextMode.FULL,
+        )
+    )
+
+    assert out.context_decision == "compact"
+
+
+async def test_a_mode_without_a_context_policy_changes_nothing() -> None:
+    rig = Rig(reply("tool_use", use("call-9")))
+    ref = await rig.put(rounds(8))
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=ref, context_mode=ContextMode.FULL))
+
+    assert results(rig.provider.calls[0]["messages"]) == results(rounds(8))
+    assert out.context_decision == "ok"
+
+
+# ---------- the share of the window (LH-406) ----------
+async def test_the_share_of_the_window_that_the_request_took_is_recorded() -> None:
+    messages = rounds(2, lines=5)
+    window = 20_000
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")), policy=context(window))
+
+    out = await rig.run(turn_input(turn_index=2, transcript_ref=await rig.put(messages)))
+
+    assert out.request_tokens > 0
+    assert rig.recorder.max_fractions == {SPEC.task_id: pytest.approx(out.request_tokens / window)}
+
+
+async def test_a_smaller_request_does_not_lower_the_recorded_share() -> None:
+    big, small = rounds(4, lines=20), rounds(1, lines=2)
+    rig = Rig(
+        reply("end_turn", TextBlock(text="Done.")),
+        reply("end_turn", TextBlock(text="Done.")),
+        policy=context(20_000),
+    )
+
+    first = await rig.run(turn_input(turn_index=4, transcript_ref=await rig.put(big, turn=4)))
+    second = await rig.run(turn_input(turn_index=5, transcript_ref=await rig.put(small, turn=5)))
+
+    assert second.request_tokens < first.request_tokens
+    assert rig.recorder.max_fractions[SPEC.task_id] == pytest.approx(first.request_tokens / 20_000)
+
+
+async def test_a_request_that_was_not_sent_is_not_recorded() -> None:
+    messages = rounds(2, lines=40)
+    rig = Rig(policy=context(window_for(messages, 0.9)))
+
+    with pytest.raises(ApplicationError):
+        await rig.run(turn_input(turn_index=2, transcript_ref=await rig.put(messages)))
+
+    assert rig.recorder.max_fractions == {}
+
+
+async def test_without_a_context_policy_no_share_is_recorded() -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")))
+
+    await rig.run(turn_input())
+
+    assert rig.recorder.max_fractions == {}
+
+
+async def test_a_retried_turn_records_the_same_share() -> None:
+    # Recording is a maximum, so a second run of the activity cannot count the request twice.
+    rig = Rig(
+        reply("end_turn", TextBlock(text="Done.")),
+        reply("end_turn", TextBlock(text="Done.")),
+        policy=context(20_000),
+    )
+
+    await rig.run(turn_input(), attempt=1)
+    once = dict(rig.recorder.max_fractions)
+    await rig.run(turn_input(), attempt=2)
+
+    assert rig.recorder.max_fractions == once

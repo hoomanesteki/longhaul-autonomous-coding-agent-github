@@ -29,10 +29,23 @@ def test_task_columns_match_data_model() -> None:
     assert set(columns) == {
         "id", "repo", "issue_number", "title", "status", "phase", "outcome", "pr_url",
         "model_coder", "cost_usd", "turns", "started_at", "ended_at", "settings", "created_at",
+        # The context totals of LH-406 (plan section 3.5 names them in that story).
+        "input_tokens_total", "output_tokens_total", "cache_read_total", "compactions",
+        "max_fraction",
     }  # fmt: skip
     assert columns["id"].primary_key
     assert columns["issue_number"].nullable
     assert not columns["repo"].nullable
+
+
+def test_task_context_totals_start_at_zero_and_are_never_null() -> None:
+    # A task row is made by the poller before any activity writes a total, and a report reads the
+    # columns of every row, so none of them may be NULL.
+    ddl = str(CreateTable(Task.__table__).compile(dialect=postgresql.dialect()))
+    for name in ("input_tokens_total", "output_tokens_total", "cache_read_total"):
+        assert f"{name} BIGINT DEFAULT 0 NOT NULL" in ddl
+    assert "compactions INTEGER DEFAULT 0 NOT NULL" in ddl
+    assert "max_fraction FLOAT DEFAULT 0 NOT NULL" in ddl
 
 
 def test_task_indexes_and_pk_name() -> None:

@@ -272,6 +272,9 @@ async def test_grader_good_bad(tmp_path: Path) -> None:
     breaks_repo_test = calc_patch(
         ("return a - b", "return a + b"), ("return a * b", "return a + b")
     )
+    # Not a fix, yet no repo test notices: add(7, 0) is 7 before and after. Only the hidden
+    # tests can say that this patch changed nothing that matters.
+    leaves_the_bug = calc_patch(("return a - b", "return a - b if b else a"))
     garbage = "--- a/nowhere.py\n+++ b/nowhere.py\n@@ -1 +1 @@\n-x\n+y\n"
 
     resolved = await grader.grade(task, good)
@@ -281,6 +284,13 @@ async def test_grader_good_bad(tmp_path: Path) -> None:
     unresolved = await grader.grade(task, wrong)
     assert unresolved.resolved is False
     assert unresolved.hidden_failed == 3
+
+    # The repo tests stay green, so the hidden tests alone must keep the task unresolved.
+    unfixed = await grader.grade(task, leaves_the_bug)
+    assert unfixed.resolved is False
+    assert (unfixed.hidden_passed, unfixed.hidden_failed, unfixed.repo_failed) == (0, 3, 0)
+    assert unfixed.repo_passed > 0
+    assert "3 hidden tests failed" in unfixed.reason
 
     broken = await grader.grade(task, breaks_repo_test)
     assert broken.resolved is False
@@ -365,6 +375,8 @@ async def test_every_task_fails_before_and_passes_after_its_reference_patch() ->
             patch = custom_tasks.reference_patch_path(task).read_text(encoding="utf-8")
             after = await grader.grade(task, patch)
         problems = []
+        if before.resolved:
+            problems.append("the base is resolved without a fix")
         if before.hidden_failed == 0:
             problems.append("its hidden tests pass on the base")
         if before.repo_failed:

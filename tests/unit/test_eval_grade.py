@@ -6,9 +6,10 @@ cover the part that decides, which is reading the closing line of pytest and wor
 
 import pytest
 
-from eval import grade_custom
+from eval import custom_tasks, grade_custom
 from eval.grade_custom import SuiteRun
-from longhaul.contracts import ExecResult
+from longhaul.agent.workspace import DEFAULT_TEST_COMMAND
+from longhaul.contracts import ExecResult, SandboxLimits
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
 
@@ -99,3 +100,80 @@ def test_the_reason_when_nothing_ran_says_so() -> None:
     assert grade_custom.describe(SuiteRun(0, 0, False, ""), SuiteRun(0, 0, False, "")) == (
         "no tests ran"
     )
+
+
+# ---------- what decides a task ----------
+class FakeSandbox:
+    """A sandbox that answers git with the base commit and pytest with a fixed result.
+
+    The hidden tests run as a second pytest command with the hidden file as its argument, so
+    the fake tells the two runs apart by that path.
+    """
+
+    id = "fake"
+    workdir = "/workspace"
+
+    def __init__(self, base_sha: str, *, repo: ExecResult, hidden: ExecResult) -> None:
+        self._base_sha = base_sha
+        self._repo = repo
+        self._hidden = hidden
+
+    async def exec(
+        self, cmd: str, *, timeout_s: int, env: dict[str, str] | None = None
+    ) -> ExecResult:
+        if cmd == "git rev-parse HEAD":
+            return run_of(self._base_sha + "\n")
+        if cmd.startswith(DEFAULT_TEST_COMMAND):
+            return self._hidden if grade_custom.HIDDEN_DIR in cmd else self._repo
+        return run_of("")
+
+    async def read_file(self, path: str) -> bytes:
+        raise FileNotFoundError(path)  # no pyproject.toml, so nothing is installed
+
+    async def write_file(self, path: str, data: bytes) -> None:
+        return None
+
+    async def destroy(self) -> None:
+        return None
+
+
+class FakeManager:
+    async def set_network(self, sandbox_id: str, enabled: bool) -> None:
+        return None
+
+
+async def grade_with(repo: ExecResult, hidden: ExecResult) -> grade_custom.GradeResult:
+    task = custom_tasks.load_tasks()[0]
+    grader = grade_custom.Grader(
+        FakeManager(),  # type: ignore[arg-type]
+        image="unused",
+        limits=SandboxLimits(),
+    )
+    sandbox = FakeSandbox(task.base_sha, repo=repo, hidden=hidden)
+    return await grader._grade_in(sandbox, task, "a patch", b"")
+
+
+PASSING = run_of("4 passed in 0.10s\n")
+FAILING = run_of("1 failed, 2 passed in 0.10s\n", exit_code=1)
+
+
+async def test_passing_hidden_tests_alone_do_not_resolve_a_task_whose_repo_tests_fail() -> None:
+    graded = await grade_with(repo=FAILING, hidden=PASSING)
+    assert graded.resolved is False
+    assert (graded.hidden_failed, graded.repo_failed) == (0, 1)
+
+
+async def test_passing_repo_tests_alone_do_not_resolve_a_task_whose_hidden_tests_fail() -> None:
+    # A patch can leave every repo test green and fix nothing. The hidden tests are the only
+    # part of the grade that notices.
+    graded = await grade_with(repo=PASSING, hidden=FAILING)
+    assert graded.resolved is False
+    assert (graded.hidden_failed, graded.repo_failed) == (1, 0)
+    assert graded.reason == "1 hidden test failed"
+    assert "--- hidden tests ---" in graded.output_tail
+
+
+async def test_a_task_is_resolved_when_both_suites_pass() -> None:
+    graded = await grade_with(repo=PASSING, hidden=PASSING)
+    assert graded.resolved is True
+    assert (graded.hidden_passed, graded.repo_passed) == (4, 4)

@@ -24,7 +24,10 @@ from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes as gen_ai
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
+from opentelemetry.trace import StatusCode
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -66,6 +69,11 @@ INPUT_MARKER = "TOOL-INPUT-MARKER-9b2e"
 OUTPUT_MARKER = "TOOL-OUTPUT-MARKER-7d3a"
 REPLY_MARKER = "REPLY-MARKER-2e8f"
 
+# A failed run. The marker enters as file content, the model reads it back, and no scripted
+# step matches the third turn. ScriptedProvider then raises invalid_request with the tail of the
+# last tool result in the message, the way a compatible server echoes a rejected request.
+FAILURE_MARKER = "FAILURE-MARKER-a1b2"
+
 TURNS = 3
 TOOL_CALLS = 3
 
@@ -98,6 +106,22 @@ def write_script(directory: Path) -> Path:
         {"respond": {"tool_calls": [{"name": "finish", "input": {"summary": "Wrote notes."}}]}},
     ]
     path = directory / "traced.yaml"
+    path.write_text(yaml.safe_dump({"steps": steps}))
+    return path
+
+
+def write_failing_script(directory: Path) -> Path:
+    steps: list[dict[str, Any]] = [
+        {
+            "respond": {
+                "tool_calls": [
+                    {"name": "write_file", "input": {"path": "n.txt", "content": FAILURE_MARKER}}
+                ]
+            }
+        },
+        {"respond": {"tool_calls": [{"name": "read_file", "input": {"path": "n.txt"}}]}},
+    ]
+    path = directory / "failing.yaml"
     path.write_text(yaml.safe_dump({"steps": steps}))
     return path
 
@@ -137,18 +161,26 @@ class Boxes:
 
 @asynccontextmanager
 async def traced_run(
-    exporter: InMemorySpanExporter, tmp_path: Path, *, capture_content: bool
+    exporter: InMemorySpanExporter,
+    tmp_path: Path,
+    *,
+    capture_content: bool,
+    fail: bool = False,
+    caller: str | None = None,
 ) -> AsyncIterator[str]:
-    """Run the script to its end with tracing on, and yield the task id."""
+    """Run the script to its end with tracing on, and yield the task id.
+
+    With `fail`, the script runs out of steps and the workflow fails. With `caller`, the task
+    is started inside an open span of that name, as the poller activity will do (LH-307).
+    """
     provider = TracerProvider(resource=Resource.create({"service.name": otel.SERVICE_NAME}))
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     spec = make_spec()
     boxes = Boxes()
     toolbox = default_registry()
     blobs, recorder = MemoryBlobStore(), MemoryRecorder()
-    llm = LlmActivities(
-        ScriptedProvider(write_script(tmp_path)), blobs, recorder, toolbox.specs(), lambda r: CFG
-    )
+    script = write_failing_script(tmp_path) if fail else write_script(tmp_path)
+    llm = LlmActivities(ScriptedProvider(script), blobs, recorder, toolbox.specs(), lambda r: CFG)
     tools = ToolActivities(toolbox, boxes, blobs, recorder)
     with otel.configured(provider, capture_content=capture_content):
         async with await WorkflowEnvironment.start_time_skipping(
@@ -168,9 +200,17 @@ async def traced_run(
                 ],
                 workflow_runner=workflow_runner(),
             ):
-                handle = await start_task(env.client, spec, task_queue=queue)
-                outcome = await handle.result()
-            assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Wrote notes.")
+                if caller is None:
+                    handle = await start_task(env.client, spec, task_queue=queue)
+                else:
+                    with provider.get_tracer("test").start_as_current_span(caller):
+                        handle = await start_task(env.client, spec, task_queue=queue)
+                if fail:
+                    with pytest.raises(WorkflowFailureError):
+                        await handle.result()
+                else:
+                    outcome = await handle.result()
+                    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Wrote notes.")
             yield spec.task_id
     provider.shutdown()
 
@@ -190,10 +230,11 @@ def by_name(spans: tuple[ReadableSpan, ...], prefix: str) -> list[ReadableSpan]:
 
 
 def everything_said(spans: tuple[ReadableSpan, ...]) -> str:
-    """Every attribute value and event of every span, as one string to look for text in."""
+    """Every attribute value, event and status description, as one string to look for text in."""
     parts: list[str] = []
     for span in spans:
         parts.append(span.name)
+        parts.append(span.status.description or "")
         parts.extend(repr(value) for value in (span.attributes or {}).values())
         for event in span.events:
             parts.append(event.name)
@@ -289,3 +330,65 @@ async def test_content_is_captured_only_when_asked_for(
     said = everything_said(spans)
     for marker in (PROMPT_MARKER, INPUT_MARKER, OUTPUT_MARKER, REPLY_MARKER):
         assert marker in said, f"{marker} did not reach a span"
+
+
+async def test_failed_activity_text_stays_out_of_spans(
+    exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    """A provider error holds text from the run. With capture off it reaches no span.
+
+    The activity spans and the workflow completion span belong to Temporal's interceptor, which
+    records an exception's message and stacktrace on its own unless the tracer stops it.
+    """
+    async with traced_run(exporter, tmp_path, capture_content=False, fail=True):
+        spans = exporter.get_finished_spans()
+
+    # The failure is on record, so an empty search below cannot mean that nothing failed.
+    failed = [s for s in spans if s.status.status_code == StatusCode.ERROR]
+    assert {s.name for s in failed} >= {f"chat {MODEL}", "RunActivity:llm_turn"}
+    chat = by_name(spans, "chat ")[-1]
+    assert dict(chat.attributes or {})[ERROR_TYPE] == "invalid_request"
+    completion = by_name(spans, "CompleteWorkflow:")
+    assert [e.name for s in completion for e in s.events] == ["exception"]
+
+    said = everything_said(spans)
+    assert FAILURE_MARKER not in said
+    assert "no scripted step matches" not in said
+    assert "Traceback" not in said
+    # What stays: the exception class, so a failed span still says what kind of failure it was.
+    events = [e for s in spans for e in s.events if e.name == "exception"]
+    assert events
+    for event in events:
+        assert set(event.attributes or {}) <= {"exception.type"}
+
+
+async def test_failed_activity_keeps_text_when_content_is_captured(
+    exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    """With capture on, Temporal's spans keep their own exception detail, which the check
+    above can then see."""
+    async with traced_run(exporter, tmp_path, capture_content=True, fail=True):
+        spans = exporter.get_finished_spans()
+
+    assert FAILURE_MARKER in everything_said(spans)
+
+
+async def test_task_trace_does_not_join_the_caller(
+    exporter: InMemorySpanExporter, tmp_path: Path
+) -> None:
+    """A task started inside another span still gets a trace of its own.
+
+    The poller starts tasks from an activity (LH-307). Without a fresh context, every task of one
+    poll would join the trace of RunActivity:poll_once.
+    """
+    async with traced_run(
+        exporter, tmp_path, capture_content=False, caller="RunActivity:poll_once"
+    ):
+        spans = exporter.get_finished_spans()
+
+    caller = next(s for s in spans if s.name == "RunActivity:poll_once")
+    rest = [s for s in spans if s is not caller]
+    assert {s.context.trace_id for s in rest} != {caller.context.trace_id}
+    assert len({s.context.trace_id for s in rest}) == 1
+    roots = [s for s in rest if s.parent is None]
+    assert [s.name for s in roots] == ["StartWorkflow:TaskWorkflow"]

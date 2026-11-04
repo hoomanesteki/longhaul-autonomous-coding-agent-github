@@ -12,11 +12,16 @@ What it is built from, and why each piece is what it is:
   worker that restarts finds them again, which is how a task survives it.
 * The model provider is the one in LONGHAUL_PROVIDER. The scripted provider is the exception: a
   script belongs to a task and not to the worker (durable/scripts.py), so a scripted worker with
-  no LONGHAUL_SCRIPT has no provider of its own and plays the script each task brings.
+  no LONGHAUL_SCRIPT has no provider of its own and plays the script each task brings. The replay
+  provider plays the recordings in LONGHAUL_RECORDINGS_DIR, which is how the chaos runs get the
+  same model answers every time. With LONGHAUL_RECORD on, the provider is wrapped and saves each
+  call to that folder (providers/replay.py).
 * Every model call goes on the cost ledger (invariant I6), priced from `pricing_file`. A model
   in the config without a price stops the worker before it takes a task (load_pricing).
 * Spans go to the OpenTelemetry collector when OTEL_EXPORTER_OTLP_ENDPOINT is set. The client
   carries the tracing interceptor, so the worker built on it needs no list of its own.
+* Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
+  that is all a worker leaves behind, and it says where the kill landed.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 
@@ -55,6 +60,7 @@ from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
+from longhaul.durable.activity_log import ActivityLogInterceptor
 from longhaul.durable.client import connect
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -90,10 +96,17 @@ class WorkerParts:
 def build_provider(settings: EnvSettings) -> LLMProvider | None:
     """The provider for tasks that bring no script, or None for a scripted worker without one.
 
-    Any other missing setting, such as the key of a real provider, raises ValueError, so a
-    misconfigured worker stops at the start and not at its first model turn.
+    Any other missing setting, such as the key of a real provider or the folder of a replay,
+    raises ValueError, so a misconfigured worker stops at the start and not at its first model
+    turn.
     """
     if settings.provider == "scripted" and settings.script is None:
+        if settings.record:
+            raise ValueError(
+                "LONGHAUL_RECORD has no provider to record: LONGHAUL_PROVIDER is scripted and "
+                "LONGHAUL_SCRIPT is not set, so each task brings its own script. Set "
+                "LONGHAUL_SCRIPT, or use a provider of the worker"
+            )
         return None
     return get_provider(settings)
 
@@ -179,6 +192,7 @@ async def serve(
         activities=activities,
         workflow_runner=workflow_runner(),
         graceful_shutdown_timeout=grace,
+        interceptors=[ActivityLogInterceptor()],
     )
     running = asyncio.create_task(worker.run())
     stopping = asyncio.create_task(stop.wait())

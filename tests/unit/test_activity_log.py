@@ -9,12 +9,12 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from longhaul.durable.activity_log import ACTIVITY_LINE, ActivityLogInterceptor, describe
 from temporalio.testing import ActivityEnvironment
 from temporalio.worker import ActivityInboundInterceptor, ExecuteActivityInput
 
-from longhaul.contracts import BlobRef, Role, TaskSpec
+from longhaul.contracts import BlobRef, RepoSettings, Role, TaskSpec
 from longhaul.durable import acts
+from longhaul.durable.activity_log import ACTIVITY_LINE, ActivityLogInterceptor, describe
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -56,7 +56,14 @@ def tool_input(tool: str = "run_command", turn: int = 7) -> acts.ToolExecInput:
 
 
 def llm_input(turn: int = 3) -> acts.LlmTurnInput:
-    spec = TaskSpec(task_id="lh-t-1", repo="local:x", title="t", body="b")
+    spec = TaskSpec(
+        task_id="lh-t-1",
+        repo="local:x",
+        issue_number=None,
+        title="t",
+        body="b",
+        settings=RepoSettings(repo="local:x"),
+    )
     return acts.LlmTurnInput(
         task_id="lh-t-1", turn_index=turn, role=Role.CODER, spec=spec, transcript_ref=REF
     )

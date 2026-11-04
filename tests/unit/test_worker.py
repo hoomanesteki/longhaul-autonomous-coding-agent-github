@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.providers.replay import ReplayProvider
 from temporalio import activity
 
 from longhaul.blobs.s3 import S3BlobStore
@@ -21,6 +20,7 @@ from longhaul.contracts import Message, TextBlock, ToolSpec
 from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
+from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
 

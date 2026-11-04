@@ -41,10 +41,10 @@ def test_the_script_never_kills_by_name(word: str) -> None:
     assert word not in code()
 
 
-def test_the_script_kills_only_the_pid_of_the_worker_it_started() -> None:
-    kills = re.findall(r"^\s*kill\b.*$", code(), re.MULTILINE)
+def test_the_script_kills_only_the_pids_of_the_processes_it_started() -> None:
+    kills = re.findall(r"\bkill\b[^\n]*", code())
     assert kills, "the script kills nothing"
-    assert all('"$WORKER_PID"' in k for k in kills), kills
+    assert all('"$WORKER_PID"' in k or '"$RUN_PID"' in k for k in kills), kills
 
 
 def test_the_script_removes_only_the_containers_of_its_own_task() -> None:

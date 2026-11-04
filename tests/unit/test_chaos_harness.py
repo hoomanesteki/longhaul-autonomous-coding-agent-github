@@ -147,7 +147,14 @@ def make_run(**changes: object) -> Run:
     values: dict[str, object] = {
         "task_id": "lh-t-1",
         "outcome": Outcome(kind=OutcomeKind.PR_OPENED, summary="done"),
-        "status": TaskStatus(task_id="lh-t-1", phase=Phase.DONE, last_checkpoint="b"),
+        "status": TaskStatus(
+            task_id="lh-t-1",
+            phase=Phase.DONE,
+            turn_index=2,
+            cost_usd=0.0,
+            last_checkpoint="b",
+            plan_version=None,
+        ),
         "diff": "the diff\n",
         "calls": [call(1, "base", "a"), call(2, "a", "b")],
         "first_parent": ["a", "b"],

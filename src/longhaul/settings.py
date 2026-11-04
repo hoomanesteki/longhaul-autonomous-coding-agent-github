@@ -61,6 +61,10 @@ class EnvSettings(BaseSettings):
     script: Path | None = None
     # Where the worker keeps one bare repo per task. Unset means ~/.longhaul/ckpt (ADR-0006).
     ckpt_dir: Path | None = None
+    # Recorded model calls (LH-209). With provider "replay" the provider plays this folder. With
+    # `record` on, the provider of the run is wrapped and saves every call into it.
+    recordings_dir: Path | None = None
+    record: bool = False
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )

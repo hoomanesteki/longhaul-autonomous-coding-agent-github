@@ -46,7 +46,6 @@ import docker
 import psycopg
 from alembic import command
 from alembic.config import Config
-from longhaul.durable.activity_log import ACTIVITY_LINE
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
@@ -55,6 +54,7 @@ from longhaul import cli
 from longhaul.blobs.s3 import S3BlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.contracts import Outcome, OutcomeKind, TaskStatus
+from longhaul.durable.activity_log import ACTIVITY_LINE
 from longhaul.durable.acts import Tuning
 from longhaul.durable.client import connect, get_task, read_status, start_task
 from longhaul.durable.scripts import upload_script
@@ -480,7 +480,7 @@ class Stack:
         require_image()
         try:
             return asyncio.run(self._run(list(kills)))
-        except BaseException as exc:
+        except Exception as exc:
             logs = "\n".join(f"--- {w.log.name}\n{w.text()[-3000:]}" for w in self.workers)
             raise AssertionError(f"the chaos run failed: {exc!r}\n{logs}") from exc
 

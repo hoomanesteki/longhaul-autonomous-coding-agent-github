@@ -1,6 +1,11 @@
 """Provider protocol re-exports, the factory chosen by LONGHAUL_PROVIDER, and the
 two transcript conventions that scripted and replay providers read.
 
+The factory. LONGHAUL_PROVIDER names who answers: `anthropic`, `openai`, `scripted`, or `replay`,
+which plays a folder of recorded calls (LONGHAUL_RECORDINGS_DIR). With LONGHAUL_RECORD on, the
+provider that was chosen is wrapped, and every call it makes is saved into that folder, so a
+later run can play it back (providers/replay.py).
+
 Role line. The first line of every system prompt names the role, written with
 ``ROLE_LINE_FORMAT``. Prompt builders import the constant instead of retyping it.
 
@@ -52,10 +57,6 @@ _TURN_OFFSET_LINE = re.compile(
     rf"^[ \t]*{re.escape(_OFFSET_HEAD)}(\d+){re.escape(_OFFSET_TAIL)}[ \t]*$", re.MULTILINE
 )
 
-_PENDING = {
-    "replay": "LH-209",
-}
-
 
 def format_role_line(role: Role | str) -> str:
     return ROLE_LINE_FORMAT.format(role=role.value if isinstance(role, Role) else role)
@@ -99,6 +100,13 @@ def turn_index(messages: list[Message]) -> int:
 
 
 def get_provider(settings: EnvSettings, *, script_path: Path | None = None) -> LLMProvider:
+    if settings.provider == "replay":
+        return _replay_provider(settings)
+    provider = _chosen_provider(settings, script_path)
+    return _recording(provider, settings) if settings.record else provider
+
+
+def _chosen_provider(settings: EnvSettings, script_path: Path | None) -> LLMProvider:
     if settings.provider == "scripted":
         path = script_path or settings.script
         if path is None:
@@ -124,5 +132,29 @@ def get_provider(settings: EnvSettings, *, script_path: Path | None = None) -> L
         if settings.openai_base_url:
             return OpenAICompatProvider(api_key, base_url=settings.openai_base_url)
         return OpenAICompatProvider(api_key)
-    story = _PENDING[settings.provider]
-    raise NotImplementedError(f"provider {settings.provider!r} is not implemented yet ({story})")
+    raise ValueError(f"unknown provider {settings.provider!r}")
+
+
+def _replay_provider(settings: EnvSettings) -> LLMProvider:
+    if settings.record:
+        raise ValueError(
+            "LONGHAUL_RECORD saves the calls of a provider that makes them, so LONGHAUL_PROVIDER "
+            "cannot be replay. Set it to anthropic, openai or scripted"
+        )
+    if settings.recordings_dir is None:
+        raise ValueError(
+            "provider 'replay' needs LONGHAUL_RECORDINGS_DIR, the folder with the recorded calls"
+        )
+    from longhaul.providers.replay import ReplayProvider
+
+    return ReplayProvider(settings.recordings_dir)
+
+
+def _recording(provider: LLMProvider, settings: EnvSettings) -> LLMProvider:
+    if settings.recordings_dir is None:
+        raise ValueError(
+            "LONGHAUL_RECORD needs LONGHAUL_RECORDINGS_DIR, the folder to save the calls in"
+        )
+    from longhaul.providers.replay import ReplayProvider
+
+    return ReplayProvider(settings.recordings_dir, record_with=provider)

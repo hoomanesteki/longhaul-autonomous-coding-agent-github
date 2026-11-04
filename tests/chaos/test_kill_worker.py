@@ -134,7 +134,9 @@ def test_kill_between_activities(stack: Stack, reference: Run) -> None:
 
 
 @pytest.mark.chaos_lite
-@pytest.mark.parametrize("seed", [7, 21])
+# Seed 9 draws a delay in the middle of the edits and seed 19 one in the command. The aimed tests
+# above cover the places that a random draw rarely hits.
+@pytest.mark.parametrize("seed", [9, 19])
 def test_a_kill_at_a_random_moment_resumes(stack: Stack, reference: Run, seed: int) -> None:
     run = stack.run(plan_kills(seed, 1, reference.work_s))
 

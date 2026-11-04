@@ -270,11 +270,16 @@ def last_user_text(call: dict[str, Any]) -> str:
 
 # ---------- find_cut ----------
 @st.composite
-def transcripts(draw: st.DrawFn) -> list[Message]:
+def transcripts(draw: st.DrawFn, *, odd: bool = False) -> list[Message]:
     """A transcript as the loop builds it: a user message, then rounds of assistant and user.
 
     A round has up to three parallel calls, answered in one user message that may carry a hint
     after the results. A turn without calls is followed by the harness nudge.
+
+    With `odd`, two things the loop never builds are mixed in. Now and then another assistant
+    message sits between a call and its result, and the transcript sometimes ends with a round
+    that has no results yet. In a loop-shaped transcript every assistant message is a safe cut,
+    so only these show whether find_cut() checks the pairing rule or only the shape.
     """
     messages = [user(text(FIRST))]
     ids = iter(range(10_000))
@@ -285,6 +290,8 @@ def transcripts(draw: st.DrawFn) -> list[Message]:
             blocks.append(text("thinking aloud"))
         blocks += [use(i) for i in ids_in_turn]
         messages.append(assistant(*blocks))
+        if odd and ids_in_turn and draw(st.integers(0, 3)) == 0:
+            messages.append(assistant(text("still thinking")))
         if ids_in_turn:
             answers: list[Block] = [res(i) for i in ids_in_turn]
             if draw(st.booleans()):
@@ -292,32 +299,76 @@ def transcripts(draw: st.DrawFn) -> list[Message]:
             messages.append(user(*answers))
         else:
             messages.append(user(text("Use tools or call finish.")))
+    if odd and draw(st.booleans()):
+        messages.append(assistant(use(f"toolu_{next(ids)}")))
     return messages
 
 
-@settings(
+def latest_safe_cut(messages: list[Message], keep: int) -> int:
+    """The cut found the slow way: the last message that can start the kept part.
+
+    It has to be an assistant message, with at least one turn in front of it and `keep` turns
+    from it on, and every call in front of it has to be answered in front of it too.
+    """
+    for i in range(len(messages) - 1, 0, -1):
+        before, after = messages[:i], messages[i:]
+        if (
+            messages[i].role == "assistant"
+            and assistants(before) >= 1
+            and assistants(after) >= keep
+            and call_ids(before) == result_ids(before)
+        ):
+            return i
+    return 0
+
+
+PROPERTY = settings(
     max_examples=300,
     deadline=None,
     # A loaded CI runner must not fail the build over speed.
     suppress_health_check=[HealthCheck.too_slow],
 )
-@given(transcripts(), st.integers(min_value=1, max_value=10))
+
+
+@PROPERTY
+@given(transcripts(odd=True), st.integers(min_value=1, max_value=10))
 def test_find_cut_property(messages: list[Message], keep: int) -> None:
     cut = find_cut(messages, keep)
 
+    # It is the latest place that keeps `keep` turns and splits no tool round, which is 0 when
+    # there is none, as in a transcript with fewer turns than the ones to keep.
+    assert cut == latest_safe_cut(messages, keep)
     if assistants(messages) <= keep:
         assert cut == 0  # nothing is older than the turns to keep
+    if cut == 0:
+        return
+
+    assert 0 < cut < len(messages)
+    assert messages[cut].role == "assistant"
+    before, after = messages[:cut], messages[cut:]
+    assert assistants(after) >= keep
+    assert assistants(before) >= 1  # a cut that folds no turn would only add notes
+    # The rule: no tool_use before the cut waits for a result after it, and no result after
+    # it answers a call from before.
+    assert call_ids(before) == result_ids(before)
+    assert not result_ids(after) & call_ids(before)
+
+
+@PROPERTY
+@given(transcripts(), st.integers(min_value=1, max_value=10))
+def test_find_cut_property_on_loop_transcripts_keeps_exactly_the_recent_turns(
+    messages: list[Message], keep: int
+) -> None:
+    cut = find_cut(messages, keep)
+
+    if assistants(messages) <= keep:
+        assert cut == 0
         return
 
     assert 0 < cut < len(messages)
     assert messages[cut].role == "assistant"
     before, after = messages[:cut], messages[cut:]
     assert assistants(after) == keep
-    assert assistants(before) >= 1  # a cut that folds no turn would only add notes
-    # The rule: no tool_use before the cut waits for a result after it, and no result after
-    # it answers a call from before.
-    assert call_ids(before) == result_ids(before)
-    assert not result_ids(after) & call_ids(before)
     validate_pairs(before)
     validate_pairs(after)
     # And what apply makes of it is a transcript the API takes.
@@ -1037,6 +1088,32 @@ def test_keep_failures_ignores_case_and_spacing_and_accepts_a_longer_entry() -> 
     assert merged.tried_and_failed == [*model.tried_and_failed, "Mocking time.sleep hides the bug"]
 
 
+def test_keep_failures_does_not_take_part_of_a_longer_word_as_the_entry() -> None:
+    # "Retry the request" is not in "Retry the request_id lookup ...", whose next word is
+    # request_id. "pin numpy" is not in a line about "numpy<2" either: a version bound is
+    # a different thing to have tried. Both earlier entries were dropped, so both come back.
+    previous = notes(tried_and_failed=["Retry the request", "pin numpy"])
+    model = notes(
+        tried_and_failed=[
+            "Retry the request_id lookup fails, wrong header",
+            "pin numpy<2 breaks pandas import",
+        ]
+    )
+
+    merged = keep_failures(model, previous)
+
+    assert merged.tried_and_failed == [*model.tried_and_failed, "Retry the request", "pin numpy"]
+
+
+def test_keep_failures_finds_the_entry_inside_a_longer_one() -> None:
+    previous = notes(tried_and_failed=["Casting to int still overflows"])
+    model = notes(
+        tried_and_failed=["Attempt 2: casting to int still overflows, even with numpy 1.26"]
+    )
+
+    assert keep_failures(model, previous) is model
+
+
 def test_keep_failures_changes_nothing_without_earlier_notes() -> None:
     model = notes(tried_and_failed=["only this"])
 
@@ -1254,6 +1331,7 @@ async def test_provider_errors_go_up_for_the_activity_retry_policy(kind: Provide
         await compact(provider, "m", None, "[turn 1]")
 
     assert caught.value.kind is kind
+    assert caught.value.usage is None  # nothing was billed, so there is nothing to ledger
     assert len(provider.calls) == 1
 
 
@@ -1275,6 +1353,84 @@ async def test_a_provider_error_on_the_repair_call_goes_up() -> None:
         await compact(provider, "m", None, "[turn 1]")
 
     assert caught.value.kind is ProviderErrorKind.OVERLOADED
+
+
+BILLED = Usage(input_tokens=5_000, output_tokens=700)
+MORE = Usage(input_tokens=10, output_tokens=20, cache_read_tokens=30, cache_write_tokens=40)
+
+
+async def test_a_provider_error_reports_what_the_earlier_calls_cost() -> None:
+    # The model is asked on auto, as claude-sonnet-5-5 has to be. Its first reply is prose and
+    # is billed. The repair call then fails. The activity that catches the error can ledger
+    # the first call only if the error carries its usage (I6).
+    provider = FakeProvider(
+        chatter(), ProviderError(ProviderErrorKind.OVERLOADED, "busy"), refuses_forced=True
+    )
+
+    with pytest.raises(ProviderError) as caught:
+        await compact(provider, "claude-sonnet-5-5", None, "[turn 1]")
+
+    assert caught.value.kind is ProviderErrorKind.OVERLOADED
+    assert len(provider.calls) == 3  # the refused force, the prose, and the failed repair
+    assert caught.value.usage == USAGE
+
+
+async def test_a_provider_error_adds_its_own_usage_to_the_earlier_calls() -> None:
+    failed_after_billing = ProviderError(ProviderErrorKind.SERVER, "bad body", usage=MORE)
+    provider = FakeProvider(chatter(), failed_after_billing)
+
+    with pytest.raises(ProviderError) as caught:
+        await compact(provider, "m", None, "[turn 1]")
+
+    assert caught.value is failed_after_billing
+    assert caught.value.usage == Usage(
+        input_tokens=USAGE.input_tokens + MORE.input_tokens,
+        output_tokens=USAGE.output_tokens + MORE.output_tokens,
+        cache_read_tokens=MORE.cache_read_tokens,
+        cache_write_tokens=MORE.cache_write_tokens,
+    )
+
+
+async def test_a_refused_force_that_was_billed_is_counted() -> None:
+    # An unknown block type in a billed reply comes back as INVALID_REQUEST with the usage on
+    # it (providers/anthropic.py). compact() asks again on auto, and the first call is still
+    # in the usages.
+    refused = ProviderError(ProviderErrorKind.INVALID_REQUEST, "unknown block", usage=BILLED)
+    provider = FakeProvider(refused, notes_reply(NOTES))
+
+    result = await compact(provider, "m", None, "[turn 1]")
+
+    assert result.status == "ok"
+    assert provider.forced() == [NOTES_TOOL_NAME, None]
+    assert result.usages == (BILLED, USAGE)
+
+
+async def test_a_refused_force_that_was_billed_is_counted_when_the_next_call_fails() -> None:
+    refused = ProviderError(ProviderErrorKind.INVALID_REQUEST, "unknown block", usage=BILLED)
+    busy = ProviderError(ProviderErrorKind.OVERLOADED, "busy")
+    provider = FakeProvider(refused, busy)
+
+    with pytest.raises(ProviderError) as caught:
+        await compact(provider, "m", None, "[turn 1]")
+
+    assert caught.value.kind is ProviderErrorKind.OVERLOADED
+    assert caught.value.usage == BILLED
+
+
+async def test_an_invalid_request_that_goes_up_carries_the_usage_of_both_tries() -> None:
+    first = ProviderError(ProviderErrorKind.INVALID_REQUEST, "bad schema", usage=BILLED)
+    second = ProviderError(ProviderErrorKind.INVALID_REQUEST, "bad schema", usage=MORE)
+    provider = FakeProvider(first, second)
+
+    with pytest.raises(ProviderError) as caught:
+        await compact(provider, "m", None, "[turn 1]")
+
+    assert caught.value.usage == Usage(
+        input_tokens=BILLED.input_tokens + MORE.input_tokens,
+        output_tokens=BILLED.output_tokens + MORE.output_tokens,
+        cache_read_tokens=MORE.cache_read_tokens,
+        cache_write_tokens=MORE.cache_write_tokens,
+    )
 
 
 async def test_compact_works_against_scripted_replies_for_every_outcome(tmp_path: Path) -> None:

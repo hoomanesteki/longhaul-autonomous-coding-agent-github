@@ -21,10 +21,22 @@ COMPOSE = ROOT / "docker-compose.yml"
 MAKEFILE = ROOT / "Makefile"
 DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 RUNBOOK = ROOT / "docs" / "runbook.md"
+TERRAFORM_DIR = ROOT / "deploy" / "terraform" / "aws"
 
 # A minimum. Later stories add jobs (console, chaos-lite), and the `ci` job has to wait for each
 # of them, which test_ci_has_required_jobs checks against the real file.
-REQUIRED_JOBS = {"lint", "types", "unit", "integration", "e2e", "security", "compose", "docs", "ci"}
+REQUIRED_JOBS = {
+    "lint",
+    "types",
+    "unit",
+    "integration",
+    "e2e",
+    "security",
+    "compose",
+    "docs",
+    "terraform",
+    "ci",
+}
 
 
 def load_workflow() -> dict[str, Any]:
@@ -244,6 +256,84 @@ def test_actions_use_pinned_major_versions() -> None:
     assert uses
     for ref in uses:
         assert re.search(r"@v\d+$", ref), f"{ref} is not pinned to a major version"
+
+
+# --- terraform: the AWS deploy is checked without an AWS account ---------------------------
+
+
+def run_commands(job: dict[str, Any]) -> list[str]:
+    """The run steps of a job, one string each, with line folding and extra spaces removed."""
+    return [" ".join(str(step["run"]).split()) for step in job.get("steps", []) if "run" in step]
+
+
+def command_index(commands: list[str], prefix: str) -> int | None:
+    return next((i for i, command in enumerate(commands) if command.startswith(prefix)), None)
+
+
+def pinned_terraform_version(versions_tf: str) -> str | None:
+    found = re.search(r'^\s*required_version\s*=\s*"([^"]+)"', versions_tf, re.M)
+    return found.group(1) if found else None
+
+
+def test_the_terraform_job_checks_the_format_then_initialises_then_validates() -> None:
+    job = load_workflow()["jobs"]["terraform"]
+    assert job["defaults"]["run"]["working-directory"] == "deploy/terraform/aws"
+    commands = run_commands(job)
+    fmt = command_index(commands, "terraform fmt -check")
+    init = command_index(commands, "terraform init")
+    validate = command_index(commands, "terraform validate")
+    assert fmt is not None, "the terraform job never runs `terraform fmt -check`"
+    assert init is not None, "the terraform job never runs `terraform init`"
+    assert validate is not None, "the terraform job never runs `terraform validate`"
+    # validate needs the providers that init installs. The format check needs neither.
+    assert fmt < init < validate
+    # No backend: CI has no state bucket and no cloud account to read one from.
+    assert "-backend=false" in commands[init]
+    # A lock file that is out of date fails the job instead of being rewritten on the runner.
+    assert "-lockfile=readonly" in commands[init]
+
+
+def test_the_terraform_job_installs_the_version_that_versions_tf_pins() -> None:
+    job = load_workflow()["jobs"]["terraform"]
+    setups = [
+        s for s in job["steps"] if str(s.get("uses", "")).startswith("hashicorp/setup-terraform@")
+    ]
+    assert len(setups) == 1, (
+        "the terraform job must install Terraform with hashicorp/setup-terraform"
+    )
+    pinned = pinned_terraform_version((TERRAFORM_DIR / "versions.tf").read_text(encoding="utf-8"))
+    assert pinned is not None, "versions.tf has no required_version"
+    # `latest` is the action's default. A job that follows it checks the Terraform of the day
+    # and not the one that versions.tf asks for.
+    assert str(setups[0]["with"]["terraform_version"]) == pinned
+    # The wrapper replaces the terraform binary with a script that captures its output.
+    assert setups[0]["with"]["terraform_wrapper"] is False
+
+
+def test_the_terraform_job_gates_the_aggregate_and_no_workflow_applies() -> None:
+    # Applying is manual (docs/deploy-aws.md) and CI has no cloud credentials. A plan would
+    # need them too, so no workflow may run either.
+    assert "terraform" in needs_of(load_workflow()["jobs"]["ci"])
+    for path in workflow_files():
+        text = path.read_text(encoding="utf-8")
+        for verb in ("plan", "apply", "destroy", "import"):
+            assert f"terraform {verb}" not in text, f"{path.name} runs terraform {verb}"
+
+
+@pytest.mark.parametrize(
+    ("versions_tf", "expected"),
+    [
+        ('terraform {\n  required_version = "1.17.0"\n}\n', "1.17.0"),
+        ('terraform {\n  required_version = "~> 1.17.0"\n}\n', "~> 1.17.0"),
+        ('terraform {\n  # required_version = "1.0.0"\n}\n', None),
+        ("terraform {}\n", None),
+    ],
+    ids=["exact", "range", "commented-out", "absent"],
+)
+def test_the_terraform_version_is_read_from_versions_tf(
+    versions_tf: str, expected: str | None
+) -> None:
+    assert pinned_terraform_version(versions_tf) == expected
 
 
 # --- the Temporal server CI starts is the one the compose file pins -------------------------

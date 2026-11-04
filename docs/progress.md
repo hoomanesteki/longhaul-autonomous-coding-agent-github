@@ -58,7 +58,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-303 | Repo allowlist and issue intake | 3 | Done | merge | 2026-10-31 |
 | LH-304 | Idempotent side-effect activities | 5 | Done | merge | 2026-10-31 |
 | LH-305 | Clone from GitHub and push from the host | 5 | Done | merge | 2026-11-04 |
-| LH-306 | PR creation and label lifecycle | 3 | Todo | | |
+| LH-306 | PR creation and label lifecycle | 3 | Done | merge | 2026-11-04 |
 | LH-307 | Poller workflow on a Temporal Schedule | 5 | Done | merge | 2026-11-04 |
 | LH-308 | Comment commands and issue-to-PR e2e | 5 | Todo | | |
 
@@ -68,7 +68,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-401 | Token meter and context budget | 3 | Done | merge | 2026-10-31 |
 | LH-402 | Output handles and read_output | 3 | Done | merge | 2026-11-04 |
 | LH-403 | Structured compaction | 5 | Done | merge | 2026-11-03 |
-| LH-404 | Eviction and compaction in the workflow | 3 | Todo | | |
+| LH-404 | Eviction and compaction in the workflow | 3 | Done | merge | 2026-11-04 |
 | LH-405 | Prompt layout and cache breakpoints | 3 | Todo | | |
 | LH-406 | Context metrics and ablation flags | 2 | Todo | | |
 | LH-407 | Long-task test | 3 | Todo | | |

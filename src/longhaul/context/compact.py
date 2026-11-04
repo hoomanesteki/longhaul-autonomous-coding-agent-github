@@ -51,8 +51,10 @@ a model can drop one while tidying a list. That rule can be checked, so keep_fai
 dropped entry back. The turn count of the notes, which a model cannot know, can be set by the
 caller.
 
-Errors. A ProviderError other than a refused force goes up as it is, because retries belong to
-the activity. The usage of an earlier call in the same compact() is then not reported.
+Errors. A ProviderError other than a refused force goes up, because retries belong to the
+activity. Its `usage` is the total of every call of this compact() that was billed, the failed
+one included, so the activity can ledger it in one row whatever the retry policy then does
+(invariant I6). It stays None when nothing was billed.
 
 Using it. A caller does this when the budget says to compact (LH-404):
 
@@ -74,7 +76,8 @@ Using it. A caller does this when the budget says to compact (LH-404):
 
 find_cut() and halve_cut() give 0 when there is nothing to cut, and then nothing is compacted.
 What to do when even that is too long is the caller's call (F6 keeps the last two turns and the
-notes). result.usages has one Usage for each model call, for the cost ledger (invariant I6).
+notes). result.usages has one Usage for each billed model call, for the cost ledger (invariant
+I6). That includes a forced call that was refused after it was billed.
 """
 
 from __future__ import annotations
@@ -479,25 +482,35 @@ def apply(messages: list[Message], cut: int, notes: ProgressNotes | None) -> lis
 
 
 # ---------- the notes of earlier rounds ----------
-def _same_words(text: str) -> str:
-    return " ".join(text.split()).casefold()
+def _words(text: str) -> list[str]:
+    return [word.casefold() for word in text.split()]
+
+
+def _inside(words: list[str], other: list[str]) -> bool:
+    """Whether `words` run together, in order, somewhere in `other`."""
+    size = len(words)
+    return any(other[start : start + size] == words for start in range(len(other) - size + 1))
 
 
 def keep_failures(notes: ProgressNotes, previous: ProgressNotes | None) -> ProgressNotes:
     """`notes` with every tried_and_failed entry of `previous` still in it.
 
-    An entry counts as kept when its words, ignoring case and spacing, are in an entry of
-    `notes`, so a model that added detail to one is not asked to add it back. Entries that
-    were dropped or reworded away go to the end of the list. Nothing else is merged here: the
-    rest is the model's work.
+    An entry counts as kept when its words, ignoring case and spacing, run together inside an
+    entry of `notes`, so a model that added detail to one is not asked to add it back. Whole
+    words only: "pin numpy" is not in "pin numpy<2", and "retry the request" is not in "retry
+    the request_id", because those are other things to have tried. A comma stuck to the last
+    word counts the same way: when in doubt the entry is added back, since a duplicate line
+    costs little and a forgotten failure gets tried again. Entries that were dropped or
+    reworded away go to the end of the list. Nothing else is merged here: the rest is the
+    model's work.
     """
     if previous is None:
         return notes
-    seen = [_same_words(entry) for entry in notes.tried_and_failed]
+    seen = [_words(entry) for entry in notes.tried_and_failed]
     restored: list[str] = []
     for entry in previous.tried_and_failed:
-        words = _same_words(entry)
-        if not any(words in other for other in seen):
+        words = _words(entry)
+        if not any(_inside(words, other) for other in seen):
             restored.append(entry)
             seen.append(words)
     if not restored:
@@ -511,7 +524,7 @@ class Compaction:
     """What compact() came to.
 
     `notes` are the notes to apply: the compactor's, or for a fallback the previous ones
-    (None when there were none). `usages` has one entry for each model call, in order.
+    (None when there were none). `usages` has one entry for each billed model call, in order.
     `problems` says what was wrong with each reply that could not be used, in order.
     """
 
@@ -596,8 +609,21 @@ def _repair_request(prompt: Message, reply: LLMResponse, problem: str) -> list[M
     return request
 
 
+def _total(usages: list[Usage]) -> Usage:
+    return Usage(
+        input_tokens=sum(u.input_tokens for u in usages),
+        output_tokens=sum(u.output_tokens for u in usages),
+        cache_read_tokens=sum(u.cache_read_tokens for u in usages),
+        cache_write_tokens=sum(u.cache_write_tokens for u in usages),
+    )
+
+
 class _Compactor:
-    """The model calls of one compact(). It forces the tool until a provider refuses."""
+    """The model calls of one compact(). It forces the tool until a provider refuses.
+
+    `usages` holds one entry for each call that was billed, in order, whether it came back as a
+    reply or as an error that carries its usage.
+    """
 
     def __init__(
         self, provider: LLMProvider, model: str, effort: EffortLevel | None, max_tokens: int
@@ -605,8 +631,22 @@ class _Compactor:
         self._provider, self._model = provider, model
         self._effort, self._max_tokens = effort, max_tokens
         self._force = True
+        self.usages: list[Usage] = []
 
     async def ask(self, messages: list[Message]) -> LLMResponse:
+        try:
+            reply = await self._ask(messages)
+        except ProviderError as error:
+            # The activity that catches this ledgers error.usage. The calls before this one were
+            # billed too, and nothing else would tell it about them (I6).
+            billed = [*self.usages, *([error.usage] if error.usage is not None else [])]
+            if billed:
+                error.usage = _total(billed)
+            raise
+        self.usages.append(reply.usage)
+        return reply
+
+    async def _ask(self, messages: list[Message]) -> LLMResponse:
         if self._force:
             try:
                 return await self._call(messages, force=True)
@@ -617,6 +657,10 @@ class _Compactor:
                 if error.kind is not ProviderErrorKind.INVALID_REQUEST:
                     raise
                 self._force = False
+                # A reply that was billed and then refused, such as one with a block type the
+                # provider does not know, carries its usage.
+                if error.usage is not None:
+                    self.usages.append(error.usage)
         return await self._call(messages, force=False)
 
     async def _call(self, messages: list[Message], *, force: bool) -> LLMResponse:
@@ -656,22 +700,20 @@ async def compact(
     compactor = _Compactor(provider, model, effort, max_tokens)
     prompt = Message(role="user", content=[TextBlock(text=_prompt(notes_prev, rendered, task))])
     request = [prompt]
-    usages: list[Usage] = []
     problems: list[str] = []
     for attempt in range(1 + REPAIR_TURNS):
         reply = await compactor.ask(request)
-        usages.append(reply.usage)
         read = _read(reply)
         if isinstance(read, ProgressNotes):
             notes = keep_failures(read, notes_prev)
             if covers_turns_up_to is not None:
                 notes = notes.model_copy(update={"covers_turns_up_to": covers_turns_up_to})
             status: CompactStatus = "ok" if attempt == 0 else "repaired"
-            return Compaction(notes, status, tuple(usages), tuple(problems))
+            return Compaction(notes, status, tuple(compactor.usages), tuple(problems))
         problems.append(read)
         # A refusal is the model's decision. Asking again with the same material is what
         # ADR-0003 says not to do.
         if reply.stop_reason == "refusal" or attempt == REPAIR_TURNS:
             break
         request = _repair_request(prompt, reply, read)
-    return Compaction(notes_prev, "fallback", tuple(usages), tuple(problems))
+    return Compaction(notes_prev, "fallback", tuple(compactor.usages), tuple(problems))

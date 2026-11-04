@@ -1108,7 +1108,7 @@ def test_keep_failures_does_not_take_part_of_a_longer_word_as_the_entry() -> Non
 def test_keep_failures_finds_the_entry_inside_a_longer_one() -> None:
     previous = notes(tried_and_failed=["Casting to int still overflows"])
     model = notes(
-        tried_and_failed=["Attempt 2: casting to int still overflows, even with numpy 1.26"]
+        tried_and_failed=["Attempt 2: casting to int still overflows (even with numpy 1.26)"]
     )
 
     assert keep_failures(model, previous) is model

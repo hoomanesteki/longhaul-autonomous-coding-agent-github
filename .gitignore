@@ -226,3 +226,14 @@ __marimo__/
 
 # Output of throwaway spikes (error bodies, usage samples, raw responses)
 spikes/out/
+
+# Terraform (deploy/terraform/aws): the providers it downloads, and the state and variable files.
+# State holds the database password and the blob access key in plain text. .terraform.lock.hcl and
+# terraform.tfvars.example are tracked.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+tfplan

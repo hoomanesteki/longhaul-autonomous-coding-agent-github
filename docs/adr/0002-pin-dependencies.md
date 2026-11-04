@@ -75,6 +75,16 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 
 MinIO no longer publishes `minio/minio` or `minio/mc` images, so we use the `bitnamilegacy` builds. That build has no web console, so only the S3 port (9000) is exposed. The Temporal dev server runs as root inside its container because the named volume is root-owned; this is a local dev service only.
 
+### Infrastructure as code (deploy/terraform/aws)
+
+| Tool | Pinned version |
+|---|---|
+| terraform | 1.17.0 (`required_version` in `versions.tf`, and the `terraform` job in `ci.yml`) |
+| terraform provider hashicorp/aws | 6.71.0 |
+| terraform provider hashicorp/random | 3.9.1 |
+
+Each is an exact version, not a range. `deploy/terraform/aws/.terraform.lock.hcl` also records the provider checksums for Linux, macOS and Windows, and CI runs `terraform init -lockfile=readonly`, so a changed provider fails the job instead of passing unnoticed. The three places that name the Terraform version and the two provider versions are `versions.tf`, the lock file and this table. `tests/unit/test_deploy_aws.py` fails when they disagree. Dependabot proposes provider bumps (see `.github/dependabot.yml`), and the pull request has to update this table as well. Terraform itself is bumped by hand in `versions.tf` and `ci.yml`.
+
 ## Consequences
 
 Any checkout builds the same environment with `uv sync`. Pinned versions can fall behind security fixes, so upgrades need their own reviewed PR rather than riding along with feature work. This table must be updated when a package is first added.

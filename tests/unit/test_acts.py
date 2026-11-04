@@ -9,6 +9,8 @@ from pathlib import Path
 from types import NoneType
 
 import pytest
+from longhaul.checkpoints.squash import NothingToDeliverError
+from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
 from pydantic import BaseModel, ValidationError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.workflow import ActivityCancellationType
@@ -25,6 +27,8 @@ from longhaul.contracts import (
 )
 from longhaul.durable import acts
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, assert_small
+from longhaul.github import side_effects
+from longhaul.github.client import GitHubFatal, GitHubRetryable
 from longhaul.settings import load_config
 from longhaul.tools.control import FINISH
 
@@ -492,3 +496,136 @@ def test_a_script_ref_survives_the_pydantic_data_converter() -> None:
 def test_the_script_and_the_tuning_have_memo_keys_of_their_own() -> None:
     assert acts.SCRIPT_MEMO_KEY == "script"
     assert acts.SCRIPT_MEMO_KEY != acts.TUNING_MEMO_KEY
+
+
+# ---------- LH-306: the GitHub activities ----------
+#
+# They are registered only on a worker that has a GitHub token, so they are a tuple of their own
+# and `ALL` stays what every worker runs.
+def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
+    names = [act.name for act in acts.GITHUB]
+    assert sorted(names) == [
+        "add_label",
+        "build_pr_branch",
+        "create_pr",
+        "deliver",
+        "post_comment",
+        "remove_label",
+    ]
+    assert not {act.name for act in acts.ALL} & set(names)
+
+
+@pytest.mark.parametrize(
+    ("act", "arg_type", "result_type"),
+    [
+        (acts.POST_COMMENT, CommentInput, str),
+        (acts.ADD_LABEL, LabelInput, str),
+        (acts.REMOVE_LABEL, LabelInput, str),
+        (acts.CREATE_PR, PullRequestInput, str),
+        (acts.BUILD_PR_BRANCH, acts.BuildPrBranchInput, acts.PrBranchOutput),
+        (acts.DELIVER, acts.DeliverInput, str),
+    ],
+    ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
+)
+def test_each_github_activity_names_its_payload_types(
+    act: acts.Act, arg_type: type, result_type: type
+) -> None:
+    assert act.arg_type is arg_type
+    assert act.result_type is result_type
+
+
+def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
+    # The workflow cannot import side_effects, so the models live in a module both import.
+    assert side_effects.CommentInput is CommentInput
+    assert side_effects.LabelInput is LabelInput
+    assert side_effects.PullRequestInput is PullRequestInput
+
+
+@pytest.mark.parametrize(
+    ("act", "start_to_close_s", "heartbeat_s", "attempts"),
+    [
+        pytest.param(acts.POST_COMMENT, 2 * 60, None, 10, id="post_comment"),
+        pytest.param(acts.ADD_LABEL, 2 * 60, None, 10, id="add_label"),
+        pytest.param(acts.REMOVE_LABEL, 2 * 60, None, 10, id="remove_label"),
+        pytest.param(acts.CREATE_PR, 2 * 60, None, 10, id="create_pr"),
+        pytest.param(acts.BUILD_PR_BRANCH, 5 * 60, None, 3, id="build_pr_branch"),
+        # Not in section 3.7. deliver pushes a branch (git's own limit is 10 minutes) and then
+        # does what create_pr does, so a killed worker has to be noticed in a minute.
+        pytest.param(acts.DELIVER, 10 * 60, 60, 5, id="deliver"),
+    ],
+)
+def test_github_timeouts_and_attempts_match_section_3_7(
+    act: acts.Act, start_to_close_s: int, heartbeat_s: int | None, attempts: int
+) -> None:
+    assert act.start_to_close == timedelta(seconds=start_to_close_s)
+    assert act.heartbeat == (None if heartbeat_s is None else timedelta(seconds=heartbeat_s))
+    assert act.retry.maximum_attempts == attempts
+
+
+@pytest.mark.parametrize(
+    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR]
+)
+def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
+    assert act.retry.maximum_interval == timedelta(minutes=5)
+    assert act.retry.backoff_coefficient == 2.0
+    assert act.retry.initial_interval == timedelta(seconds=5)
+
+
+@pytest.mark.parametrize("act", acts.GITHUB, ids=lambda act: act.name)
+def test_no_github_activity_retries_what_a_retry_cannot_fix(act: acts.Act) -> None:
+    never = set(act.retry.non_retryable_error_types or [])
+    assert {PayloadTooLargeError.__name__, acts.GITHUB_FATAL} <= never
+    assert acts.GITHUB_RETRYABLE not in never
+
+
+def test_the_github_error_types_are_the_ones_side_effects_raises() -> None:
+    assert GitHubFatal.__name__ == acts.GITHUB_FATAL
+    assert GitHubRetryable.__name__ == acts.GITHUB_RETRYABLE
+
+
+@pytest.mark.parametrize("act", acts.GITHUB, ids=lambda act: act.name)
+def test_github_activities_are_not_local(act: acts.Act) -> None:
+    assert not act.local
+
+
+def test_tuning_shortens_the_heartbeat_of_deliver_only() -> None:
+    tuning = acts.Tuning(heartbeat_timeout_s=2)
+    for act in acts.GITHUB:
+        expected = timedelta(seconds=2) if act is acts.DELIVER else None
+        assert acts.options(act, tuning)["heartbeat_timeout"] == expected
+
+
+GITHUB_SAMPLES: list[BaseModel] = [
+    acts.BuildPrBranchInput(task_id="lh-x", repo="acme/calc", summary="Fixed it.", head_sha=SHA),
+    acts.PrBranchOutput(
+        branch="longhaul-pr/42",
+        head_sha=SHA,
+        base_sha="b" * 40,
+        base_branch="main",
+        title="fix(calc): fix it",
+    ),
+    acts.DeliverInput(
+        task_id="lh-x",
+        repo="acme/calc",
+        issue_number=42,
+        summary="Fixed it.",
+        branch="longhaul-pr/42",
+        base_branch="main",
+        base_sha="b" * 40,
+        head_sha=SHA,
+        title="fix(calc): fix it",
+    ),
+    CommentInput(task_id="lh-x", repo="acme/calc", number=42, body="hi", idempotency_key="k:a:1"),
+    LabelInput(task_id="lh-x", repo="acme/calc", number=42, label="l", idempotency_key="k:a:1"),
+]
+
+
+@pytest.mark.parametrize("sample", GITHUB_SAMPLES, ids=lambda sample: type(sample).__name__)
+def test_github_payloads_survive_the_pydantic_data_converter(sample: BaseModel) -> None:
+    converter = pydantic_data_converter.payload_converter
+    payloads = converter.to_payloads([sample])
+    assert converter.from_payloads(payloads, [type(sample)]) == [sample]
+
+
+def test_nothing_to_deliver_is_named_after_the_error_class() -> None:
+    assert NothingToDeliverError.__name__ == acts.NOTHING_TO_DELIVER

@@ -466,6 +466,54 @@ async def test_list_items_filters_by_status_and_kind(store: PgMemoryStore) -> No
     assert entry.created_at is not None and entry.last_used_at is None
 
 
+async def test_get_verified_finds_the_item_checked_at_a_sha(store: PgMemoryStore) -> None:
+    other = "b" * 40
+    at_sha = await store.add_verified(
+        note('{"sha": "a"}', kind="repo_map", status="approved", source="default_branch"),
+        source_ref=SHA,
+    )
+    await store.add_verified(
+        note('{"sha": "b"}', kind="repo_map", status="approved", source="default_branch"),
+        source_ref=other,
+    )
+    await store.add_verified(
+        note("pytest -q", kind="command", status="approved", source="default_branch"),
+        source_ref=SHA,
+    )
+
+    found = await store.get_verified(REPO, "repo_map", SHA)
+    assert found is not None
+    assert (found.id, found.content, found.source_ref) == (at_sha, '{"sha": "a"}', SHA)
+    assert (found.kind, found.status, found.source) == ("repo_map", "approved", "default_branch")
+    # Another repo, another kind of item and a sha that was never checked find nothing.
+    assert await store.get_verified(OTHER_REPO, "repo_map", SHA) is None
+    assert await store.get_verified(REPO, "command", other) is None
+    assert await store.get_verified(REPO, "repo_map", "c" * 40) is None
+
+
+async def test_get_verified_ignores_what_a_person_turned_down(store: PgMemoryStore) -> None:
+    item_id = await store.add_verified(
+        note("{}", kind="repo_map", status="approved", source="default_branch"), source_ref=SHA
+    )
+    await store.reject(item_id, "alice")
+
+    assert await store.get_verified(REPO, "repo_map", SHA) is None
+
+
+async def test_get_verified_returns_the_newest_of_two_items_at_one_sha(
+    store: PgMemoryStore,
+) -> None:
+    # The same commit read by two versions of the parser gives two different notes.
+    for text in ('{"version": 1}', '{"version": 2}'):
+        await store.add_verified(
+            note(text, kind="repo_map", status="approved", source="default_branch"),
+            source_ref=SHA,
+        )
+
+    found = await store.get_verified(REPO, "repo_map", SHA)
+    assert found is not None and found.content == '{"version": 2}'
+
+
 # ---------- the migration ----------
 def test_the_hash_is_one_step_on_the_migration_path(scratch: Scratch) -> None:
     cfg = scratch.config()

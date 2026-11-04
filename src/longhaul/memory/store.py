@@ -10,6 +10,8 @@ ADR-0010 are kept here, at the one place that writes the table:
   person or a merged pull request through `promote`, which always records who.
 * `search` returns approved items unless it is asked for the others (invariant I7), and counts
   each use of what it returns.
+* `get_verified` finds the approved item that Longhaul checked at one sha, which is how the repo
+  map of a commit is found again without reading the maps of the others.
 
 The same note is stored once per repo and kind. Case and spacing are folded before the note is
 hashed, so "Run pytest -q" and "run  PYTEST -q" are one note. The hash is a column of its own
@@ -165,6 +167,31 @@ class PgMemoryStore:
         stmt = stmt.order_by(MemoryItemRow.created_at, MemoryItemRow.id)
         async with self._sessions() as session:
             return [_entry_of(row) for row in await session.scalars(stmt)]
+
+    async def get_verified(self, repo: str, kind: str, source_ref: str) -> MemoryEntry | None:
+        """The approved item of the default branch that Longhaul checked at `source_ref`.
+
+        This is how the repo map is found again for a sha (LH-602). A search by meaning would
+        find a map for the wrong commit, and listing the items of the repo would read the map of
+        every sha it was ever built at. If two items were checked at one sha, as happens when the
+        parser changes, the newer one is returned. An item that a person rejected is not.
+        """
+        stmt = (
+            select(MemoryItemRow)
+            .options(defer(MemoryItemRow.embedding))
+            .where(
+                MemoryItemRow.repo == repo,
+                MemoryItemRow.kind == kind,
+                MemoryItemRow.source_ref == source_ref,
+                MemoryItemRow.status == "approved",
+                MemoryItemRow.source == "default_branch",
+            )
+            .order_by(MemoryItemRow.created_at.desc(), MemoryItemRow.id.desc())
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            row = (await session.scalars(stmt)).first()
+        return None if row is None else _entry_of(row)
 
     # ---------- writing ----------
     async def add_candidate(self, item: MemoryItem, *, source_ref: str | None = None) -> str:

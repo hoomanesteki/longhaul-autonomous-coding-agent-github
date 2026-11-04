@@ -238,6 +238,7 @@ def test_the_cost_of_a_turn_cannot_be_negative() -> None:
 
 SAMPLES: list[BaseModel] = [
     acts.PrepareWorkspaceOutput(sandbox_id="sbx-1", base_sha=SHA, head_sha=SHA),
+    acts.PrepareWorkspaceOutput(sandbox_id="sbx-1", base_sha=SHA, head_sha=SHA, repo_map_ref=REF),
     acts.EnsureSandboxInput(task_id="lh-x", head_sha=SHA, sandbox_id="sbx-1", spec=SPEC),
     acts.EnsureSandboxInput(task_id="lh-x", head_sha=SHA, sandbox_id=None, spec=SPEC),
     acts.LlmTurnInput(
@@ -301,6 +302,13 @@ def test_payloads_survive_the_pydantic_data_converter(sample: BaseModel) -> None
     converter = pydantic_data_converter.payload_converter
     payloads = converter.to_payloads([sample])
     assert converter.from_payloads(payloads, [type(sample)]) == [sample]
+
+
+def test_a_workspace_recorded_before_the_repo_map_existed_still_reads() -> None:
+    # Workflow histories hold the output of earlier runs, and they must replay.
+    old = {"sandbox_id": "sbx-1", "base_sha": SHA, "head_sha": SHA}
+
+    assert acts.PrepareWorkspaceOutput.model_validate(old).repo_map_ref is None
 
 
 # ---------- LH-204: what the activities added to the payloads ----------

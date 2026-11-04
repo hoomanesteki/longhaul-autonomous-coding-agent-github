@@ -91,9 +91,17 @@ MAX_SANDBOX_RECREATIONS = 2
 
 # ---------- payloads ----------
 class PrepareWorkspaceOutput(BaseModel):
+    """What the workflow keeps of a prepared workspace.
+
+    `repo_map_ref` is the repo map for the task's issue (LH-602): text in the blob store, for
+    the memory block of the prompt (LH-604). It is None when the worker has no memory store, or
+    the map could not be built, and the task goes on without it.
+    """
+
     sandbox_id: str
     base_sha: str
     head_sha: str
+    repo_map_ref: BlobRef | None = None
 
 
 class EnsureSandboxInput(BaseModel):

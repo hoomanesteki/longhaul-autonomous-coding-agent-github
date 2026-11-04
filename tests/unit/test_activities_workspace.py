@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import shutil
@@ -44,7 +45,9 @@ from longhaul.durable.activities.workspace import (
     SETUP_TIMEOUT_S,
     WorkspaceActivities,
 )
+from longhaul.memory import repo_map
 from longhaul.memory.commands import DISCOVERY_BUDGET_S
+from longhaul.memory.repo_map import SCRIPT_TIMEOUT_S
 from longhaul.sandbox.local_manager import FakeSandbox
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -888,4 +891,154 @@ def test_the_setup_and_the_commands_together_fit_in_the_activity() -> None:
     # The commands start after the setup, and the whole preparation has to end inside the
     # time limit of the activity or Temporal cancels it.
     total = timedelta(seconds=SETUP_TIMEOUT_S + DISCOVERY_BUDGET_S)
+    assert total < acts.PREPARE_WORKSPACE.start_to_close
+
+
+# ---------- the repo map (LH-602) ----------
+class MapNotes(Notes):
+    """The memory store with the lookup the repo map cache uses, kept in a dict."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.by_ref: dict[tuple[str, str, str], str] = {}
+
+    async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str:
+        item_id = await super().add_verified(item, source_ref=source_ref)
+        self.by_ref[(item.repo, item.kind, source_ref)] = item.content
+        return item_id
+
+    async def get_verified(self, repo: str, kind: str, source_ref: str) -> Any:
+        content = self.by_ref.get((repo, kind, source_ref))
+        return None if content is None else type("Row", (), {"content": content})()
+
+    @property
+    def maps(self) -> list[str]:
+        return [item.content for item, _ in self.added if item.kind == "repo_map"]
+
+
+def mapping(rig: Rig, notes: MapNotes, blobs: MemoryBlobStore | None) -> WorkspaceActivities:
+    """The activities of the rig with a memory store, and a blob store unless it is None."""
+    return WorkspaceActivities(
+        rig.host, rig.store, rig.recorder, image=IMAGE, limits=LIMITS, memory=notes, blobs=blobs
+    )
+
+
+async def prepare_mapped(
+    rig: Rig, activities: WorkspaceActivities, spec: TaskSpec | None = None
+) -> acts.PrepareWorkspaceOutput:
+    out: acts.PrepareWorkspaceOutput = await rig.environment().run(
+        activities.prepare_workspace, spec or rig.spec()
+    )
+    return out
+
+
+def script_runs(box: Box) -> list[tuple[str, bool]]:
+    return [(c, net) for c, net in box.commands if c.startswith("python3 -I -S -c ")]
+
+
+async def text_of(blobs: MemoryBlobStore, out: acts.PrepareWorkspaceOutput) -> str:
+    assert out.repo_map_ref is not None
+    return (await blobs.get(out.repo_map_ref)).decode()
+
+
+async def test_the_repo_map_for_the_issue_is_put_in_the_blob_store_and_named_in_the_output(
+    rig: Rig,
+) -> None:
+    blobs = MemoryBlobStore()
+    notes = MapNotes()
+    spec = rig.spec()
+
+    out = await prepare_mapped(rig, mapping(rig, notes, blobs), spec)
+
+    assert out.repo_map_ref is not None
+    assert out.repo_map_ref.key == f"tasks/{TASK}/memory/0000/repo-map.txt"
+    text = await text_of(blobs, out)
+    assert text.startswith("Python files of this repo, most relevant first")
+    assert "add(a: int, b: int) -> int" in text
+    # The structure is kept for the next task, as an approved item of this commit.
+    [kept] = notes.maps
+    assert json.loads(kept)["sha"] == out.base_sha
+    assert notes.by_ref[(spec.repo, "repo_map", out.base_sha)] == kept
+
+
+async def test_the_map_is_read_from_the_base_commit_before_any_command_can_change_it(
+    rig: Rig,
+) -> None:
+    out = await prepare_mapped(rig, mapping(rig, MapNotes(), MemoryBlobStore()))
+
+    # The setup with the network on, then the map and the commands with it cut. The map comes
+    # first because a command can write into the workspace.
+    box = rig.box(out.sandbox_id)
+    named = [("map" if c.startswith("python3 -I -S -c ") else c, net) for c, net in ran(box)]
+    assert named == [(SETUP, True), ("map", False), (PYTEST, False)]
+    assert await sh(box, "git status --porcelain") == ""
+
+
+async def test_a_second_task_on_the_same_commit_parses_nothing_and_still_gets_its_own_map(
+    rig: Rig,
+) -> None:
+    blobs = MemoryBlobStore()
+    activities = mapping(rig, MapNotes(), blobs)
+    assert activities.repo_maps is not None
+
+    first = await prepare_mapped(rig, activities)
+    again = await prepare_mapped(rig, activities, rig.spec())  # a retried attempt, or a second task
+
+    assert again.base_sha == first.base_sha
+    assert activities.repo_maps.script_runs == 1
+    assert script_runs(rig.box(again.sandbox_id)) == []
+    assert await text_of(blobs, again) == await text_of(blobs, first)
+
+
+async def test_without_a_blob_store_there_is_no_map_and_no_script_run(rig: Rig) -> None:
+    activities = mapping(rig, MapNotes(), None)
+
+    out = await prepare_mapped(rig, activities)
+
+    assert activities.repo_maps is None
+    assert out.repo_map_ref is None
+    assert script_runs(rig.box(out.sandbox_id)) == []
+
+
+async def test_without_a_memory_store_there_is_no_map_and_no_script_run(rig: Rig) -> None:
+    activities = WorkspaceActivities(
+        rig.host, rig.store, rig.recorder, image=IMAGE, limits=LIMITS, blobs=MemoryBlobStore()
+    )
+
+    out = await prepare_mapped(rig, activities)
+
+    assert activities.repo_maps is None
+    assert out.repo_map_ref is None
+    assert script_runs(rig.box(out.sandbox_id)) == []
+
+
+async def test_a_map_that_cannot_be_built_does_not_fail_the_preparation(
+    rig: Rig, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(repo_map, "SCRIPT_COMMAND", "echo broken >&2; exit 3")
+    notes = MapNotes()
+
+    with caplog.at_level(logging.WARNING, logger="longhaul.durable.activities.workspace"):
+        out = await prepare_mapped(rig, mapping(rig, notes, MemoryBlobStore()))
+
+    assert out.repo_map_ref is None
+    assert rig.host.live(TASK) == [out.sandbox_id]
+    assert "could not build the repo map" in caplog.text and "broken" in caplog.text
+    # The commands are still looked for.
+    assert notes.commands == [PYTEST]
+
+
+async def test_a_repo_without_python_modules_has_no_map(rig: Rig) -> None:
+    shutil.rmtree(rig.source / "src")
+    shutil.rmtree(rig.source / "tests")
+    blobs = MemoryBlobStore()
+
+    out = await prepare_mapped(rig, mapping(rig, MapNotes(), blobs))
+
+    assert out.repo_map_ref is None
+    assert blobs.objects == {}
+
+
+def test_the_setup_the_map_and_the_commands_together_fit_in_the_activity() -> None:
+    total = timedelta(seconds=SETUP_TIMEOUT_S + DISCOVERY_BUDGET_S + SCRIPT_TIMEOUT_S)
     assert total < acts.PREPARE_WORKSPACE.start_to_close

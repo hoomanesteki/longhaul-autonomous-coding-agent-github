@@ -24,7 +24,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from longhaul.memory.repo_map import build_repo_map
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -39,6 +38,7 @@ from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.repo_map import build_repo_map
 from longhaul.memory.store import DEFAULT_BRANCH_APPROVER, PgMemoryStore
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import EnvSettings, get_settings

@@ -27,9 +27,11 @@ with SandboxGoneError, which the activity does not retry. The workflow calls `en
 with the latest `head_sha`, stores the id it returns and runs the same call again from the same
 `pre_sha`. One call may do that MAX_SANDBOX_RECREATIONS times. A sandbox that is gone again after
 that ends the run with ERROR "sandbox lost", instead of looping on a host that cannot keep a
-container alive. A run that starts with a sandbox id, because an earlier run prepared it
-(LH-207 hands one over), calls `ensure_sandbox` before its first turn, since the container may
-be gone by then.
+container alive. The end still answers every call of the turn through `append_results`: the
+calls that ran keep their results and the rest get an error result, so the stored transcript
+has no tool_use without a tool_result. A run that starts with a sandbox id, because an earlier
+run prepared it (LH-207 hands one over), calls `ensure_sandbox` before its first turn, since the
+container may be gone by then.
 
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
@@ -107,8 +109,18 @@ class _CancelRequested(Exception):
     """Unwinds run() to the cancel path. It never leaves the workflow."""
 
 
+# What the transcript says for the calls of a turn that ended in a lost sandbox. Nothing reads
+# these to decide anything. They keep every tool_use answered, as the API requires.
+LOST_CALL = "the sandbox was lost and could not be recreated, so this call did not finish"
+NOT_RUN_AFTER_LOSS = "not run: an earlier call of this turn lost the sandbox for good"
+
+
 class _SandboxLost(Exception):
     """A tool call found its sandbox gone more often than it may. It unwinds to _turn()."""
+
+    def __init__(self, call_id: str) -> None:
+        super().__init__(call_id)
+        self.call_id = call_id
 
 
 def _is_sandbox_gone(err: ActivityError) -> bool:
@@ -255,11 +267,17 @@ class TaskWorkflow:
             return await self._idle_turn(index, sampled.transcript_ref)
 
         self.idle = 0
+        finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
+
+        async def run(call: acts.ToolCallSummary) -> ToolResult:
+            result = await self._run_tool(index, call)
+            finished.append(result)
+            return result
+
         try:
-            ran = await rules.run_calls(calls, lambda call: self._run_tool(index, call))
-        except _SandboxLost:
-            state.turn_index = index + 1
-            return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
+            ran = await rules.run_calls(calls, run)
+        except _SandboxLost as lost:
+            return await self._end_lost(index, sampled.transcript_ref, calls, finished, lost)
         # The transcript lives in the blob store, so an activity answers the calls. It answers
         # all of them, `finish` and the calls that did not run included, so the transcript stays
         # paired when the run ends here.
@@ -276,6 +294,43 @@ class TaskWorkflow:
         if ran.finish is not None:
             return self._end(rules.finished(ran.finish), Phase.DONE)
         return None
+
+    async def _end_lost(
+        self,
+        index: int,
+        transcript_ref: BlobRef,
+        calls: list[acts.ToolCallSummary],
+        finished: list[ToolResult],
+        lost: _SandboxLost,
+    ) -> Outcome:
+        """End the run for a sandbox that keeps dying, with every call of the turn answered.
+
+        The calls that ran keep their results. The one that lost the sandbox and the ones after
+        it get an error result, so the stored transcript has no tool_use without a tool_result.
+        """
+        state = self.state
+        done = {r.call_id: r for r in finished}
+        answers = [
+            acts.summarize_result(done[call.id])
+            if call.id in done
+            else acts.ToolResultSummary(
+                call_id=call.id,
+                ok=False,
+                output=LOST_CALL if call.id == lost.call_id else NOT_RUN_AFTER_LOSS,
+            )
+            for call in calls
+        ]
+        state.transcript_ref = await self._call(
+            acts.APPEND_RESULTS,
+            acts.AppendResultsInput(
+                task_id=state.spec.task_id,
+                turn_index=index,
+                transcript_ref=transcript_ref,
+                results=answers,
+            ),
+        )
+        state.turn_index = index + 1
+        return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
 
     async def _sample(self, index: int) -> acts.LlmTurnOutput | Outcome:
         """Call the model until one reply can be used, or the run has to end (D8, D9)."""
@@ -366,7 +421,7 @@ class TaskWorkflow:
                         recreated + 1,
                         call.name,
                     )
-                    raise _SandboxLost from err
+                    raise _SandboxLost(call.id) from err
                 recreated += 1
                 await self._ensure_sandbox()
         if result.post_sha is not None:

@@ -62,7 +62,8 @@ handler posts a comment with the state of the task through the `post_comment` ac
 a side effect with a key like any other, `status:<n>`, where n counts the requests the task has had.
 The count is part of the workflow's state, so a replay posts nothing again, and the memo carries it
 over a Continue-As-New. The handler is best effort: a status that cannot be posted is logged and
-does not fail the task, and a cancel does not wait for it. It posts for a task of an issue only.
+does not fail the task, and a cancel does not wait for it, not in a turn and not at a hand-over
+(see `_settle_handlers`). It posts for a task of an issue only.
 
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
@@ -108,7 +109,9 @@ out after a bundle upload. The hand-over goes in this order:
 1. `bundle_checkpoint` uploads the history of the checkpoint repo, so that a lost host costs at
    most the work since the last hand-over (failure mode F4);
 2. `record_event` writes a `continue_as_new` event (a local activity);
-3. the workflow waits for its signal handlers to finish (workflow.all_handlers_finished);
+3. the workflow waits for its signal handlers to finish (workflow.all_handlers_finished), but
+   not for long: it stops waiting at a cancel request, and after acts.STATUS_GRACE it drops a
+   status comment that is still being posted;
 4. it looks at the cancel request one last time and calls continue_as_new with its state. Nothing
    is awaited between that look and the call, so a signal cannot land in the gap. A signal that
    reaches the server together with the command makes the server refuse the command, and the SDK
@@ -446,11 +449,34 @@ class TaskWorkflow:
                 "bundle": bundle,
             },
         )
-        await workflow.wait_condition(workflow.all_handlers_finished)
+        await self._settle_handlers()
         # A cancel that came in during the awaits above must not be lost with this run. It is
         # acted on here. No await follows, so none can arrive between this look and the call.
         self._stop_if_cancelled()
         workflow.continue_as_new(state, memo=self._memo_to_carry())
+
+    async def _settle_handlers(self) -> None:
+        """Give a status comment that is being posted a short while to finish before a hand-over.
+
+        The only handler that awaits is report_status, and its activity retries for about twenty
+        minutes when GitHub fails. Waiting for it without a limit would stop the task for that
+        long, and a cancel that came in meanwhile would wait with it. So the wait ends at the
+        first of: every handler is done, a cancel request, or the grace (acts.STATUS_GRACE). In
+        the last case the comment is dropped with this run. Its number is in the memo, so no
+        later comment reuses its key.
+        """
+        if workflow.all_handlers_finished():
+            return  # the usual case, and it needs no timer in the history
+        try:
+            await workflow.wait_condition(
+                lambda: workflow.all_handlers_finished() or self.cancel_request is not None,
+                timeout=acts.status_grace(self._tuning()),
+            )
+        except TimeoutError:
+            workflow.logger.warning(
+                "task %s hands over with a status comment still being posted: it is dropped",
+                self.state.spec.task_id,
+            )
 
     async def _bundle(self) -> str | None:
         """Upload the repo history. Returns the key of the blob, or None when it was not made."""

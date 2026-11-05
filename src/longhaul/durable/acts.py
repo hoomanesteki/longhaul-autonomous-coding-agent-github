@@ -109,6 +109,10 @@ TOOL_TIMEOUT_S = 600
 # under the 4,096 at which the server suggests a hand-over (ADR-0004, appendix section 4). That
 # suggestion is the safety net for a turn with many calls.
 CONTINUE_AS_NEW_EVERY_TURNS = 40
+# How long a hand-over waits for a status comment that is still being posted (LH-308). A comment
+# that GitHub accepts takes a second or two, so this only runs out when the post keeps retrying.
+# The comment is then dropped with the run, and a cancel ends the wait at once.
+STATUS_GRACE = timedelta(seconds=30)
 
 # F6: when the window is too full to wait, or the provider says the prompt is too long, the view
 # is compacted down to this many recent turns and the notes. A proactive compaction keeps
@@ -690,6 +694,9 @@ class Tuning(BaseModel):
     # number. Every run of the chain then hands over after that many turns, because the memo
     # carries over Continue-As-New.
     continue_as_new_every_turns: int | None = Field(default=None, ge=1)
+    # The wait of a hand-over for a status comment that cannot be posted. The test server does
+    # not skip time while an activity runs, so a test of the drop would wait 30 s without this.
+    status_grace_s: float | None = Field(default=None, gt=0)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:
@@ -738,6 +745,13 @@ def continue_as_new_every(tuning: Tuning | None = None) -> int:
     if tuning is not None and tuning.continue_as_new_every_turns is not None:
         return tuning.continue_as_new_every_turns
     return CONTINUE_AS_NEW_EVERY_TURNS
+
+
+def status_grace(tuning: Tuning | None = None) -> timedelta:
+    """The wait of a hand-over for a status comment: the run's tuning, or STATUS_GRACE."""
+    if tuning is not None and tuning.status_grace_s is not None:
+        return timedelta(seconds=tuning.status_grace_s)
+    return STATUS_GRACE
 
 
 def hand_off_due(turn_index: int, tuning: Tuning | None = None, *, suggested: bool = False) -> bool:

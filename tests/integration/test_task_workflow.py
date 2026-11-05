@@ -2534,8 +2534,9 @@ async def test_a_status_comment_that_is_still_posting_does_not_stop_the_hand_ove
     spec = github_spec()
     stubs = Stubs(edits_then_finishes(4))
     stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, status_grace_s=1)
     async with running(env, stubs) as queue:
-        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
         await wait_until(lambda: stubs.started(1), "turn 1")
         stubs.hold(acts.POST_COMMENT.name)
         await handle.signal(TaskWorkflow.report_status, "maintainer")

@@ -338,9 +338,9 @@ class Spy:
             raise RuntimeError("the worker was killed")
         return sha
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
         self.restores.append(sha)
-        await self.store.restore(sandbox, sha)
+        await self.store.restore(sandbox, sha, keep_ignored=keep_ignored)
 
     async def bundle(self, task_id: str) -> BlobRef:
         return await self.store.bundle(task_id)
@@ -1364,6 +1364,20 @@ async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(rep
     assert result.ok and result.post_sha is None
     assert spy.restores == []
     assert PLANNING_NOTE not in result.output
+
+
+async def test_a_reset_of_the_planning_phase_keeps_what_the_setup_built(repo: Repo) -> None:
+    # The network is off once the planner runs, so nothing could build these files again.
+    built = "src/calc.egg-info/PKG-INFO"
+    await repo.box.exec(
+        "mkdir -p src/calc.egg-info && echo built > src/calc.egg-info/PKG-INFO", timeout_s=30
+    )
+    assert await porcelain(repo) == ""  # git ignores it, so it is not a change
+    result = await repo.rig().exec(planning("run_command", repo.base_sha, command="echo x > r.txt"))
+
+    assert result.ok and result.post_sha is None
+    assert await porcelain(repo) == ""  # the note the command left is gone
+    assert (await repo.box.read_file(built)).decode().strip() == "built"
 
 
 async def test_a_call_of_the_planning_phase_without_a_checkpoint_runs_where_it_is(

@@ -58,6 +58,11 @@ class TaskResult(BaseModel):
     config: Config
     model: str
     git_sha: str
+    # Where the answers came from. `scripted` is true when a script played them: such a run is
+    # free and fixes what its script fixes, so it says nothing about a model. `provider` is what
+    # --provider asked for. None means the worker's own, which the runner cannot see.
+    provider: str | None
+    scripted: bool
     # What the operator asked for on the command line. The worker takes memory and context
     # settings from its own config, so these two describe how it was started.
     memory: Switch = "on"
@@ -94,6 +99,8 @@ class Summary(BaseModel):
     task_set: TaskSet
     config: Config
     model: str
+    provider: str | None
+    scripted: bool
     started_at: AwareDatetime
     ended_at: AwareDatetime
     wall_time_s: float
@@ -137,7 +144,7 @@ def read_results(folder: Path) -> list[TaskResult]:
 
 
 def _check_one_run(results: list[TaskResult]) -> None:
-    for field in ("run_id", "task_set", "config", "model"):
+    for field in ("run_id", "task_set", "config", "model", "provider", "scripted"):
         values = {str(getattr(r, field)) for r in results}
         if len(values) != 1:
             raise ValueError(
@@ -163,6 +170,8 @@ def summarize(results: list[TaskResult], *, started_at: datetime, ended_at: date
         task_set=first.task_set,
         config=first.config,
         model=first.model,
+        provider=first.provider,
+        scripted=first.scripted,
         started_at=started_at,
         ended_at=ended_at,
         wall_time_s=(ended_at - started_at).total_seconds(),

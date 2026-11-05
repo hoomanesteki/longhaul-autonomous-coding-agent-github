@@ -44,6 +44,7 @@ if __package__ in (None, ""):  # started as `python eval/run.py`
 from sqlalchemy import func, select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E402
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle  # noqa: E402
+from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
 from eval import custom_tasks, grade_custom, results  # noqa: E402
 from longhaul.agent.workspace import DEFAULT_TEST_COMMAND  # noqa: E402
@@ -84,6 +85,8 @@ CANCEL_GRACE_S = 30.0
 # The workflow has its own limit of task_wall_minutes. The runner's is a backstop for a task
 # that is stuck somewhere the workflow cannot see, so it comes a little later.
 WALL_MARGIN_S = 300.0
+# How much of an exception goes into a result file.
+FAILURE_CHARS = 500
 
 # Plan section 8.4: the caps that every config and every set shares.
 CUSTOM_BUDGETS = Budgets(task_usd=2.0, task_turns=150, task_wall_minutes=120)
@@ -116,6 +119,11 @@ class RunOptions:
     script: Path | None = None
     results_dir: Path = DEFAULT_RESULTS_DIR
     pause_timeout_s: float = PAUSE_TIMEOUT_S
+
+    @property
+    def scripted(self) -> bool:
+        """A script plays the answers. The result files say so, because such a run is free."""
+        return self.script is not None
 
 
 def positive_int(text: str) -> int:
@@ -276,12 +284,38 @@ def resolve_model(options: RunOptions, cfg: AppConfig) -> str:
 
 
 def claim_run_dir(results_dir: Path, run_id: str) -> Path:
-    """The folder of a run. A run id that already holds results is not used a second time."""
+    """A new folder for a run. A run id whose folder exists is not used a second time.
+
+    An empty folder counts too. A run that was interrupted leaves one, and its tasks have
+    started workflows under this run id, which Temporal does not start a second time.
+    """
     folder = results_dir / run_id
-    if folder.is_dir() and any(folder.glob("*.json")):
-        raise ValueError(f"run id {run_id} was used already: {folder} holds results")
-    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        folder.mkdir(parents=True)
+    except FileExistsError:
+        raise ValueError(
+            f"run id {run_id} was used already: {folder} exists. Use another --run-id"
+        ) from None
     return folder
+
+
+async def check_workflow_ids_free(client: Client, workflow_ids: Sequence[str]) -> None:
+    """Stop when a workflow of this run id exists, whether it is open or closed.
+
+    The results folder is not the only record of a run: it may have been moved or deleted.
+    Temporal refuses to start an id a second time, so the run would fail task by task.
+    """
+    for workflow_id in workflow_ids:
+        try:
+            await get_task(client, workflow_id).describe()
+        except RPCError as exc:
+            if exc.status is RPCStatusCode.NOT_FOUND:
+                continue
+            raise ConnectionError(f"could not ask Temporal about {workflow_id}: {exc}") from exc
+        raise ValueError(
+            f"the workflow {workflow_id} exists already, so this run id was used before. "
+            "Use another --run-id"
+        )
 
 
 def git_sha() -> str:
@@ -493,12 +527,75 @@ async def clean_up(ctx: RunContext, workflow_id: str) -> None:
             await remove(workflow_id)
 
 
+def identity(ctx: RunContext, task: custom_tasks.CustomTask) -> dict[str, Any]:
+    """The fields that every result of this run shares, whether the task finished or not."""
+    options = ctx.options
+    return {
+        "run_id": options.run_id,
+        "task_id": task.id,
+        "workflow_id": workflow_id_for(options.run_id, task),
+        "task_set": options.task_set,
+        "config": options.config,
+        "model": ctx.model,
+        "git_sha": ctx.commit,
+        "provider": options.provider,
+        "scripted": options.scripted,
+        "memory": options.memory,
+        "context_mode": options.context_mode,
+    }
+
+
 async def run_one(ctx: RunContext, task: custom_tasks.CustomTask) -> results.TaskResult:
+    """Run one task and write its result file.
+
+    When the runner itself fails on the task, with a lost connection or a database error, the
+    task ends with an error result and the other tasks go on. A stop of the whole run (Ctrl-C)
+    is not a failure of one task and passes through.
+    """
+    started_at = datetime.now(UTC)
+    try:
+        return await execute_task(ctx, task, started_at)
+    except Exception as exc:
+        return await record_failure(ctx, task, started_at, exc)
+
+
+async def record_failure(
+    ctx: RunContext, task: custom_tasks.CustomTask, started_at: datetime, exc: Exception
+) -> results.TaskResult:
+    """Write the result of a task that the runner could not run to the end."""
+    ended_at = datetime.now(UTC)
+    workflow_id = workflow_id_for(ctx.options.run_id, task)
+    try:
+        cost_usd, tokens = await ledger_totals(ctx.sessions, workflow_id)
+    except Exception:  # the ledger may be what failed; the task still gets its result
+        cost_usd, tokens = 0.0, results.Tokens()
+    message = f"the runner failed: {type(exc).__name__}: {exc}"[:FAILURE_CHARS]
+    result = results.TaskResult(
+        **identity(ctx, task),
+        outcome=OutcomeKind.ERROR.value,
+        outcome_summary=message,
+        resolved=None,
+        grading=f"not graded: {message}",
+        cost_usd=cost_usd,
+        tokens=tokens,
+        cache_ratio=results.cache_ratio(tokens),
+        started_at=started_at,
+        ended_at=ended_at,
+        wall_time_s=(ended_at - started_at).total_seconds(),
+        turns=0,
+    )
+    results.write_result(ctx.folder, result)
+    print(describe(result), flush=True)
+    return result
+
+
+async def execute_task(
+    ctx: RunContext, task: custom_tasks.CustomTask, started_at: datetime
+) -> results.TaskResult:
     options = ctx.options
     workflow_id = workflow_id_for(options.run_id, task)
     script = script_for(options, task)
     script_ref = await upload_script(ctx.blobs, workflow_id, script) if script else None
-    started_at = datetime.now(UTC)
     try:
         await start_task(
             ctx.client,
@@ -524,15 +621,7 @@ async def run_one(ctx: RunContext, task: custom_tasks.CustomTask) -> results.Tas
         grading = f"{grading} ({unreadable})"
     (ctx.folder / f"{results.check_task_id(task.id)}.patch").write_text(patch, encoding="utf-8")
     result = results.TaskResult(
-        run_id=options.run_id,
-        task_id=task.id,
-        workflow_id=workflow_id,
-        task_set=options.task_set,
-        config=options.config,
-        model=ctx.model,
-        git_sha=ctx.commit,
-        memory=options.memory,
-        context_mode=options.context_mode,
+        **identity(ctx, task),
         outcome=outcome.kind.value,
         outcome_summary=outcome.summary,
         resolved=resolved,
@@ -561,11 +650,31 @@ def describe(result: results.TaskResult) -> str:
 
 
 # ---------- the run ----------
+async def run_tasks(
+    ctx: RunContext, tasks: Sequence[custom_tasks.CustomTask]
+) -> list[results.TaskResult]:
+    """Run the tasks, `concurrency` at a time, and return their results in task order.
+
+    run_one turns a failure of one task into its result, so one bad task never cancels the
+    others that are still running.
+    """
+    gate = asyncio.Semaphore(ctx.options.concurrency)
+
+    async def limited(task: custom_tasks.CustomTask) -> results.TaskResult:
+        async with gate:
+            return await run_one(ctx, task)
+
+    async with asyncio.TaskGroup() as group:
+        running = [group.create_task(limited(task)) for task in tasks]
+    return [job.result() for job in running]
+
+
 async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summary:
     """Run the tasks, write the result files and the summary, and return the summary.
 
     Everything that can be checked without starting a task is checked first, so a mistake costs
-    nothing: the model, the repos, the scripts, and the settings of the stack.
+    nothing: the model, the repos, the scripts, the settings of the stack and the run id. The
+    results folder is made last, so a run that stops before its first task leaves no trace.
     """
     cfg = load_config(config_path(settings))
     model = resolve_model(options, cfg)
@@ -575,49 +684,47 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
         script_for(options, task)
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set: the cost comes from the cost ledger")
-    folder = claim_run_dir(options.results_dir, options.run_id)
 
     blobs = make_blobs(settings)
+    client = await open_client(settings)
+    await check_workflow_ids_free(client, [workflow_id_for(options.run_id, t) for t in tasks])
+    folder = claim_run_dir(options.results_dir, options.run_id)
+
     engine = make_engine(settings.database_url.get_secret_value())
     sandboxes = DockerSandboxManager()
-    ctx = RunContext(
-        options=options,
-        settings=settings,
-        client=await open_client(settings),
-        blobs=blobs,
-        store=make_store(blobs, settings),
-        sessions=async_sessionmaker[AsyncSession](engine, expire_on_commit=False),
-        sandboxes=sandboxes,
-        grader=grade_custom.Grader(sandboxes, image=cfg.sandbox.image, limits=cfg.sandbox.limits),
-        model=model,
-        commit=git_sha(),
-        folder=folder,
-    )
     started_at = datetime.now(UTC)
-    gate = asyncio.Semaphore(options.concurrency)
-
-    async def limited(task: custom_tasks.CustomTask) -> results.TaskResult:
-        async with gate:
-            return await run_one(ctx, task)
-
     try:
-        async with asyncio.TaskGroup() as group:
-            running = [group.create_task(limited(task)) for task in tasks]
+        ctx = RunContext(
+            options=options,
+            settings=settings,
+            client=client,
+            blobs=blobs,
+            store=make_store(blobs, settings),
+            sessions=async_sessionmaker[AsyncSession](engine, expire_on_commit=False),
+            sandboxes=sandboxes,
+            grader=grade_custom.Grader(
+                sandboxes, image=cfg.sandbox.image, limits=cfg.sandbox.limits
+            ),
+            model=model,
+            commit=git_sha(),
+            folder=folder,
+        )
+        finished = await run_tasks(ctx, tasks)
     finally:
         await engine.dispose()
-    summary = results.summarize(
-        [job.result() for job in running], started_at=started_at, ended_at=datetime.now(UTC)
-    )
+    summary = results.summarize(finished, started_at=started_at, ended_at=datetime.now(UTC))
     results.write_summary(folder, summary)
     return summary
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     options = parse_args(argv)
-    if options.memory != "on" or options.context_mode is not None:
+    unapplied_provider = options.provider not in (None, "scripted")
+    if options.memory != "on" or options.context_mode is not None or unapplied_provider:
         print(
-            "note: --memory and --context-mode are recorded in the results. The worker takes "
-            "them from its own config, so start it with the settings you mean to measure.",
+            "note: --memory, --context-mode and --provider are recorded in the results. The "
+            "worker takes them from its own config, so start it with the settings you mean to "
+            "measure.",
             file=sys.stderr,
         )
     try:

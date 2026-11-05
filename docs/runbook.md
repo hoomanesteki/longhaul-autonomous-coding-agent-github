@@ -207,9 +207,10 @@ make up && make sandbox-image && make migrate
 # shell 1: the worker, with the config you mean to measure
 uv run longhaul worker
 
-# shell 2: a dry run on two tasks with scripted answers, then a real run
+# shell 2: a dry run on two tasks with scripted answers (its results go to a scratch folder,
+# because they are not model results), then a real run
 uv run python eval/run.py --set custom --config full --limit 2 --run-id dry-1 \
-  --script tests/fixtures/scripts/eval
+  --script tests/fixtures/scripts/eval --results-dir "${TMPDIR:-/tmp}/longhaul-dry"
 uv run python eval/run.py --set custom --config full --run-id headline-1
 ```
 
@@ -219,23 +220,25 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 |---|---|
 | `--set custom` | The 15 custom tasks. `swebench` is accepted and refused until LH-902. |
 | `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
-| `--run-id NAME` | Names the folder `eval/results/NAME`. A run id that holds results is never reused. |
+| `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
 | `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
 | `--concurrency K` | How many tasks run at once. The default is 1. |
 | `--model ID` | Checked against the coder model in the worker's config, and recorded. |
 | `--memory on\|off`, `--context-mode full\|no_compaction\|none` | Recorded in each result file. The worker reads memory and context settings from its own config, so start it with the settings you mean to measure. |
-| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. |
+| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. Every other `--provider` is only recorded: the worker answers with its own provider. |
 | `--results-dir`, `--pause-timeout-s` | Where results go (default `eval/results`), and how long a pause lasts before the runner ends the task (default 60). |
 
 ### What a run does
 
-1. Checks everything it can before it starts a task: the model, each repo folder (it must match the `base_sha` in `tasks.yaml`, and must hold no hidden test), and the scripts.
+1. Checks everything it can before it starts a task: the model, each repo folder (it must match the `base_sha` in `tasks.yaml`, and must hold no hidden test), the scripts, and that the run id is new. The results folder is made last, so a run that stops here leaves nothing behind.
 2. Starts each task as a workflow with id `lh-eval-<run id>-<task id>`. The task is a folder on this machine (`local:/abs/path`), so nothing is written to GitHub. The plan gate is off, no hints are sent, and the caps are the ones of plan section 8.4: 2 dollars, 150 turns, 120 minutes.
 3. Watches the task. A pause marks it `intervention_needed`. A pause that lasts a minute ends the task with a cancel, because nobody is there to answer. A task that runs past its time limit is ended the same way, and one that ignores the cancel for 30 seconds is terminated.
 4. Reads the patch from the checkpoint repo and grades it. A task counts as resolved when the agent finished (outcome `pr_opened`) and the grader passed the patch. A task that ended any other way is not graded and is not resolved.
 5. Writes `<task id>.json` and `<task id>.patch`, removes the sandbox and the checkpoint repo of the task, and at the end writes `summary.json`.
 
-A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+When the runner itself fails on a task, for example a lost connection or a database error, that task gets a result with outcome `error` and `resolved` null, and the other tasks go on. The summary counts it as attempted and not graded. Ctrl-C ends the whole run: the tasks that are running are terminated, no summary is written, and the run id cannot be used again.
+
+A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
 
 ### The custom task set
 

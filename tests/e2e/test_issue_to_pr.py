@@ -66,10 +66,13 @@ SCRATCH_PREFIX = "longhaul_e2e_pr_"
 FAKE_GITHUB_PORT = 8099
 LABEL = "longhaul"
 TOKEN = "ghp_e2e_issue_to_pr_0123456789abcdef"
-# The whole test has to fit in three minutes in CI. The task itself is five turns of a script and
-# a workspace setup, so what is left over is slack for a slow machine.
+# The whole path from the labeled issue to the pull request has to fit in three minutes (LH-308).
+# One deadline covers the start of the worker, both polls and the wait for the task, so slow
+# stages cannot add up to more. The task itself is five turns of a script and a workspace setup,
+# so what is left over is slack for a slow machine. The worker also has its own limit, because
+# its start is a loop in a thread.
+TOTAL_S = 180
 WORKER_START_S = 60
-TASK_WAIT_S = 150
 
 _spec = importlib.util.spec_from_file_location(
     "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
@@ -306,6 +309,14 @@ def stack(tmp_path: Path, database: str) -> Iterator[Stack]:
 
 async def test_label_to_pr_fake_github(stack: Stack) -> None:
     require_image()
+    try:
+        async with asyncio.timeout(TOTAL_S):
+            await label_to_pr(stack)
+    except TimeoutError:
+        pytest.fail(f"no pull request in {TOTAL_S} s, the target:\n{stack.worker_log()}")
+
+
+async def label_to_pr(stack: Stack) -> None:
     fake, repo = stack.fake, stack.repo
     issue = fake.seed_issue(
         repo,
@@ -320,13 +331,12 @@ async def test_label_to_pr_fake_github(stack: Stack) -> None:
     s = service_settings()
     client = await connect(s["temporal"], namespace=s["namespace"])
 
-    async with asyncio.timeout(TASK_WAIT_S):
-        poll = await client.execute_workflow(
-            PollerWorkflow.run,
-            id=f"lh-e2e-poll-{uuid.uuid4().hex[:8]}",
-            task_queue=stack.queue,
-        )
-        outcome = await get_task(client, task_id).result()
+    poll = await client.execute_workflow(
+        PollerWorkflow.run,
+        id=f"lh-e2e-poll-{uuid.uuid4().hex[:8]}",
+        task_queue=stack.queue,
+    )
+    outcome = await get_task(client, task_id).result()
 
     shown = f"worker:\n{stack.worker_log()}"
     assert poll == acts.PollResult(repos=1, issues=1, started=1, known=0), shown
@@ -357,12 +367,11 @@ async def test_label_to_pr_fake_github(stack: Stack) -> None:
     ]
 
     # A second poll finds the issue still labeled, and starts nothing and opens nothing.
-    async with asyncio.timeout(60):
-        again = await client.execute_workflow(
-            PollerWorkflow.run,
-            id=f"lh-e2e-poll-{uuid.uuid4().hex[:8]}",
-            task_queue=stack.queue,
-        )
+    again = await client.execute_workflow(
+        PollerWorkflow.run,
+        id=f"lh-e2e-poll-{uuid.uuid4().hex[:8]}",
+        task_queue=stack.queue,
+    )
     assert again == acts.PollResult(repos=1, issues=1, started=0, known=1), shown
     assert fake.count_pulls(repo) == 1
     assert fake.count_comments(repo, issue) == 1

@@ -21,6 +21,7 @@ from tests.chaos.harness import (
     ANY_ENDED,
     ANY_STARTED,
     BETWEEN,
+    FIRST_ATTEMPT_STARTED,
     KINDS,
     STARTUP,
     WINDOW_SHARE,
@@ -92,28 +93,35 @@ UNIT_S = 0.05
 FIRST_TURN_NTH = 2  # prepare_workspace is the first activity, the first model turn the second
 
 
-def timed(when: datetime, name: str, event: str, detail: str = "") -> str:
+def timed(when: datetime, name: str, event: str, detail: str = "", attempt: int = 1) -> str:
     stamp = f"{when:%Y-%m-%d %H:%M:%S},{when.microsecond // 1000:03d}"
-    where = f"task lh-t-1, attempt 1{detail}"
+    where = f"task lh-t-1, attempt {attempt}{detail}"
     return f"{stamp} INFO longhaul.durable.activity_log: activity {name} {event}: {where}"
 
 
-def run_events(unit_s: float) -> list[tuple[float, str]]:
+def run_events(unit_s: float, prepare_failures: int = 0) -> list[tuple[float, str]]:
     """The log of a run as (seconds from its start, line).
 
     The run prepares its workspace (3 units), then makes ten turns of a model call (2 units) and
-    an edit (1 unit). That is 21 activities, one after the other.
+    an edit (1 unit). That is 21 activities, one after the other. With `prepare_failures`, the
+    preparation fails that many times first, as it does on a loaded machine, and each failed
+    attempt takes as long as the one that works.
     """
-    steps = [("prepare_workspace", "", 3)]
+    steps = [
+        ("prepare_workspace", "", 3, attempt, "failed")
+        for attempt in range(1, prepare_failures + 1)
+    ]
+    steps.append(("prepare_workspace", "", 3, prepare_failures + 1, "ended"))
     for turn in range(10):
-        steps.append(("llm_turn", f", turn {turn}", 2))
-        steps.append(("tool_exec", f", turn {turn}, edit_file", 1))
+        steps.append(("llm_turn", f", turn {turn}", 2, 1, "ended"))
+        steps.append(("tool_exec", f", turn {turn}, edit_file", 1, 1, "ended"))
     events: list[tuple[float, str]] = []
     clock = 0.0
-    for name, detail, units in steps:
-        for event, offset in (("started", 0.0), ("ended", units * unit_s)):
+    for name, detail, units, attempt, ending in steps:
+        for event, offset in (("started", 0.0), (ending, units * unit_s)):
             at = clock + offset
-            events.append((at, timed(BEGAN + timedelta(seconds=at), name, event, detail)))
+            when = BEGAN + timedelta(seconds=at)
+            events.append((at, timed(when, name, event, detail, attempt)))
         clock += units * unit_s
     return events
 
@@ -138,6 +146,16 @@ def test_an_activity_took_the_time_between_its_started_and_ended_lines() -> None
     assert REFERENCE[0].took_s == pytest.approx(3 * UNIT_S, abs=0.002)
     assert REFERENCE[1].took_s == pytest.approx(2 * UNIT_S, abs=0.002)
     assert REFERENCE[2].took_s == pytest.approx(UNIT_S, abs=0.002)
+
+
+def test_an_activity_knows_its_attempt() -> None:
+    retried = activities_of(log_of(run_events(UNIT_S, prepare_failures=2)))
+    assert [(a.name, a.attempt) for a in retried[:4]] == [
+        ("prepare_workspace", 1),
+        ("prepare_workspace", 2),
+        ("prepare_workspace", 3),
+        ("llm_turn", 1),
+    ]
 
 
 def test_an_activity_keeps_its_started_line_without_the_time() -> None:
@@ -195,10 +213,19 @@ def test_a_slower_reference_changes_the_pauses_and_not_the_activity_the_kill_wai
         assert slow.delay_s >= fast.delay_s
 
 
+def test_a_retried_activity_in_the_reference_does_not_move_the_plan() -> None:
+    # The k-th first attempt of a worker is the k-th activity of the reference whatever was retried
+    # on the way, so only first attempts are counted and drawn from.
+    retried = activities_of(log_of(run_events(UNIT_S, prepare_failures=2)))
+    assert len(retried) == len(REFERENCE) + 2
+    for seed in range(1, 41):
+        assert plan_kills(seed, 3, retried) == plan_kills(seed, 3, REFERENCE)
+
+
 def test_the_first_kill_waits_for_a_started_activity_after_the_first_model_turn() -> None:
     for seed in range(1, 201):
         (kill,) = plan_kills(seed, 1, REFERENCE)
-        assert kill.after is ANY_STARTED
+        assert kill.after is FIRST_ATTEMPT_STARTED
         assert kill.nth in NTH_CHOICES, (seed, kill.nth)
 
 
@@ -220,7 +247,7 @@ def test_the_pause_of_the_first_kill_is_no_longer_than_its_activity_took() -> No
 
 def test_a_later_kill_waits_for_the_new_worker_to_finish_an_activity() -> None:
     first, second, third = plan_kills(3, 3, REFERENCE)
-    assert first.after is ANY_STARTED
+    assert first.after is FIRST_ATTEMPT_STARTED
     assert second.after is third.after is ANY_ENDED
     assert second.nth == third.nth == 1
 
@@ -306,14 +333,36 @@ def test_a_kill_meets_a_run_that_is_faster_or_slower_than_the_reference(
 
     with worker_logging(tmp_path, run_events(UNIT_S * pace)) as (worker, finished):
         point = kill_it(kill, worker)
+        # Inside the block, which kills the process on its way out and would hide a kill that
+        # did not happen.
+        assert worker.proc.poll() is not None, "the worker is still running"
         ended_first = finished.is_set()
-        started = len(ANY_STARTED.findall(worker.text()))
+        started = len(FIRST_ATTEMPT_STARTED.findall(worker.text()))
 
     assert point is not None
     assert not ended_first, "the log had ended before the kill"
     assert started >= kill.nth
-    assert worker.proc.poll() is not None, "the worker is still running"
     assert point.kind != STARTUP
+
+
+@pytest.mark.parametrize("nth", [2, 3])
+def test_a_retried_activity_does_not_move_a_kill_into_the_preparation(
+    tmp_path: Path, nth: int
+) -> None:
+    # The worker prepares its workspace three times. The reference prepared it once, so the
+    # kill that waits for its second or third activity must not take attempt 2 or 3 of the
+    # preparation for it.
+    seed = next(s for s in range(1, 400) if plan_kills(s, 1, REFERENCE)[0].nth == nth)
+    (kill,) = plan_kills(seed, 1, REFERENCE)
+
+    with worker_logging(tmp_path, run_events(UNIT_S, prepare_failures=2)) as (worker, _):
+        point = kill_it(kill, worker)
+        assert worker.proc.poll() is not None, "the worker is still running"
+        first_attempts = len(FIRST_ATTEMPT_STARTED.findall(worker.text()))
+
+    assert point is not None
+    assert point.kind != "prepare_workspace", point.line
+    assert first_attempts >= nth
 
 
 @pytest.mark.parametrize(("lines", "killed"), [(2, False), (3, True)])

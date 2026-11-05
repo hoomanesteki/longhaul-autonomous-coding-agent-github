@@ -107,6 +107,10 @@ _STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) ")
 
 # The lines the kills wait for. Each is a regular expression over one line of the worker's log.
 ANY_STARTED = re.compile(r"activity \w+ started")
+# A retried activity writes a started line for each attempt. A seeded kill counts only the first
+# attempts, because the reference has the same first attempts in the same order whatever was
+# retried on the way.
+FIRST_ATTEMPT_STARTED = re.compile(r"activity \w+ started: task \S+, attempt 1\b")
 ANY_ENDED = re.compile(r"activity \w+ ended")
 # Turn 3 of inventory_fix.yaml waits 3 s before the model answers.
 SLOW_TURN_STARTED = re.compile(r"activity llm_turn started: .*, turn 3$", re.MULTILINE)
@@ -192,6 +196,7 @@ class Activity:
     name: str
     line: str  # the line that says it started, without the time
     took_s: float  # from that line to the line that ended or failed it; 0 if neither came
+    attempt: int = 1
 
 
 def activities_of(log: str) -> list[Activity]:
@@ -211,7 +216,7 @@ def activities_of(log: str) -> list[Activity]:
         when = stamp(text)
         if match["event"] == "started":
             open_at[key] = (len(found), when)
-            found.append(Activity(match["name"], match.group(0), 0.0))
+            found.append(Activity(match["name"], match.group(0), 0.0, int(match["attempt"])))
         elif key in open_at:
             index, began = open_at.pop(key)
             if began is not None and when is not None:

@@ -38,7 +38,9 @@ What it is built from, and why each piece is what it is:
   `submit_plan`, and none that writes a file (roles/planner.py). `store_plan` writes the plans
   table and every worker registers it. With the GitHub token the worker also registers
   `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
-  Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's.
+  Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
+  workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
+  another number stops before it takes a task.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. Without a token the worker still starts and still registers `poll_once`, so a
   worker for local runs needs none. A poll on it fails with the name of the setting, and the
@@ -81,6 +83,7 @@ from longhaul.cost.pricing import load_pricing
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
+from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
@@ -158,6 +161,14 @@ def build_parts(
     `sandboxes` is a DockerSandboxManager. It is a parameter because building one connects to
     the Docker daemon, which a test of this wiring does not have.
     """
+    if cfg.loop.planner_max_turns != acts.PLANNER_MAX_TURNS:
+        # The workflow cannot read the config file and keeps its own copy of the limit. A
+        # different number here would be accepted and then ignored on every task.
+        raise ValueError(
+            f"loop.planner_max_turns is {cfg.loop.planner_max_turns}, but the workflow gives the "
+            f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
+            f"Set it to {acts.PLANNER_MAX_TURNS}"
+        )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
     try:

@@ -203,6 +203,15 @@ def test_a_model_without_a_price_stops_the_worker_before_it_starts(tmp_path: Pat
         worker.build_parts(settings, config, FakeManager())  # type: ignore[arg-type]
 
 
+def test_a_planner_turn_limit_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The workflow keeps its own copy of the limit, so a different number in the file would be
+    # read, accepted and ignored. Stopping at the start says so while the operator is looking.
+    loop = CONFIG.loop.model_copy(update={"planner_max_turns": 8})
+    config = CONFIG.model_copy(update={"loop": loop})
+    with pytest.raises(ValueError, match=r"loop\.planner_max_turns.*8.*20"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.blobs, S3BlobStore)

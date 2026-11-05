@@ -35,7 +35,7 @@ loop:
   continue_as_new_every_turns: 40
   max_tokens_per_turn: 8192
   max_tokens_retry: 64000   # cap for the one retry of a turn that stopped on max_tokens
-  planner_max_turns: 20     # turns the planner gets to submit a plan before the task ends
+  planner_max_turns: 20     # planner turns before the task ends; the workflow fixes it at 20, so keep it
 stuck:
   no_progress_turns: 15
   repeated_failure_count: 3

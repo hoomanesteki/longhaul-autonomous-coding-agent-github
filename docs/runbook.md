@@ -235,7 +235,7 @@ A task started without `--plan` goes straight to coding, as it did before the pl
 SELECT version, status, plan->>'summary' FROM plans WHERE task_id = 'lh-acme-calc-42';
 ```
 
-The planner has `loop.planner_max_turns` turns (20) to submit. A plan has 2 to 8 steps, each with a `done_when`, and at least one acceptance check. A plan that does not fit gets one repair turn: the answer to `submit_plan` lists what is wrong, and the planner may call it again. These ends are an `error` outcome with a fixed summary:
+The planner has 20 turns to submit. That number is `acts.PLANNER_MAX_TURNS`, and `loop.planner_max_turns` must equal it: a worker whose config holds another number stops at the start and names the setting. A plan has 2 to 8 steps, each with a `done_when`, and at least one acceptance check. A plan that does not fit gets one repair turn: the answer to `submit_plan` lists what is wrong, and the planner may call it again. These ends are an `error` outcome with a fixed summary:
 
 | Summary | Meaning |
 |---|---|

@@ -92,8 +92,8 @@ POLL_S = 0.002
 SLOW_POLL_S = 0.25
 
 # The first kill of a plan waits for one of the first WINDOW_SHARE of the activities of the
-# reference to start. The activities after that are left out, so that work remains after the kill
-# and a pause that runs a little long does not outlast the run.
+# reference to start for the first time. The activities after that are left out, so that work
+# remains after the kill and a pause that runs a little long does not outlast the run.
 WINDOW_SHARE = 0.85
 
 # Where a worker was, as the kill points name it. An activity that was running is named by its
@@ -227,11 +227,16 @@ def activities_of(log: str) -> list[Activity]:
 def plan_kills(seed: int, count: int, reference: Sequence[Activity]) -> list[Kill]:
     """`count` kills drawn from a seeded generator and the activities of a run that was not killed.
 
-    The first kill waits for the k-th activity to start. The seed draws k from the activities from
-    the first model turn to the first WINDOW_SHARE of them, so the long preparation of the
-    sandbox is not part of the window and work is left after the kill. The kill then pauses for a
-    seeded time that is no longer than that activity took in the reference, which puts it inside
-    the activity or just after it.
+    The first kill waits for the k-th activity to start. Only first attempts count, on both
+    sides: a worker that retries an activity writes more started lines than the reference did, and
+    counting those would move the kill to an earlier activity, into the preparation of the sandbox
+    when that was retried. The k-th first attempt of any worker is the k-th activity of the
+    reference.
+
+    The seed draws k from the first attempts from the first model turn to the first WINDOW_SHARE
+    of them, so the long preparation of the sandbox is not part of the window and work is left
+    after the kill. The kill then pauses for a seeded time that is no longer than that activity
+    took in the reference, which puts it inside the activity or just after it.
 
     A later kill waits for the new worker to finish an activity, so that it falls in new work and
     not in the retry of the activity that was killed: an activity gives up after three attempts,
@@ -241,19 +246,20 @@ def plan_kills(seed: int, count: int, reference: Sequence[Activity]) -> list[Kil
     The plan reads nothing but the seed and the reference's activities, so a seed is a repeatable
     plan and a run of any speed meets it.
     """
-    first_turn = next((n for n, a in enumerate(reference, 1) if a.name == "llm_turn"), None)
+    firsts = [a for a in reference if a.attempt == 1]
+    first_turn = next((n for n, a in enumerate(firsts, 1) if a.name == "llm_turn"), None)
     if first_turn is None:
         raise ValueError("the reference has no model turn to aim a kill after")
-    last = max(first_turn, int(WINDOW_SHARE * len(reference)))
+    last = max(first_turn, int(WINDOW_SHARE * len(firsts)))
     rng = random.Random(seed)
     kills: list[Kill] = []
     for n in range(count):
         nth = rng.randint(first_turn, last)
-        delay_s = round(rng.uniform(0.0, reference[nth - 1].took_s), 3)
+        delay_s = round(rng.uniform(0.0, firsts[nth - 1].took_s), 3)
         note = f"seed {seed}, kill {n + 1} of {count}"
         if n == 0:
-            note += f", after activity {nth} started ({reference[nth - 1].line})"
-            kills.append(Kill(after=ANY_STARTED, nth=nth, delay_s=delay_s, note=note))
+            note += f", after activity {nth} started ({firsts[nth - 1].line})"
+            kills.append(Kill(after=FIRST_ATTEMPT_STARTED, nth=nth, delay_s=delay_s, note=note))
         else:
             kills.append(Kill(after=ANY_ENDED, delay_s=delay_s, note=note))
     return kills

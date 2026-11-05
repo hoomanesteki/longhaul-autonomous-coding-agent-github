@@ -19,9 +19,11 @@ inside `llm_turn`, and between two activities. Each asserts the place from the l
 worker, so a kill that missed its aim fails the test instead of passing for the wrong reason. The
 two seeded tests kill at a random point of the run's progress and report where it fell. The point
 is drawn from the activities of the reference run (plan_kills): the kill waits for the k-th
-activity of the worker to start and then pauses for no longer than that activity took in the
-reference. It follows the worker's progress and not the clock, so a machine that is busier or
-quieter than it was for the reference does not move a kill past the end of its run.
+activity of the worker to start for the first time and then pauses for no longer than that
+activity took in the reference. It follows the worker's progress and not the clock, so a machine
+that is busier or quieter than it was for the reference does not move a kill past the end of its
+run, and it counts first attempts only, so an activity that the worker retries does not move it
+to an earlier one.
 
 Markers. `chaos_lite` is the five runs of CI and of the gates. `chaos` alone is the full suite: 20
 seeded runs with 1 to 3 kills each, answered by the replay provider, for Phase 9. It plays

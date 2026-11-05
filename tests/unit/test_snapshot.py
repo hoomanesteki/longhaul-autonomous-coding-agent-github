@@ -257,3 +257,10 @@ async def test_a_failure_leaves_no_half_built_repo_behind(
         await snapshot_folder(source, files, tmp_path / "repo")
 
     assert not (tmp_path / "repo").exists()
+
+
+async def test_the_commit_of_two_small_files_is_a_known_one(tmp_path: Path) -> None:
+    # A change to the message, the date, the identity or the git settings of snapshot.py changes
+    # every base commit, and so every task that a log line names by sha. This pins the id.
+    source = make_source(tmp_path / "src", {"a.txt": "a\n", "dir/b.txt": "b\n"})
+    assert await snap(source, tmp_path / "repo") == "06f1357d118d10009cb96a81b664412ae5d0586b"

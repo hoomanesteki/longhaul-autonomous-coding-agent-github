@@ -19,7 +19,8 @@ What `run-local` prints, on stdout in this order: a header with the task id, the
 provider and the model; one line per turn; one line for how the run ended; and the final
 `git_diff`. Progress notes, warnings and errors go to stderr, so the output can be piped on.
 `run` prints a header, a status line each time the status of the task changes, the outcome and
-the final diff, in the same shape.
+the final diff, in the same shape. `run --window N` asks for a context window of N tokens in place
+of the worker's, which is how a short task is made to compact its context (LH-407).
 
 Exit codes. 0: the agent called `finish`. 2: the run failed or ended in error (turn limit, no
 tool calls, a refusal, a failing setup, a provider error, a missing Docker or image), or it
@@ -336,13 +337,24 @@ def run(
             resolve_path=True,
         ),
     ] = None,
+    window: Annotated[
+        int | None,
+        typer.Option(
+            "--window",
+            min=1,
+            help="The context window of this run, in tokens, in place of context.window_tokens "
+            "of the worker's config. A small one makes a short task compact its context. The "
+            "cap for one tool result shrinks with it, to 1/32 of the window at most. The prompt "
+            "and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.",
+        ),
+    ] = None,
 ) -> None:
     """Start a task on the durable stack and follow it until it ends.
 
     Prints the status each time it changes, then the outcome and the final diff. Exits 0 when
     the agent finishes and 2 when the run fails. Ctrl-C stops the command and not the task.
     """
-    options = DurableOptions(path, issue_file, provider, script)
+    options = DurableOptions(path, issue_file, provider, script, window)
     try:
         code = asyncio.run(submit(options))
     except DURABLE_ERRORS as exc:
@@ -653,6 +665,8 @@ class DurableOptions:
     issue_file: Path
     provider: ProviderName | None
     script: Path | None
+    # The context window this run asks for, in tokens. None leaves it to the worker's config.
+    window: int | None = None
 
 
 async def open_client(settings: EnvSettings) -> Client:
@@ -724,11 +738,15 @@ async def submit(options: DurableOptions) -> int:
     if script is not None:
         script_ref = await upload_script(blobs, task_id, script)
     client = await open_client(settings)
-    handle = await start_task(client, spec, task_queue=settings.task_queue, script=script_ref)
+    tuning = acts.Tuning(window_tokens=options.window) if options.window is not None else None
+    handle = await start_task(
+        client, spec, task_queue=settings.task_queue, script=script_ref, tuning=tuning
+    )
 
     who = "provider scripted" if script is not None else "provider of the worker"
+    window = f", context window {options.window} tokens" if options.window is not None else ""
     typer.echo(f"task {task_id}: {title}")
-    typer.echo(f"repo {spec.repo}, {who}, task queue {settings.task_queue}")
+    typer.echo(f"repo {spec.repo}, {who}{window}, task queue {settings.task_queue}")
     try:
         outcome = await follow(handle)
     except asyncio.CancelledError:

@@ -59,10 +59,17 @@ workflow's own copy and is not used to build the request.
 
 Without a `context` policy the activity elides nothing, projects nothing and always says "ok".
 The log is written either way.
+
+A window of the run's own. `longhaul run --window` puts a window in the tuning of the task, and the
+workflow hands it to each call in `LlmTurnInput.window_tokens`. The call then uses the policy of
+the config with that window and with the cap for one result cut to fit it
+(settings.Context.for_window), for the guard, for the room kept for results and for the decision.
+The other thresholds are shares of the window, so they follow it.
 """
 
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -201,6 +208,25 @@ class LlmActivities:
 
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+        # A run that asked for a window of its own is served by a copy of this activity with that
+        # window in its policy, so that nothing below needs to know that a run can ask.
+        return await self._scoped(inp.window_tokens)._turn(inp)
+
+    def _scoped(self, window_tokens: int | None) -> LlmActivities:
+        """This activity for a run with the window `window_tokens`, or itself when it has none.
+
+        The copy shares everything but the policy and the budget: the stores, the ledger, the
+        token meters and the provider. It is made for the call and dropped after it, so one run's
+        window never reaches the next. Without a context policy there is nothing to scope.
+        """
+        if window_tokens is None or self._context is None:
+            return self
+        scoped = copy.copy(self)
+        scoped._context = self._context.for_window(window_tokens)
+        scoped._budget = _budget(scoped._context)
+        return scoped
+
+    async def _turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
         inp = small(inp)
         cfg = self._config_for(inp.role)
         try:

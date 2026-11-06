@@ -13,6 +13,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from longhaul.context.tokens import result_cap
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
 
 # A key is secret-looking when its name contains one of these after it is lower-cased and
@@ -140,6 +141,24 @@ class Context(StrictModel):
     keep_recent_turns: int
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
+
+    def for_window(self, window_tokens: int | None) -> Self:
+        """The policy of a run that asks for a window of its own (`longhaul run --window`).
+
+        Only two numbers change. The window is the one asked for, and the cap for one tool result
+        is cut to fit it (context.tokens.result_cap): a result of 4,000 tokens, which the config
+        allows in a window of 200,000, would fill half of a window of 8,000, and the room that
+        llm_turn keeps for the results of a turn would never be there. The thresholds are shares
+        of the window, so they follow it. None gives the policy as it is.
+        """
+        if window_tokens is None:
+            return self
+        return self.model_copy(
+            update={
+                "window_tokens": window_tokens,
+                "tool_output_max_tokens": result_cap(self.tool_output_max_tokens, window_tokens),
+            }
+        )
 
 
 class Loop(StrictModel):

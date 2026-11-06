@@ -18,7 +18,9 @@ from longhaul.agent.prompts import (
     FIRST_USER_MESSAGE,
     PLAN_HEADING,
     SECTION_HEADINGS,
+    TASK_HEADING,
     build_system_prompt,
+    first_user_message,
 )
 from longhaul.context.compact import NOTES_HEADING, apply, find_cut
 from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
@@ -233,6 +235,21 @@ def test_the_plan_heading_is_a_section_of_its_own() -> None:
     assert PLAN_HEADING.startswith("## ")
     assert PLAN_HEADING not in SECTION_HEADINGS
     assert PLAN_HEADING != NOTES_HEADING
+
+
+def test_the_planner_has_the_four_blocks_and_shares_the_task_and_the_memory() -> None:
+    # The planner (LH-501) has blocks 1 and 2 of its own. Blocks 3 and 4 belong to the task, so
+    # they are the same bytes as the coder's. It writes the plan, so block 5 is not in its prompt,
+    # and its transcript opens with a first message of its own.
+    planner_system = build_system_prompt(Role.PLANNER, SPEC, MEMORY)
+    assert [planner_system.count(heading) for heading in SECTION_HEADINGS] == [1] * 4
+    places = [planner_system.index(heading) for heading in SECTION_HEADINGS]
+    assert places == sorted(places)
+    assert planner_system.endswith(SYSTEM[SYSTEM.index(TASK_HEADING) :])
+    assert planner_system != SYSTEM
+    assert PLAN_HEADING not in planner_system
+    assert first_user_message(Role.PLANNER) != FIRST_USER_MESSAGE
+    assert first_user_message(Role.CODER) == FIRST_USER_MESSAGE
 
 
 async def test_the_system_breakpoint_closes_block_4() -> None:

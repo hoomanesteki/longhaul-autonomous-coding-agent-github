@@ -1,0 +1,319 @@
+# The compactor of the longlog run. longlog.yaml holds the same steps, because a run takes
+# one script. A test keeps the two equal.
+#
+# The compactor answers with notes that list the modules fixed so far. The step that edits
+# a module says `Fixed <module>:`, and so do the notes. The highest module that the
+# request mentions, in the turns to fold or in the previous notes, is the one the notes go
+# up to. The steps run from the last module down, and the first that matches answers.
+steps:
+  # 12 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed words:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: &goal "Fix the planted bug in each of the 12 modules of src/longlog, one module at a time, until the whole suite passes."
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py, src/longlog/stats.py, src/longlog/words.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Fixed stats: the mean used integer division"
+              - "Fixed words: splitting on one space counted every extra space as a word"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests: []
+            open_hypotheses: []
+            tried_and_failed: &tried
+              - "Reading the trace of a test run. It has 5,000 lines: use the summary line, and read_output with a pattern when a detail is needed."
+            covers_turns_up_to: 0
+  # 11 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed stats:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py, src/longlog/stats.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Fixed stats: the mean used integer division"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_words.py::test_word_count_ignores_extra_spaces"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 10 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed slug:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_stats.py::test_mean_keeps_the_fraction"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 9 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed ranges:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_slug.py::test_slugify_lowercases"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 8 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed percent:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_ranges.py::test_inclusive_range_includes_the_stop"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 7 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed pages:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_percent.py::test_percent_of_a_whole"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 6 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed ordinal:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_pages.py::test_page_count_rounds_up"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 5 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed leap:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_ordinal.py::test_the_teens_end_in_th"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 4 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed initials:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_leap.py::test_a_century_divisible_by_400_is_a_leap_year"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 3 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed dedupe:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_initials.py::test_initials_uses_every_word"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 2 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed clamp:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_dedupe.py::test_dedupe_keeps_the_first_copy"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 1 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed chunks:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_clamp.py::test_clamp_allows_the_upper_bound"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 0 of 12 modules fixed.
+  - match:
+      role: compactor
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: []
+            decisions:
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_chunks.py::test_chunk_keeps_the_last_partial_chunk"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0

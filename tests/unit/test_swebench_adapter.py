@@ -142,6 +142,11 @@ def test_the_dataset_name_is_the_one_that_carries_the_eval_script() -> None:
             "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
         ),
         (
+            "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 "
+            "cache.tests deprecation.test_middleware_mixin runtests",
+            "./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1",
+        ),
+        (
             "PYTHONWARNINGS='ignore::UserWarning,ignore::SyntaxWarning' bin/test -C --verbose "
             "astropy/modeling/tests/test_separable.py",
             "PYTHONWARNINGS=ignore::UserWarning,ignore::SyntaxWarning bin/test -C --verbose",

@@ -862,3 +862,22 @@ def test_the_swebench_set_has_its_own_dollar_cap_and_the_same_turn_and_time_caps
     assert run.CUSTOM_BUDGETS.task_usd == 2.0
     assert run.SWEBENCH_BUDGETS.task_turns == run.CUSTOM_BUDGETS.task_turns == 150
     assert run.SWEBENCH_BUDGETS.task_wall_minutes == run.CUSTOM_BUDGETS.task_wall_minutes == 120
+
+
+def test_a_swebench_run_ends_by_pointing_at_the_grader_and_does_not_count_resolved(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    done = result_for(first_task())
+
+    async def run_eval(_options: RunOptions, _settings: object) -> results.Summary:
+        return results.summarize([done], started_at=done.started_at, ended_at=done.ended_at)
+
+    monkeypatch.setattr(run, "run_eval", run_eval)
+    argv = ["--set", "swebench", "--config", "full", "--run-id", "try1"]
+
+    assert run.main([*argv, "--results-dir", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "not graded yet" in out
+    assert "resolved" not in out
+    assert f"eval/swebench/grade.sh {tmp_path / 'try1'}" in out

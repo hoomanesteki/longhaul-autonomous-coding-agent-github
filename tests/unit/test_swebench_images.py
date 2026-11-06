@@ -53,6 +53,21 @@ def test_the_repo_moves_to_workspace_and_testbed_stays_as_a_link() -> None:
     assert "chown -R agent:agent /workspace" in text
 
 
+def test_the_history_of_the_clone_is_removed_so_the_fix_cannot_be_read() -> None:
+    text = images.derived_dockerfile(BASE_IMAGE)
+
+    # The clone in a harness image holds the commits after the base commit, among them the fix.
+    assert "rm -rf /workspace/.git" in text
+    assert text.index("rm -rf /workspace/.git") < text.index("chown -R agent:agent /workspace")
+
+
+def test_the_instance_image_does_not_start_a_shell_that_ends_at_once() -> None:
+    lines = images.derived_dockerfile(BASE_IMAGE).splitlines()
+
+    assert "ENTRYPOINT []" in lines
+    assert 'CMD ["sleep", "infinity"]' in lines
+
+
 def test_the_conda_environment_leads_the_path_of_every_command_through_the_venv_link() -> None:
     text = images.derived_dockerfile(BASE_IMAGE)
 
@@ -173,11 +188,11 @@ class FakeDocker:
         self,
         *,
         present: set[str] | None = None,
-        head: str = "a" * 40,
+        export_error: Exception | None = None,
         files: dict[str, bytes] | None = None,
     ) -> None:
         self.present = set(present or ())
-        self.head = head
+        self.export_error = export_error
         self.files = files or {"pkg/core.py": b"x = 1\n"}
         self.calls: list[tuple[str, ...]] = []
 
@@ -194,12 +209,10 @@ class FakeDocker:
         assert dockerfile.startswith("FROM ")
         self.present.add(tag)
 
-    def read_head(self, image: str) -> str:
-        self.calls.append(("head", image))
-        return self.head
-
-    def export_tree(self, image: str) -> io.BytesIO:
-        self.calls.append(("export", image))
+    def export_tree(self, image: str, base_commit: str) -> io.BytesIO:
+        self.calls.append(("export", image, base_commit))
+        if self.export_error is not None:
+            raise self.export_error
         return io.BytesIO(tar_of(self.files))
 
 
@@ -215,6 +228,7 @@ def test_preparing_an_instance_pulls_builds_and_exports_once(tmp_path: Path) -> 
         "build",
         "export",
     ]
+    assert ("export", BASE_IMAGE, "a" * 40) in docker.calls
     assert (tmp_path / "pkg" / "core.py").read_bytes() == b"x = 1\n"
 
 
@@ -227,8 +241,12 @@ def test_an_image_that_is_there_is_neither_pulled_nor_built_again(tmp_path: Path
     assert [c[0] for c in docker.calls if c[0] in ("pull", "build")] == []
 
 
-def test_an_instance_image_at_another_commit_is_refused(tmp_path: Path) -> None:
-    docker = FakeDocker(present={BASE_IMAGE}, head="b" * 40)
+def test_an_instance_image_without_the_base_commit_is_refused_and_leaves_no_files(
+    tmp_path: Path,
+) -> None:
+    docker = FakeDocker(
+        present={BASE_IMAGE}, export_error=images.ImageError("the base commit is not in the image")
+    )
 
     with pytest.raises(images.ImageError, match="base commit"):
         images.DockerImages(docker).prepare(FakeInstance(), tmp_path)
@@ -243,3 +261,36 @@ def test_a_failed_pull_says_which_image_and_why() -> None:
 
     with pytest.raises(images.ImageError, match="no matching manifest"):
         images.DockerImages(Failing()).prepare(FakeInstance(), Path("/unused"))
+
+
+def test_the_export_script_checks_the_base_commit_and_lists_the_files_git_does_not_ignore() -> None:
+    script = images.export_script()
+
+    assert script.startswith("set -e")
+    # A wrong image is told by its missing base commit.
+    assert 'git cat-file -e "$BASE_COMMIT^{commit}"' in script
+    # The files of the working tree as the image has them: tracked, and new but not ignored.
+    assert "git ls-files -z --cached --others --exclude-standard" in script
+    assert "tar --null --ignore-failed-read -T - -cf -" in script
+    # The tree is not reset to the base commit: the agent starts from what the harness tests.
+    assert "checkout" not in script
+
+
+def test_the_platform_comes_from_the_environment_or_is_linux_amd64(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(images.PLATFORM_VARIABLE, raising=False)
+    assert images.default_platform() == "linux/amd64"
+
+    monkeypatch.setenv(images.PLATFORM_VARIABLE, "linux/arm64")
+    assert images.default_platform() == "linux/arm64"
+
+
+@pytest.mark.parametrize("bad", ["--rm", "linux amd64", "linux/amd64;ls", ""])
+def test_a_platform_that_could_be_an_option_is_refused(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    monkeypatch.setenv(images.PLATFORM_VARIABLE, bad)
+
+    with pytest.raises(images.ImageError, match=images.PLATFORM_VARIABLE):
+        images.default_platform()

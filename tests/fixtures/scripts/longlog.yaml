@@ -15,6 +15,13 @@
 # a module says `Fixed <module>:`, and so do the notes. The highest module that the
 # request mentions, in the turns to fold or in the previous notes, is the one the notes go
 # up to. The steps run from the last module down, and the first that matches answers.
+#
+# The first compaction of the long-task test folds the fixes of chunks, clamp and dedupe, and has
+# no previous notes. Every step above dedupe belongs to a later round, and asks for the previous
+# notes as well: the line `"Fixed chunks:` with its quote is how the notes are printed in the
+# request (as JSON), while a turn to fold shows the same words as `said: Fixed chunks:`. A run
+# that does not carry the notes from one compaction to the next gets the last step, which lists
+# no module, and the long-task test fails on the notes it finds.
 # Its steps are the ones in compactor.yaml, after the coder.
 steps:
   # Turn 0: the first full run.
@@ -580,6 +587,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed words:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -610,6 +618,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed stats:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -639,6 +648,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed slug:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -667,6 +677,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed ranges:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -694,6 +705,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed percent:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -720,6 +732,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed pages:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -745,6 +758,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed ordinal:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -769,6 +783,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed leap:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes
@@ -792,6 +807,7 @@ steps:
   - match:
       role: compactor
       user_text_contains: "Fixed initials:"
+      request_contains: '"Fixed chunks:'
     respond:
       tool_calls:
         - name: record_progress_notes

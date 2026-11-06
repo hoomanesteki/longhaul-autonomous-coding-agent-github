@@ -13,8 +13,9 @@ and a run that ignored the flag would fail the test.
 
 What the test reads is what the run left behind. The final diff, printed by the command, is applied
 to a fresh copy of the fixture, and the fixture's own tests run on it. The `events` and `turns`
-tables of a scratch database say how often the task compacted and how full the window got. The
-notes after the last compaction are read from the blob store.
+tables of a scratch database say how often the task compacted and how full the window got, and
+`longhaul status` has to say the same. The notes after the last compaction are read from the blob
+store.
 
 Run `make up` and `make sandbox-image` first. The workspace setup builds a venv and installs
 pytest from PyPI, so the machine needs outbound network. The test takes a few minutes: the
@@ -72,6 +73,7 @@ MODULES = [
 # The first ten turns are a full run, and the fixes of chunks (turn 2) and clamp (turn 7).
 FIXED_IN_THE_FIRST_10_TURNS = MODULES[:2]
 RUN_TIMEOUT_S = 1500
+STATUS_TIMEOUT_S = 120
 HEADER = re.compile(r"^task (lh-local-longlog-[0-9a-f]{8}):", re.MULTILINE)
 DIFF_MARKER = "final diff against base:"
 
@@ -106,7 +108,13 @@ class LonglogStack(Stack):
         return path
 
     def environment(self) -> dict[str, str]:
-        return {**super().environment(), "LONGHAUL_CONFIG": str(self.config)}
+        return {
+            **super().environment(),
+            "LONGHAUL_CONFIG": str(self.config),
+            # Port 0 lets the system pick a free port for the metrics endpoint. The default is
+            # taken by the worker of a developer or of another test run on the same machine.
+            "LONGHAUL_METRICS_PORT": "0",
+        }
 
     def run_command(self) -> list[str]:
         return [
@@ -164,9 +172,11 @@ def notes_after_the_last_compaction(
     The call after the last compaction starts from the compacted view, and its row in `turns`
     names that view by blob key. The first message holds the task and the notes.
     """
+    # A turn that was asked again has a row for each attempt, and every attempt gets the same view.
     ((key,),) = rows(
         database,
-        "SELECT request_ref FROM turns WHERE task_id = %s AND role = 'coder' AND turn_index = %s",
+        "SELECT request_ref FROM turns WHERE task_id = %s AND role = 'coder' AND turn_index = %s "
+        "ORDER BY attempt DESC LIMIT 1",
         task_id,
         last["turn_index"] + 1,
     )
@@ -252,7 +262,9 @@ def test_longlog_many_compactions(tmp_path: Path) -> None:
 
             assert code == 0, shown
             assert "Traceback" not in output, shown
-            assert re.search(rf"^finished after {TURNS} turns: Fixed the planted bug", output, re.M)
+            assert re.search(
+                rf"^finished after {TURNS} turns: Fixed the planted bug", output, re.M
+            ), shown
 
             # The task finished with all twelve modules fixed: the printed diff is the fix of each
             # of them, and the fixture's tests pass on the tree it makes.
@@ -275,6 +287,21 @@ def test_longlog_many_compactions(tmp_path: Path) -> None:
             fraction = max_fraction(database, task_id)
             assert fraction < HARD_LIMIT, f"max_fraction {fraction:.3f}"
             assert fraction > COMPACT_AT - 0.1, f"max_fraction {fraction:.3f}: was the window used?"
+
+            # `longhaul status` says the same, as the smoke of Integration checkpoint 4 expects.
+            asked = subprocess.run(
+                [str(LONGHAUL), "status", task_id],
+                cwd=tmp_path,
+                env=stack.environment(),
+                capture_output=True,
+                text=True,
+                timeout=STATUS_TIMEOUT_S,
+                check=False,
+            )
+            assert asked.returncode == 0, asked.stderr
+            assert (
+                f"context: {len(events)} compactions, max_fraction {fraction:.2f}" in asked.stdout
+            ), asked.stdout
 
             # The notes after the last compaction still list what was fixed in the first 10 turns.
             notes = notes_after_the_last_compaction(stack, database, task_id, events[-1])

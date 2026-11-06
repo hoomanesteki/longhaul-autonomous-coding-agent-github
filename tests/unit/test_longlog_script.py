@@ -7,7 +7,8 @@ shown of a result: a head with the summary line, and a tail, and not the whole o
 
 The compactor is not asked in a play like this one, because the in-process loop has no tier 2.
 Its steps are checked on their own: each request that names a fixed module gets the notes that
-list the modules up to it.
+list the modules up to it. From the second round on, a step also asks for the previous notes, so
+that a run that does not carry the notes from one compaction to the next gets no answer.
 """
 
 from pathlib import Path
@@ -53,6 +54,9 @@ MODULES = [
     "words",
 ]
 TURNS = 62
+# The modules that the first compaction of the long-task test has fixed to fold (the fixes of
+# chunks, clamp and dedupe are in turns 2, 7 and 12). Every later round has notes behind it.
+FIRST_ROUND_MODULES = 3
 # What the model is allowed to see of one result in the long-task test: a window of 8,000 tokens
 # gives 1/32 of it (Context.for_window).
 RESULT_CAP_TOKENS = 250
@@ -139,12 +143,37 @@ async def notes_for(request_text: str) -> ProgressNotes:
     return ProgressNotes.model_validate(call.input)
 
 
+def previous_notes_block(notes: ProgressNotes) -> str:
+    """The part of the request that carries the notes of the round before.
+
+    It has the shape that compact() gives it: the notes as JSON, so a decision is in quotes. The
+    turns to fold show the same decision as a line that the model said, without a quote.
+    """
+    return f"## Previous notes\n{notes.model_dump_json(indent=2)}\n\n"
+
+
+def folded_turns(fixed: int) -> str:
+    return (
+        f"## Transcript to fold into the notes\n[turn 3]\n  said: Fixed {MODULES[fixed - 1]}: it."
+    )
+
+
+async def request_of_round(fixed: int) -> str:
+    """The request of a round whose turns to fold end with the fix of the module `fixed`.
+
+    The first round has no previous notes. A later one has the notes that the round before it got.
+    """
+    if fixed <= FIRST_ROUND_MODULES:
+        return folded_turns(fixed)
+    before = await notes_for(await request_of_round(fixed - 1))
+    return previous_notes_block(before) + folded_turns(fixed)
+
+
 @pytest.mark.parametrize("fixed", range(1, len(MODULES) + 1))
 async def test_the_notes_list_the_modules_fixed_so_far(fixed: int) -> None:
     # The request names the last module that was fixed, in the turns to fold or in the notes of
     # the round before. Modules after it that were only read must not be listed.
-    request = f"[turn 3]\n  said: Fixed {MODULES[fixed - 1]}: it was wrong.\n  call read_file x"
-    notes = await notes_for(request)
+    notes = await notes_for(await request_of_round(fixed))
 
     assert notes.files_touched == [f"src/longlog/{m}.py" for m in MODULES[:fixed]]
     assert [d.split(":")[0] for d in notes.decisions[:fixed]] == [
@@ -168,9 +197,54 @@ async def test_the_highest_module_in_the_request_wins() -> None:
 
 
 async def test_the_notes_keep_what_was_tried_and_failed() -> None:
-    first = await notes_for("Fixed chunks: a.")
-    last = await notes_for("Fixed words: a.")
+    first = await notes_for(await request_of_round(1))
+    last = await notes_for(await request_of_round(len(MODULES)))
     assert first.tried_and_failed == last.tried_and_failed != []
+
+
+# ---------- the compactor needs the previous notes from the second round on ----------
+def assert_nothing_is_listed(notes: ProgressNotes) -> None:
+    """The notes of the last step, which the script gives to a request that no other step fits."""
+    assert notes.files_touched == []
+    assert not [d for d in notes.decisions if d.startswith("Fixed ")]
+
+
+@pytest.mark.parametrize("fixed", range(FIRST_ROUND_MODULES + 1, len(MODULES) + 1))
+async def test_a_later_round_with_only_the_turns_to_fold_gets_notes_of_nothing_fixed(
+    fixed: int,
+) -> None:
+    # What a run that drops the notes between two compactions sends: the turns to fold, and no
+    # previous notes.
+    assert_nothing_is_listed(await notes_for(folded_turns(fixed)))
+
+
+@pytest.mark.parametrize("fixed", range(FIRST_ROUND_MODULES + 1, len(MODULES) + 1))
+async def test_a_said_line_is_not_the_previous_notes(fixed: int) -> None:
+    # The first module is in the turns to fold as a line that the model said, without the quote
+    # that the notes have in the request. It does not stand in for the notes.
+    notes = await notes_for(folded_turns(1) + "\n" + folded_turns(fixed))
+
+    assert notes.files_touched == ["src/longlog/chunks.py"]
+
+
+async def test_a_later_round_whose_previous_notes_lost_the_first_modules_gets_none_either() -> None:
+    # Notes that reached the compactor but lost what was fixed first are as bad as none.
+    lost = (await notes_for(await request_of_round(5))).model_copy(
+        update={"decisions": ["Fixed ordinal: a"], "files_touched": []}
+    )
+
+    assert_nothing_is_listed(await notes_for(previous_notes_block(lost) + folded_turns(6)))
+
+
+def test_every_step_after_the_first_round_asks_for_the_previous_notes() -> None:
+    asked = {
+        s["match"]["user_text_contains"]: s["match"].get("request_contains")
+        for s in steps(COMPACTOR, "compactor")
+        if "user_text_contains" in s["match"]
+    }
+    for index, module in enumerate(MODULES, start=1):
+        wanted = '"Fixed chunks:' if index > FIRST_ROUND_MODULES else None
+        assert asked[f"Fixed {module}:"] == wanted, module
 
 
 # ---------- a play in a fake sandbox ----------

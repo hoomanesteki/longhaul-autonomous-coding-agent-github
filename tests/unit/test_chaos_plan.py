@@ -129,3 +129,11 @@ def test_a_run_has_between_one_and_three_kills() -> None:
         RunPlan(1, "calc-01", 1, ())
     with pytest.raises(ValueError, match="1 to 3"):
         RunPlan(1, "calc-01", 1, ("worker",) * 4)
+
+
+def test_the_seed_of_the_short_suite_hits_every_kind() -> None:
+    # tests/chaos/test_chaos_full.py runs two runs. Seed 43 is the seed where those two runs
+    # between them meet the worker, the sandbox, Temporal and Postgres.
+    plans = plan_runs(2, 43)
+
+    assert all(count >= 1 for count in plan.hits_by_type(plans).values())

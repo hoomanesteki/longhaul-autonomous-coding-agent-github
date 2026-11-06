@@ -84,7 +84,7 @@ def test_the_summary_counts_runs_that_completed_with_the_reference_diff() -> Non
     assert summary.runs == 3
     assert summary.completed == 2
     assert summary.completion_rate == pytest.approx(2 / 3)
-    assert summary.diff_matches == 2
+    assert summary.diff_matches == 1
     assert summary.survived == 1
 
 

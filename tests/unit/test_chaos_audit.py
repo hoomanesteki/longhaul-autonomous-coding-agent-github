@@ -7,6 +7,7 @@ the history has the server's time for the start of every activity, including a r
 """
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +19,7 @@ from tests.fakes.fake_github import FakeGitHub
 from eval.chaos import audit, history
 from eval.chaos.results import SideEffects
 from longhaul.contracts import RepoSettings, TaskSpec
+from longhaul.cost.pricing import Pricing
 from longhaul.github import lifecycle
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -223,3 +225,24 @@ async def test_a_task_that_never_continued_has_one_run() -> None:
         return only
 
     assert await history.chain_history(read) == only
+
+
+# ---------- what the ledger rows would cost ----------
+PRICES = Path(__file__).resolve().parents[2] / "config" / "pricing.yaml"
+
+
+def test_ledger_rows_are_priced_at_the_published_rates() -> None:
+    # A replayed run bills nothing, so its ledger has no dollars. The rows still say how many
+    # tokens each call used, and those are priced here with the rates of config/pricing.yaml.
+    rows = [
+        audit.LedgerRow("claude-sonnet-5-5", 1_000_000, 100_000, 0, 0),
+        audit.LedgerRow("claude-sonnet-5-5", 0, 0, 1_000_000, 1_000_000),
+    ]
+
+    cost = audit.ledger_cost(rows, Pricing.load(PRICES))
+
+    assert cost == pytest.approx(2.00 + 1.00 + 0.20 + 2.50)
+
+
+def test_no_ledger_rows_cost_nothing() -> None:
+    assert audit.ledger_cost([], Pricing.load(PRICES)) == 0.0

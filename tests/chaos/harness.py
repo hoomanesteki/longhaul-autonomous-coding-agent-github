@@ -22,6 +22,10 @@ for a condition (`until`), then for a pause (`delay_s`). The wait runs in a thre
 poll, because an event loop that is busy with the run adds tens of milliseconds, which is the whole
 window of a kill between two activities.
 
+A kill is of the worker (SIGKILL to its pid) unless it names another kind. `Stack.strike` does the
+kill of a kind: the base class knows the worker, and a subclass adds the others (the full suite of
+LH-904 adds the sandbox, the Temporal server and Postgres). Only a killed worker is started again.
+
 A seeded plan follows the progress of the worker and not the clock. It is drawn from the activities
 of a run that was never killed (`plan_kills`): the kill waits for the k-th activity to start and
 then pauses for no longer than that activity took in the reference. A run that is faster or slower
@@ -45,10 +49,11 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import boto3
 import docker
@@ -57,12 +62,13 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
-from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
+from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
+from temporalio.service import RPCError
 
 from longhaul import cli
 from longhaul.blobs.s3 import S3BlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
-from longhaul.contracts import Outcome, OutcomeKind, TaskStatus
+from longhaul.contracts import Outcome, OutcomeKind, TaskSpec, TaskStatus
 from longhaul.durable.activity_log import ACTIVITY_LINE
 from longhaul.durable.acts import Tuning
 from longhaul.durable.client import connect, get_task, read_status, start_task
@@ -90,11 +96,16 @@ WORKER_START_TIMEOUT_S = 180
 KILL_WAIT_S = 400
 POLL_S = 0.002
 SLOW_POLL_S = 0.25
+# How long a read of the database waits for Postgres to come back after a restart of it.
+QUERY_RETRY_S = 60.0
 
 # The first kill of a plan waits for one of the first WINDOW_SHARE of the activities of the
 # reference to start for the first time. The activities after that are left out, so that work
 # remains after the kill and a pause that runs a little long does not outlast the run.
 WINDOW_SHARE = 0.85
+
+# The kind of a kill that sends SIGKILL to the worker. Another kind is struck by Stack.strike.
+WORKER = "worker"
 
 # Where a worker was, as the kill points name it. An activity that was running is named by its
 # own name (llm_turn, tool_exec, prepare_workspace ...).
@@ -168,7 +179,11 @@ class Kill:
 
     It waits for the `nth` line that matches `after` in the log of that worker (the worker's own
     log, so a new worker counts from its first line), then for `until(task_id)` to hold, then for
-    `delay_s` seconds, and then sends SIGKILL.
+    `delay_s` seconds, and then strikes: SIGKILL for the worker, or whatever `kind` names.
+
+    With `fresh`, only the lines written after the kill starts to wait count. A kill of another
+    kind leaves the worker running, so its log still holds the lines of the activities that ended
+    before, and the kill must not take one of those for the activity it is waiting for.
     """
 
     after: re.Pattern[str]
@@ -176,6 +191,8 @@ class Kill:
     delay_s: float = 0.0
     until: Callable[[str], bool] | None = None
     note: str = ""
+    kind: str = WORKER
+    fresh: bool = False
 
     def __post_init__(self) -> None:
         if self.nth < 1:
@@ -184,9 +201,13 @@ class Kill:
 
 @dataclass(frozen=True)
 class KillPoint:
-    kind: str  # one of KINDS, another activity name, or STARTUP
-    line: str  # the last activity line of the worker, as it was when the worker died
+    kind: str  # where the worker was: one of KINDS, another activity name, or STARTUP
+    line: str  # the last activity line of the worker, as it was at the kill
     after_s: float  # seconds from the start of the task
+    via: str = WORKER  # what was struck: the Kill's kind
+    # When the strike was over (UTC): the kill itself, or the restart that has returned.
+    struck_at: datetime | None = None
+    hit: bool = True  # False when there was nothing to strike, such as a task with no sandbox
 
 
 @dataclass(frozen=True)
@@ -224,7 +245,14 @@ def activities_of(log: str) -> list[Activity]:
     return found
 
 
-def plan_kills(seed: int, count: int, reference: Sequence[Activity]) -> list[Kill]:
+def plan_kills(
+    seed: int,
+    count: int,
+    reference: Sequence[Activity],
+    *,
+    kinds: Sequence[str] | None = None,
+    window_share: float = WINDOW_SHARE,
+) -> list[Kill]:
     """`count` kills drawn from a seeded generator and the activities of a run that was not killed.
 
     The first kill waits for the k-th activity to start. Only first attempts count, on both
@@ -243,25 +271,36 @@ def plan_kills(seed: int, count: int, reference: Sequence[Activity]) -> list[Kil
     and three kills on one tool call would end the run for a reason that is not a bug. Its pause
     is drawn the same way, from an activity of the window.
 
+    `kinds` names what each kill strikes, one for each kill (the worker when it is left out). It
+    is a second decision, made after the times, so naming kinds moves no kill. `window_share`
+    is the share of the first attempts that the first kill may wait for. The default leaves the
+    last part of a run to finish after the kill. The full suite passes 1.0, because the delivery
+    of the pull request is the last part of a run and the audit of the writes needs kills there.
+
     The plan reads nothing but the seed and the reference's activities, so a seed is a repeatable
     plan and a run of any speed meets it.
     """
+    if kinds is not None and len(kinds) != count:
+        raise ValueError(f"a plan of {count} kills needs {count} kinds, not {len(kinds)}")
     firsts = [a for a in reference if a.attempt == 1]
     first_turn = next((n for n, a in enumerate(firsts, 1) if a.name == "llm_turn"), None)
     if first_turn is None:
         raise ValueError("the reference has no model turn to aim a kill after")
-    last = max(first_turn, int(WINDOW_SHARE * len(firsts)))
+    last = max(first_turn, int(window_share * len(firsts)))
     rng = random.Random(seed)
     kills: list[Kill] = []
     for n in range(count):
         nth = rng.randint(first_turn, last)
         delay_s = round(rng.uniform(0.0, firsts[nth - 1].took_s), 3)
-        note = f"seed {seed}, kill {n + 1} of {count}"
+        kind = WORKER if kinds is None else kinds[n]
+        note = f"seed {seed}, kill {n + 1} of {count} ({kind})"
         if n == 0:
             note += f", after activity {nth} started ({firsts[nth - 1].line})"
-            kills.append(Kill(after=FIRST_ATTEMPT_STARTED, nth=nth, delay_s=delay_s, note=note))
+            kills.append(
+                Kill(after=FIRST_ATTEMPT_STARTED, nth=nth, delay_s=delay_s, note=note, kind=kind)
+            )
         else:
-            kills.append(Kill(after=ANY_ENDED, delay_s=delay_s, note=note))
+            kills.append(Kill(after=ANY_ENDED, delay_s=delay_s, note=note, kind=kind, fresh=True))
     return kills
 
 
@@ -280,10 +319,14 @@ def appended(path: str = "CHANGES.txt", text: str = APPENDED_LINE) -> Callable[[
     def holds(task_id: str) -> bool:
         client = docker.from_env()
         try:
-            label = {"label": f"longhaul.task_id={task_id}"}
+            label: dict[str, str | list[str] | bool] = {"label": f"longhaul.task_id={task_id}"}
             for container in client.containers.list(filters=label):
                 code, output = container.exec_run(["cat", f"/workspace/{path}"])
-                if code == 0 and text in output.decode("utf-8", errors="replace"):
+                if (
+                    code == 0
+                    and isinstance(output, bytes)
+                    and text in output.decode("utf-8", errors="replace")
+                ):
                     return True
             return False
         finally:
@@ -401,10 +444,14 @@ def service_settings() -> dict[str, str]:
 
 
 @contextlib.contextmanager
-def scratch_database() -> Iterator[str]:
+def scratch_database(server_url: str | None = None) -> Iterator[str]:
     """A fresh database at the head revision, dropped at the end. The application database is
-    never touched: Alembic is given this URL explicitly."""
-    server = make_url(service_settings()["database"])
+    never touched: Alembic is given this URL explicitly.
+
+    `server_url` names the Postgres to make it in. Without it the one of `make up` is used. The
+    full chaos suite passes the Postgres of its own compose project.
+    """
+    server = make_url(server_url or service_settings()["database"])
     admin = str(server.set(database="postgres").render_as_string(hide_password=False))
     name = SCRATCH_PREFIX + uuid.uuid4().hex[:12]
     url = str(server.set(database=name).render_as_string(hide_password=False))
@@ -438,8 +485,8 @@ class Stack:
     """One chaos run's workers, task and clean-up.
 
     `provider` is what the worker answers with: the scripted provider with the script that the
-    task brings (the default), or whatever `worker_env` sets. `tuning` is added to the heartbeat
-    timeout that every chaos run uses.
+    task brings (the default), or whatever `worker_env` sets. `continue_as_new_every` and the
+    heartbeat timeout go into the tuning that the task starts with.
     """
 
     def __init__(
@@ -450,6 +497,7 @@ class Stack:
         worker_env: dict[str, str] | None = None,
         script: Path | None = SCRIPT,
         continue_as_new_every: int | None = None,
+        heartbeat_timeout_s: float = HEARTBEAT_TIMEOUT_S,
     ) -> None:
         self.root = root
         self.database = database
@@ -457,11 +505,13 @@ class Stack:
         self.worker_env = worker_env or {}
         self.script = script
         self.tuning = Tuning(
-            heartbeat_timeout_s=HEARTBEAT_TIMEOUT_S,
+            heartbeat_timeout_s=heartbeat_timeout_s,
             continue_as_new_every_turns=continue_as_new_every,
         )
         self.workers: list[Worker] = []
         self.task_ids: list[str] = []
+        # Every kill that landed, in order. A run that fails still says which kills it had met.
+        self.kill_points: list[KillPoint] = []
         root.mkdir(parents=True, exist_ok=True)
 
     # ----- processes -----
@@ -496,6 +546,9 @@ class Stack:
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.root / "ckpt"),
             LONGHAUL_CONFIG=str(CONFIG),
+            # Port 0 lets the system choose. Two workers of two builds on one machine cannot both
+            # have 9464, and a worker that cannot bind it stops before it takes any work.
+            LONGHAUL_METRICS_PORT="0",
             **self.worker_env,
         )
         return env
@@ -530,12 +583,25 @@ class Stack:
             time.sleep(poll)
         return False
 
+    def strike(self, kind: str, worker: Worker, task_id: str) -> bool:
+        """Do a kill of `kind` to the running task. True when it struck something.
+
+        The base class kills the worker, by its pid. A subclass adds the kinds that need more
+        than a pid and calls this for the worker.
+        """
+        if kind != WORKER:
+            raise ValueError(f"this stack cannot strike {kind!r}; it kills the {WORKER} only")
+        worker.proc.kill()  # SIGKILL, to the pid this stack started
+        worker.proc.wait(timeout=60)
+        return True
+
     def _kill_one(
         self, kill: Kill, worker: Worker, task_id: str, began: float, stop: threading.Event
     ) -> KillPoint | None:
-        """Wait until the kill is due, then SIGKILL the worker by its pid and read where it was."""
+        """Wait until the kill is due, then strike and read where the worker was."""
+        already = len(kill.after.findall(worker.text())) if kill.fresh else 0
         if not self._wait(
-            lambda: len(kill.after.findall(worker.text())) >= kill.nth,
+            lambda: len(kill.after.findall(worker.text())) - already >= kill.nth,
             stop,
             f"line {kill.nth} like {kill.after.pattern!r} ({kill.note})",
             POLL_S,
@@ -551,10 +617,22 @@ class Stack:
             return None
         if stop.is_set():
             return None
-        worker.proc.kill()  # SIGKILL, to the pid this stack started
-        worker.proc.wait(timeout=60)
-        kind, line = kill_point(worker.text())
-        return KillPoint(kind=kind, line=line, after_s=time.monotonic() - began)
+        # A dead worker has written its last line. A worker that goes on running is read before
+        # the strike, which is where it was when the strike began.
+        place = kill_point(worker.text())
+        hit = self.strike(kill.kind, worker, task_id)
+        struck_at = datetime.now(UTC)
+        if kill.kind == WORKER:
+            place = kill_point(worker.text())
+        kind, line = place
+        return KillPoint(
+            kind=kind,
+            line=line,
+            after_s=time.monotonic() - began,
+            via=kill.kind,
+            struck_at=struck_at,
+            hit=hit,
+        )
 
     def _kill_all(
         self, kills: Sequence[Kill], task_id: str, began: float, stop: threading.Event
@@ -565,7 +643,9 @@ class Stack:
             if point is None:
                 break
             points.append(point)
-            self.start_worker()  # the restart the plan asks for, at once
+            self.kill_points.append(point)
+            if point.via == WORKER:
+                self.start_worker()  # the restart the plan asks for, at once
         return points
 
     # ----- a run -----
@@ -578,12 +658,16 @@ class Stack:
             logs = "\n".join(f"--- {w.log.name}\n{w.text()[-3000:]}" for w in self.workers)
             raise AssertionError(f"the chaos run failed: {exc!r}\n{logs}") from exc
 
+    def _new_task(self) -> TaskSpec:
+        """The task of this run. The default is the inventory fix of tests/fixtures."""
+        title, body = cli.read_issue(INVENTORY / "ISSUE.md")
+        return cli.durable_spec(INVENTORY, cli.new_task_id(INVENTORY), title, body)
+
     async def _run(self, kills: list[Kill]) -> Run:
         s = self.settings
-        title, body = cli.read_issue(INVENTORY / "ISSUE.md")
-        task_id = cli.new_task_id(INVENTORY)
+        spec = self._new_task()
+        task_id = spec.task_id
         self.task_ids.append(task_id)
-        spec = cli.durable_spec(INVENTORY, task_id, title, body)
         blobs = S3BlobStore(
             s["blob_endpoint"], s["blob_bucket"], s["blob_access_key"], s["blob_secret_key"]
         )
@@ -602,7 +686,7 @@ class Stack:
         # A kill that fails is raised by _until_done. This keeps asyncio from also reporting it
         # as an exception that nobody retrieved.
         killing.add_done_callback(lambda t: t.cancelled() or t.exception())
-        result = asyncio.ensure_future(handle.result())
+        result = asyncio.ensure_future(self._outcome(handle))
         try:
             async with asyncio.timeout(RUN_TIMEOUT_S):
                 await self._until_done(result, killing)
@@ -613,7 +697,9 @@ class Stack:
             stop.set()  # a kill that is still waiting has nothing left to kill
         points = await killing
 
-        status = await read_status(get_task(client, task_id), timeout_s=60)
+        status = await self.through_restarts(
+            lambda: read_status(get_task(client, task_id), timeout_s=60)
+        )
         assert status.last_checkpoint is not None, status
         store = GitCheckpointStore(blobs, root=self.root / "ckpt")
         diff = await store.diff(task_id, status.last_checkpoint)
@@ -632,12 +718,28 @@ class Stack:
         )
 
     @staticmethod
+    async def through_restarts[T](call: Callable[[], Awaitable[T]]) -> T:
+        """Make a call to Temporal again while the server is down or coming back.
+
+        A restart of the server (LH-904) cuts the connection of this process too, and the SDK
+        reports that as an RPC error. The run's own timeout bounds the wait.
+        """
+        while True:
+            try:
+                return await call()
+            except RPCError:
+                await asyncio.sleep(1.0)
+
+    async def _outcome(self, handle: WorkflowHandle[Any, Outcome]) -> Outcome:
+        return await self.through_restarts(handle.result)
+
+    @staticmethod
     async def _until_done(
         result: asyncio.Future[Outcome], killing: asyncio.Future[list[KillPoint]]
     ) -> None:
         """Wait for the workflow. A kill that fails ends the wait, and the failure is raised."""
         while not result.done():
-            waiting: set[asyncio.Future[object]] = {result}
+            waiting: set[asyncio.Future[Any]] = {result}
             if not killing.done():
                 waiting.add(killing)
             await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
@@ -646,8 +748,16 @@ class Stack:
 
     # ----- what the run left behind -----
     def _query(self, statement: str, *params: object) -> list[tuple[object, ...]]:
-        with psycopg.connect(self.database) as conn:
-            return conn.execute(statement, params).fetchall()
+        """Read rows. A restart of Postgres (LH-904) is waited out for a minute, not raised."""
+        deadline = time.monotonic() + QUERY_RETRY_S
+        while True:
+            try:
+                with psycopg.connect(self.database) as conn:
+                    return conn.execute(statement, params).fetchall()
+            except psycopg.OperationalError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1.0)
 
     def _calls(self, task_id: str) -> list[CallRow]:
         rows = self._query(
@@ -702,7 +812,7 @@ class Stack:
     def _remove_sandbox(task_id: str) -> None:
         client = docker.from_env()
         try:
-            label = {"label": f"longhaul.task_id={task_id}"}
+            label: dict[str, str | list[str] | bool] = {"label": f"longhaul.task_id={task_id}"}
             for container in client.containers.list(all=True, filters=label):
                 container.remove(force=True)
             for volume in client.volumes.list(filters={"name": f"lh-ws-{task_id}"}):
@@ -720,9 +830,11 @@ class Stack:
             region_name="us-east-1",
         )
         listing = s3.list_objects_v2(Bucket=s["blob_bucket"], Prefix=f"tasks/{task_id}/")
-        keys = [{"Key": item["Key"]} for item in listing.get("Contents", [])]
+        keys = [item["Key"] for item in listing.get("Contents", [])]
         if keys:
-            s3.delete_objects(Bucket=s["blob_bucket"], Delete={"Objects": keys})
+            s3.delete_objects(
+                Bucket=s["blob_bucket"], Delete={"Objects": [{"Key": key} for key in keys]}
+            )
 
     def _terminate_workflows(self) -> None:
         async def terminate() -> None:

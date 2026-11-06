@@ -41,9 +41,9 @@ def test_a_count_or_seed_that_is_not_above_zero_is_a_usage_error(flag: str, valu
 
 
 def test_tasks_are_chosen_by_id_from_the_recorded_ones() -> None:
-    options = chaos.parse_args(["--tasks", "calc-01,textkit-02"])
+    options = chaos.parse_args(["--tasks", "calc-01,inventory-01"])
 
-    assert options.tasks == ("calc-01", "textkit-02")
+    assert options.tasks == ("calc-01", "inventory-01")
 
 
 def test_a_task_that_has_no_recording_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:

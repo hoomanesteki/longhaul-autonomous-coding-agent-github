@@ -6,7 +6,7 @@ four kinds: the worker (SIGKILL), the sandbox (`docker kill`), the Temporal serv
 (a restart of the container). The runs deliver to a FakeGitHub, so the writes to GitHub are
 counted from its state.
 
-This test runs the first two runs of that plan and checks that the summary has every field and
+This test runs the first two runs of a plan and checks that the summary has every field and
 that the numbers in it agree with each other. The 20 runs are run by hand (docs/runbook.md, "The
 full chaos suite"); they take about an hour.
 
@@ -29,7 +29,11 @@ from eval.chaos.plan import KILL_TYPES, RECORDED_TASKS
 pytestmark = [pytest.mark.chaos, pytest.mark.phase9]
 
 RUNS = 2
-SEED = 7
+# The first two runs of seed 7 both kill the sandbox. This seed makes calc-01 and calc-02 meet
+# the four kinds between them (Postgres and Temporal, then the sandbox and the worker), so the
+# short suite goes through every kind of strike. test_the_seed_of_the_short_suite_hits_every_kind
+# in tests/unit/test_chaos_plan.py keeps it so.
+SEED = 43
 
 
 @pytest.fixture(scope="module")

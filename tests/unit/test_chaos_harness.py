@@ -582,6 +582,8 @@ def test_a_fresh_kill_waits_for_a_line_that_is_new(tmp_path: Path) -> None:
     kill = Kill(after=ANY_ENDED, fresh=True, kind="sandbox")
     with worker_logging(tmp_path, old + new) as (worker, _):
         stack = StrikingStack(tmp_path / "stack")
+        while len(ANY_ENDED.findall(worker.text())) < len(old):
+            time.sleep(0.01)  # the kill starts to wait after the old lines are in the log
         began = time.monotonic()
         point = stack._kill_one(kill, worker, "lh-t-1", began, threading.Event())
         waited = time.monotonic() - began

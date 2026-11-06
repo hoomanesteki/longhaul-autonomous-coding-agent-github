@@ -27,16 +27,15 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
-from google.protobuf.message import Message as ProtoMessage
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError, RetryState
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+from tests.fakes.history import payload_sizes
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.agent.turns import validate_pairs
@@ -67,6 +66,7 @@ from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.support import heartbeating
 from longhaul.durable.activities.tools import NoCheckpoints, SandboxLookup, ToolActivities
 from longhaul.durable.client import start_task
+from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -101,8 +101,10 @@ SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=3)
 # ---------- the Temporal server, the database and the blobs ----------
 @pytest.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
+    # The converter of durable.client.connect, so the guard of I2 is in place as it is in a
+    # worker.
     async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
+        data_converter=guarded_data_converter
     ) as environment:
         yield environment
 
@@ -341,32 +343,6 @@ def scheduled(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.HasField("activity_task_scheduled_event_attributes")
     ]
-
-
-def payload_sizes(history: WorkflowHistory) -> list[int]:
-    """The size of every payload in the history: inputs, results, failure details and so on."""
-    sizes: list[int] = []
-
-    def walk(message: ProtoMessage) -> None:
-        if message.DESCRIPTOR.full_name == "temporal.api.common.v1.Payload":
-            sizes.append(len(message.data))  # type: ignore[attr-defined]
-            return
-        for field_, value in message.ListFields():
-            if field_.message_type is None:
-                continue  # a number, a string or an enum
-            if isinstance(value, ProtoMessage):
-                walk(value)
-            elif field_.message_type.GetOptions().map_entry:
-                items = [v for v in value.values() if isinstance(v, ProtoMessage)]
-                for item in items:
-                    walk(item)
-            else:
-                for item in value:  # a repeated field
-                    walk(item)
-
-    for event in history.events:
-        walk(event)
-    return sizes
 
 
 def started_attempts(history: WorkflowHistory, activity_name: str) -> list[int]:

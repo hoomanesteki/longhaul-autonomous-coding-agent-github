@@ -13,7 +13,6 @@ from opentelemetry.sdk.trace import TracerProvider
 from temporalio.client import Client
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
-from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, CarryState, Phase, RepoSettings, TaskSpec, TaskStatus
@@ -32,6 +31,7 @@ from longhaul.durable.client import (
     read_status,
     start_task,
 )
+from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.settings import EnvSettings
 from longhaul.telemetry import otel
@@ -137,7 +137,7 @@ def test_the_default_task_queue_is_the_one_in_the_settings() -> None:
     assert EnvSettings.model_fields["task_queue"].default == DEFAULT_TASK_QUEUE
 
 
-async def test_connect_uses_the_pydantic_data_converter(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_connect_uses_the_guarded_data_converter(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: dict[str, Any] = {}
 
     async def fake_connect(address: str, **kwargs: Any) -> str:
@@ -152,7 +152,7 @@ async def test_connect_uses_the_pydantic_data_converter(monkeypatch: pytest.Monk
     assert seen == {
         "address": "temporal.internal:7233",
         "namespace": "prod",
-        "data_converter": pydantic_data_converter,
+        "data_converter": guarded_data_converter,
     }
     assert [type(i) for i in interceptors] == [LogContextInterceptor]  # tracing is off here
 

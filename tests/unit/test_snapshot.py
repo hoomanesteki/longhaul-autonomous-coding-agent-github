@@ -8,10 +8,12 @@ replaced by hostile settings where that matters.
 
 from __future__ import annotations
 
+import errno
 import os
-import stat
+import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -214,30 +216,46 @@ async def test_a_destination_that_exists_is_refused(tmp_path: Path) -> None:
         await snap(CALC, tmp_path / "taken")
 
 
-async def test_a_file_that_cannot_be_read_is_a_workspace_error(tmp_path: Path) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("root reads every file")
+def deny_reading(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Make the copy of the file called `name` fail the way an unreadable file does.
+
+    A chmod of 0 stops every user but root, and root is who runs these tests in some
+    containers. Raising the error from the copy takes the same path in the code under test and
+    works for any user.
+    """
+    real_copy = shutil.copyfile
+
+    def copyfile(src: Any, dst: Any, **kwargs: Any) -> Any:
+        if Path(src).name == name:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(src))
+        return real_copy(src, dst, **kwargs)
+
+    monkeypatch.setattr(shutil, "copyfile", copyfile)
+
+
+async def test_a_file_that_cannot_be_read_is_a_workspace_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     source = make_source(tmp_path / "src", {"ok.txt": "x\n", "locked.txt": "y\n"})
     files = collect_source_files(source)
-    (source / "locked.txt").chmod(0)
-    try:
-        with pytest.raises(WorkspaceError, match=r"locked\.txt"):
-            await snapshot_folder(source, files, tmp_path / "repo")
-    finally:
-        (source / "locked.txt").chmod(stat.S_IRUSR | stat.S_IWUSR)
+    deny_reading(monkeypatch, "locked.txt")
+
+    with pytest.raises(WorkspaceError, match=r"cannot read locked\.txt: Permission denied"):
+        await snapshot_folder(source, files, tmp_path / "repo")
 
 
-async def test_a_failure_leaves_no_half_built_repo_behind(tmp_path: Path) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("root reads every file")
-    source = make_source(tmp_path / "src", {"locked.txt": "y\n"})
+async def test_a_failure_leaves_no_half_built_repo_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Files are copied in path order, so first.txt is already in the new folder when the error
+    # comes. That is the half-built repo the failure has to remove.
+    source = make_source(tmp_path / "src", {"first.txt": "x\n", "locked.txt": "y\n"})
     files = collect_source_files(source)
-    (source / "locked.txt").chmod(0)
-    try:
-        with pytest.raises(WorkspaceError):
-            await snapshot_folder(source, files, tmp_path / "repo")
-    finally:
-        (source / "locked.txt").chmod(stat.S_IRUSR | stat.S_IWUSR)
+    deny_reading(monkeypatch, "locked.txt")
+
+    with pytest.raises(WorkspaceError):
+        await snapshot_folder(source, files, tmp_path / "repo")
+
     assert not (tmp_path / "repo").exists()
 
 

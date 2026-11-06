@@ -476,6 +476,14 @@ class Act[In, Out]:
 # Retrying cannot make a payload smaller (ADR-0005), and the payload guard raises this type.
 _OVERSIZED = PayloadTooLargeError.__name__
 
+# What the data converter raises in workflow code when the workflow tries to schedule an activity
+# with a payload over the cap. The SDK's answer to an unknown exception is to fail the workflow
+# task, and the server then runs the same task again, on the same history, for as long as the
+# workflow is open. This list makes the error end the workflow instead, with the message of the
+# guard. TaskWorkflow passes it as `failure_exception_types` (ADR-0005), and converts its state
+# before a hand-over so that the same holds there.
+FAIL_THE_WORKFLOW: tuple[type[BaseException], ...] = (PayloadTooLargeError,)
+
 PREPARE_WORKSPACE = Act(
     "prepare_workspace",
     TaskSpec,

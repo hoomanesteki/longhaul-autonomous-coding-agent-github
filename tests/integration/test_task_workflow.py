@@ -31,7 +31,6 @@ from typing import Any
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
@@ -57,6 +56,7 @@ from longhaul.contracts import (
 )
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
+from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github import lifecycle
@@ -362,8 +362,10 @@ def compacted(inp: acts.CompactInput) -> acts.CompactOutput:
 
 @pytest.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
+    # The converter of durable.client.connect, so every path in this file runs with the guard of
+    # I2 in place as it does in a worker.
     async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
+        data_converter=guarded_data_converter
     ) as environment:
         yield environment
 
@@ -1776,7 +1778,7 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
     replayer = Replayer(
         workflows=[TaskWorkflow],
         workflow_runner=workflow_runner(),
-        data_converter=pydantic_data_converter,
+        data_converter=guarded_data_converter,
     )
     for history in histories:
         await replayer.replay_workflow(history)
@@ -2114,7 +2116,7 @@ async def test_histories_with_a_compaction_replay(env: WorkflowEnvironment) -> N
     replayer = Replayer(
         workflows=[TaskWorkflow],
         workflow_runner=workflow_runner(),
-        data_converter=pydantic_data_converter,
+        data_converter=guarded_data_converter,
     )
     await replayer.replay_workflow(history)
 
@@ -2569,6 +2571,6 @@ async def test_histories_of_a_run_with_a_mode_replay(env: WorkflowEnvironment) -
     replayer = Replayer(
         workflows=[TaskWorkflow],
         workflow_runner=workflow_runner(),
-        data_converter=pydantic_data_converter,
+        data_converter=guarded_data_converter,
     )
     await replayer.replay_workflow(history)

@@ -5,6 +5,11 @@ every replay and eventually hit the server's limits (ADR-0005). Large data goes 
 store and only a BlobRef crosses the boundary. This guard turns a mistake into an immediate
 error in the activity that made it, instead of a failure inside Temporal later.
 
+Two layers apply it. The data converter (durable/payload_converter.py) refuses to encode a
+payload over the limit, on every client and in every worker, so an oversized input never reaches
+the history. `assert_small` runs inside an activity, on its input and output, and support.small
+turns the same error into a non-retryable ApplicationError that fails the activity for good.
+
 The size is measured with pydantic's JSON encoder, which writes non-ASCII text as UTF-8, so the
 count is in bytes, not characters. Another encoder can differ by a small factor for text full
 of non-ASCII characters. The limit is far below the server's, so that cannot matter.
@@ -38,8 +43,12 @@ def json_size(obj: object) -> int:
     return len(to_json(obj))
 
 
-def assert_small(obj: object, limit: int = DEFAULT_LIMIT) -> None:
-    """Raise PayloadTooLargeError if obj serializes to more than limit bytes of JSON."""
-    size = json_size(obj)
+def assert_size(size: int, limit: int = DEFAULT_LIMIT) -> None:
+    """Raise PayloadTooLargeError if a payload of `size` bytes is over the limit. At it is fine."""
     if size > limit:
         raise PayloadTooLargeError(size, limit)
+
+
+def assert_small(obj: object, limit: int = DEFAULT_LIMIT) -> None:
+    """Raise PayloadTooLargeError if obj serializes to more than limit bytes of JSON."""
+    assert_size(json_size(obj), limit)

@@ -1,9 +1,10 @@
 """The client side of the durable layer: connect to Temporal, start a task, and ask about it.
 
-Every client and worker uses the pydantic data converter. Without it the SDK falls back to
-the pydantic v1 methods, warns on every encode, and returns plain dicts where a model is
-expected (ADR-0004, appendix section 2). A worker takes its converter from its client, so
-connecting here is enough.
+Every client and worker uses the pydantic data converter with the size guard of invariant I2
+(durable/payload_converter.py). Without the pydantic converter the SDK falls back to the
+pydantic v1 methods, warns on every encode, and returns plain dicts where a model is expected
+(ADR-0004, appendix section 2). Without the guard a payload over 256 KB would reach the history
+(ADR-0005). A worker takes its converter from its client, so connecting here is enough.
 """
 
 from __future__ import annotations
@@ -13,11 +14,11 @@ from typing import Any
 
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
-from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, CarryState, Outcome, Phase, TaskSpec, TaskStatus
 from longhaul.durable.acts import CONTEXT_MODE_MEMO_KEY, SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.telemetry import logging as logging_context
 from longhaul.telemetry import otel
@@ -41,7 +42,7 @@ async def connect(address: str, *, namespace: str = "default") -> Client:
     }
     try:
         return await Client.connect(
-            address, namespace=namespace, data_converter=pydantic_data_converter, **options
+            address, namespace=namespace, data_converter=guarded_data_converter, **options
         )
     except RuntimeError as exc:  # the SDK raises this for a server it cannot reach
         raise ConnectionError(f"cannot reach Temporal at {address}: {exc}") from exc

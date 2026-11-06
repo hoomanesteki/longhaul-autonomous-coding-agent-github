@@ -29,6 +29,7 @@ __all__ = [
     "GitHubRemote",
     "RepoReads",
     "check_repo_name",
+    "clone_url_under",
     "github_clone_url",
 ]
 
@@ -76,6 +77,16 @@ def check_repo_name(repo: str) -> str:
 def github_clone_url(repo: str) -> str:
     """The https address of a repo on github.com, with no credential in it."""
     return f"{GITHUB_WEB_URL}/{check_repo_name(repo)}.git"
+
+
+def clone_url_under(base: str) -> Callable[[str], str]:
+    """The address of a repo under `base`, as `<base>/<owner>/<name>.git`.
+
+    `base` is a folder of bare repos or the address of a git server. The chaos suite uses a
+    folder, so a run can push to a repo that sits on this machine (LH-904).
+    """
+    root = base.rstrip("/")
+    return lambda repo: f"{root}/{repo}.git"
 
 
 class GitHubRemote:

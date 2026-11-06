@@ -58,6 +58,12 @@ class EnvSettings(BaseSettings):
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_base_url: str | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
     github_token: SecretStr | None = None
+    # Where the REST API is and where repos are cloned from, for a GitHub that is not github.com
+    # (LH-904). Unset means api.github.com and https://github.com. The chaos suite points a worker
+    # at a FakeGitHub it serves on this machine, so it can count what a run wrote. The clone base
+    # is a folder or a server address; a repo lives at <base>/<owner>/<name>.git.
+    github_api_url: str | None = None
+    github_clone_base: str | None = None
     github_app_id: int | None = None
     github_app_key_path: Path | None = None
     admin_token: SecretStr | None = None

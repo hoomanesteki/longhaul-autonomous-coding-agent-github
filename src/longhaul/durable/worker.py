@@ -98,7 +98,7 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
-from longhaul.github.remote import GitHubRemote
+from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_url
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
@@ -150,6 +150,12 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
             )
         return None
     return get_provider(settings)
+
+
+def clone_url_for(settings: EnvSettings) -> Callable[[str], str]:
+    """Where repos are cloned from: github.com, or the base the settings name."""
+    base = settings.github_clone_base
+    return github_clone_url if base is None else clone_url_under(base)
 
 
 def build_parts(
@@ -214,8 +220,8 @@ def build_parts(
     remote: GitHubRemote | None = None
     if settings.github_token is not None:
         auth = PatAuth(settings.github_token)
-        github = GitHubClient(GITHUB_API_URL, auth)
-        remote = GitHubRemote(github, auth)
+        github = GitHubClient(settings.github_api_url or GITHUB_API_URL, auth)
+        remote = GitHubRemote(github, auth, clone_url=clone_url_for(settings))
     workspace = WorkspaceActivities(
         sandboxes,
         store,

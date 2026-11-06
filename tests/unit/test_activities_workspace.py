@@ -865,7 +865,7 @@ class Notes:
         self.listing_failure: Exception | None = None
         # The notes that a person turned down. The real store keeps a rejected note rejected when
         # a task finds it again, so it is never among the approved ones.
-        self.rejected: set[str] = set()
+        self.turned_down: set[str] = set()
 
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str:
         if self.failure is not None:
@@ -890,11 +890,12 @@ class Notes:
                 (),
                 {
                     "content": item.content,
-                    "status": "rejected" if item.content in self.rejected else "approved",
+                    "kind": item.kind,
+                    "status": "rejected" if item.content in self.turned_down else "approved",
                 },
             )()
             for item in found
-            if (item.content in self.rejected) == (wanted == "rejected")
+            if (item.content in self.turned_down) == (wanted == "rejected")
         ]
 
     @property
@@ -1580,7 +1581,7 @@ async def test_a_linter_is_not_a_test_command(rig: Rig) -> None:
 async def test_a_command_that_a_person_rejected_is_not_the_test_command(rig: Rig) -> None:
     # The command works at this commit and is verified again, but the store keeps it rejected.
     notes = Notes()
-    notes.rejected = {PYTEST}
+    notes.turned_down = {PYTEST}
 
     out = await prepare_with(rig, notes)
 

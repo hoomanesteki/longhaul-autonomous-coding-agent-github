@@ -185,9 +185,9 @@ BLOCK = "Notes from past work on this repo.\n\n```text\n- pytest -q\n```"
 async def test_the_memory_block_of_the_task_ends_the_system_prompt_of_every_turn() -> None:
     rig = Rig(reply("end_turn"), reply("end_turn"))
     block = await rig.blobs.put(
-        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "block.txt")
+        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "memory-block.txt")
     )
-    ref = await rig.put("transcript-1.json", answered())
+    ref = await rig.put("transcript-1.json", answered(), turn=1)
 
     await rig.run(turn_input(memory_ref=block))
     await rig.run(turn_input(turn_index=1, transcript_ref=ref, memory_ref=block))

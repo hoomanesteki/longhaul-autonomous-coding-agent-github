@@ -11,6 +11,11 @@ import re
 from typing import Any
 
 import pytest
+from tests.fakes.memory import REPO, FakeMemory, Row, row
+
+from longhaul.context.tokens import estimate_tokens
+from longhaul.contracts import MemoryItem
+from longhaul.memory.embedder import HashEmbedder
 from longhaul.memory.retrieve import (
     HEADER,
     LESSON_KINDS,
@@ -20,11 +25,6 @@ from longhaul.memory.retrieve import (
     is_test_command,
     render_memory_block,
 )
-from tests.fakes.memory import REPO, FakeMemory, Row, row
-
-from longhaul.context.tokens import estimate_tokens
-from longhaul.contracts import MemoryItem
-from longhaul.memory.embedder import HashEmbedder
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 
@@ -180,7 +180,9 @@ async def test_the_commands_and_lessons_win_over_the_map_when_room_is_short() ->
     assert estimate_tokens(block) <= 700
     assert "pytest -q" in block
     assert lesson_lines(block)
-    assert "cut to fit" in block
+    # What is left after them holds no line of the map, so the map is left out, not shown cut.
+    assert "pkg/module_0.py" not in block
+    assert "cut to fit" not in block
 
 
 async def test_a_lesson_is_one_capped_line() -> None:

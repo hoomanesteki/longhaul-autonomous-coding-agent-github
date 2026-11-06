@@ -42,6 +42,7 @@ from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from temporalio.client import WorkflowExecutionStatus, WorkflowHandle
+from tests.fakes.worker_config import hash_embedder_config
 
 from longhaul.contracts import Phase
 from longhaul.durable.client import connect, get_task, read_status
@@ -52,7 +53,6 @@ pytestmark = [pytest.mark.e2e, pytest.mark.phase2]
 ROOT = Path(__file__).resolve().parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
 SCRIPT = ROOT / "tests" / "fixtures" / "scripts" / "calc_fix.yaml"
-CONFIG = ROOT / "config" / "longhaul.example.yaml"
 IMAGE = "longhaul-sandbox:py312"
 # `uv run` and `uv sync` put the script next to the interpreter.
 LONGHAUL = Path(sys.executable).with_name("longhaul")
@@ -173,7 +173,7 @@ class Durable:
             LONGHAUL_BLOB_ACCESS_KEY=s["blob_access_key"],
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.tmp_path / "ckpt"),
-            LONGHAUL_CONFIG=str(CONFIG),
+            LONGHAUL_CONFIG=str(hash_embedder_config(self.tmp_path)),
             # Port 0 lets the system pick a free port for the metrics endpoint. The default is
             # taken by the worker of a developer or of another test run on the same machine.
             LONGHAUL_METRICS_PORT="0",

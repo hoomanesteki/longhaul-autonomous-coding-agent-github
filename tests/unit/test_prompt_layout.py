@@ -13,7 +13,6 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
-from longhaul.memory.retrieve import HEADER, render_memory_block
 from tests.fakes.memory import REPO as MEMORY_REPO
 from tests.fakes.memory import FakeMemory, row
 
@@ -38,6 +37,7 @@ from longhaul.contracts import (
     ToolSpec,
     ToolUseBlock,
 )
+from longhaul.memory.retrieve import HEADER, render_memory_block
 from longhaul.providers.anthropic import AnthropicProvider
 from longhaul.tools.registry import default_registry
 

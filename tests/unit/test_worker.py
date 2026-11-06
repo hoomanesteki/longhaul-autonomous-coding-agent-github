@@ -402,6 +402,13 @@ class FakeParts:
 
     def __init__(self) -> None:
         self.closed = False
+        self.checked = False
+        self.check_error: Exception | None = None
+
+    async def check_memory(self) -> None:
+        self.checked = True
+        if self.check_error is not None:
+            raise self.check_error
 
     async def close(self) -> None:
         self.closed = True
@@ -490,6 +497,52 @@ async def test_a_taken_metrics_port_stops_the_worker_before_it_connects(
 
 
 # ---------- memory (LH-604) ----------
+@pytest.mark.phase6
+async def test_a_memory_table_of_another_embedder_stops_the_worker_before_it_takes_a_port(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    parts = FakeParts()
+    parts.check_error = ValueError("memory.embedder names another embedder than the table's")
+    monkeypatch.setattr(worker, "build_parts", lambda *args: parts)
+    connected: list[str] = []
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        connected.append(address)
+        return object()
+
+    monkeypatch.setattr(worker, "connect", connect)
+
+    with pytest.raises(ValueError, match="another embedder"):
+        await worker.main()
+
+    # It stopped before the metrics endpoint and the connection, and still closed what it built.
+    assert (parts.checked, parts.closed) == (True, True)
+    assert serving_endpoints == []
+    assert connected == []
+
+
+@pytest.mark.phase6
+async def test_a_healthy_memory_table_lets_the_worker_start(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    parts = FakeParts()
+    monkeypatch.setattr(worker, "build_parts", lambda *args: parts)
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        return object()
+
+    async def serve(client: Any, queue: str, activities: Any, stop: asyncio.Event) -> None:
+        return None
+
+    monkeypatch.setattr(worker, "connect", connect)
+    monkeypatch.setattr(worker, "serve", serve)
+
+    await worker.main()
+
+    assert parts.checked is True
+    assert len(serving_endpoints) == 1
+
+
 def loader_of(parts: worker.WorkerParts) -> Any:
     (found,) = [
         fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "load_memory"
@@ -498,7 +551,8 @@ def loader_of(parts: worker.WorkerParts) -> Any:
 
 
 def with_memory(**fields: Any) -> AppConfig:
-    return CONFIG.model_copy(update={"memory": Memory(**fields)})
+    values = {"enabled": True, "embedder": "hash", **fields}
+    return CONFIG.model_copy(update={"memory": Memory(**values)})
 
 
 def pretend_fastembed_is(installed: bool, monkeypatch: pytest.MonkeyPatch) -> None:

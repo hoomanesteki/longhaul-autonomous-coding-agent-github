@@ -26,8 +26,6 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
-from longhaul.durable.activities.memory import MemoryActivities
-from longhaul.memory.retrieve import HEADER, MAX_LESSONS, first_test_command, render_memory_block
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -54,10 +52,12 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts, worker
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.memory import MemoryActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.memory.embedder import EMBEDDING_DIM, HashEmbedder
+from longhaul.memory.retrieve import HEADER, MAX_LESSONS, first_test_command, render_memory_block
 from longhaul.memory.store import EmbedderMismatchError, PgMemoryStore
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, Memory, get_settings, load_config

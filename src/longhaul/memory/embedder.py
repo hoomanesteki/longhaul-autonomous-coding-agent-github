@@ -22,6 +22,7 @@ changing the embedder means embedding every row again (ADR-0010).
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import math
 import re
 import threading
@@ -30,15 +31,34 @@ from collections import Counter
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from longhaul.contracts import Embedder
+
 if TYPE_CHECKING:
     from fastembed import TextEmbedding
 
-__all__ = ["EMBEDDING_DIM", "LOCAL_MODEL", "HashEmbedder", "LocalEmbedder"]
+__all__ = [
+    "EMBEDDER_NAMES",
+    "EMBEDDING_DIM",
+    "LOCAL_MODEL",
+    "MISSING_EXTRA",
+    "HashEmbedder",
+    "LocalEmbedder",
+    "make_embedder",
+]
 
 # The width of every stored vector: bge-small-en-v1.5 makes 384 numbers per text, and the
 # memory_items.embedding column is vector(384).
 EMBEDDING_DIM = 384
 LOCAL_MODEL = "BAAI/bge-small-en-v1.5"
+
+# What `memory.embedder` in the config may name.
+EMBEDDER_NAMES = ("local", "hash")
+# The message of a missing fastembed, so that the worker at its start and the model at its first
+# text say the same thing.
+MISSING_EXTRA = (
+    "LocalEmbedder needs fastembed, which is an optional extra. "
+    "Install it with: uv sync --extra memory"
+)
 
 # Mixed into every word hash. It names the scheme, so a later change to how words are bucketed
 # takes a new key and cannot be mistaken for this one.
@@ -139,17 +159,39 @@ class LocalEmbedder:
             return self._model
 
 
+def make_embedder(name: str) -> Embedder:
+    """The embedder that `memory.embedder` of the config names.
+
+    The local embedder loads its model on the first text, but the worker must not wait until a
+    task searches to hear that the extra is missing, so a missing fastembed fails here with the
+    command that installs it. Nothing is downloaded or loaded.
+    """
+    if name == "hash":
+        return HashEmbedder()
+    if name == "local":
+        if not _fastembed_is_installed():
+            raise ModuleNotFoundError(MISSING_EXTRA, name="fastembed")
+        return LocalEmbedder()
+    raise ValueError(
+        f"unknown embedder {name!r}: memory.embedder is one of {', '.join(EMBEDDER_NAMES)}"
+    )
+
+
+def _fastembed_is_installed() -> bool:
+    try:
+        return importlib.util.find_spec("fastembed") is not None
+    except ValueError:
+        # A module that is in sys.modules without a spec, which a test puts there. It is there.
+        return True
+
+
 def _new_model(cache_dir: str | None) -> TextEmbedding:
     try:
         from fastembed import TextEmbedding
     except ModuleNotFoundError as exc:
         if exc.name != "fastembed":
             raise  # fastembed is installed, but one of its own imports is not
-        raise ModuleNotFoundError(
-            "LocalEmbedder needs fastembed, which is an optional extra. "
-            "Install it with: uv sync --extra memory",
-            name="fastembed",
-        ) from exc
+        raise ModuleNotFoundError(MISSING_EXTRA, name="fastembed") from exc
     if cache_dir is None:
         return TextEmbedding(LOCAL_MODEL)  # fastembed picks its own cache folder
     return TextEmbedding(LOCAL_MODEL, cache_dir=cache_dir)

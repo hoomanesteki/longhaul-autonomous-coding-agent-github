@@ -112,6 +112,25 @@ asks as it always did: `compact` answers "unchanged" in a mode without compactio
 "context limit" at once, since there is nothing to relieve it with. The memo is read and no
 command is added, so the histories of runs before this story replay as they were.
 
+Memory (LH-604, ADR-0010). When prepare_workspace says that the worker keeps memory
+(`PrepareWorkspaceOutput.memory_enabled`), the workflow calls `load_memory` once, right after it,
+with the spec and the repo map that prepare_workspace wrote. The activity returns the ref of the
+memory block, the notes about the repo that end the system prompt, and the workflow hands it to
+every `llm_turn` and `compact`. The block is loaded once and not on each turn because the prompt
+must be the same bytes for the whole task, or the prompt cache of every turn is lost (ADR-0013).
+Nothing else decides whether to call it. It is read from the recorded result of prepare_workspace,
+so a history from before this story, whose result has no flag, replays without the call, and a
+worker with no store adds no activity to its tasks. A `load_memory` that fails after its retries
+does not fail the task: the notes are hints, and the task goes on with a prompt that has no block.
+If prepare_workspace found a test command for a repo whose settings name none, it goes into the
+spec for the whole task, so every prompt names it.
+
+The memory ref is kept in the state, so it carries over Continue-As-New with the rest of it and
+the new run builds its prompts from the same block without calling the activity again. CarryState
+is a shared contract that this story does not change, so the workflow takes acts.RunState, which
+adds the one field (see there). The JSON of an older run's state decodes into it with no block,
+and such a run has never had one.
+
 Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
 the same workflow id. After a turn that did not end the run, the workflow hands over when the
 turns done are a multiple of the interval (acts.CONTINUE_AS_NEW_EVERY_TURNS, 40, or the run's
@@ -175,7 +194,6 @@ with workflow.unsafe.imports_passed_through():
     from longhaul.context.tokens import Decision
     from longhaul.contracts import (
         BlobRef,
-        CarryState,
         Outcome,
         OutcomeKind,
         Phase,
@@ -288,7 +306,7 @@ class TaskWorkflow:
     # same first workflow task as the start. Building the state in run() lost most of the
     # signals sent while a workflow was starting (ADR-0004, appendix section 4).
     @workflow.init
-    def __init__(self, state: CarryState) -> None:
+    def __init__(self, state: acts.RunState) -> None:
         self.state = state
         self.outcome: Outcome | None = None
         self.cancel_request: CancelRequest | None = None
@@ -339,7 +357,7 @@ class TaskWorkflow:
 
     # ---------- the run ----------
     @workflow.run
-    async def run(self, state: CarryState) -> Outcome:
+    async def run(self, state: acts.RunState) -> Outcome:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
             outcome = await self._finish_the_task()
@@ -410,6 +428,37 @@ class TaskWorkflow:
         prepared = await self._call(acts.PREPARE_WORKSPACE, state.spec)
         state.sandbox_id = prepared.sandbox_id
         state.head_sha = prepared.head_sha
+        self._use_test_command(prepared.test_command)
+        if prepared.memory_enabled:
+            state.memory_ref = await self._load_memory(prepared.repo_map_ref)
+
+    def _use_test_command(self, found: str | None) -> None:
+        """Name the verified test command in the spec of a repo whose settings name none.
+
+        The spec is in CarryState, so the command is in every later run and in every prompt of
+        the task. A command in the settings is never replaced.
+        """
+        state = self.state
+        if found and not state.spec.settings.test_command:
+            settings = state.spec.settings.model_copy(update={"test_command": found})
+            state.spec = state.spec.model_copy(update={"settings": settings})
+
+    async def _load_memory(self, repo_map_ref: BlobRef | None) -> BlobRef | None:
+        """Write the memory block of the task. None when it could not be written.
+
+        A failure after the retries is logged and the task goes on without notes: they are hints.
+        A cancel is not a failure and passes through.
+        """
+        state = self.state
+        try:
+            return await self._call(
+                acts.LOAD_MEMORY, acts.LoadMemoryInput(spec=state.spec, repo_map_ref=repo_map_ref)
+            )
+        except ActivityError as err:
+            workflow.logger.warning(
+                "no memory block for task %s: %s", state.spec.task_id, err.cause or err
+            )
+            return None
 
     async def _ensure_sandbox(self) -> None:
         """Have a running sandbox at the latest checkpoint, and keep its id."""
@@ -612,6 +661,7 @@ class TaskWorkflow:
                         transcript_ref=state.transcript_ref,
                         notes=state.notes,
                         plan=state.plan,
+                        memory_ref=state.memory_ref,
                         hints=list(state.hints),
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
@@ -680,6 +730,7 @@ class TaskWorkflow:
                 forced=forced,
                 script_ref=self._script(),
                 context_mode=mode,
+                memory_ref=state.memory_ref,
             ),
         )
         state.cost_usd += done.cost_usd

@@ -56,6 +56,11 @@ elided and room for the results of the calls it just made (each up to `tool_outp
 and returns what to do before then in `context_decision`: go on, compact, or force. The workflow
 runs the compaction when this turn is over.
 
+The memory block (LH-604). `LlmTurnInput.memory_ref` names the blob that load_memory wrote once for
+the task, and its text ends the system prompt (block 4). The workflow passes the same ref on every
+turn of every run, so the prompt is the same bytes throughout and the cache of the system prompt
+and the tool list stays valid. A blob that cannot be read is retried like the transcript.
+
 The notes. After a compaction the notes are in the first message of the view, right after the task
 text, where context/compact.py `apply` put them. The system prompt does not change (D7), so the
 cached prefix survives a compaction as far as its first message. `LlmTurnInput.notes` is the
@@ -124,6 +129,7 @@ from longhaul.cost.ledger import Ledger, NoLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.db.records import Recorder, TurnRecord
 from longhaul.durable import acts
+from longhaul.durable.activities.memory import read_memory_block
 from longhaul.durable.activities.support import (
     Meters,
     call_slug,
@@ -223,7 +229,11 @@ class LlmActivities:
         cfg = self._config_for(inp.role)
         mode = self._mode(inp.context_mode)
         try:
-            system = build_system_prompt(inp.role, inp.spec)
+            # The block is blob text that was written once for the task, so the system prompt is
+            # the same bytes on every turn (D7). A task without one gets the prompt it always had.
+            system = build_system_prompt(
+                inp.role, inp.spec, await read_memory_block(self._blobs, inp.memory_ref)
+            )
             stored = await self._transcript(inp)
             shown = show_hints(stored, inp.hints)
             transcript = self._evict(shown, mode)  # tier 1

@@ -66,6 +66,14 @@ on the same commit does not parse again. The map itself depends on the issue, so
 gets its own, in the blob store, and `repo_map_ref` in the output names it for the prompt
 builder (LH-604). A map that cannot be built is logged, and the task goes on without one. A
 person who rejected the map of the base commit also leaves the task without one.
+
+The output also tells the workflow what to do with memory next (LH-604). `memory_enabled` is
+true when this worker has a store, and the workflow then calls load_memory to write the memory
+block of the prompt. `test_command` is the first approved command of the repo that runs its
+tests, read from the store after the commands were kept, and it is set only when the repo
+settings name no test command. The store is asked and not the list of commands just found: a
+command that a person rejected is found again and verified again, and it must not become the
+test command of the task.
 """
 
 from __future__ import annotations
@@ -74,7 +82,7 @@ import asyncio
 import logging
 import shutil
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
@@ -100,6 +108,7 @@ from longhaul.github.intake import LOCAL_PREFIX, is_local
 from longhaul.github.remote import GitHubRemote
 from longhaul.memory.commands import discover_commands
 from longhaul.memory.repo_map import RepoMapCache, StructureMemory
+from longhaul.memory.retrieve import first_test_command
 from longhaul.telemetry import metrics
 
 log = logging.getLogger(__name__)
@@ -133,9 +142,17 @@ class WorkspaceHost(Protocol):
 
 
 class CommandMemory(Protocol):
-    """The part of PgMemoryStore that prepare_workspace uses to keep the verified commands."""
+    """The part of PgMemoryStore that prepare_workspace uses for the verified commands.
+
+    It keeps them with `add_verified`, and reads the approved ones back with `list_items` to name
+    the test command.
+    """
 
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str: ...
+
+    async def list_items(
+        self, repo: str, *, status: str | None = None, kind: str | None = None
+    ) -> Sequence[Any]: ...
 
 
 class WorkspaceMemory(CommandMemory, StructureMemory, Protocol):
@@ -227,13 +244,19 @@ class WorkspaceActivities:
                 # the commands that are tried next can write into it.
                 repo_map_ref = await self._map_repo(sandbox, spec, base_sha)
                 await self._learn_commands(sandbox, spec, base_sha)
+                test_command = await self._test_command(spec)
                 head_sha = await self._store.head(task_id)
             except BaseException:  # also a cancel: a task that is cancelled must leave nothing
                 await self._discard(task_id)
                 raise
         metrics.current().task_started(task_id)
         return acts.PrepareWorkspaceOutput(
-            sandbox_id=sandbox.id, base_sha=base_sha, head_sha=head_sha, repo_map_ref=repo_map_ref
+            sandbox_id=sandbox.id,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            repo_map_ref=repo_map_ref,
+            memory_enabled=self._memory is not None,
+            test_command=test_command,
         )
 
     async def _source(self, spec: TaskSpec) -> LocalFolder | GitHubBase:
@@ -360,6 +383,25 @@ class WorkspaceActivities:
         # ignored by git, the network is off by now, and nothing could build it again.
         if not await self._store.is_at(sandbox, base_sha):
             await self._store.restore(sandbox, base_sha, keep_ignored=True)
+
+    async def _test_command(self, spec: TaskSpec) -> str | None:
+        """The approved test command for a repo whose settings name none, else None.
+
+        None also says that the settings are to stay as they are. A store that cannot be read is
+        logged: the task then runs as it would without memory, with no test command in its prompt.
+        """
+        if self._memory is None or spec.settings.test_command:
+            return None
+        try:
+            return await first_test_command(self._memory, spec.repo)
+        except Exception as exc:  # a cancel is not an Exception and passes through
+            log.warning(
+                "could not read the test command of %s for task %s: %s",
+                spec.repo,
+                spec.task_id,
+                exc,
+            )
+            return None
 
     # ---------- ensure_sandbox ----------
     @activity.defn(name=acts.ENSURE_SANDBOX.name)

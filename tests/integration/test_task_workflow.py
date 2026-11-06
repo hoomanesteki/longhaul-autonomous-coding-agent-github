@@ -2615,7 +2615,7 @@ async def test_load_memory_runs_once_after_prepare_and_the_block_goes_to_every_t
     assert stubs.every[1] == "llm_turn"
     turns = stubs.payloads(acts.LLM_TURN.name)
     assert len(turns) == 3
-    assert {t.memory_ref for t in turns} == {stubs.memory_block}
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
 
 
 async def test_a_worker_without_memory_adds_no_activity_to_the_task(
@@ -2647,7 +2647,7 @@ async def test_the_block_survives_continue_as_new_and_is_not_loaded_again(
     assert len(stubs.memory_loads) == 1
     turns = stubs.payloads(acts.LLM_TURN.name)
     assert len(turns) == 7
-    assert {t.memory_ref for t in turns} == {stubs.memory_block}
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
 
 
 async def test_the_compaction_gets_the_block_as_well(

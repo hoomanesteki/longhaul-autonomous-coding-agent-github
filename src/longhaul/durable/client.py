@@ -16,8 +16,14 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.contrib.pydantic import pydantic_data_converter
 
 from longhaul.context.modes import ContextMode
-from longhaul.contracts import BlobRef, CarryState, Outcome, Phase, TaskSpec, TaskStatus
-from longhaul.durable.acts import CONTEXT_MODE_MEMO_KEY, SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.contracts import BlobRef, Outcome, Phase, TaskSpec, TaskStatus
+from longhaul.durable.acts import (
+    CONTEXT_MODE_MEMO_KEY,
+    SCRIPT_MEMO_KEY,
+    TUNING_MEMO_KEY,
+    RunState,
+    Tuning,
+)
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.telemetry import logging as logging_context
 from longhaul.telemetry import otel
@@ -69,7 +75,7 @@ async def start_task(
     label stays on the issue. Namespace retention bounds the second case, so the `tasks`
     table stays the record of what ran.
     """
-    state = CarryState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
+    state = RunState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
     memo: dict[str, Any] = {}
     if tuning is not None:
         memo[TUNING_MEMO_KEY] = tuning

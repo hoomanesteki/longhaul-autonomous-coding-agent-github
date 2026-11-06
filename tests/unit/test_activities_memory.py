@@ -7,8 +7,6 @@ it a store in a list and the memory blob store, so they need no database.
 """
 
 import pytest
-from longhaul.durable.activities.memory import MemoryActivities
-from longhaul.memory.retrieve import HEADER
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.memory import REPO, FakeMemory, row
@@ -17,7 +15,9 @@ from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import BlobRef, RepoSettings, TaskSpec
 from longhaul.durable import acts
+from longhaul.durable.activities.memory import MemoryActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
+from longhaul.memory.retrieve import HEADER
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 

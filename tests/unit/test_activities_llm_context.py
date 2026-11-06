@@ -18,6 +18,7 @@ from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.turns import validate_pairs
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
@@ -46,6 +47,7 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.providers.base import turn_index
 from longhaul.settings import Context
 from longhaul.tools.registry import default_registry
 
@@ -616,9 +618,11 @@ async def test_only_the_full_mode_asks_for_a_compaction(
     assert out.context_decision == (wanted or full)
 
 
-@pytest.mark.parametrize("mode", list(ContextMode))
+@pytest.mark.parametrize("mode", [mode for mode in ContextMode if not mode.slides])
 async def test_every_mode_refuses_a_request_over_the_hard_limit(mode: ContextMode) -> None:
-    # `none` drops both tiers, and the guard stays: it is what ends the task cleanly.
+    # `none` drops both tiers, and the guard stays: it is what ends the task cleanly. The
+    # sliding mode answers the guard by cutting the request instead (tests below), and it
+    # refuses only a request that no cut brings under the limit.
     messages = rounds(2, lines=40)
     rig = Rig(
         reply("end_turn", TextBlock(text="Done.")),
@@ -631,6 +635,153 @@ async def test_every_mode_refuses_a_request_over_the_hard_limit(mode: ContextMod
     assert caught.value.type == ProviderErrorKind.CONTEXT_TOO_LONG.value
     assert caught.value.non_retryable is True
     assert rig.provider.calls == []
+
+
+# ---------- the sliding window (LH-903) ----------
+def sliding_rig(
+    messages: list[Message], share: float, *replies: LLMResponse | ProviderError
+) -> Rig:
+    """A rig in sliding mode whose window makes `messages` take `share` of the room."""
+    steps = replies or (reply("end_turn", TextBlock(text="Done.")),)
+    return Rig(*steps, policy=context(window_for(messages, share), mode=ContextMode.SLIDING))
+
+
+def sent_pairs_are_whole(sent: list[Message]) -> None:
+    calls = [b.id for m in sent for b in m.content if isinstance(b, ToolUseBlock)]
+    answers = [b.tool_use_id for m in sent for b in m.content if isinstance(b, ToolResultBlock)]
+    assert calls == answers
+    validate_pairs(sent)
+
+
+async def test_a_request_over_the_hard_limit_is_cut_to_the_newest_turns_in_sliding_mode() -> None:
+    messages = rounds(10, lines=40)
+    rig = sliding_rig(messages, 1.6)
+
+    out = await rig.run(turn_input(turn_index=10, transcript_ref=await rig.put(messages)))
+
+    (call,) = rig.provider.calls
+    sent = call["messages"]
+    assert 0 < len(sent) < len(messages)
+    assert sent[0].content[0] == FIRST.content[0]  # the task stays
+    assert sent[1:] == messages[-(len(sent) - 1) :]  # the newest turns, whole
+    sent_pairs_are_whole(sent)
+    assert out.stop_reason == "end_turn"
+    # The view that is stored is the cut one plus the reply, so the next turn starts from it.
+    stored = await rig.view(out.transcript_ref)
+    assert stored[:-1] == sent
+    assert turn_index(stored) == 11
+
+
+@pytest.mark.parametrize("share", [0.86, 0.95, 1.5, 4.0])
+async def test_sliding_mode_never_sends_a_request_over_the_hard_limit(share: float) -> None:
+    messages = rounds(12, lines=30)
+    rig = sliding_rig(messages, share)
+    policy = context(window_for(messages, share), mode=ContextMode.SLIDING)
+
+    out = await rig.run(turn_input(turn_index=12, transcript_ref=await rig.put(messages)))
+
+    sent = rig.provider.calls[0]["messages"]
+    assert estimate(sent) < policy.hard_limit * policy.window_tokens
+    # It is the request that was sent which the share is noted for.
+    assert rig.recorder.max_fractions[SPEC.task_id] < policy.hard_limit
+    assert out.request_tokens == estimate(sent)
+    sent_pairs_are_whole(sent)
+
+
+async def test_sliding_mode_never_orphans_a_tool_result_with_parallel_calls() -> None:
+    messages = [FIRST]
+    for n in range(1, 9):
+        calls = [use(f"c{n}-{k}", path=f"f{n}{k}.py") for k in range(3)]
+        messages.append(Message(role="assistant", content=calls))
+        messages.append(
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id=c.id, content=output(n, lines=20)) for c in calls
+                ],
+            )
+        )
+    rig = sliding_rig(messages, 1.7)
+
+    await rig.run(turn_input(turn_index=8, transcript_ref=await rig.put(messages)))
+
+    sent = rig.provider.calls[0]["messages"]
+    assert len(sent) < len(messages)
+    sent_pairs_are_whole(sent)
+    assert all(len(m.content) == 3 for m in sent[1:]), (
+        "a round of three calls is kept whole or dropped whole"
+    )
+
+
+async def test_sliding_mode_sends_a_request_under_the_limit_as_it_is() -> None:
+    messages = rounds(8)
+    rig = sliding_rig(messages, 0.5)
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=await rig.put(messages)))
+
+    sent = rig.provider.calls[0]["messages"]
+    assert sent == messages  # no cut, and no elision either: the window is the only tier
+    assert not any(text.startswith(ELIDED_PREFIX) for text in results(sent))
+    assert out.context_decision == "ok"
+
+
+async def test_sliding_mode_never_asks_for_a_compaction() -> None:
+    messages = rounds(8)
+    # 0.7 of the window is over compact_at, where `full` would ask for one.
+    rig = sliding_rig(messages, 0.7)
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=await rig.put(messages)))
+
+    assert out.context_decision == "ok"
+    assert len(rig.provider.calls[0]["messages"]) == len(messages)
+
+
+async def test_sliding_mode_refuses_a_request_that_no_cut_can_bring_under_the_limit() -> None:
+    # One result alone takes more than the window, so dropping every older turn is not enough.
+    messages = rounds(3, lines=2)
+    big = Message(
+        role="user",
+        content=[ToolResultBlock(tool_use_id="call-3", content=output(3, lines=400))],
+    )
+    messages = [*messages[:-1], big]
+    rig = sliding_rig(rounds(3, lines=2), 0.5)
+
+    with pytest.raises(ApplicationError) as caught:
+        await rig.run(turn_input(turn_index=3, transcript_ref=await rig.put(messages)))
+
+    assert caught.value.type == ProviderErrorKind.CONTEXT_TOO_LONG.value
+    assert caught.value.non_retryable is True
+    assert rig.provider.calls == []
+
+
+async def test_sliding_mode_keeps_the_text_of_a_paused_reply_inside_the_limit() -> None:
+    # The paused text goes at the end of the request, so it counts toward the limit.
+    messages = rounds(10, lines=30)
+    rig = sliding_rig(messages, 0.84)
+    paused = await rig.blobs.put_json(
+        [TextBlock(text="x" * 3000)], blob_key(SPEC.task_id, "turns", 10, "paused-1.json")
+    )
+
+    await rig.run(
+        turn_input(turn_index=10, transcript_ref=await rig.put(messages), paused_ref=paused)
+    )
+
+    sent = rig.provider.calls[0]["messages"]
+    assert sent[-1].role == "assistant"
+    assert estimate(sent) < 0.85 * window_for(messages, 0.84)
+
+
+async def test_the_log_gets_the_reply_of_a_turn_in_which_the_window_slid() -> None:
+    # The view is cut and the log is not touched: it holds what was said, and a cut of the
+    # request changes nothing about that.
+    messages = rounds(6, lines=30)
+    rig = sliding_rig(messages, 1.5, reply("tool_use", use("call-9")))
+
+    await rig.run(turn_input(turn_index=0, transcript_ref=await rig.put(messages)))
+
+    assert len(rig.provider.calls[0]["messages"]) < len(messages)
+    log = await read_log(rig.blobs, SPEC.task_id)
+    assert log == [Message(role="assistant", content=[use("call-9")])]
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,8 @@
 
 `context.mode` says which of the two context tiers a run uses: `full` (elide old tool outputs
 and compact), `no_compaction` (elide only) or `none` (neither; the hard limit still ends the run).
-A run can name its own mode, and that wins over the config of the worker.
+The `sliding` mode of the naive baseline (LH-903) has neither tier and cuts the oldest turns at the
+hard limit instead. A run can name its own mode, and that wins over the config of the worker.
 
 The workflow runs on a time skipping Temporal test server with the real llm_turn, compact,
 tool_exec, append_results and record_event activities, a fake sandbox for the commands, the
@@ -41,10 +42,12 @@ from temporalio.worker import Worker
 from tests.fakes.scripted_runs import SCRIPTS, TEST_COMMAND, seed
 
 from longhaul.agent.loop import LoopConfig
+from longhaul.agent.turns import validate_pairs
 from longhaul.blobs.base import BlobStoreBase
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.context.compact import NOTES_TOOL_NAME
 from longhaul.context.evict import ELIDED_PREFIX
+from longhaul.context.log import read_log
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
@@ -76,6 +79,7 @@ from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import get_task, start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.providers.base import turn_index
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.settings import Context, EnvSettings, get_settings
@@ -507,7 +511,7 @@ async def test_modes_run(env: WorkflowEnvironment, database: Scratch, mode: Cont
     The totals are checked against what the provider reported for each of its calls, and against
     the ledger rows, which are the other record of the same calls. The window is far larger than
     the task, so no mode compacts here. What differs is tier 1: the older results of the view
-    are stubs in `full` and `no_compaction` and are whole in `none`.
+    are stubs in `full` and `no_compaction` and are whole in `none` and `sliding`.
     """
     script = SCRIPTS / "calc_fix.yaml"
     played = await play(env, database, script, mode=mode, repo="calc")
@@ -539,7 +543,7 @@ async def test_modes_run(env: WorkflowEnvironment, database: Scratch, mode: Cont
     assert 0 < totals.max_fraction < POLICY.compact_at
 
     stubs = ELIDED_PREFIX in text_of(played.view)
-    assert stubs is (mode is not ContextMode.NONE)
+    assert stubs is mode.elides
 
 
 async def test_none_mode_hits_limit_cleanly(
@@ -571,6 +575,46 @@ async def test_none_mode_hits_limit_cleanly(
     assert POLICY.hard_limit - 0.1 < totals.max_fraction < POLICY.hard_limit
     fresh = sum(u.input_tokens + u.cache_write_tokens for u in worker.provider.of(SONNET))
     assert totals.input_tokens_total == fresh > 0
+
+
+async def test_sliding_mode_runs_the_long_task_to_its_end_under_the_limit(
+    env: WorkflowEnvironment, database: Scratch, tmp_path: Path
+) -> None:
+    """The naive baseline: no tier at all, and the oldest turns go when the window is full.
+
+    The long task ends in `context limit` in mode `none`. In mode `sliding` the same task goes
+    on, because each request that would pass the hard limit is cut to the newest turns first. No
+    request is refused, none is projected over the limit, nothing is elided or compacted, and the
+    view never holds a result without its call.
+    """
+    script = write_script(tmp_path, long_task())
+    played = await play(env, database, script, mode=ContextMode.SLIDING)
+    worker = played.worker
+
+    assert played.outcome == FINISHED
+    assert played.phase is Phase.DONE
+    assert played.turns == LONG_TURNS
+    assert worker.llm.refused == 0
+
+    # Every request that went out was under the hard limit, as the guard projects it.
+    limit = POLICY.hard_limit * WINDOW
+    assert max(out.request_tokens for out in worker.llm.outputs) < limit
+    assert played.totals.max_fraction < POLICY.hard_limit
+
+    # The window slid and nothing else ran.
+    assert played.totals.compactions == 0
+    assert database.event_count(played.spec.task_id, "compaction") == 0
+    assert worker.provider.of(HAIKU) == []
+    assert ELIDED_PREFIX not in text_of(played.view)
+
+    # The view holds fewer turns than the task took, pairs intact, and still counts the turns.
+    validate_pairs(played.view)
+    kept = sum(1 for m in played.view if m.role == "assistant")
+    assert kept < LONG_TURNS
+    assert turn_index(played.view) == LONG_TURNS
+    # The log is the whole record: it has every turn that the window dropped from the view.
+    logged = await read_log(worker.blobs, played.spec.task_id)
+    assert sum(1 for m in logged if m.role == "assistant") == LONG_TURNS
 
 
 async def test_the_modes_end_where_their_tiers_end(

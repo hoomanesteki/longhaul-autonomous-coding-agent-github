@@ -1,0 +1,18 @@
+# The one answer of the single-shot baseline for eval task calc-01: add() subtracts.
+# The runner reads the diff out of the fenced block. This one is clean, so git apply takes it.
+steps:
+  - respond:
+      text: |
+        add() subtracts its arguments. This diff makes it add them.
+
+        ```diff
+        --- a/src/calc/__init__.py
+        +++ b/src/calc/__init__.py
+        @@ -3,5 +3,5 @@
+
+         def add(a: int, b: int) -> int:
+             """Return the sum of a and b."""
+        -    return a - b
+        +    return a + b
+
+        ```

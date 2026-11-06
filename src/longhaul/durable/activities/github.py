@@ -11,6 +11,9 @@ What the poller leaves to the task. It only reads from GitHub. The "Picked up" c
 idempotency key (LH-306). A poller that wrote them would do it before the task exists, and a
 second poller could write them again.
 
+Every task the poller starts plans first (LH-501): the planner writes the plan, and the task
+posts it on the issue, before any code is written.
+
 An issue already has its task when any of these holds, and the poll leaves it alone:
 
 * the `tasks` table has a row with the task id, whatever its status. A finished task keeps its
@@ -255,7 +258,9 @@ class PollerActivities:
     async def _start(self, client: Client, spec: TaskSpec) -> bool:
         """Start the workflow of the task. False when it exists already, which is as good."""
         try:
-            await start_task(client, spec, task_queue=self._task_queue)
+            # A task of the poller plans first: the plan is what a maintainer reads before any
+            # code is written (LH-501).
+            await start_task(client, spec, task_queue=self._task_queue, plan=True)
         except WorkflowAlreadyStartedError:
             log.info("task %s exists already, so it is not started again", spec.task_id)
             return False

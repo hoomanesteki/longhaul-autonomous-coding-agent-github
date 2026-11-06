@@ -8,11 +8,19 @@
     6. progress notes     change on compaction      first user message
 
 The system prompt is blocks 1 to 4. It is built once when a transcript starts and is the same
-bytes in every request of the task, so the cache breakpoint at its end stays valid for the whole
-task, together with the tool list that renders in front of it (ADR-0003, D7; the breakpoints are
-in providers/anthropic.py). The function is pure. The same arguments give the same bytes: it
-reads no clock, no environment and no random source, and it leaves the task id out, because two
-tasks on one issue should not differ in their first bytes. The first line is the role line from
+bytes in every request of the transcript, so the cache breakpoint at its end stays valid for the
+whole transcript, together with the tool list that renders in front of it (ADR-0003, D7; the
+breakpoints are in providers/anthropic.py).
+
+Each role has an intro, rules and a tool guide of its own (block 1 and block 2), and shares the
+task block and the memory block. The coder's text is here. The planner's intro and rules are in
+roles/planner.py, which owns what the planner may do, and its tool guide is here, next to the
+coder's, because the two share most lines. A role also has its own first user message
+(`first_user_message`), and its own transcript, so each role has its own cached prefix (ADR-0007).
+
+The function is pure. The same arguments give the same bytes: it reads no clock, no
+environment and no random source, and it leaves the task id out, because two tasks on one
+issue should not differ in their first bytes. The first line is the role line from
 `providers.base`, which the scripted provider reads to pick its steps.
 
 Blocks 5 and 6 are text blocks of the first user message, in that order, after the line that
@@ -43,6 +51,7 @@ of a transcript, because a change to a tool drops every cache (ADR-0003, appendi
 
 from longhaul.contracts import Role, TaskSpec
 from longhaul.providers.base import format_role_line
+from longhaul.roles import planner
 
 RULES_HEADING = "## Rules"
 TOOLS_HEADING = "## Tools"
@@ -87,31 +96,60 @@ _CODER_RULES = (
     "code or open a pull request. The pipeline does that after you finish.",
 )
 
-# Every tool and parameter named here is checked against the registry in test_prompts, so
-# the guide cannot send the model after a tool that is not there.
-_TOOL_GUIDE = (
+# Every tool and parameter named in the guides is checked against the registry in test_prompts and
+# test_roles, so a guide cannot send the model after a tool that is not there.
+_FIND = (
     "- Find code with `search` and `list_dir`, then read it with `read_file`. For a long file, "
-    "read a range with `start_line` and `end_line`.",
+    "read a range with `start_line` and `end_line`."
+)
+_EDIT = (
     "- Change code with `edit_file`. `old_str` must match exactly one place in the file, so "
     "include enough surrounding lines to make it unique, and leave out the line numbers that "
-    "`read_file` prints. Use `write_file` only for a new file.",
+    "`read_file` prints. Use `write_file` only for a new file."
+)
+_RUN = (
     "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. Use "
-    "`run_command` for any other shell command. It runs in /workspace.",
-    "- Look at `git_diff` before you finish, to check that the change is what you meant.",
+    "`run_command` for any other shell command. It runs in /workspace."
+)
+_DIFF = "- Look at `git_diff` before you finish, to check that the change is what you meant."
+_OUTPUT = (
     "- A long result is cut to its first and last lines and ends with a handle. An old result "
     "is replaced by one line that starts with [elided: and names its handle. Read the rest, or "
     "the old text, with `read_output`: give it that `handle`, a range with `start_line` and "
     "`end_line`, or a `pattern` to get only the lines that contain some text. Do not run "
-    "the command again to see more of its output.",
-    "- Independent tool calls can go in one reply. Send `finish` on its own.",
-    "- When a tool reports an error, read it and change your next call.",
+    "the command again to see more of its output."
 )
+_PARALLEL = "- Independent tool calls can go in one reply. Send `finish` on its own."
+_ERRORS = "- When a tool reports an error, read it and change your next call."
 
-# Roles with a prompt. The planner and the verifier get theirs from their own stories
-# (LH-501, LH-504), and the compactor does not use this builder.
-_ROLE_TEXT: dict[Role, tuple[str, tuple[str, ...]]] = {
-    Role.CODER: (_CODER_INTRO, _CODER_RULES),
+_TOOL_GUIDE = (_FIND, _EDIT, _RUN, _DIFF, _OUTPUT, _PARALLEL, _ERRORS)
+
+_PLANNER_RUN = (
+    "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. Use "
+    "`run_command` for any other shell command, such as git log or a short script that "
+    "shows the problem. It runs in /workspace. A file that a command writes is deleted again "
+    "when the command ends."
+)
+_PLANNER_PARALLEL = (
+    f"- Independent tool calls can go in one reply. Send `{planner.SUBMIT_PLAN}` on its own."
+)
+_PLANNER_TOOL_GUIDE = (_FIND, _PLANNER_RUN, _OUTPUT, _PLANNER_PARALLEL, _ERRORS)
+
+# Roles with a prompt: the intro, the rules and the tool guide. The verifier gets its own from
+# LH-504, and the compactor does not use this builder.
+_ROLE_TEXT: dict[Role, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
+    Role.CODER: (_CODER_INTRO, _CODER_RULES, _TOOL_GUIDE),
+    Role.PLANNER: (planner.INTRO, planner.RULES, _PLANNER_TOOL_GUIDE),
 }
+
+# The first user message of each role that has one of its own. Every other role starts as the
+# coder does.
+_FIRST_MESSAGE: dict[Role, str] = {Role.PLANNER: planner.FIRST_USER_MESSAGE}
+
+
+def first_user_message(role: Role) -> str:
+    """The user message that opens the transcript of `role`."""
+    return _FIRST_MESSAGE.get(role, FIRST_USER_MESSAGE)
 
 
 def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = None) -> str:
@@ -123,12 +161,12 @@ def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = N
     Raises ValueError for a role that has no prompt yet.
     """
     try:
-        intro, rules = _ROLE_TEXT[role]
+        intro, rules, guide = _ROLE_TEXT[role]
     except KeyError:
         raise ValueError(f"no system prompt is written for the {role!s} role yet") from None
     sections = [
         "\n".join([format_role_line(role), "", intro, "", RULES_HEADING, *rules]),
-        "\n".join([TOOLS_HEADING, *_TOOL_GUIDE]),
+        "\n".join([TOOLS_HEADING, *guide]),
         task_statement(spec),
     ]
     facts = _clean(memory_block or "")

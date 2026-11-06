@@ -19,7 +19,7 @@ import pytest
 from temporalio import activity
 
 from longhaul.blobs.s3 import S3BlobStore
-from longhaul.contracts import Message, TextBlock, ToolSpec
+from longhaul.contracts import Message, Role, TextBlock, ToolSpec
 from longhaul.cost.ledger import SqlLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
@@ -28,6 +28,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
+from longhaul.roles import planner
 from longhaul.settings import EnvSettings, load_config
 from longhaul.telemetry import metrics
 
@@ -204,6 +205,15 @@ def test_a_model_without_a_price_stops_the_worker_before_it_starts(tmp_path: Pat
     settings = make_settings(tmp_path, provider="anthropic", ANTHROPIC_API_KEY="test-key")
     with pytest.raises(PricingError, match="claude-opus-9"):
         worker.build_parts(settings, config, FakeManager())  # type: ignore[arg-type]
+
+
+def test_a_planner_turn_limit_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The workflow keeps its own copy of the limit, so a different number in the file would be
+    # read, accepted and ignored. Stopping at the start says so while the operator is looking.
+    loop = CONFIG.loop.model_copy(update={"planner_max_turns": 8})
+    config = CONFIG.model_copy(update={"loop": loop})
+    with pytest.raises(ValueError, match=r"loop\.planner_max_turns.*8.*20"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
@@ -480,3 +490,50 @@ async def test_a_taken_metrics_port_stops_the_worker_before_it_connects(
         with pytest.raises(ValueError, match="LONGHAUL_METRICS_PORT"):
             await worker.main()
     assert connected == []
+
+
+# ---------- the planner (LH-501) ----------
+def activity_object(parts: worker.WorkerParts, name: str) -> Any:
+    (owner,) = {fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == name}
+    return owner
+
+
+def test_the_planner_gets_its_own_tools_on_every_worker(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+
+    assert [tool.name for tool in llm.tools_for(Role.PLANNER)] == [*planner.TOOLS, "submit_plan"]
+    coder = {tool.name for tool in llm.tools_for(Role.CODER)}
+    assert {"edit_file", "write_file", "finish"} <= coder
+    assert "submit_plan" not in coder
+
+
+def test_a_worker_stores_plans_with_the_recorder_of_the_rest(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    store = activity_object(parts, "store_plan")
+    assert store._records is activity_object(parts, "llm_turn")._recorder
+
+
+async def test_a_worker_with_a_token_posts_plans_through_the_ledger_of_the_writes(
+    tmp_path: Path,
+) -> None:
+    templates = tmp_path / "templates"
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests", templates_dir=templates),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        posting = activity_object(parts, "post_plan")
+        writes = activity_object(parts, "post_comment")
+        assert posting._ledger is writes._ledger
+        assert posting._client is parts.github
+        assert posting._templates == templates
+    finally:
+        await parts.close()
+
+
+def test_a_worker_without_a_token_cannot_post_a_plan_but_still_stores_it(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    names = names_of(parts)
+    assert "store_plan" in names and "post_plan" not in names

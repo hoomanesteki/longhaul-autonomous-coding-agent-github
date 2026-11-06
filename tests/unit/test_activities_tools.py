@@ -49,6 +49,7 @@ from longhaul.contracts import (
 from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.tools import (
+    PLANNING_NOTE,
     SHELL_TOOLS,
     NoCheckpoints,
     ToolActivities,
@@ -338,9 +339,9 @@ class Spy:
             raise RuntimeError("the worker was killed")
         return sha
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
         self.restores.append(sha)
-        await self.store.restore(sandbox, sha)
+        await self.store.restore(sandbox, sha, keep_ignored=keep_ignored)
 
     async def bundle(self, task_id: str) -> BlobRef:
         return await self.store.bundle(task_id)
@@ -1307,3 +1308,146 @@ async def test_a_sandbox_that_is_gone_is_not_timed(counters: Metrics) -> None:
         "longhaul_tool_duration_seconds_count", {"tool": "read_file"}
     )
     assert count is None
+
+
+# ---------- LH-501: a call of the planning phase changes nothing ----------
+def planning(
+    name: str, pre_sha: str | None, call_id: str = "toolu_1", **arguments: Any
+) -> acts.ToolExecInput:
+    return exec_input(name, call_id, pre_sha=pre_sha, **arguments).model_copy(
+        update={"read_only": True}
+    )
+
+
+async def porcelain(repo: Repo) -> str:
+    return (await repo.box.exec("git status --porcelain", timeout_s=30)).stdout
+
+
+async def test_a_command_of_the_planning_phase_that_writes_a_file_is_undone(repo: Repo) -> None:
+    spy = Spy(repo.store)
+    rig = repo.rig(spy=spy)
+    result = await rig.exec(
+        planning("run_command", repo.base_sha, command="echo planned > plan-note.txt && ls")
+    )
+
+    assert result.ok
+    assert "plan-note.txt" in result.output  # the command ran and saw its own file
+    assert (result.pre_sha, result.post_sha) == (repo.base_sha, None)
+    # The tree is the checkpoint again: nothing to save, nothing left over.
+    assert await porcelain(repo) == ""
+    with pytest.raises(FileNotFoundError):
+        await repo.box.read_file("plan-note.txt")
+    assert spy.restores == [repo.base_sha]
+    assert spy.commits == []
+    assert repo.branch_head() == repo.base_sha
+    assert rig.recorder.checkpoints == []
+    (row,) = rig.recorder.tool_calls.values()
+    assert (row.pre_sha, row.post_sha) == (repo.base_sha, None)
+
+
+async def test_the_planner_is_told_that_its_changes_were_undone(repo: Repo) -> None:
+    rig = repo.rig()
+    result = await rig.exec(planning("run_command", repo.base_sha, command="echo x > note.txt"))
+
+    assert result.output_ref is not None
+    stored = (await rig.blobs.get(result.output_ref)).decode()
+    assert stored.endswith(PLANNING_NOTE)
+    assert PLANNING_NOTE.isascii()
+
+
+async def test_a_command_of_the_planning_phase_that_edits_a_tracked_file_is_undone(
+    repo: Repo,
+) -> None:
+    before = await repo.text()
+    rig = repo.rig()
+    result = await rig.exec(
+        planning("run_command", repo.base_sha, command=f"echo changed > {MODULE}")
+    )
+
+    assert result.ok and result.post_sha is None
+    assert await repo.text() == before
+    assert await porcelain(repo) == ""
+
+
+async def test_a_test_run_of_the_planning_phase_that_writes_files_is_undone(repo: Repo) -> None:
+    rig = repo.rig(test_command="echo report > report.txt")
+    result = await rig.exec(planning("run_tests", repo.base_sha))
+
+    assert result.ok and result.post_sha is None
+    assert await porcelain(repo) == ""
+    assert rig.recorder.checkpoints == []
+
+
+async def test_an_edit_that_reaches_the_planning_phase_is_undone_too(repo: Repo) -> None:
+    # The workflow never sends one, and this is the net under it.
+    rig = repo.rig()
+    result = await rig.exec(
+        planning("edit_file", repo.base_sha, path=MODULE, old_str="a - b", new_str="a + b")
+    )
+
+    assert result.post_sha is None
+    assert "a - b" in await repo.text()
+    assert repo.branch_head() == repo.base_sha
+
+
+async def test_a_call_of_the_planning_phase_that_only_reads_restores_nothing(repo: Repo) -> None:
+    spy = Spy(repo.store)
+    rig = repo.rig(spy=spy)
+    result = await rig.exec(planning("read_file", repo.base_sha, path=MODULE))
+
+    assert result.ok and result.post_sha is None
+    assert spy.restores == [] and spy.commits == []
+    assert PLANNING_NOTE not in result.output
+
+
+async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(repo: Repo) -> None:
+    # Running the tests writes caches. Undoing those would only make every run slower.
+    spy = Spy(repo.store)
+    command = "mkdir -p src/calc/__pycache__ && echo x > src/calc/__pycache__/m.pyc"
+    result = await repo.rig(spy=spy).exec(planning("run_command", repo.base_sha, command=command))
+
+    assert result.ok and result.post_sha is None
+    assert spy.restores == []
+    assert PLANNING_NOTE not in result.output
+
+
+async def test_a_reset_of_the_planning_phase_keeps_what_the_setup_built(repo: Repo) -> None:
+    # The network is off once the planner runs, so nothing could build these files again.
+    built = "src/calc.egg-info/PKG-INFO"
+    await repo.box.exec(
+        "mkdir -p src/calc.egg-info && echo built > src/calc.egg-info/PKG-INFO", timeout_s=30
+    )
+    assert await porcelain(repo) == ""  # git ignores it, so it is not a change
+    result = await repo.rig().exec(planning("run_command", repo.base_sha, command="echo x > r.txt"))
+
+    assert result.ok and result.post_sha is None
+    assert await porcelain(repo) == ""  # the note the command left is gone
+    assert (await repo.box.read_file(built)).decode().strip() == "built"
+
+
+async def test_a_call_of_the_planning_phase_without_a_checkpoint_runs_where_it_is(
+    repo: Repo,
+) -> None:
+    # A run with no checkpoint has nothing to go back to. The call is not saved either.
+    result = await repo.rig().exec(planning("run_command", None, command="echo x > note.txt"))
+    assert result.ok and result.post_sha is None
+
+
+async def test_a_retried_call_of_the_planning_phase_leaves_the_same_tree(repo: Repo) -> None:
+    rig = repo.rig()
+    first = await rig.exec(planning("run_command", repo.base_sha, command="echo x > note.txt"))
+    again = await rig.exec(
+        planning("run_command", repo.base_sha, command="echo x > note.txt"), attempt=2
+    )
+
+    assert first.output == again.output
+    assert await porcelain(repo) == ""
+
+
+async def test_a_call_of_the_coding_phase_is_still_saved(repo: Repo) -> None:
+    # read_only is off by default, and then a command that writes is saved as before.
+    result = await repo.rig().exec(
+        exec_input("run_command", pre_sha=repo.base_sha, command="echo built > out.txt")
+    )
+    assert result.post_sha is not None
+    assert PLANNING_NOTE not in result.output

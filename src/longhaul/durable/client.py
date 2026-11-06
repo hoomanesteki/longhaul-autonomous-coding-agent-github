@@ -17,7 +17,13 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, CarryState, Outcome, Phase, TaskSpec, TaskStatus
-from longhaul.durable.acts import CONTEXT_MODE_MEMO_KEY, SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.acts import (
+    CONTEXT_MODE_MEMO_KEY,
+    PLAN_MEMO_KEY,
+    SCRIPT_MEMO_KEY,
+    TUNING_MEMO_KEY,
+    Tuning,
+)
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.telemetry import logging as logging_context
@@ -56,6 +62,7 @@ async def start_task(
     tuning: Tuning | None = None,
     script: BlobRef | None = None,
     context_mode: ContextMode | None = None,
+    plan: bool = False,
 ) -> WorkflowHandle[TaskWorkflow, Outcome]:
     """Start the workflow for a task. Its id is the task id.
 
@@ -63,6 +70,10 @@ async def start_task(
     (longhaul.durable.scripts). It rides in the memo with the tuning, because the worker is a
     process of its own and started before the task. So does `context_mode`, the mode this run
     asks for in place of the config's (longhaul.context.modes); None leaves it to the config.
+
+    `plan` has the planner write a plan before the coder starts (LH-501). A task started without
+    it goes straight to coding. The poller and `longhaul run --plan` ask for it. It rides in the
+    memo as well, so it holds for every run of the Continue-As-New chain.
 
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run
@@ -78,6 +89,8 @@ async def start_task(
         memo[SCRIPT_MEMO_KEY] = script
     if context_mode is not None:
         memo[CONTEXT_MODE_MEMO_KEY] = context_mode
+    if plan:
+        memo[PLAN_MEMO_KEY] = True
     # Each task is one trace. The poller starts tasks from an activity, where a current span
     # would otherwise make every task of a poll a child of that activity.
     with otel.detached():

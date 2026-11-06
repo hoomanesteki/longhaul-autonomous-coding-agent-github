@@ -1,0 +1,27 @@
+## Plan, version {{ version }}
+
+{{ summary }}
+
+### Steps
+
+{% for step in steps %}
+- [ ] **{{ step.id }}**: {{ step.description }}
+  - Done when: {{ step.done_when }}
+{% if step.files %}
+  - Files: {{ step.files }}
+{% endif %}
+{% endfor %}
+
+### Acceptance checks
+
+{% for check in checks %}
+- [ ] {{ check }}
+{% endfor %}
+{% if risks %}
+
+### Risks
+
+{% for risk in risks %}
+- {{ risk }}
+{% endfor %}
+{% endif %}

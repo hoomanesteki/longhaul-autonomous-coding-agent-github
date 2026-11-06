@@ -50,6 +50,16 @@ on the branch".
 Each run that reached its tool is timed into longhaul_tool_duration_seconds (LH-704), the failing
 ones too. A call that found its sandbox gone never ran, and is not timed.
 
+The planning phase (LH-501) changes nothing. A call with `read_only` set runs from `pre_sha` like
+any other, and then the tree is looked at: if the call changed it, `restore(pre_sha)` puts it
+back, and no commit is made, so the result has no `post_sha` and no checkpoint row is written.
+Files that git ignores do not count, as for `is_at` before a call, so the caches of a test run are
+left alone. The text of the result ends with PLANNING_NOTE when something was undone, so the
+planner does not build on a file that is gone. The planner is not offered `edit_file` or
+`write_file`, and the workflow answers a call outside its tool set without running it. This reset
+is the guarantee under both: whatever a shell command did, the next call and the coder start from
+the checkpoint. A planner call that has no `pre_sha` has nothing to go back to and is left as it is.
+
 A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
 finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
 again from the same `pre_sha`. The error is raised for a container that was gone before the
@@ -100,6 +110,11 @@ from longhaul.tools.registry import ToolRegistry
 # advance, so `mutates` is False for both (tools/exec.py) and the tree is looked at after them.
 SHELL_TOOLS = frozenset({"run_command", "run_tests"})
 
+# What the planner reads at the end of a call that wrote files, which were then undone (LH-501).
+PLANNING_NOTE = (
+    "[planning phase: files cannot be changed here, so what this command wrote was undone]"
+)
+
 
 class SandboxLookup(Protocol):
     """The part of a SandboxManager that tool_exec uses: find a running sandbox by its id."""
@@ -108,17 +123,19 @@ class SandboxLookup(Protocol):
 
 
 class WorkspaceCheckpoints(CheckpointStore, Protocol):
-    """A CheckpointStore that can also say whether the workspace already is at a commit, and
-    that can build a commit on a named parent.
+    """A CheckpointStore that can also say whether the workspace already is at a commit, that
+    can build a commit on a named parent, and that can restore without deleting ignored files.
 
-    GitCheckpointStore has `is_at` and the `parent` argument of `commit`. The contracts do not,
-    and they stay as they are, so what tool_exec needs beyond them is added here, where it is
-    used.
+    GitCheckpointStore has `is_at`, the `parent` argument of `commit` and the `keep_ignored`
+    argument of `restore`. The contracts do not, and they stay as they are, so what tool_exec
+    needs beyond them is added here, where it is used.
     """
 
     async def commit(
         self, sandbox: Sandbox, message: str, *, parent: str | None = None
     ) -> str | None: ...
+
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None: ...
 
     async def is_at(self, sandbox: Sandbox, sha: str) -> bool: ...
 
@@ -138,7 +155,7 @@ class NoCheckpoints:
     ) -> str | None:
         return None  # the tree counts as clean
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
         return None
 
     async def bundle(self, task_id: str) -> BlobRef:
@@ -223,7 +240,14 @@ class ToolActivities:
                     result = await tool_step(self._registry, sandbox, call, ctx)
                     self._time(call.name, time.monotonic() - began)
                     span.record(result)
-                post_sha = await self._save(sandbox, inp, call)
+                if inp.read_only:
+                    post_sha = None
+                    if await self._discard(sandbox, inp.pre_sha):
+                        result = result.model_copy(
+                            update={"output": f"{result.output}\n{PLANNING_NOTE}"}
+                        )
+                else:
+                    post_sha = await self._save(sandbox, inp, call)
         except Exception as exc:
             if await self._is_gone(inp.sandbox_id):
                 raise _gone(inp.sandbox_id) from exc
@@ -301,6 +325,19 @@ class ToolActivities:
             return
         if not await self._checkpoints.is_at(sandbox, pre_sha):
             await self._checkpoints.restore(sandbox, pre_sha)
+
+    async def _discard(self, sandbox: Sandbox, pre_sha: str | None) -> bool:
+        """Put the tree back on `pre_sha` after a call of the planning phase. True if it moved.
+
+        Nothing is saved: the planner may look and may run commands, and what it leaves behind
+        is not work. A tree that is at `pre_sha` with nothing to save is left alone, because a
+        restore also deletes ignored files. When it does restore, what git ignores stays: that is
+        what the setup built, the network is off by now, and nothing could build it again.
+        """
+        if pre_sha is None or await self._checkpoints.is_at(sandbox, pre_sha):
+            return False
+        await self._checkpoints.restore(sandbox, pre_sha, keep_ignored=True)
+        return True
 
     async def _save(self, sandbox: Sandbox, inp: acts.ToolExecInput, call: ToolCall) -> str | None:
         """Commit what the call changed. None when it changed nothing since `pre_sha`.

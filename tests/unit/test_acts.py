@@ -19,6 +19,8 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Plan,
+    PlanStep,
     ProgressNotes,
     ProviderErrorKind,
     RepoSettings,
@@ -73,6 +75,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "poll_once",
         "prepare_workspace",
         "record_event",
+        "store_plan",
         "tool_exec",
     ]
     assert len(set(names)) == len(names)
@@ -91,6 +94,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
+        (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -128,6 +132,8 @@ def test_each_activity_names_its_payload_types(
         # Section 3.7 gives compact 10 minutes and 5 attempts. The heartbeat is added for the
         # reason llm_turn has one: it is a model call, and a cancel has to reach it.
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
+        # Not in the table. A plan is one row, so it is sized like append_results.
+        pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -737,6 +743,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         "create_pr",
         "deliver",
         "post_comment",
+        "post_plan",
         "remove_label",
     ]
     assert not {act.name for act in acts.ALL} & set(names)
@@ -751,6 +758,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         (acts.CREATE_PR, PullRequestInput, str),
         (acts.BUILD_PR_BRANCH, acts.BuildPrBranchInput, acts.PrBranchOutput),
         (acts.DELIVER, acts.DeliverInput, str),
+        (acts.POST_PLAN, acts.PostPlanInput, str),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -779,6 +787,8 @@ def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
         # Not in section 3.7. deliver pushes a branch (git's own limit is 10 minutes) and then
         # does what create_pr does, so a killed worker has to be noticed in a minute.
         pytest.param(acts.DELIVER, 10 * 60, 60, 5, id="deliver"),
+        # The plan comment is a post_comment whose body the activity renders.
+        pytest.param(acts.POST_PLAN, 2 * 60, None, 10, id="post_plan"),
     ],
 )
 def test_github_timeouts_and_attempts_match_section_3_7(
@@ -790,7 +800,7 @@ def test_github_timeouts_and_attempts_match_section_3_7(
 
 
 @pytest.mark.parametrize(
-    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR]
+    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR, acts.POST_PLAN]
 )
 def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
     assert act.retry.maximum_interval == timedelta(minutes=5)
@@ -858,3 +868,76 @@ def test_github_payloads_survive_the_pydantic_data_converter(sample: BaseModel) 
 
 def test_nothing_to_deliver_is_named_after_the_error_class() -> None:
     assert NothingToDeliverError.__name__ == acts.NOTHING_TO_DELIVER
+
+
+# ---------- LH-501: the planner ----------
+def test_the_planner_turn_limit_follows_the_configured_one() -> None:
+    # Same reason as the tool timeout: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.loop.planner_max_turns == acts.PLANNER_MAX_TURNS == 20
+
+
+def test_planning_is_switched_on_by_a_memo_key_of_its_own() -> None:
+    assert acts.PLAN_MEMO_KEY == "plan"
+    assert len({acts.PLAN_MEMO_KEY, acts.SCRIPT_MEMO_KEY, acts.TUNING_MEMO_KEY}) == 3
+
+
+def test_a_tool_call_is_not_read_only_unless_the_workflow_says_so() -> None:
+    call = acts.ToolCallSummary(id="t1", name="read_file", input={"path": "a.py"})
+    default = acts.ToolExecInput(
+        task_id="lh-x", turn_index=0, call=call, pre_sha=SHA, sandbox_id="sbx-1"
+    )
+    planning = default.model_copy(update={"read_only": True})
+    assert default.read_only is False
+    assert planning.read_only is True
+
+
+def test_the_plan_activities_are_registered_where_their_inputs_need_a_token() -> None:
+    # Storing a plan needs the database only. Posting it needs a GitHub token.
+    assert acts.STORE_PLAN in acts.ALL
+    assert acts.POST_PLAN in acts.GITHUB
+    assert acts.STORE_PLAN not in acts.GITHUB and acts.POST_PLAN not in acts.ALL
+
+
+def test_a_plan_has_a_version_from_one() -> None:
+    plan = Plan(summary="s", steps=[], acceptance_checks=["pytest -q"])
+    with pytest.raises(ValidationError):
+        acts.StorePlanInput(task_id="lh-x", version=0, plan=plan)
+    with pytest.raises(ValidationError):
+        acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=0, plan=plan)
+
+
+PLAN = Plan(
+    summary="add() subtracts",
+    steps=[PlanStep(id="s1", description="Fix add()", done_when="the tests pass")],
+    acceptance_checks=["pytest -q"],
+    risks=["none known"],
+)
+PLAN_SAMPLES: list[BaseModel] = [
+    acts.StorePlanInput(task_id="lh-x", version=1, plan=PLAN),
+    acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=1, plan=PLAN),
+    acts.ToolExecInput(
+        task_id="lh-x",
+        turn_index=2,
+        call=acts.ToolCallSummary(id="t1", name="run_command", input={"command": "ls"}),
+        pre_sha=SHA,
+        sandbox_id="sbx-1",
+        read_only=True,
+    ),
+    acts.LlmTurnInput(
+        task_id="lh-x",
+        turn_index=0,
+        role=Role.PLANNER,
+        spec=SPEC,
+        transcript_ref=None,
+        plan=PLAN,
+    ),
+]
+
+
+@pytest.mark.parametrize("sample", PLAN_SAMPLES, ids=lambda sample: type(sample).__name__)
+def test_planner_payloads_survive_the_pydantic_data_converter(sample: BaseModel) -> None:
+    converter = pydantic_data_converter.payload_converter
+    payloads = converter.to_payloads([sample])
+    assert converter.from_payloads(payloads, [type(sample)]) == [sample]
+    assert_small(sample)

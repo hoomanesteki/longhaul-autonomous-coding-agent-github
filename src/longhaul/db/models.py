@@ -185,6 +185,33 @@ class ToolCallRow(Base):
     )
 
 
+class PlanRow(Base):
+    """One version of the plan of a task (LH-501).
+
+    The planner's plan is version 1. A plan that a person rejects is followed by a new version
+    (LH-502), and the old row is marked superseded, so the table is the history of the plan and
+    the workflow's CarryState holds only the version in force. `plan` is the contract (`Plan`)
+    as JSON. `decided_by` and `decided_at` stay empty until someone approves or rejects it.
+    """
+
+    __tablename__ = "plans"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('proposed', 'approved', 'rejected', 'superseded')", name="status"
+        ),
+    )
+
+    task_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'proposed'"))
+    decided_by: Mapped[str | None] = mapped_column(Text)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Event(Base):
     """One thing that happened to a task, such as a sandbox that had to be recreated (LH-206).
 

@@ -9,7 +9,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 def test_baseline_tables_registered() -> None:
     # Each story that adds a table adds it here: LH-205 checkpoints, LH-204 turns and
-    # tool_calls, LH-304 side_effects, LH-206 events, LH-701 cost_ledger, LH-601 memory_items.
+    # tool_calls, LH-304 side_effects, LH-206 events, LH-701 cost_ledger, LH-601 memory_items,
+    # LH-501 plans.
     tables = {
         "repo_settings",
         "tasks",
@@ -20,6 +21,7 @@ def test_baseline_tables_registered() -> None:
         "events",
         "cost_ledger",
         "memory_items",
+        "plans",
     }
     assert set(Base.metadata.tables) == tables
 

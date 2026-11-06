@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from docker.errors import DockerException
+from sqlalchemy.exc import OperationalError
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 from temporalio.service import RPCError, RPCStatusCode
@@ -28,8 +29,10 @@ from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import RepoNotFoundError
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import Outcome, OutcomeKind, Phase, TaskSpec, TaskStatus
+from longhaul.db.context_totals import ContextTotals
 from longhaul.durable import acts
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.settings import load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -85,8 +88,10 @@ class FakeHandle:
         *,
         final: TaskStatus | Exception | None = None,
         outcome: Outcome | Exception = FINISHED,
+        memo: dict[str, Any] | None = None,
     ) -> None:
         self.polls = polls
+        self.memo = memo or {}
         self.final = final if final is not None else status(Phase.DONE, 5)
         self.outcome = outcome
         self.describes = 0
@@ -103,7 +108,13 @@ class FakeHandle:
             if isinstance(self.outcome, WorkflowFailureError)
             else WorkflowExecutionStatus.COMPLETED
         )
-        return SimpleNamespace(status=WorkflowExecutionStatus.RUNNING if self.open else closed)
+        return SimpleNamespace(
+            status=WorkflowExecutionStatus.RUNNING if self.open else closed,
+            memo_value=self.memo_value,
+        )
+
+    async def memo_value(self, key: str, default: Any = None, **_: Any) -> Any:
+        return self.memo.get(key, default)
 
     async def query(self, query: Any, **kwargs: Any) -> TaskStatus:
         assert query == TaskWorkflow.status
@@ -190,6 +201,9 @@ class Stack:
         self.store = store or FakeStore()
         self.manager = FakeManager()
         self.pauses: list[float] = []
+        # What the database says of the context of the task: None for a task it does not know.
+        self.totals: ContextTotals | Exception | None = None
+        self.totals_asked: list[tuple[str, int | None]] = []
 
     @property
     def spec(self) -> TaskSpec:
@@ -229,6 +243,14 @@ def stack_for(monkeypatch: pytest.MonkeyPatch) -> Callable[..., Stack]:
         monkeypatch.setattr(cli, "make_store", lambda blobs, settings: stack.store)
         monkeypatch.setattr(cli, "make_manager", lambda: stack.manager)
         monkeypatch.setattr(cli, "pause", pause)
+
+        async def context_totals_of(task_id: str, window: int | None) -> ContextTotals | None:
+            stack.totals_asked.append((task_id, window))
+            if isinstance(stack.totals, Exception):
+                raise stack.totals
+            return stack.totals
+
+        monkeypatch.setattr(cli, "context_totals_of", context_totals_of)
         return stack
 
     return build
@@ -773,6 +795,126 @@ def test_status_of_an_unknown_task_is_an_error(stack_for: Callable[..., Stack]) 
 
     assert result.exit_code == 2
     assert "lh-nothing" in result.stderr
+
+
+# --- status: the context of the task (LH-407) -------------------------------------------------
+TASK_ID = "lh-local-calc-0a1b2c3d"
+
+
+def test_status_of_a_finished_task_shows_its_compactions_and_its_fullest_request(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(FakeHandle([], final=status(Phase.DONE, 5)))
+    stack.totals = ContextTotals(compactions=5, max_fraction=0.5862)
+
+    result = invoke(["status", TASK_ID])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines() == [
+        f"task {TASK_ID}: completed",
+        "status: done, 5 turns done, cost $0.0000, checkpoint 1a2b3c4",
+        "context: 5 compactions, max_fraction 0.59",
+        f"finished after 5 turns: {SUMMARY}",
+    ]
+    assert [task for task, _ in stack.totals_asked] == [TASK_ID]
+
+
+def test_status_of_a_running_task_shows_them_too(stack_for: Callable[..., Stack]) -> None:
+    stack = stack_for(FakeHandle([status(Phase.CODING, 3)] * 3))
+    stack.totals = ContextTotals(compactions=1, max_fraction=0.31)
+
+    result = invoke(["status", TASK_ID])
+
+    assert result.stdout.splitlines() == [
+        f"task {TASK_ID}: running",
+        "status: coding, 3 turns done, cost $0.0000, checkpoint 1a2b3c4",
+        "context: 1 compaction, max_fraction 0.31",
+    ]
+
+
+def test_status_shows_the_compactions_when_the_window_is_not_known(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(FakeHandle([status(Phase.CODING, 3)] * 3))
+    stack.totals = ContextTotals(compactions=0, max_fraction=None)
+
+    result = invoke(["status", TASK_ID])
+
+    assert result.stdout.splitlines()[-1] == "context: 0 compactions"
+
+
+def test_status_has_no_context_line_for_a_task_the_database_does_not_know(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack_for(FakeHandle([status(Phase.CODING, 3)] * 3))  # the totals stay None
+
+    result = invoke(["status", TASK_ID])
+
+    assert not [ln for ln in result.stdout.splitlines() if ln.startswith("context:")]
+
+
+def test_status_still_answers_when_the_database_cannot_be_read(
+    stack_for: Callable[..., Stack],
+) -> None:
+    stack = stack_for(FakeHandle([], final=status(Phase.DONE, 5)))
+    stack.totals = OperationalError("SELECT 1", {}, ConnectionRefusedError("refused"))
+
+    result = invoke(["status", TASK_ID])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines() == [
+        f"task {TASK_ID}: completed",
+        "status: done, 5 turns done, cost $0.0000, checkpoint 1a2b3c4",
+        f"finished after 5 turns: {SUMMARY}",
+    ]
+    assert "could not read the context totals" in result.stderr
+    assert "refused" in result.stderr
+
+
+def test_the_totals_are_read_against_the_window_the_run_asked_for(
+    stack_for: Callable[..., Stack],
+) -> None:
+    memo = {acts.TUNING_MEMO_KEY: acts.Tuning(window_tokens=8_000)}
+    stack = stack_for(FakeHandle([status(Phase.CODING, 3)] * 3, memo=memo))
+
+    invoke(["status", TASK_ID])
+
+    assert stack.totals_asked == [(TASK_ID, 8_000)]
+
+
+def test_a_run_without_a_window_of_its_own_is_read_against_the_window_of_the_config(
+    stack_for: Callable[..., Stack], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(ROOT / "config" / "longhaul.example.yaml"))
+    stack = stack_for(FakeHandle([status(Phase.CODING, 3)] * 3))
+
+    invoke(["status", TASK_ID])
+
+    window = load_config(ROOT / "config" / "longhaul.example.yaml").context.window_tokens
+    assert stack.totals_asked == [(TASK_ID, window)]
+
+
+def test_a_config_that_cannot_be_read_leaves_the_window_unknown(
+    stack_for: Callable[..., Stack], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(tmp_path / "missing.yaml"))
+    stack = stack_for(FakeHandle([status(Phase.CODING, 3)] * 3))
+
+    result = invoke(["status", TASK_ID])
+
+    assert result.exit_code == 0, result.output
+    assert stack.totals_asked == [(TASK_ID, None)]
+
+
+def test_without_a_database_setting_there_are_no_totals_to_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unset(*preferred: str | None) -> str:
+        raise RuntimeError("LONGHAUL_DATABASE_URL is not set")
+
+    monkeypatch.setattr(cli, "database_url", unset)
+
+    assert asyncio.run(cli.context_totals_of(TASK_ID, 8_000)) is None
 
 
 # --- cancel --------------------------------------------------------------------------------

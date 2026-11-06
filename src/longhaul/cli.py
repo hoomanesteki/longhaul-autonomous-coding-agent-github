@@ -20,7 +20,9 @@ provider and the model; one line per turn; one line for how the run ended; and t
 `git_diff`. Progress notes, warnings and errors go to stderr, so the output can be piped on.
 `run` prints a header, a status line each time the status of the task changes, the outcome and
 the final diff, in the same shape. `run --window N` asks for a context window of N tokens in place
-of the worker's, which is how a short task is made to compact its context (LH-407).
+of the worker's, which is how a short task is made to compact its context (LH-407). `status` adds
+a line with the compactions of the task and the largest share of the window one request took, when
+LONGHAUL_DATABASE_URL names a database that knows the task (db/context_totals.py).
 
 Exit codes. 0: the agent called `finish`. 2: the run failed or ended in error (turn limit, no
 tool calls, a refusal, a failing setup, a provider error, a missing Docker or image), or it
@@ -93,6 +95,7 @@ from longhaul.contracts import (
     ToolCall,
     ToolContext,
 )
+from longhaul.db.context_totals import ContextTotals, read_context_totals
 from longhaul.db.session import database_url, make_engine
 from longhaul.durable import acts, schedule
 from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
@@ -832,13 +835,16 @@ async def print_task_diff(
 
 
 async def show_status(task_id: str) -> None:
-    handle = get_task(await open_client(EnvSettings()), task_id)
-    state = (await handle.describe()).status
+    settings = EnvSettings()
+    handle = get_task(await open_client(settings), task_id)
+    description = await handle.describe()
+    state = description.status
     name = state.name.lower().replace("_", " ") if state is not None else "in an unknown state"
     typer.echo(f"task {task_id}: {name}")
     current = await try_status(handle)
     if current is not None or state in OPEN_STATES:
         typer.echo(status_line(current))
+    await print_context(task_id, await window_of_run(description, settings))
     if state in OPEN_STATES:
         return
     try:
@@ -848,6 +854,60 @@ async def show_status(task_id: str) -> None:
         return
     turns = current.turn_index if current is not None else None
     typer.echo(outcome_line(outcome.kind, turns, outcome.summary))
+
+
+async def context_totals_of(task_id: str, window: int | None) -> ContextTotals | None:
+    """The compactions and the fullest request of a task, or None when the database has no word.
+
+    None also means that no database is configured: `status` then says what Temporal knows and
+    nothing more. A function of its own so that unit tests can replace it.
+    """
+    try:
+        url = database_url()
+    except RuntimeError:
+        return None
+    # One short loop per command: a pooled connection would wait for a loop that is gone.
+    engine = make_engine(url, pooled=False)
+    try:
+        sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
+        return await read_context_totals(sessions, task_id, window)
+    finally:
+        await engine.dispose()
+
+
+async def window_of_run(description: Any, settings: EnvSettings) -> int | None:
+    """The context window of a task: the one it asked for, else the one of the config.
+
+    The config is the one of this process. The worker reads its own, which is the same file on
+    a machine that runs both, and a task that asked for a window has it in its memo anyway.
+    """
+    tuning = await description.memo_value(acts.TUNING_MEMO_KEY, None, type_hint=acts.Tuning)
+    if tuning is not None and tuning.window_tokens is not None:
+        return int(tuning.window_tokens)
+    try:
+        return load_config(config_path(settings)).context.window_tokens
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+
+
+def context_line(totals: ContextTotals) -> str:
+    """For example `context: 5 compactions, max_fraction 0.59`."""
+    noun = "compaction" if totals.compactions == 1 else "compactions"
+    line = f"context: {totals.compactions} {noun}"
+    if totals.max_fraction is not None:
+        line += f", max_fraction {totals.max_fraction:.2f}"
+    return line
+
+
+async def print_context(task_id: str, window: int | None) -> None:
+    """Print the context line. A database that cannot be read costs the line, not the command."""
+    try:
+        totals = await context_totals_of(task_id, window)
+    except (OSError, SQLAlchemyError) as exc:
+        typer.echo(f"could not read the context totals: {describe(exc)}", err=True)
+        return
+    if totals is not None:
+        typer.echo(context_line(totals))
 
 
 async def send_cancel(task_id: str, reason: str) -> None:

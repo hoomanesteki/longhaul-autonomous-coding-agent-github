@@ -178,7 +178,7 @@ uv run longhaul run \
 |---|---|
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
 | `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
-| `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow and, once it ended, the outcome. |
+| `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow, the compactions and the largest request of the task (`context: 5 compactions, max_fraction 0.59`) and, once it ended, the outcome. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
 
 ### What `run` does
@@ -215,7 +215,7 @@ The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` an
 
 A task that has to compact on a short script can ask for a smaller window with `run --window N`. The number goes to the worker in the workflow memo, and every activity that counts tokens uses it in place of `window_tokens`. The cap for one tool result shrinks with it, to 1/32 of the window at most (250 tokens in a window of 8,000), so that a window this small has room for the results of a turn. The prompt and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.
 
-The long-task fixture `tests/fixtures/repos/longlog` runs the context system under this pressure. It has twelve modules with one planted bug each, and its test command prints 5,000 lines. `tests/fixtures/scripts/longlog.yaml` fixes one module in five turns, 62 turns in all, and `compactor.yaml` answers the compactor with notes that list the modules fixed so far. The test `tests/e2e/test_long_task.py::test_longlog_many_compactions` runs the command below with `compact_at` 0.6 and `keep_recent_turns` 4, and checks that all twelve modules are fixed, that the task compacted at least three times and that no request took 85 percent of the window. The run compacts five times, at turns 16, 26, 36, 46 and 56, and its fullest request takes 59 percent of the window. The test takes 2 to 5 minutes, depending on the load of the machine:
+The long-task fixture `tests/fixtures/repos/longlog` runs the context system under this pressure. It has twelve modules with one planted bug each, and its test command prints 5,000 lines. `tests/fixtures/scripts/longlog.yaml` fixes one module in five turns, 62 turns in all, and `compactor.yaml` answers the compactor with notes that list the modules fixed so far. From the second compaction on its steps need the previous notes in the request, so a run that loses its notes between two compactions gets notes that list nothing and fails the test. The test `tests/e2e/test_long_task.py::test_longlog_many_compactions` runs the command below with `compact_at` 0.6 and `keep_recent_turns` 4, and checks that all twelve modules are fixed, that the task compacted at least three times and that no request took 85 percent of the window. The run compacts five times, at turns 16, 26, 36, 46 and 56, and its fullest request takes 59 percent of the window. The test then asks `longhaul status` for the same two numbers. It takes 2 to 5 minutes, depending on the load of the machine:
 
 ```bash
 uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtures/repos/longlog/ISSUE.md \
@@ -291,6 +291,8 @@ FROM tasks WHERE id = 'lh-acme-calc-42';
 ```
 
 A task has these columns only when it has a row in `tasks`. The poller makes the row when it starts a task. `longhaul run` does not, so a task started with it has its calls in `cost_ledger` and its compactions in `events`, and the totals stay at 0. The cost ledger works the same way.
+
+`longhaul status TASK_ID` prints two of them in a `context:` line, such as `context: 5 compactions, max_fraction 0.59`. It reads the database of `LONGHAUL_DATABASE_URL`, and leaves the line out when no database is set or the task is not in it. For a task with a row the line is the row. For a task of `longhaul run`, which has none, it counts the distinct `compaction` events, and it divides the largest prompt that the provider reported for a model turn of the coder (input, cache reads and cache writes) by the window of the run: the `--window` that the task asked for, or else `context.window_tokens` of the config of the command. That figure is a little different from `max_fraction` of a row, which is the estimate from before the request was sent.
 
 ### Stopping a worker
 

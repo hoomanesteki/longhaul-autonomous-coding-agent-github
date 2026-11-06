@@ -55,7 +55,7 @@ Install can be run again at any time. It creates the Schedule when it is missing
 - **Ended tasks.** A signal to a closed workflow fails with NOT_FOUND, and the command is dropped. `retry` is the exception: on a task that has ended it starts the attempt `<task id>-a2` (`-a3` and so on) from the issue as it is now, writing the row after the start as for any task. On a task that still runs it does nothing. Later commands go to the latest attempt.
 - **Failures.** An issue that fails does not stop the next one. The poll fails after the last issue, like a repo that cannot be read.
 
-`status` is the signal `report_status`. The task posts the answer itself, through `post_comment` with the key `status:<n>`, where n counts the requests in the workflow state and in the memo across a Continue-As-New.
+`status` is the signal `report_status`. The task posts the answer itself, through `post_comment` with the key `status:<n>`, where n counts the requests in the workflow state and in the memo across a Continue-As-New. A hand-over waits up to 30 seconds for a status comment that is still being posted, then drops it, and a cancel ends that wait at once. The count is already in the memo, so the next status comment gets a new key.
 
 **Failures.** A repo that GitHub cannot read is logged, and the poll goes on with the next repo. At the end the activity fails, so a broken repo shows as a failed poll in the Temporal UI for as long as it is broken, without stopping the repos that work.
 

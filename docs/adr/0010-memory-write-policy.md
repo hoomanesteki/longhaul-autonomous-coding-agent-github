@@ -68,6 +68,12 @@ A vector has 384 numbers and unit length, and vectors are compared by cosine dis
 
 fastembed is an optional extra named `memory`, imported only inside `LocalEmbedder`. `uv sync --locked`, which CI runs, does not install it, and no unit, integration or end-to-end test needs it. The opt-in test `tests/slow/test_local_embedder.py` runs the real model and skips with a message when the extra is missing.
 
+### Retrieval into the prompt
+
+`load_memory` (LH-604) writes the memory block of a task once, after `prepare_workspace`, and the workflow hands the same blob to every model turn, so the system prompt is the same bytes for the whole task (ADR-0013). It holds the approved commands, the five approved lessons, pitfalls and conventions nearest to the issue, and the repo map, in 4,000 tokens at most. The store is asked for approved items only, and `render_memory_block` drops any item that is not approved, not of the repo or not of the asked kind, so invariant I7 does not rest on one filter. The map is the part that is cut when the block is full. Each note is one line, and the notes sit in a fence that is longer than any run of backticks inside it, so a note cannot close the fence and read as prose.
+
+`PgMemoryStore.search` takes `kinds`, so that the lessons of a repo do not compete with its repo maps and commands for the five places. The workflow keeps the ref in `acts.RunState`, a subclass of `CarryState` with one more field, because `CarryState` is a shared contract. A worker with `memory.enabled` off builds no store, and the block stays empty.
+
 ### The index
 
 The column is `vector(384)`, with an HNSW index on `vector_cosine_ops`, which matches the `<=>` operator that retrieval orders by. The build parameters are pgvector's defaults, `m = 16` and `ef_construction = 64`, written out in the migration so that a new default cannot change the index. The plan allowed ivfflat if the pinned pgvector lacked HNSW. pgvector 0.8.0 has it (since 0.5.0), so ADR-0002 needs no note. HNSW also needs no rows to build from, where ivfflat places its lists from the rows that exist when the index is built.
@@ -83,7 +89,7 @@ The column is `vector(384)`, with an HNSW index on `vector_cosine_ops`, which ma
 **Harder**
 
 - Learning is slower. A lesson waits for a merge, or for a person when the task never opened a pull request.
-- The vectors of the two embedders cannot be compared, and nothing in the table records which one wrote a row. A database holds the vectors of one embedder, and a real deployment uses `LocalEmbedder`: `HashEmbedder` would match lessons by shared words only. Changing the embedder or the model means embedding every row again.
+- The vectors of the two embedders cannot be compared, and nothing in the table records which one wrote a row. A database holds the vectors of one embedder, and a real deployment uses `LocalEmbedder`: `HashEmbedder` would match lessons by shared words only. Changing the embedder or the model means embedding every row again. The worker checks this when it starts (`PgMemoryStore.check_embedder`, LH-604). It embeds the text of up to five stored notes again and compares each new vector with the stored one: the same embedder gives the same vector, and another one gives an unrelated vector. A table that fails the check stops the worker with a message, and an empty table passes. The check is a sample and not an audit, and it keeps the table free of a new column and a migration.
 - The width is part of the column type. An embedder of another width fails on insert instead of storing vectors that cannot be compared, and a new width needs a migration and a re-embed.
 - The first `LocalEmbedder` call needs the network, unless the model file is already in the cache folder. The default folder sits under the system temp directory, which a reboot may clear. A worker should set `FASTEMBED_CACHE_PATH` to a folder that stays, or bake the file into its image.
 - The extra brings `httpx` into the environment through `huggingface-hub`. ADR-0002 notes that the base install has only `httpx2`.

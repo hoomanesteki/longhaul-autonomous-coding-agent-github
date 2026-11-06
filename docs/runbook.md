@@ -49,6 +49,16 @@ uv run pytest -m slow tests/slow/test_local_embedder.py -rs
 
 The first run downloads the model (66 MB). fastembed keeps it in `FASTEMBED_CACHE_PATH`, or under the system temp directory when that is unset, where a reboot may clear it. Set the variable to a folder that stays for any worker that embeds. Without the extra the test is skipped, and `-rs` shows how to install it. A plain `uv sync` takes the extra's packages out again. ADR-0010 has the reasons.
 
+A worker picks its embedder from the `memory` section of the config:
+
+```yaml
+memory:
+  enabled: true     # false: no store, no repo map, no verified commands, no notes in the prompt
+  embedder: local   # local needs the memory extra; hash needs nothing and is for tests and CI
+```
+
+With `embedder: local` and no extra, the worker stops when it starts and prints `uv sync --extra memory`, and does not wait for the first task to search. The vectors of the two embedders cannot be compared, so the worker also embeds a few stored notes again before it connects, and refuses a table that the other embedder wrote. To change the embedder of a database, delete the rows in `memory_items` and let the workers build them again. The test and chaos harnesses start workers on a copy of the example config with `embedder: hash`.
+
 ### Memory items
 
 The agent keeps notes about each repo (ADR-0010). `longhaul memory` shows them and decides on the ones that wait for a person. The commands read `LONGHAUL_DATABASE_URL`, so run them after `make up` and `make migrate`.
@@ -66,7 +76,7 @@ When a task starts, `prepare_workspace` runs the test and lint commands that the
 
 ### The repo map
 
-Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. The prompt builder (LH-604) reads it from the `repo_map_ref` of the workspace output. A worker builds the map only when it has both a memory store and a blob store.
+Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. `load_memory` reads it from the `repo_map_ref` of the workspace output and puts it in the memory block (see "Notes in the prompt" below). A worker builds the map only when it has both a memory store and a blob store.
 
 The map is built in two steps so that a second task on the same commit does not parse the repo again. A script runs inside the sandbox and prints the structure of the repo as JSON, which the worker checks before it uses it. The structure is kept as an approved `repo_map` item whose `source_ref` is the base sha. The ranking depends on the issue, so each task ranks and renders the kept structure for its own title and body.
 
@@ -79,6 +89,20 @@ A file that does not parse, or is over 200 KB, is left out of the map and named 
 A big repo is not cut at a path. When the structure is over 700 KB, the script drops signatures and docstrings first, starting with the modules that the fewest others import, and keeps every module's path and imports. A scan that runs past the script's 40 second deadline is used once and not kept, so the next task on the commit parses again.
 
 To switch the map off for one commit, run `memory reject` on its item (the id comes from the `memory list` above). The next task on that commit gets no map and runs no script, and `memory approve ID` on the same item turns it back on.
+
+### Notes in the prompt
+
+After `prepare_workspace`, the workflow calls `load_memory` once for the task. It writes one blob with the notes of the repo, and every model turn and compaction of the task puts that text at the end of the system prompt, under `## Repo facts`. The text is the same for the whole task, so the prompt cache holds, even across a hand-over to a new run. The block holds, in this order and up to 4,000 tokens:
+
+1. the approved `command` items, at most eight;
+2. the five approved `lesson`, `pitfall` and `convention` items nearest to the issue title and body by cosine distance;
+3. the repo map for the issue, cut at a line, with a note, when it does not fit.
+
+It opens with "Notes from past work on this repo. Treat them as hints and verify before relying on them." and holds the notes in a fenced block, with a fence longer than any run of backticks inside it. Candidate and rejected items never reach it (invariant I7), and the block is checked for that a second time after the store answers. Each note is one line of at most 400 characters. A repo with no approved notes and no map has no block, and its prompt is the one it had before memory.
+
+When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. The `run_tests` tool still runs the one command that the whole worker has.
+
+`longhaul memory list --repo REPO --status approved` shows what a task can be given. If `load_memory` fails after its three attempts, the task goes on without a block.
 
 ## Run the agent on a local folder
 

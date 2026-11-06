@@ -721,3 +721,38 @@ def test_the_example_env_file_names_the_metrics_settings() -> None:
     example = _env_example()
     assert example["LONGHAUL_METRICS_PORT"] == "9464"
     assert example["LONGHAUL_METRICS_HOST"] == "127.0.0.1"
+
+
+# ---------- LH-904: a GitHub other than github.com ----------
+def test_the_github_endpoints_are_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_GITHUB_API_URL", raising=False)
+    monkeypatch.delenv("LONGHAUL_GITHUB_CLONE_BASE", raising=False)
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url is None
+    assert settings.github_clone_base is None
+
+
+def test_the_github_endpoints_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "http://127.0.0.1:8099")
+    monkeypatch.setenv("LONGHAUL_GITHUB_CLONE_BASE", "/tmp/remotes")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url == "http://127.0.0.1:8099"
+    assert settings.github_clone_base == "/tmp/remotes"
+
+
+def test_blank_github_endpoints_count_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "")
+    monkeypatch.setenv("LONGHAUL_GITHUB_CLONE_BASE", "")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url is None
+    assert settings.github_clone_base is None
+
+
+def test_env_example_lists_the_github_endpoints() -> None:
+    example = _env_example()
+
+    assert example["LONGHAUL_GITHUB_API_URL"] == ""
+    assert example["LONGHAUL_GITHUB_CLONE_BASE"] == ""

@@ -12,7 +12,7 @@ from tests.fakes.calc_remote import REPO, TOKEN, Github, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub
 
 from longhaul.github.client import GitHubFatal, GitHubRetryable, PatAuth
-from longhaul.github.remote import GitHubRemote, github_clone_url
+from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_url
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
@@ -181,3 +181,21 @@ async def test_every_call_asks_the_auth_again_so_an_expiring_token_renews() -> N
 def test_the_repr_shows_no_token() -> None:
     remote = GitHubRemote(Canned({}, {}), PatAuth(TOKEN))
     assert TOKEN not in repr(remote)
+
+
+# ---------- LH-904: a clone base other than github.com ----------
+def test_a_clone_base_gives_every_repo_an_address_under_it() -> None:
+    clone = clone_url_under("/tmp/remotes/")
+
+    assert clone("acme/calc") == "/tmp/remotes/acme/calc.git"
+    assert clone_url_under("http://git.internal:3000")("acme/calc") == (
+        "http://git.internal:3000/acme/calc.git"
+    )
+
+
+def test_a_remote_built_on_a_clone_base_checks_the_repo_name_first() -> None:
+    remote = GitHubRemote(Canned({}, {}), PatAuth(TOKEN), clone_url=clone_url_under("/r"))
+
+    assert remote.clone_url("acme/calc") == "/r/acme/calc.git"
+    with pytest.raises(ValueError, match="owner/name"):
+        remote.clone_url("../calc")

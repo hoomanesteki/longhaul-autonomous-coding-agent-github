@@ -279,6 +279,42 @@ async def test_a_worker_with_a_github_token_can_prepare_github_repos(tmp_path: P
     assert parts.github is not None and parts.github._http.is_closed
 
 
+async def test_a_worker_talks_to_the_github_it_is_told_about(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            github_api_url="http://127.0.0.1:8099",
+            github_clone_base=str(tmp_path / "remotes"),
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "http://127.0.0.1:8099"
+        remote = _workspace_of(parts)._github
+        assert remote.clone_url("acme/calc") == f"{tmp_path / 'remotes'}/acme/calc.git"
+    finally:
+        await parts.close()
+
+
+async def test_a_worker_with_no_endpoints_set_talks_to_github_com(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "https://api.github.com"
+        assert _workspace_of(parts)._github.clone_url("acme/calc") == (
+            "https://github.com/acme/calc.git"
+        )
+    finally:
+        await parts.close()
+
+
 def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert _workspace_of(parts)._github is None

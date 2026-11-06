@@ -161,7 +161,7 @@ uv run longhaul run \
 | Command | What it does |
 |---|---|
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
-| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. |
+| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
 | `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow and, once it ended, the outcome. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
 
@@ -195,6 +195,15 @@ SELECT ts, payload FROM events WHERE task_id = 'lh-local-calc-1a2b3c4d' AND type
 ```
 
 The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` and a `results.json` for each turn. `longhaul.context.log.read_log(blobs, task_id)` joins them into one transcript. It is never elided or compacted, so a report can say what the agent did in turn 3 of 150. The view of a task is the `transcript_ref` of the workflow state, under `tasks/<task id>/turns/`.
+
+A task that has to compact on a short script can ask for a smaller window with `run --window N`. The number goes to the worker in the workflow memo, and every activity that counts tokens uses it in place of `window_tokens`. The cap for one tool result shrinks with it, to 1/32 of the window at most (250 tokens in a window of 8,000), so that a window this small has room for the results of a turn. The prompt and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.
+
+The long-task fixture `tests/fixtures/repos/longlog` runs the context system under this pressure. It has twelve modules with one planted bug each, and its test command prints 5,000 lines. `tests/fixtures/scripts/longlog.yaml` fixes one module in five turns, 62 turns in all, and `compactor.yaml` answers the compactor with notes that list the modules fixed so far. The test `tests/e2e/test_long_task.py::test_longlog_many_compactions` runs the command below with `compact_at` 0.6 and `keep_recent_turns` 4, and checks that all twelve modules are fixed, that the task compacted at least three times and that no request took 85 percent of the window. The run compacts five times, at turns 16, 26, 36, 46 and 56, and its fullest request takes 59 percent of the window. The test takes 2 to 5 minutes, depending on the load of the machine:
+
+```bash
+uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtures/repos/longlog/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/longlog.yaml --window 8000
+```
 
 ### The prompt cache
 

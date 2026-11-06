@@ -20,6 +20,7 @@ import pytest
 
 from longhaul.agent.workspace import (
     IGNORE_FILE,
+    IMAGE_FILE,
     IgnoreRules,
     LocalWorkspace,
     SetupCommandError,
@@ -28,6 +29,7 @@ from longhaul.agent.workspace import (
     copy_source,
     default_setup_command,
     prepare_local_workspace,
+    read_image_file,
 )
 from longhaul.contracts import ExecResult, Sandbox, SandboxLimits
 from longhaul.sandbox.local_manager import FakeSandbox
@@ -765,3 +767,45 @@ async def test_a_cleanup_that_fails_does_not_hide_the_first_error(
     ):
         await prepare(manager, source, setup_command="exit 1")
     assert "cleanup broke" in caplog.text
+
+
+# ---------- the image a folder asks for (LH-902) ----------
+def test_a_folder_without_an_image_file_asks_for_no_image(tmp_path: Path) -> None:
+    assert read_image_file(make_source(tmp_path, {"a.py": "x = 1\n"})) is None
+
+
+def test_the_image_file_names_the_image_on_its_first_line(tmp_path: Path) -> None:
+    source = make_source(tmp_path, {IMAGE_FILE: "longhaul-swebench:django__django-1-abc\n"})
+
+    assert read_image_file(source) == "longhaul-swebench:django__django-1-abc"
+
+
+def test_an_image_file_with_text_around_the_name_is_read_without_it(tmp_path: Path) -> None:
+    source = make_source(tmp_path, {IMAGE_FILE: "\n  repo/name:1.2  \n\n"})
+
+    assert read_image_file(source) == "repo/name:1.2"
+
+
+@pytest.mark.parametrize(
+    "text", ["", "\n\n", "-v", "--privileged", "a b", "a\tb", "name;rm -rf /", "x" * 300]
+)
+def test_an_image_file_that_does_not_hold_one_image_name_is_refused(
+    tmp_path: Path, text: str
+) -> None:
+    source = make_source(tmp_path, {IMAGE_FILE: text})
+
+    with pytest.raises(WorkspaceError, match=IMAGE_FILE):
+        read_image_file(source)
+
+
+def test_an_image_file_with_a_second_line_is_refused(tmp_path: Path) -> None:
+    source = make_source(tmp_path, {IMAGE_FILE: "one:1\ntwo:2\n"})
+
+    with pytest.raises(WorkspaceError, match="one image"):
+        read_image_file(source)
+
+
+def test_the_image_file_is_not_copied_into_the_sandbox(tmp_path: Path) -> None:
+    source = make_source(tmp_path, {"a.py": "x = 1\n", IMAGE_FILE: "repo/name:1\n"})
+
+    assert [f.path for f in collect_source_files(source)] == ["a.py"]

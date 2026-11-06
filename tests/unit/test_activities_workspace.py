@@ -29,7 +29,12 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.calc_remote import REPO, TOKEN, Github, commit_on, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub
 
-from longhaul.agent.workspace import SetupCommandError, collect_source_files, default_setup_command
+from longhaul.agent.workspace import (
+    IMAGE_FILE,
+    SetupCommandError,
+    collect_source_files,
+    default_setup_command,
+)
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints import git_store
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore
@@ -346,6 +351,40 @@ async def test_the_container_is_made_with_the_configured_image_limits_and_the_re
     assert created["mounts"] == rig.store.mounts(TASK)
 
 
+async def test_a_folder_that_names_an_image_gets_a_container_of_that_image(rig: Rig) -> None:
+    (rig.source / IMAGE_FILE).write_text("longhaul-swebench:inst-1\n", encoding="utf-8")
+
+    out = await rig.prepare()
+
+    (created,) = rig.host.created
+    assert created["image"] == "longhaul-swebench:inst-1"
+    # The file is a note to the worker. It is not part of the repo the agent works on.
+    box = rig.box(out.sandbox_id)
+    assert not (box.root / IMAGE_FILE).exists()
+    assert await sh(box, "git status --porcelain") == ""
+    assert IMAGE_FILE not in rig.bare("ls-tree", "-r", "--name-only", f"refs/heads/{BRANCH}")
+
+
+async def test_a_folder_that_names_no_image_gets_the_image_of_the_worker(rig: Rig) -> None:
+    await rig.prepare()
+
+    assert [c["image"] for c in rig.host.created] == [IMAGE]
+
+
+async def test_an_image_name_that_is_not_one_name_is_refused_without_a_retry_and_touches_nothing(
+    rig: Rig,
+) -> None:
+    (rig.source / IMAGE_FILE).write_text("--privileged\n", encoding="utf-8")
+
+    with pytest.raises(ApplicationError) as refused:
+        await rig.prepare()
+
+    assert refused.value.non_retryable
+    assert IMAGE_FILE in str(refused.value)
+    assert rig.host.created == []
+    assert not rig.store.has_repo(TASK)
+
+
 async def test_the_setup_runs_with_the_network_on_and_the_network_is_cut_after_it(
     rig: Rig,
 ) -> None:
@@ -559,6 +598,28 @@ async def test_the_new_container_is_made_and_set_up_like_the_first(rig: Rig) -> 
     assert setup_runs(box) == 2  # once for the first container and once for this one
     assert rig.host.network[new_id] is False
     assert rig.host.log[-2:] == [f"create {new_id}", f"network {new_id} off"]
+
+
+async def test_the_new_container_is_made_from_the_image_the_folder_names(rig: Rig) -> None:
+    (rig.source / IMAGE_FILE).write_text("longhaul-swebench:inst-1\n", encoding="utf-8")
+    out = await rig.prepare()
+    await rig.host.rm_f(out.sandbox_id)
+
+    await rig.ensure(out.sandbox_id, out.head_sha)
+
+    assert [c["image"] for c in rig.host.created] == ["longhaul-swebench:inst-1"] * 2
+
+
+async def test_a_task_whose_folder_is_gone_is_recreated_from_the_image_of_the_worker(
+    rig: Rig,
+) -> None:
+    out = await rig.prepare()
+    await rig.host.rm_f(out.sandbox_id)
+    shutil.rmtree(rig.source)
+
+    await rig.ensure(out.sandbox_id, out.head_sha)
+
+    assert [c["image"] for c in rig.host.created] == [IMAGE, IMAGE]
 
 
 async def test_work_on_the_surviving_volume_is_reset_to_head_sha_and_the_venv_is_kept(

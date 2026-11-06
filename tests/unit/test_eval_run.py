@@ -79,10 +79,11 @@ def test_every_flag_of_the_plan_is_accepted(tmp_path: Path) -> None:
     assert (options.provider, options.script, options.results_dir) == ("scripted", script, tmp_path)
 
 
-def test_the_swebench_set_is_not_there_yet(capsys: pytest.CaptureFixture[str]) -> None:
-    err = refuses(capsys, ["--set", "swebench", "--config", "full", "--run-id", "try1"])
-    assert "swebench" in err
-    assert "LH-902" in err
+def test_the_swebench_set_is_accepted() -> None:
+    options = run.parse_args(["--set", "swebench", "--config", "full", "--run-id", "try1"])
+
+    assert options.task_set == "swebench"
+    assert options.config == "full"
 
 
 @pytest.mark.parametrize("config", ["naive", "single_shot"])
@@ -640,6 +641,7 @@ def run_context(tmp_path: Path, *extra: str) -> run.RunContext:
         model="claude-sonnet-5-5",
         commit="f" * 40,
         folder=tmp_path,
+        driver=None,
     )
 
 
@@ -820,3 +822,43 @@ def test_a_run_with_the_defaults_has_nothing_to_note(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main_with_a_stub(monkeypatch, capsys) == ""
+
+
+# ---------- the SWE-bench set (LH-902) ----------
+def test_the_swebench_tasks_are_the_first_instances_of_the_subset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from eval.swebench import adapter
+
+    asked: list[int | None] = []
+    found = [object(), object()]
+
+    def select_instances(limit: int | None) -> list[object]:
+        asked.append(limit)
+        return found
+
+    monkeypatch.setattr(adapter, "select_instances", select_instances)
+    options = run.parse_args(
+        ["--set", "swebench", "--config", "full", "--run-id", "try1", "--limit", "2"]
+    )
+
+    assert run.select_tasks(options) == found
+    assert asked == [2]
+
+
+def test_the_custom_set_still_comes_from_tasks_yaml() -> None:
+    options = run.parse_args(
+        ["--set", "custom", "--config", "full", "--run-id", "try1", "--limit", "2"]
+    )
+
+    assert [t.id for t in run.select_tasks(options)] == [
+        t.id for t in custom_tasks.load_tasks()[:2]
+    ]
+
+
+def test_the_swebench_set_has_its_own_dollar_cap_and_the_same_turn_and_time_caps() -> None:
+    # Plan section 8.4: task_usd 4 on SWE-bench and 2 on the custom set.
+    assert run.SWEBENCH_BUDGETS.task_usd == 4.0
+    assert run.CUSTOM_BUDGETS.task_usd == 2.0
+    assert run.SWEBENCH_BUDGETS.task_turns == run.CUSTOM_BUDGETS.task_turns == 150
+    assert run.SWEBENCH_BUDGETS.task_wall_minutes == run.CUSTOM_BUDGETS.task_wall_minutes == 120

@@ -195,3 +195,66 @@ async def test_the_same_event_twice_is_two_events() -> None:
     await recorder.record_event("lh-x", "sandbox_recreated", {})
     await recorder.record_event("lh-x", "sandbox_recreated", {})
     assert len(recorder.events) == 2
+
+
+# ---------- the last call of a tool (LH-306) ----------
+def named(call_id: str, name: str, turn_index: int, task_id: str = "lh-x") -> ToolCallRecord:
+    return ToolCallRecord(
+        id=call_id, task_id=task_id, turn_index=turn_index, name=name, ok=True, exit_code=0
+    )
+
+
+async def test_the_last_call_of_a_tool_is_the_one_of_the_latest_turn() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("t1", "run_tests", 1))
+    await recorder.record_tool_call(named("t3", "run_tests", 3))
+    await recorder.record_tool_call(named("t2", "run_tests", 2))
+    await recorder.record_tool_call(named("t4", "read_file", 4))
+
+    found = await recorder.last_tool_call("lh-x", "run_tests")
+
+    assert found is not None
+    assert found.id == "t3"
+
+
+async def test_two_calls_in_one_turn_give_the_one_that_was_recorded_last() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("first", "run_tests", 5))
+    await recorder.record_tool_call(named("second", "run_tests", 5))
+
+    found = await recorder.last_tool_call("lh-x", "run_tests")
+
+    assert found is not None
+    assert found.id == "second"
+
+
+async def test_no_call_of_the_tool_gives_none() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("t1", "read_file", 1))
+    await recorder.record_tool_call(named("t2", "run_tests", 1, task_id="lh-other"))
+
+    assert await recorder.last_tool_call("lh-x", "run_tests") is None
+
+
+# ---------- the share of the window (LH-406) ----------
+async def test_the_largest_share_of_the_window_is_kept() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.30)
+    await recorder.record_request_fraction("lh-x", 0.55)
+    await recorder.record_request_fraction("lh-x", 0.40)  # a smaller request changes nothing
+    assert recorder.max_fractions == {"lh-x": 0.55}
+
+
+async def test_the_share_is_kept_for_each_task() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-y", 0.20)
+    assert recorder.max_fractions == {"lh-x": 0.50, "lh-y": 0.20}
+
+
+async def test_recording_the_same_share_again_changes_nothing() -> None:
+    # An activity that runs again records what it recorded before.
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-x", 0.50)
+    assert recorder.max_fractions == {"lh-x": 0.50}

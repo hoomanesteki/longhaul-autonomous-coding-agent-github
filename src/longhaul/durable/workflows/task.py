@@ -1,7 +1,8 @@
 """TaskWorkflow: the one durable owner of a task.
 
 It holds the task's CarryState, answers `status()`, takes the signals that steer a task, and
-drives the phases through activities: PREPARING, a CODING loop, then DONE. All I/O happens in
+drives the phases through activities: PREPARING, a CODING loop, then DONE. The task of an issue
+goes through DELIVERING before DONE (see "A task of an issue" below). All I/O happens in
 activities, which this module calls by name through longhaul.durable.acts. It imports no I/O
 library (invariant I1, checked by tests/unit/test_invariants.py), reads time only through
 workflow.now() (it needs none yet), and uses no random numbers.
@@ -37,11 +38,31 @@ has no tool_use without a tool_result. A run that starts with a sandbox id, beca
 run prepared it and handed over (see Continue-As-New below), calls `ensure_sandbox` before its
 first turn, since the container may be gone by then.
 
+A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
+(lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
+
+1. Its first activity is the pickup: the "Picked up" comment and the `longhaul:working` label on
+   the issue, both written through github/side_effects.py with stable keys. A run that starts
+   with a sandbox id, because an earlier run prepared it and handed over, has been picked up
+   already and does not repeat it. The keys would make a repeat harmless, but each one costs an
+   activity and a place in the history.
+2. When the model calls `finish`, the phase becomes DELIVERING and the task is not over. The
+   `build_pr_branch` activity makes the pull request branch, and `deliver` pushes it and opens
+   a draft pull request. The task then swaps the label (`longhaul:working` out, `longhaul:pr-open`
+   in) and ends with PR_OPENED carrying the URL. `status()` shows no outcome until then.
+3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
+   because GitHub refuses a pull request with no commit.
+
+Pause and resume (Phases 5 and 7) add and remove `longhaul:needs-human` through `_needs_human`
+and `_human_done`, which are here for them. Nothing calls them yet. The labels of a task that
+ends any other way (an error, a cancel) are left alone until LH-507.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
-- the model calls `finish` with a summary: PR_OPENED with the model's summary and no pr_url, since
-  opening the pull request is Phase 3 work. This is the same outcome the in-process loop returns;
+- the model calls `finish` with a summary: PR_OPENED with the model's summary. A local task has
+  no pull request and so no pr_url, which is the outcome the in-process loop returns too. The
+  task of an issue has the URL of its pull request;
 - a `cancel` signal: CANCELLED, after a `cleanup` activity;
 - `task_turns` plus the turns added by `add_budget` pass: ERROR "turn limit";
 - a tool call finds its sandbox gone more often than it may: ERROR "sandbox lost";
@@ -74,6 +95,27 @@ context_too_long. The workflow then compacts with `forced=True`, which keeps the
 and the notes, and asks the turn again, once. It does not ask again when the compaction folded
 nothing, because the view would be the same. A second overflow in the same turn, or one with
 nothing to fold (the first turn has no view at all), ends the run with "context limit" as before.
+
+The end of a run is noted for the metrics (LH-704). Counting is I/O, so the workflow cannot do it.
+When run() ends, by any of the outcomes above or by an activity that failed for good, it calls
+the `record_event` local activity once with the type acts.OUTCOME_EVENT, and the worker counts the
+task as finished and no longer active. A hand-over to a new run (below) is not an end and makes no
+such call. The note is made after the cleanup of a cancel, outside `_call`, because `_call` stops
+at once when a cancel was requested. It is a record for people, like the hand-over event: a
+failure to write it is logged and the outcome stands. A run that Temporal itself ends, by a
+terminate or a timeout, never gets to make it, and its task stays among the active ones until the
+worker restarts.
+
+The context modes (LH-406). `context.mode` of the worker's config, or the mode a run asks for with
+`longhaul run --context-mode`, switches the tiers off for an ablation: `no_compaction` keeps tier 1
+and `none` has neither (longhaul.context.modes). The workflow cannot read the config, so a run's
+own mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
+and `compact`, which resolve it against the config, and it skips the `compact` call itself when the
+memo says the mode has no compaction. When the memo is empty the config decides, and the workflow
+asks as it always did: `compact` answers "unchanged" in a mode without compaction, and
+`_compact` reads that as nothing to fold. A prompt over the hard limit then ends the run with
+"context limit" at once, since there is nothing to relieve it with. The memo is read and no
+command is added, so the histories of runs before this story replay as they were.
 
 Continue-As-New (failure mode F12). A run keeps its history short by handing over to a new run of
 the same workflow id. After a turn that did not end the run, the workflow hands over when the
@@ -134,6 +176,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 # model that came from outside still works (ADR-0004, appendix section 1).
 with workflow.unsafe.imports_passed_through():
     from longhaul.agent import rules
+    from longhaul.context.modes import ContextMode
     from longhaul.context.tokens import Decision
     from longhaul.contracts import (
         BlobRef,
@@ -147,6 +190,7 @@ with workflow.unsafe.imports_passed_through():
         ToolResult,
     )
     from longhaul.durable import acts
+    from longhaul.github import lifecycle
 
 
 @dataclass(frozen=True)
@@ -169,6 +213,8 @@ def cancel_summary(by: str, reason: str) -> str:
 
 # The summary of the outcome when one tool call keeps finding its sandbox gone.
 SANDBOX_LOST = "sandbox lost"
+# The summary of the outcome of a task of an issue whose work changes no file.
+NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
@@ -197,6 +243,14 @@ class _SandboxLost(Exception):
         self.call_id = call_id
 
 
+def _error_type(err: FailureError) -> str:
+    """The type of the error that failed the run: an application error's type, else its class."""
+    cause = err.cause or err
+    if isinstance(cause, ApplicationError) and cause.type:
+        return cause.type
+    return type(cause).__name__
+
+
 def _is_sandbox_gone(err: ActivityError) -> bool:
     """True when a tool call failed because its container was not there.
 
@@ -204,6 +258,12 @@ def _is_sandbox_gone(err: ActivityError) -> bool:
     """
     cause = err.cause
     return isinstance(cause, ApplicationError) and cause.type == acts.SANDBOX_GONE
+
+
+def _has_nothing_to_deliver(err: ActivityError) -> bool:
+    """True when build_pr_branch failed because the work changes no file."""
+    cause = err.cause
+    return isinstance(cause, ApplicationError) and cause.type == acts.NOTHING_TO_DELIVER
 
 
 def _provider_error_kind(err: ActivityError) -> ProviderErrorKind | None:
@@ -287,10 +347,62 @@ class TaskWorkflow:
     async def run(self, state: CarryState) -> Outcome:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
+            outcome = await self._finish_the_task()
+        except FailureError as err:
+            # The workflow is about to fail. The task is over all the same, and its error type is
+            # all the note says: the message of a provider error can echo the request.
+            await self._note_outcome(
+                Outcome(kind=OutcomeKind.ERROR, summary=f"workflow failed: {_error_type(err)}")
+            )
+            raise
+        await self._note_outcome(outcome)
+        return outcome
+
+    async def _finish_the_task(self) -> Outcome:
+        try:
+            await self._pick_up()
             await self._prepare()
-            return await self._code()
+            outcome = await self._code()
+            if self.state.phase is Phase.DELIVERING:
+                outcome = await self._deliver(outcome)
+            return outcome
         except _CancelRequested:
             return await self._cancelled()
+
+    async def _pick_up(self) -> None:
+        """Tell the issue that the task has begun: the first activity of a task of an issue."""
+        state = self.state
+        if state.sandbox_id is not None or not lifecycle.is_github_task(state.spec):
+            return
+        state.phase = Phase.PREPARING
+        await self._call(acts.POST_COMMENT, lifecycle.pickup_comment(state.spec))
+        await self._label(lifecycle.on_pickup(state.spec))
+
+    async def _note_outcome(self, outcome: Outcome) -> None:
+        """Tell the worker that the task ended, so that it counts it (see the module docstring)."""
+        state = self.state
+        note = acts.RecordEventInput(
+            task_id=state.spec.task_id,
+            type=acts.OUTCOME_EVENT,
+            payload={
+                "kind": outcome.kind.value,
+                "repo": state.spec.repo,
+                "turns": state.turn_index,
+                "cost_usd": state.cost_usd,
+                "summary": outcome.summary[: acts.OUTCOME_SUMMARY_CHARS],
+            },
+        )
+        try:
+            await workflow.execute_local_activity(
+                acts.RECORD_EVENT.name,
+                note,
+                result_type=acts.RECORD_EVENT.result_type,
+                **acts.local_options(acts.RECORD_EVENT),
+            )
+        except FailureError as err:
+            workflow.logger.warning(
+                "outcome of task %s not recorded: %s", state.spec.task_id, err.cause or err
+            )
 
     async def _prepare(self) -> None:
         state = self.state
@@ -442,7 +554,7 @@ class TaskWorkflow:
         )
         state.turn_index = index + 1
         if ran.finish is not None:
-            return self._end(rules.finished(ran.finish), Phase.DONE)
+            return self._finish(rules.finished(ran.finish))
         await self._relieve(index, sampled.context_decision)
         return None
 
@@ -512,6 +624,7 @@ class TaskWorkflow:
                         paused_ref=paused_ref,
                         script_ref=self._script(),
                         window_tokens=self._window(),
+                        context_mode=self._context_mode(),
                     ),
                 )
             except ActivityError as err:
@@ -555,9 +668,12 @@ class TaskWorkflow:
         The compactor is paid for either way, so its cost is added before anything else. A view
         with nothing to fold, or one that a failed compactor left as it was, changes nothing and
         records no event. The failure of the activity, after its retries, fails the workflow
-        like any other activity does.
+        like any other activity does. A run whose mode has no compaction never calls it.
         """
         state = self.state
+        mode = self._context_mode()
+        if mode is not None and not mode.compacts:
+            return False
         if state.transcript_ref is None:
             return False  # nothing has been said yet, so there is nothing to fold
         done = await self._call(
@@ -571,6 +687,7 @@ class TaskWorkflow:
                 notes=state.notes,
                 forced=forced,
                 script_ref=self._script(),
+                context_mode=mode,
             ),
         )
         state.cost_usd += done.cost_usd
@@ -650,6 +767,69 @@ class TaskWorkflow:
             state.head_sha = result.post_sha
         return result
 
+    # ---------- delivery and labels ----------
+    def _finish(self, finished: Outcome) -> Outcome:
+        """The model finished. A local task is done. The task of an issue still has to deliver."""
+        if lifecycle.is_github_task(self.state.spec):
+            self.state.phase = Phase.DELIVERING  # run() delivers, and ends the task
+            return finished
+        return self._end(finished, Phase.DONE)
+
+    async def _deliver(self, finished: Outcome) -> Outcome:
+        """Open the draft pull request and move the label. Ends the task with its URL."""
+        state = self.state
+        issue = state.spec.issue_number
+        if state.head_sha is None or issue is None:
+            # Both are set for a task of an issue that has run. Asking again changes nothing.
+            raise ApplicationError(
+                "a pull request cannot be built: the task has no checkpoint or no issue",
+                non_retryable=True,
+            )
+        task_id, repo = state.spec.task_id, state.spec.repo
+        try:
+            built = await self._call(
+                acts.BUILD_PR_BRANCH,
+                acts.BuildPrBranchInput(
+                    task_id=task_id, repo=repo, summary=finished.summary, head_sha=state.head_sha
+                ),
+            )
+        except ActivityError as err:
+            if not _has_nothing_to_deliver(err):
+                raise
+            return self._end(rules.error(NOTHING_TO_DELIVER), Phase.FAILED)
+        pr_url = await self._call(
+            acts.DELIVER,
+            acts.DeliverInput(
+                task_id=task_id,
+                repo=repo,
+                issue_number=issue,
+                summary=finished.summary,
+                branch=built.branch,
+                base_branch=built.base_branch,
+                base_sha=built.base_sha,
+                head_sha=built.head_sha,
+                title=built.title,
+            ),
+        )
+        await self._label(lifecycle.on_pr_opened(state.spec))
+        done = Outcome(kind=OutcomeKind.PR_OPENED, pr_url=pr_url, summary=finished.summary)
+        return self._end(done, Phase.DONE)
+
+    async def _label(self, steps: list[lifecycle.LabelStep]) -> None:
+        """Run label changes in order, each as an idempotent activity."""
+        for step in steps:
+            await self._call(acts.ADD_LABEL if step.add else acts.REMOVE_LABEL, step.label)
+
+    async def _needs_human(self, pause: int) -> None:
+        """Ask for a person on the issue. For the pause of Phases 5 and 7: `pause` counts from 1."""
+        if lifecycle.is_github_task(self.state.spec):
+            await self._label(lifecycle.on_pause(self.state.spec, pause))
+
+    async def _human_done(self, pause: int) -> None:
+        """Take the request for a person back when the task resumes."""
+        if lifecycle.is_github_task(self.state.spec):
+            await self._label(lifecycle.on_resume(self.state.spec, pause))
+
     # ---------- cancel ----------
     async def _cancelled(self) -> Outcome:
         request = self.cancel_request
@@ -721,6 +901,10 @@ class TaskWorkflow:
         """The context window the run asked for, or None when the config of the worker decides."""
         tuning = self._tuning()
         return tuning.window_tokens if tuning is not None else None
+
+    def _context_mode(self) -> ContextMode | None:
+        """The context mode the run asked for, or None when the worker's config decides."""
+        return workflow.memo_value(acts.CONTEXT_MODE_MEMO_KEY, None, type_hint=ContextMode)
 
     def _sandbox_id(self) -> str:
         sandbox_id = self.state.sandbox_id

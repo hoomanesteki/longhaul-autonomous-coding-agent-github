@@ -19,6 +19,13 @@ call and drift from the ledger. The sum is rounded once instead. A task with no 
 local run, is not an error: its calls are on the ledger, and the total catches up at the first
 call after the row exists.
 
+The token totals of the task (LH-406) are set the same way, in the same statement, from the same
+rows: `input_tokens_total` is the input tokens plus the cache writes, `output_tokens_total` the
+output tokens and `cache_read_total` the cache reads. Because every one is the sum of the rows and
+no one is an increment, an activity that runs again cannot count a call twice. A call that it makes
+again is a call that was billed again, and has a row of its own. Calls of the compactor are rows
+like any other, so the totals say what a task cost to run, compaction included.
+
 `MemoryLedger` keeps the rows in a list for unit tests, and `NoLedger` records nothing, for a
 caller with no database.
 """
@@ -118,10 +125,31 @@ class SqlLedger:
             cache_write_tokens=usage.cache_write_tokens,
             usd=usd,
         )
-        total = (
-            select(func.coalesce(func.sum(CostLedgerRow.usd), 0))
+        # Grouped by task, so the update has a join condition. The row inserted just before it
+        # is in the group, which therefore always has the task's row to join to.
+        sums = (
+            select(
+                CostLedgerRow.task_id,
+                func.sum(CostLedgerRow.usd).label("usd"),
+                func.sum(CostLedgerRow.input_tokens + CostLedgerRow.cache_write_tokens).label(
+                    "fresh"
+                ),
+                func.sum(CostLedgerRow.output_tokens).label("output"),
+                func.sum(CostLedgerRow.cache_read_tokens).label("cached"),
+            )
             .where(CostLedgerRow.task_id == task_id)
-            .scalar_subquery()
+            .group_by(CostLedgerRow.task_id)
+            .subquery()
+        )
+        totals = (
+            update(Task)
+            .where(Task.id == sums.c.task_id)
+            .values(
+                cost_usd=sums.c.usd,
+                input_tokens_total=sums.c.fresh,
+                output_tokens_total=sums.c.output,
+                cache_read_total=sums.c.cached,
+            )
         )
         async with self._sessions.begin() as session:
             # The task row is locked first. Two calls of one task then take turns, and the
@@ -130,5 +158,5 @@ class SqlLedger:
             # total. A task with no row locks nothing, and the update below changes nothing.
             await session.execute(select(Task.id).where(Task.id == task_id).with_for_update())
             await session.execute(row)
-            await session.execute(update(Task).where(Task.id == task_id).values(cost_usd=total))
+            await session.execute(totals)
         return usd

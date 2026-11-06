@@ -9,6 +9,9 @@ Temporal test server, and tests/e2e/test_durable_run.py starts the real process.
 import asyncio
 import os
 import signal
+import socket
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +25,11 @@ from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts, worker
 from longhaul.github.client import GitHubClient
 from longhaul.github.remote import GitHubRemote
+from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.settings import EnvSettings, load_config
+from longhaul.telemetry import metrics
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -307,3 +312,171 @@ async def test_the_poller_and_the_clone_share_one_github_client(
     finally:
         await parts.close()
     assert all(client._http.is_closed for client in built)
+
+
+# ---------- GitHub delivery (LH-306) ----------
+async def test_a_worker_with_a_github_token_registers_the_github_activities(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        # Everything the workflow calls, for a task of an issue as well as for a local one.
+        assert names_of(parts) == sorted(act.name for act in (*acts.ALL, *acts.GITHUB))
+    finally:
+        await parts.close()
+
+
+def test_a_worker_without_a_github_token_registers_none_of_them(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    assert not {act.name for act in acts.GITHUB} & set(names_of(parts))
+
+
+async def test_the_github_writes_go_through_the_ledger_of_the_worker(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (writes,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "post_comment"
+        }
+        (delivery,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"
+        }
+        assert isinstance(writes._ledger, SqlEffectLedger)
+        assert delivery._ledger is writes._ledger
+        assert delivery._author == "longhaul <longhaul@users.noreply.github.com>"
+    finally:
+        await parts.close()
+
+
+async def test_the_commit_author_and_the_templates_come_from_the_settings(tmp_path: Path) -> None:
+    templates = tmp_path / "templates"
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            git_author="Ada <ada@example.com>",
+            templates_dir=templates,
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (delivery,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"
+        }
+        assert delivery._author == "Ada <ada@example.com>"
+        assert delivery._templates == templates
+    finally:
+        await parts.close()
+
+
+def test_a_commit_author_git_would_misread_stops_the_worker_before_it_starts(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(
+        tmp_path, github_token="github-token-for-tests", git_author="no address here"
+    )
+    with pytest.raises(ValueError, match="LONGHAUL_GIT_AUTHOR"):
+        worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
+
+
+# ---------- the metrics endpoint (LH-704) ----------
+class FakeParts:
+    """What build_parts returns, for a main() that connects to nothing."""
+
+    activities: list[Any] = []
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def scrape(port: int) -> str:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=10) as reply:
+        return str(reply.read().decode())
+
+
+@pytest.fixture
+def serving_endpoints(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+    """main() with its connections replaced. The servers it starts are collected for the test."""
+    monkeypatch.chdir(tmp_path)  # a .env in the folder must not change the settings
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", "0")
+    monkeypatch.setenv("LONGHAUL_METRICS_HOST", "127.0.0.1")
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(ROOT / "config" / "longhaul.example.yaml"))
+    monkeypatch.setattr(worker, "DockerSandboxManager", FakeManager)
+    monkeypatch.setattr(worker, "build_parts", lambda *args: FakeParts())
+    monkeypatch.setattr(worker, "install_signal_handlers", lambda stop: None)
+    servers: list[Any] = []
+    real = metrics.serve
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        servers.append(real(*args, **kwargs))
+        return servers[-1]
+
+    monkeypatch.setattr(worker.metrics, "serve", spy)
+    return servers
+
+
+async def test_the_worker_serves_its_metrics_while_it_runs_and_stops_them_after(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    seen: list[str] = []
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        return object()
+
+    async def serve(client: Any, queue: str, activities: Any, stop: asyncio.Event) -> None:
+        seen.append(scrape(serving_endpoints[0].port))
+
+    monkeypatch.setattr(worker, "connect", connect)
+    monkeypatch.setattr(worker, "serve", serve)
+
+    await worker.main()
+
+    assert "# TYPE longhaul_active_tasks gauge" in seen[0]
+    with pytest.raises(urllib.error.URLError):
+        scrape(serving_endpoints[0].port)
+
+
+async def test_the_endpoint_stops_when_the_worker_fails(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    async def connect(address: str, **kwargs: Any) -> object:
+        raise ConnectionError("temporal is down")
+
+    monkeypatch.setattr(worker, "connect", connect)
+
+    with pytest.raises(ConnectionError):
+        await worker.main()
+
+    with pytest.raises(urllib.error.URLError):
+        scrape(serving_endpoints[0].port)
+
+
+async def test_a_taken_metrics_port_stops_the_worker_before_it_connects(
+    monkeypatch: pytest.MonkeyPatch, serving_endpoints: list[Any]
+) -> None:
+    connected: list[str] = []
+
+    async def connect(address: str, **kwargs: Any) -> object:
+        connected.append(address)
+        return object()
+
+    monkeypatch.setattr(worker, "connect", connect)
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen()
+        monkeypatch.setenv("LONGHAUL_METRICS_PORT", str(taken.getsockname()[1]))
+        with pytest.raises(ValueError, match="LONGHAUL_METRICS_PORT"):
+            await worker.main()
+    assert connected == []

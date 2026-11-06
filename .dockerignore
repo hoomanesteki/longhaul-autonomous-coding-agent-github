@@ -1,5 +1,5 @@
 # The build context of docker/worker/Dockerfile is the repo root. It needs pyproject.toml,
-# uv.lock, src/ and config/, and nothing else.
+# uv.lock, src/, config/ and templates/, and nothing else.
 .git
 .github
 .venv

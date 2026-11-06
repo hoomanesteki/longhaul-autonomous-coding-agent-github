@@ -52,6 +52,9 @@ activities get the window in their input and use result_cap(), the cap of the wo
 of that window (context/tokens.py). `llm_turn` keeps room for the results of a turn by the same
 number, so the three have to agree.
 
+Each run that reached its tool is timed into longhaul_tool_duration_seconds (LH-704), the failing
+ones too. A call that found its sandbox gone never ran, and is not timed.
+
 A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
 finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
 again from the same `pre_sha`. The error is raised for a container that was gone before the
@@ -62,6 +65,7 @@ when any step fails and the sandbox is no longer there, the sandbox is the cause
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -93,6 +97,7 @@ from longhaul.contracts import (
 from longhaul.db.records import CheckpointRecord, Recorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import heartbeating, not_retried, small
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import tool_span
 from longhaul.tools.output import output_handle, store_output
 from longhaul.tools.registry import ToolRegistry
@@ -220,7 +225,9 @@ class ToolActivities:
                     turn_index=inp.turn_index,
                     arguments=call.input,
                 ) as span:
+                    began = time.monotonic()
                     result = await tool_step(self._registry, sandbox, call, ctx)
+                    self._time(call.name, time.monotonic() - began)
                     span.record(result)
                 post_sha = await self._save(sandbox, inp, call)
         except Exception as exc:
@@ -269,6 +276,13 @@ class ToolActivities:
                 CheckpointRecord(inp.task_id, post_sha, "tool", inp.turn_index)
             )
         return small(returned)
+
+    def _time(self, tool: str, seconds: float) -> None:
+        """Add a run to the duration histogram. The model chooses the name of the tool it calls,
+        so a name that is not in the registry is one label and not a new series for each.
+        """
+        known = self._registry.get(tool) is not None
+        metrics.current().observe_tool(tool if known else metrics.UNKNOWN, seconds)
 
     async def _sandbox(self, sandbox_id: str) -> Sandbox:
         sandbox = await self._sandboxes.get(sandbox_id)

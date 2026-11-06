@@ -26,6 +26,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -173,6 +174,9 @@ class Durable:
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.tmp_path / "ckpt"),
             LONGHAUL_CONFIG=str(CONFIG),
+            # Port 0 lets the system pick a free port for the metrics endpoint. The default is
+            # taken by the worker of a developer or of another test run on the same machine.
+            LONGHAUL_METRICS_PORT="0",
         )
         return env
 
@@ -222,6 +226,18 @@ class Durable:
             assert proc.poll() is None, f"the process ended first:\n{self.output_of(proc)}"
             time.sleep(0.2)
         pytest.fail(f"{text!r} did not appear in {seconds:.0f} s:\n{self.output_of(proc)}")
+
+    def metrics_of(self, worker: subprocess.Popen[str]) -> str:
+        """The /metrics text of a running worker, from the address it logged at its start.
+
+        The port is 0 in this environment, so the system chose it and the log is the only place
+        that says which.
+        """
+        self.wait_for_text(worker, "metrics on http://")
+        found = re.search(r"metrics on (http://\S+)", self.output_of(worker))
+        assert found, self.output_of(worker)
+        with urllib.request.urlopen(found.group(1), timeout=10) as reply:
+            return str(reply.read().decode())
 
     def task_id_of(self, proc: subprocess.Popen[str]) -> str:
         deadline = time.monotonic() + 120
@@ -384,6 +400,13 @@ def test_run_calc_durable(durable: Durable, tmp_path: Path) -> None:
     assert_the_reference_fix(output, tmp_path)
     assert snapshot(CALC) == before, "the source folder was changed"
     assert leftovers(task_id) == ([], [])
+
+    # The worker counted the run (LH-704): one task that ended with a pull request, five turns,
+    # and nothing left among the active tasks.
+    metrics = durable.metrics_of(worker)
+    assert 'longhaul_tasks_total{outcome="pr_opened",repo="local"} 1.0' in metrics, metrics
+    assert 'longhaul_turns_total{role="coder"} 5.0' in metrics, metrics
+    assert "longhaul_active_tasks 0.0" in metrics, metrics
 
 
 async def test_a_worker_stopped_with_sigint_mid_run_is_replaced_and_the_run_completes(

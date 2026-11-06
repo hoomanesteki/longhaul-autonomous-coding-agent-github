@@ -77,6 +77,7 @@ from longhaul.agent.workspace import (
 from longhaul.blobs.base import BlobError, BlobStoreBase
 from longhaul.blobs.s3 import S3BlobStore
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -348,13 +349,22 @@ def run(
             "and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.",
         ),
     ] = None,
+    context_mode: Annotated[
+        ContextMode | None,
+        typer.Option(
+            "--context-mode",
+            help="Which context tiers this run uses: `full` (elide old tool outputs and compact), "
+            "`no_compaction` (elide only) or `none` (neither; the run ends with `context limit` "
+            "when the window is full). Default: context.mode of the worker's config.",
+        ),
+    ] = None,
 ) -> None:
     """Start a task on the durable stack and follow it until it ends.
 
     Prints the status each time it changes, then the outcome and the final diff. Exits 0 when
     the agent finishes and 2 when the run fails. Ctrl-C stops the command and not the task.
     """
-    options = DurableOptions(path, issue_file, provider, script, window)
+    options = DurableOptions(path, issue_file, provider, script, window, context_mode)
     try:
         code = asyncio.run(submit(options))
     except DURABLE_ERRORS as exc:
@@ -667,6 +677,8 @@ class DurableOptions:
     script: Path | None
     # The context window this run asks for, in tokens. None leaves it to the worker's config.
     window: int | None = None
+    # The mode this run asks for. None leaves it to the worker's config (LH-406).
+    context_mode: ContextMode | None = None
 
 
 async def open_client(settings: EnvSettings) -> Client:
@@ -740,13 +752,19 @@ async def submit(options: DurableOptions) -> int:
     client = await open_client(settings)
     tuning = acts.Tuning(window_tokens=options.window) if options.window is not None else None
     handle = await start_task(
-        client, spec, task_queue=settings.task_queue, script=script_ref, tuning=tuning
+        client,
+        spec,
+        task_queue=settings.task_queue,
+        script=script_ref,
+        tuning=tuning,
+        context_mode=options.context_mode,
     )
 
     who = "provider scripted" if script is not None else "provider of the worker"
     window = f", context window {options.window} tokens" if options.window is not None else ""
+    mode = f", context mode {options.context_mode.value}" if options.context_mode else ""
     typer.echo(f"task {task_id}: {title}")
-    typer.echo(f"repo {spec.repo}, {who}{window}, task queue {settings.task_queue}")
+    typer.echo(f"repo {spec.repo}, {who}{window}{mode}, task queue {settings.task_queue}")
     try:
         outcome = await follow(handle)
     except asyncio.CancelledError:

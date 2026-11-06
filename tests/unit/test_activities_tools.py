@@ -55,6 +55,7 @@ from longhaul.durable.activities.tools import (
     WorkspaceCheckpoints,
 )
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.telemetry.metrics import Metrics
 from longhaul.tools.output import ReadOutput, output_handle
 from longhaul.tools.registry import ToolRegistry, default_registry
 
@@ -1318,3 +1319,47 @@ async def test_the_log_keeps_the_text_that_the_model_was_given_for_a_long_output
     (logged,) = result_blocks((await read_log(rig.blobs, TASK))[0])
     assert "[output truncated: 5000 lines" in logged.content
     assert "handle out_a" in logged.content
+
+
+# ---------- the metrics of a call (LH-704) ----------
+async def test_a_tool_run_is_timed_under_the_name_of_its_tool(
+    sandbox: FakeSandbox, counters: Metrics
+) -> None:
+    rig = Rig(sandbox)
+    await rig.exec(exec_input("read_file", path="src/calc/__init__.py"))
+    await rig.exec(exec_input("read_file", call_id="toolu_2", path="src/calc/__init__.py"))
+    await rig.exec(exec_input("list_dir", call_id="toolu_3", path="."))
+
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_tool_duration_seconds_count", {"tool": "read_file"}) == 2
+    assert reading("longhaul_tool_duration_seconds_count", {"tool": "list_dir"}) == 1
+    assert reading("longhaul_tool_duration_seconds_sum", {"tool": "read_file"}) is not None
+
+
+async def test_a_call_that_failed_is_timed_too(sandbox: FakeSandbox, counters: Metrics) -> None:
+    # A failing test run is the slowest call there is, and the one an operator wants to see.
+    await Rig(sandbox).exec(exec_input("read_file", path="missing.py"))
+    count = counters.registry.get_sample_value(
+        "longhaul_tool_duration_seconds_count", {"tool": "read_file"}
+    )
+    assert count == 1
+
+
+async def test_a_name_that_is_not_a_tool_is_one_label_value(
+    sandbox: FakeSandbox, counters: Metrics
+) -> None:
+    # The model chooses the name. A label per invented name would grow without end.
+    rig = Rig(sandbox)
+    await rig.exec(exec_input("no_such_tool"))
+    await rig.exec(exec_input("another_made_up_tool", call_id="toolu_2"))
+    reading = counters.registry.get_sample_value
+    assert reading("longhaul_tool_duration_seconds_count", {"tool": "unknown"}) == 2
+
+
+async def test_a_sandbox_that_is_gone_is_not_timed(counters: Metrics) -> None:
+    with pytest.raises(ApplicationError):
+        await Rig(None).exec(exec_input("read_file", path="a.py"))
+    count = counters.registry.get_sample_value(
+        "longhaul_tool_duration_seconds_count", {"tool": "read_file"}
+    )
+    assert count is None

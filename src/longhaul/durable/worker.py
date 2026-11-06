@@ -25,6 +25,18 @@ What it is built from, and why each piece is what it is:
   local folders only and still recovers the sandbox of a GitHub task.
 * Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
   that is all a worker leaves behind, and it says where the kill landed.
+* With the token the worker also registers the GitHub writes (post_comment, add_label,
+  remove_label, create_pr) and the delivery (build_pr_branch, deliver), LH-306. They share one
+  idempotency ledger, the `side_effects` table on this worker's database, so a retry of any of
+  them finds the row of the attempt before. The commits of a pull request branch are made by
+  LONGHAUL_GIT_AUTHOR, and the body of the pull request comes from the templates folder
+  (LONGHAUL_TEMPLATES_DIR). Without the token none of them is registered, and a task of an
+  issue could not have been prepared in the first place.
+* Metrics are served at /metrics on LONGHAUL_METRICS_PORT (default 9464, which Prometheus in
+  docker/prometheus/prometheus.yml scrapes) from before the worker connects until it stops. The
+  activities update them (telemetry/metrics.py), and the interceptor that `serve` gives the
+  worker counts the retries of every activity. A port that is taken stops the worker at the
+  start, with the name of the setting to change.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
@@ -36,6 +48,9 @@ What it is built from, and why each piece is what it is:
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
   replies of a task taught. The compactor's calls are on the cost ledger one by one (I6).
+  `context.mode` can switch the tiers off (LH-406), and a run can name its own mode. A run that
+  names none takes the config of whichever worker runs each of its turns, so the workers of a
+  queue should share one `context.mode`.
 
 Stopping. SIGTERM and SIGINT start a graceful stop: the worker polls no more, waits up to
 GRACEFUL_SHUTDOWN_S for the activities that are running, and cancels the rest. A cancelled
@@ -70,6 +85,7 @@ from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
 from longhaul.durable.activities.context import ContextActivities
+from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
@@ -83,9 +99,12 @@ from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
 from longhaul.github.remote import GitHubRemote
+from longhaul.github.side_effects import SideEffectActivities
+from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
+from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
 
@@ -209,6 +228,23 @@ def build_parts(
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
+    delivery: list[Callable[..., Any]] = []
+    if github is not None and remote is not None:
+        # One ledger for the writes and the delivery, so that a key is held and recorded once.
+        effects = EffectLedger(sessions)
+        delivery = [
+            *SideEffectActivities(github, effects).activities,
+            *DeliveryActivities(
+                store,
+                remote,
+                github,
+                effects,
+                recorder,
+                blobs,
+                author=settings.git_author,
+                templates=templates_path(settings),
+            ).activities,
+        ]
     return WorkerParts(
         activities=[
             *llm.activities,
@@ -217,6 +253,7 @@ def build_parts(
             *workspace.activities,
             *events.activities,
             *poller.activities,
+            *delivery,
         ],
         blobs=blobs,
         store=store,
@@ -252,7 +289,7 @@ async def serve(
         activities=activities,
         workflow_runner=workflow_runner(),
         graceful_shutdown_timeout=grace,
-        interceptors=[ActivityLogInterceptor()],
+        interceptors=[ActivityLogInterceptor(), metrics.RetryCounter()],
     )
     running = asyncio.create_task(worker.run())
     stopping = asyncio.create_task(stop.wait())
@@ -275,7 +312,10 @@ async def main() -> None:
     tracer = setup_tracing(settings, cfg.telemetry)
     stop = asyncio.Event()
     install_signal_handlers(stop)  # before the connection, so an early stop is not a crash
+    endpoint: metrics.MetricsServer | None = None
     try:
+        endpoint = metrics.serve(settings.metrics_port, settings.metrics_host)
+        log.info("metrics on http://%s:%d/metrics", settings.metrics_host, endpoint.port)
         client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)
         log.info(
             "worker running on task queue %s at %s (namespace %s)",
@@ -286,6 +326,8 @@ async def main() -> None:
         await serve(client, settings.task_queue, parts.activities, stop)
         log.info("worker stopped")
     finally:
+        if endpoint is not None:
+            endpoint.stop()
         await parts.close()
         if tracer is not None:
             tracer.shutdown()  # sends the spans that are still queued

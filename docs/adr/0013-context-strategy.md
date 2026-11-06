@@ -54,6 +54,12 @@ The fourth exists because of tier 1. A stub replaces one more old result on ever
 
 **Hints survive a compaction.** `show_hints` shows a hint again when its text is not in the transcript. The compact activity moves the hint texts of the folded turns into the first message, where they stay through later compactions, so a compaction does not make every hint come back.
 
+**Switching the tiers off (LH-406).** `context.mode` is `full`, `no_compaction` (tier 1 only) or `none`, and a run can set its own with `longhaul run --context-mode`. The evaluation needs the two ablations to measure what each tier buys, and a switch in the product beats a second code path in the harness. The guard in front of the call is not a tier, so it stays on in every mode. Without tier 2 there is nothing to answer it with, so the run ends with `error` and the summary `context limit` and does not force a compaction. A forced compaction in `no_compaction` would make the ablation measure something other than tier 1.
+
+The mode reaches the two places that act on it. `llm_turn` and `compact` hold the config, so they resolve it there, and the mode of a run travels in the workflow memo and in their inputs, like the script of a scripted task. The workflow reads the memo only to skip a `compact` call that would do nothing. A run that asks for no mode has no memo entry, and then `compact` answers `unchanged` in a mode without compaction, which the workflow already reads as nothing to fold.
+
+The totals of a task (`tasks.input_tokens_total`, `output_tokens_total`, `cache_read_total`, `compactions`, `max_fraction`) are written by activities and are never counters. The token totals are the sum of the ledger rows, the compactions are the number of different `compaction` events, and the share of the window is a maximum. Each is the same after an activity runs twice. `input_tokens_total` includes cache writes, so that the three token totals do not overlap and the plan's formulas (tokens per task, cache ratio) can add and divide them.
+
 ## Consequences
 
 **Easier**

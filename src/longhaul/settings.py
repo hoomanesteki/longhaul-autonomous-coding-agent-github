@@ -13,8 +13,13 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import result_cap
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
+
+# The identity of the commits on a pull request branch, written the way git writes an author.
+# squash.parse_author checks it when the worker starts.
+DEFAULT_GIT_AUTHOR = "longhaul <longhaul@users.noreply.github.com>"
 
 # A key is secret-looking when its name contains one of these after it is lower-cased and
 # stripped of separators. Matching inside the flattened name catches camelCase (githubToken),
@@ -66,9 +71,19 @@ class EnvSettings(BaseSettings):
     # `record` on, the provider of the run is wrapped and saves every call into it.
     recordings_dir: Path | None = None
     record: bool = False
+    # Author and committer of the commits on a pull request branch (LH-306).
+    git_author: str = DEFAULT_GIT_AUTHOR
+    # Where the Jinja templates are, such as pr_body.md.j2. Unset means templates/ in the checkout.
+    templates_dir: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
     )
+    # Where the worker serves its Prometheus metrics (telemetry/metrics.py). The port is the one
+    # docker/prometheus/prometheus.yml scrapes. The host keeps the endpoint on this machine; a
+    # Prometheus in Docker on Linux reaches the host through the docker bridge and needs
+    # 0.0.0.0 (docs/runbook.md). Port 0 lets the system choose a free port.
+    metrics_port: int = Field(default=9464, ge=0, le=65535)
+    metrics_host: str = "127.0.0.1"
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.
@@ -86,6 +101,17 @@ def config_path(settings: EnvSettings) -> Path:
         return path
     bundled = PROJECT_ROOT / path
     return bundled if bundled.exists() else path
+
+
+def templates_path(settings: EnvSettings) -> Path:
+    """The folder of the Jinja templates: LONGHAUL_TEMPLATES_DIR, else templates/ of the checkout.
+
+    The worker image copies the folder next to the code and sets the variable, because an
+    installed package does not sit inside the checkout.
+    """
+    return (
+        settings.templates_dir if settings.templates_dir is not None else PROJECT_ROOT / "templates"
+    )
 
 
 class StrictModel(BaseModel):
@@ -141,6 +167,10 @@ class Context(StrictModel):
     keep_recent_turns: int
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
+    # Which of the two tiers run (LH-406). `full` is what the product does, and the default keeps
+    # every config written before the mode existed on that behavior. A run can name its own mode
+    # (`longhaul run --context-mode`), and that wins over this one.
+    mode: ContextMode = ContextMode.FULL
 
     def for_window(self, window_tokens: int | None) -> Self:
         """The policy of a run that asks for a window of its own (`longhaul run --window`).

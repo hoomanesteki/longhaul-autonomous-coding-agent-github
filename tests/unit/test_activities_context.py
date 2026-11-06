@@ -20,6 +20,7 @@ from longhaul.agent.turns import show_hints, validate_pairs
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.context.compact import NO_NOTES, NOTES_HEADING, NOTES_TOOL_NAME
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import count_request_chars
 from longhaul.contracts import (
     BlobRef,
@@ -135,12 +136,13 @@ class Rig:
         self,
         *steps: LLMResponse | ProviderError,
         ledger: MemoryLedger | None = None,
+        policy: Context = POLICY,
     ) -> None:
         self.provider = FakeProvider(*steps)
         self.blobs = MemoryBlobStore()
         self.ledger = ledger or MemoryLedger(PRICES)
         self.activities = ContextActivities(
-            self.provider, self.blobs, TOOLS, config_for, POLICY, ledger=self.ledger
+            self.provider, self.blobs, TOOLS, config_for, policy, ledger=self.ledger
         )
 
     async def run(self, inp: acts.CompactInput, *, attempt: int = 1) -> acts.CompactOutput:
@@ -553,3 +555,58 @@ def test_the_activity_list_is_the_compact_activity() -> None:
     activities = ContextActivities(FakeProvider(), MemoryBlobStore(), TOOLS, config_for, POLICY)
 
     assert [fn.__name__ for fn in activities.activities] == ["compact"]
+
+
+# ---------- the modes (LH-406) ----------
+def with_mode(mode: ContextMode) -> Context:
+    return POLICY.model_copy(update={"mode": mode})
+
+
+@pytest.mark.parametrize("forced", [False, True])
+@pytest.mark.parametrize("mode", [ContextMode.NO_COMPACTION, ContextMode.NONE])
+async def test_a_mode_without_compaction_leaves_the_view_alone(
+    mode: ContextMode, forced: bool
+) -> None:
+    # The workflow asks for a forced compaction after an overflow. In these modes the answer is
+    # that nothing changed, and the workflow then ends the run instead of asking again.
+    rig = Rig(notes_reply(), policy=with_mode(mode))
+    ref = await rig.put(rounds(8))
+
+    out = await rig.run(compact_input(ref, forced=forced))
+
+    assert out.status == "unchanged"
+    assert out.folded_turns == 0
+    assert out.transcript_ref == ref
+    assert out.notes is None
+    assert out.cost_usd == 0
+    assert rig.provider.calls == []  # the compactor was not called
+    assert rig.ledger.entries == []
+
+
+async def test_the_full_mode_compacts() -> None:
+    rig = Rig(notes_reply(), policy=with_mode(ContextMode.FULL))
+
+    out = await rig.run(compact_input(await rig.put(rounds(8))))
+
+    assert out.status == "ok"
+    assert out.folded_turns > 0
+
+
+@pytest.mark.parametrize(
+    ("config", "asked", "compacts"),
+    [
+        (ContextMode.NONE, ContextMode.FULL, True),
+        (ContextMode.NO_COMPACTION, ContextMode.FULL, True),
+        (ContextMode.FULL, ContextMode.NONE, False),
+        (ContextMode.FULL, ContextMode.NO_COMPACTION, False),
+    ],
+)
+async def test_the_mode_of_the_run_wins_over_the_config(
+    config: ContextMode, asked: ContextMode, compacts: bool
+) -> None:
+    rig = Rig(notes_reply(), policy=with_mode(config))
+
+    out = await rig.run(compact_input(await rig.put(rounds(8)), context_mode=asked))
+
+    assert (out.folded_turns > 0) is compacts
+    assert len(rig.provider.calls) == (1 if compacts else 0)

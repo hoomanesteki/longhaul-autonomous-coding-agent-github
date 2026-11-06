@@ -12,12 +12,15 @@ pytest runs these before it filters by `-m`, so a broken test cannot hide behind
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from functools import cache
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import pytest
+
+if TYPE_CHECKING:
+    from longhaul.telemetry.metrics import Metrics
 
 collect_ignore = ["fixtures"]
 
@@ -104,3 +107,17 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             + "\nPut each test file in one layer directory and give it a phase marker, for "
             "example pytestmark = [pytest.mark.unit, pytest.mark.phase1]."
         )
+
+
+@pytest.fixture
+def counters() -> Iterator[Metrics]:
+    """A fresh set of metrics for the code under test, so a test reads only what it made.
+
+    The activities update the process-wide metrics (telemetry/metrics.py). Without this, a count
+    would carry over from one test to the next.
+    """
+    from longhaul.telemetry import metrics
+
+    fresh = metrics.Metrics()
+    with metrics.configured(fresh):
+        yield fresh

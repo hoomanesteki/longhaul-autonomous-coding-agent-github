@@ -30,6 +30,7 @@ context:
   keep_recent_turns: 6
   elide_tool_outputs_after_turns: 4
   tool_output_max_tokens: 4000
+  mode: full              # full, no_compaction (tier 1 only) or none; a run can set its own
 loop:
   max_verify_rounds: 3
   continue_as_new_every_turns: 40

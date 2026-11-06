@@ -28,6 +28,10 @@ call that is billed and then lost to a failure of this activity is still on the 
 runs the activity again and the model is called again, which makes a second row with attempt 2.
 The cost on the ledger is the cost in `LlmTurnOutput` and in the `turns` row.
 
+Metrics (LH-704). A call that returns a reply counts as a turn and adds its cache ratio. A call
+that fails counts as an error of its kind. The cost counter follows the ledger: it grows by the
+price that `_charge` got back, for a call that failed after it was billed as well.
+
 Who answers. A task that carries a script (`script_ref`, from `longhaul run --script`) is answered
 by a scripted provider built from it, and any other task by the provider of the worker. A worker
 whose provider is the scripted one but that was given no script has none of its own, and refuses
@@ -56,6 +60,18 @@ The notes. After a compaction the notes are in the first message of the view, ri
 text, where context/compact.py `apply` put them. The system prompt does not change (D7), so the
 cached prefix survives a compaction as far as its first message. `LlmTurnInput.notes` is the
 workflow's own copy and is not used to build the request.
+
+The modes (LH-406). `context.mode` switches the tiers off for an ablation, and a run can name its
+own mode, which travels in `LlmTurnInput.context_mode` and wins over the config
+(longhaul.context.modes). Tier 1 runs in `full` and `no_compaction`. The decision is always "ok"
+unless the mode is `full`, so a workflow that acts on the decision never compacts in the others.
+The guard in front of the call stays on in every mode: it is how a task in `none` ends, at the hard
+limit, with the outcome "context limit" and not with a provider error.
+
+The share of the window. A request that passes the guard is going out, and the activity notes what
+share of the window it takes (`Recorder.record_request_fraction`), so that `tasks.max_fraction`
+holds the largest. That is the projection, which is the number the guard works with. A refused
+request is not noted, because it is not sent.
 
 Without a `context` policy the activity elides nothing, projects nothing and always says "ok".
 The log is written either way.
@@ -94,6 +110,7 @@ from longhaul.agent.turns import (
 from longhaul.blobs.base import BlobStoreBase, blob_key
 from longhaul.context.evict import elide_old_outputs
 from longhaul.context.log import added_messages, append_to_log
+from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import ContextBudget, Decision, TokenMeter, count_request_chars
 from longhaul.contracts import (
     BlobRef,
@@ -126,6 +143,7 @@ from longhaul.durable.activities.support import (
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
 from longhaul.settings import Context
+from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import chat_span
 from longhaul.tools.control import is_control_tool
 
@@ -229,11 +247,12 @@ class LlmActivities:
     async def _turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
         inp = small(inp)
         cfg = self._config_for(inp.role)
+        mode = self._mode(inp.context_mode)
         try:
             system = build_system_prompt(inp.role, inp.spec)
             stored = await self._transcript(inp)
             shown = show_hints(stored, inp.hints)
-            transcript = self._evict(shown)  # tier 1
+            transcript = self._evict(shown, mode)  # tier 1
             validate_pairs(transcript)  # a transcript the API would reject is not sent
         except ValueError as exc:  # also TranscriptError and a damaged blob
             raise not_retried(exc) from exc
@@ -243,6 +262,7 @@ class LlmActivities:
         request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         meter = self._meters.for_task(inp.task_id)
         projected = await self._preflight(provider, cfg, system, request, meter)
+        await self._note_share(inp.task_id, projected)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
         began = time.monotonic()
@@ -256,7 +276,7 @@ class LlmActivities:
             sent=transcript,
             paused=paused,
         )
-        out = await self._store(inp, resp, view, attempt, cost, system, meter, projected)
+        out = await self._store(inp, resp, view, attempt, cost, system, meter, projected, mode)
         await self._recorder.record_turn(
             TurnRecord(
                 task_id=inp.task_id,
@@ -290,11 +310,22 @@ class LlmActivities:
         """The script of the task if it has one, else the provider of the worker."""
         return await provider_for_task(self._scripts, self._provider, inp.task_id, inp.script_ref)
 
-    def _evict(self, transcript: list[Message]) -> list[Message]:
+    def _mode(self, asked: ContextMode | None) -> ContextMode:
+        """The mode of this call: the one the run asked for, else the one in the config."""
+        if asked is not None:
+            return asked
+        return self._context.mode if self._context is not None else ContextMode.FULL
+
+    def _evict(self, transcript: list[Message], mode: ContextMode) -> list[Message]:
         """Tier 1: the results older than the configured number of turns become stubs."""
-        if self._context is None:
+        if self._context is None or not mode.elides:
             return transcript
         return elide_old_outputs(transcript, self._context.elide_tool_outputs_after_turns)
+
+    async def _note_share(self, task_id: str, projected: int) -> None:
+        """Note the share of the window that the request about to be sent takes."""
+        if self._budget is not None:
+            await self._recorder.record_request_fraction(task_id, projected / self._budget.window)
 
     # ----- tier 2: the size of the request -----
     async def _preflight(
@@ -356,16 +387,18 @@ class LlmActivities:
         system: str,
         view: list[Message],
         calls: list[ToolCall],
+        mode: ContextMode,
     ) -> Decision:
         """What to do before the next turn, from the projection of the request after this one.
 
         That request has one more result elided than this one (eviction runs at the start of a
         turn, and the reply just made ages the others), and it holds the results of the calls
         just made. Those are not known yet, and each is at most tool_output_max_tokens, so that
-        is what is reserved. A `finish` call has no result to reserve for.
+        is what is reserved. A `finish` call has no result to reserve for. A mode without
+        compaction has nothing to do before the next turn, whatever the projection says.
         """
         policy, budget = self._context, self._budget
-        if policy is None or budget is None:
+        if policy is None or budget is None or not mode.compacts:
             return "ok"
         upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
         pending = sum(1 for call in calls if not is_control_tool(call.name))
@@ -406,8 +439,10 @@ class LlmActivities:
                     )
                 cost = await self._charge(inp, cfg.model, resp.usage)
                 span.record(resp, cost_usd=float(cost))
+            metrics.current().count_turn(inp.role, resp.usage)
             return resp, cost
         except ProviderError as exc:
+            metrics.current().count_llm_error(exc.kind.value)
             if exc.usage is not None:
                 # Billed, then failed: the call is on the ledger and in `turns` before the error
                 # goes up.
@@ -439,11 +474,14 @@ class LlmActivities:
         of those calls could be priced.
         """
         try:
-            return await self._ledger.record(
+            cost = await self._ledger.record(
                 inp.task_id, inp.spec.repo, model, inp.turn_index, activity.info().attempt, usage
             )
         except PricingError as exc:
             raise not_retried(exc) from exc
+        # The metric follows the ledger, so a call that is not on the ledger adds no cost.
+        metrics.current().add_cost(model, inp.spec.repo, float(cost))
+        return cost
 
     # ----- what came back -----
     async def _store(
@@ -456,6 +494,7 @@ class LlmActivities:
         system: str,
         meter: TokenMeter,
         projected: int,
+        mode: ContextMode,
     ) -> acts.LlmTurnOutput:
         paused = view.paused
         complete = rules.is_complete(resp)
@@ -500,7 +539,7 @@ class LlmActivities:
             raw_stop_reason=resp.raw_stop_reason,
             response_ref=response_ref,
             paused_ref=paused_ref,
-            context_decision=self._decide(meter, system, grown, calls),
+            context_decision=self._decide(meter, system, grown, calls, mode),
             request_tokens=projected,
         )
 

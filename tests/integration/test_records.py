@@ -409,3 +409,68 @@ async def test_events_keep_their_order_and_the_same_event_is_not_merged(
     await recorder.record_event("lh-a-1", "sandbox_recreated", {"n": 1})
     rows = scratch.query("SELECT type, payload FROM events ORDER BY id")
     assert rows == [("sandbox_recreated", {"n": 1}), ("hint", {}), ("sandbox_recreated", {"n": 1})]
+
+
+# ---------- the last call of a tool (LH-306) ----------
+def named(call_id: str, name: str, turn_index: int, task_id: str = "lh-acme-calc-42") -> Any:
+    return ToolCallRecord(
+        id=call_id,
+        task_id=task_id,
+        turn_index=turn_index,
+        name=name,
+        ok=True,
+        exit_code=0,
+        output_ref=f"tasks/{task_id}/turns/{turn_index:04d}/tool-{call_id}-output.txt",
+    )
+
+
+async def test_the_last_call_of_a_tool_is_the_one_of_the_latest_turn(recorder: SqlRecorder) -> None:
+    await recorder.record_tool_call(named("t1", "run_tests", 1))
+    await recorder.record_tool_call(named("t3", "run_tests", 3))
+    await recorder.record_tool_call(named("t2", "run_tests", 2))
+    await recorder.record_tool_call(named("t4", "read_file", 4))
+
+    found = await recorder.last_tool_call("lh-acme-calc-42", "run_tests")
+
+    assert found == named("t3", "run_tests", 3)
+
+
+async def test_two_calls_in_one_turn_give_the_one_that_was_written_last(
+    recorder: SqlRecorder,
+) -> None:
+    await recorder.record_tool_call(named("first", "run_tests", 5))
+    await recorder.record_tool_call(named("second", "run_tests", 5))
+
+    found = await recorder.last_tool_call("lh-acme-calc-42", "run_tests")
+
+    assert found is not None
+    assert found.id == "second"
+
+
+async def test_no_call_of_the_tool_gives_none(recorder: SqlRecorder) -> None:
+    await recorder.record_tool_call(named("t1", "read_file", 1))
+    await recorder.record_tool_call(named("t2", "run_tests", 1, task_id="lh-other"))
+
+    assert await recorder.last_tool_call("lh-acme-calc-42", "run_tests") is None
+
+
+async def test_a_call_comes_back_with_every_field_it_was_written_with(
+    recorder: SqlRecorder,
+) -> None:
+    written = ToolCallRecord(
+        id="toolu_01",
+        task_id="lh-acme-calc-42",
+        turn_index=3,
+        name="run_tests",
+        ok=False,
+        attempt=2,
+        args_ref="tasks/lh-acme-calc-42/turns/0003/tool-toolu_01-args.json",
+        exit_code=1,
+        output_ref="tasks/lh-acme-calc-42/turns/0003/tool-toolu_01-output.txt",
+        duration_ms=812,
+        pre_sha="a" * 40,
+        post_sha="b" * 40,
+    )
+    await recorder.record_tool_call(written)
+
+    assert await recorder.last_tool_call("lh-acme-calc-42", "run_tests") == written

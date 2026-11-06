@@ -15,9 +15,15 @@ from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 from temporalio.contrib.opentelemetry import TracingInterceptor
 from temporalio.contrib.pydantic import pydantic_data_converter
 
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, CarryState, Phase, RepoSettings, TaskSpec, TaskStatus
 from longhaul.durable import client as durable_client
-from longhaul.durable.acts import SCRIPT_MEMO_KEY, TUNING_MEMO_KEY, Tuning
+from longhaul.durable.acts import (
+    CONTEXT_MODE_MEMO_KEY,
+    SCRIPT_MEMO_KEY,
+    TUNING_MEMO_KEY,
+    Tuning,
+)
 from longhaul.durable.client import (
     DEFAULT_TASK_QUEUE,
     cancel_task,
@@ -220,6 +226,37 @@ async def test_start_task_passes_the_script_and_the_tuning_together(spec: TaskSp
     tuning = Tuning(heartbeat_timeout_s=2)
     await start_task(cast(Client, fake), spec, tuning=tuning, script=SCRIPT)
     assert fake.calls[0][1]["memo"] == {TUNING_MEMO_KEY: tuning, SCRIPT_MEMO_KEY: SCRIPT}
+
+
+# ---------- LH-406: the context mode of a run ----------
+async def test_start_task_passes_the_context_mode_in_the_memo(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, context_mode=ContextMode.NONE)
+    assert fake.calls[0][1]["memo"] == {CONTEXT_MODE_MEMO_KEY: ContextMode.NONE}
+
+
+async def test_start_task_sends_no_mode_unless_the_run_names_one(spec: TaskSpec) -> None:
+    # Without a mode the config of the worker decides, so the memo has nothing to say.
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, script=SCRIPT)
+    assert CONTEXT_MODE_MEMO_KEY not in fake.calls[0][1]["memo"]
+
+
+async def test_start_task_passes_the_mode_with_the_script_and_the_tuning(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    tuning = Tuning(heartbeat_timeout_s=2)
+    await start_task(
+        cast(Client, fake),
+        spec,
+        tuning=tuning,
+        script=SCRIPT,
+        context_mode=ContextMode.NO_COMPACTION,
+    )
+    assert fake.calls[0][1]["memo"] == {
+        TUNING_MEMO_KEY: tuning,
+        SCRIPT_MEMO_KEY: SCRIPT,
+        CONTEXT_MODE_MEMO_KEY: ContextMode.NO_COMPACTION,
+    }
 
 
 class FakeHandle:

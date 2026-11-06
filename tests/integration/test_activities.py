@@ -254,7 +254,9 @@ def make_spec(test_command: str | None = None) -> TaskSpec:
     return TaskSpec(
         task_id=task_id,
         repo="acme/calc",
-        issue_number=42,
+        # No issue number: the task of an issue on an owner/name repo is delivered as a pull
+        # request (LH-306), and this test runs the loop on a faked workspace with no GitHub.
+        issue_number=None,
         title="add() subtracts",
         body="`calc.add` subtracts its arguments instead of adding them.",
         settings=RepoSettings(
@@ -319,6 +321,8 @@ async def running(
             *tools.activities,
             workspace.prepare_workspace,
             workspace.cleanup,
+            # The workflow notes the end of every run with record_event (LH-704).
+            *EventActivities(recorder).activities,
             *extra,
         ],
         workflow_runner=workflow_runner(),
@@ -749,7 +753,6 @@ async def test_a_task_hands_over_and_the_hint_reaches_the_next_run(
         extra=[
             hand_over.ensure_sandbox,
             hand_over.bundle_checkpoint,
-            *EventActivities(recorder).activities,
         ],
     ) as run:
         handle = await start_task(
@@ -777,7 +780,13 @@ async def test_a_task_hands_over_and_the_hint_reaches_the_next_run(
     events = database.rows(
         "SELECT type, payload->>'turn_index', payload->>'reason' FROM events ORDER BY id"
     )
-    assert events == [("continue_as_new", "2", "turns"), ("continue_as_new", "4", "turns")]
+    # The two hand-overs, and the note at the end of the run that the metrics count the task
+    # from (LH-704). A note has no turn_index and no reason.
+    assert events == [
+        ("continue_as_new", "2", "turns"),
+        ("continue_as_new", "4", "turns"),
+        (acts.OUTCOME_EVENT, None, None),
+    ]
 
     # The first two requests are from before the hint. The third is the next run's first.
     assert [hint_text in texts_of(p) for p in provider.prompts] == [False, False, True, True, True]

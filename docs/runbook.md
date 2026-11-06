@@ -64,6 +64,22 @@ uv run longhaul memory reject ID                                   # it stays in
 
 When a task starts, `prepare_workspace` runs the test and lint commands that the repo's `pyproject.toml`, `tox.ini`, Makefile and CI files name. It keeps the ones that print a pytest, ruff or tox summary as approved `command` items. This runs only on a worker that was given a memory store, and `memory list --kind command` shows the result.
 
+### The repo map
+
+Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. The prompt builder (LH-604) reads it from the `repo_map_ref` of the workspace output. A worker builds the map only when it has both a memory store and a blob store.
+
+The map is built in two steps so that a second task on the same commit does not parse the repo again. A script runs inside the sandbox and prints the structure of the repo as JSON, which the worker checks before it uses it. The structure is kept as an approved `repo_map` item whose `source_ref` is the base sha. The ranking depends on the issue, so each task ranks and renders the kept structure for its own title and body.
+
+```bash
+uv run longhaul memory list --repo acme/inventory --kind repo_map    # one item for each base sha that was mapped
+```
+
+A file that does not parse, or is over 200 KB, is left out of the map and named in it as "Not parsed", and the worker logs it as a warning. A map that cannot be built at all is logged and the task goes on without one.
+
+A big repo is not cut at a path. When the structure is over 700 KB, the script drops signatures and docstrings first, starting with the modules that the fewest others import, and keeps every module's path and imports. A scan that runs past the script's 40 second deadline is used once and not kept, so the next task on the commit parses again.
+
+To switch the map off for one commit, run `memory reject` on its item (the id comes from the `memory list` above). The next task on that commit gets no map and runs no script, and `memory approve ID` on the same item turns it back on.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.
@@ -187,6 +203,7 @@ A task that runs for many turns keeps two records of its transcript (ADR-0013). 
 | `compact_at` | 0.60 | At this share of the window the older turns are folded into progress notes by the compactor model. |
 | `hard_limit` | 0.85 | A request projected above this share is not sent. The view is compacted down to the last two turns and the turn is asked once more. |
 | `keep_recent_turns` | 6 | The turns a compaction leaves as they are. |
+| `mode` | full | Which tiers run: `full`, `no_compaction` or `none`. See the next section. |
 
 Each compaction writes a `compaction` event with the tokens before and after, and each call of the compactor model has its own row in `cost_ledger`:
 
@@ -205,6 +222,23 @@ uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtu
   --provider scripted --script tests/fixtures/scripts/longlog.yaml --window 8000
 ```
 
+### Pull requests and labels
+
+A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a draft pull request:
+
+| When | What the issue shows |
+|---|---|
+| The task starts | A "Picked up" comment, and the label `longhaul:working` |
+| The agent calls `finish` | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and a draft pull request is opened |
+| The pull request is open | `longhaul:working` is removed and `longhaul:pr-open` is added |
+| A pause for a person (Phases 5 and 7) | `longhaul:needs-human` is added, and removed when the task resumes |
+
+The pull request branch has one commit on top of the base commit, whatever number of checkpoints the agent made. Its tree is the tree of the last checkpoint, so its diff is the diff of the scratch branch. The commit is titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`, and its author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
+
+The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
+
+Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
+
 ### The prompt cache
 
 Every request of a task starts with the same bytes: the tool list, then the system prompt (the role and rules, the tool guide, the task statement and the memory block). The plan and the progress notes are in the first user message, behind that prefix, so a plan update or a compaction does not touch it (ADR-0013). The Anthropic provider marks up to four places in the request for the cache: the last tool, the end of the system prompt, the last assistant turn that has a message after it, and the newest message that holds an elided result.
@@ -216,7 +250,47 @@ SELECT turn_index, input_tokens, cache_read_tokens, cache_write_tokens, round(ca
 FROM turns WHERE task_id = 'lh-local-calc-1a2b3c4d' ORDER BY turn_index, attempt;
 ```
 
-The first turn writes the prefix and reads nothing. From the second turn on the ratio should be well above 0.5. A ratio of 0 on every turn means the prefix changes between requests, or that it is shorter than the model's minimum for caching: 512 tokens on the 5.5 models, up to 4,096 on older ones. A model that is under its minimum is not told, and `cache_write_tokens` stays 0. A drop on one turn is normal after a compaction or a plan update, which write the conversation again. To check the cache against the real API, run `uv run pytest -m live tests/live/test_cache_live.py` with `ANTHROPIC_API_KEY` set. It makes four small requests.
+The first turn writes the prefix and reads nothing. On the second turn only the tools and the system prompt are read (about 1,900 tokens for the coder), and the first tool result is new input, so the ratio is low. It climbs as the conversation grows, because each turn reads the turns before it from the cache. A ratio of 0 on every turn means the prefix changes between requests, or that it is shorter than the model's minimum for caching: 512 tokens on the 5.5 models, up to 4,096 on older ones. A model that is under its minimum is not told, and `cache_write_tokens` stays 0. A drop on one turn is normal after a compaction or a plan update, which write the conversation again. To check the cache against the real API, run `uv run pytest -m live tests/live/test_cache_live.py` with `ANTHROPIC_API_KEY` set. It makes four small requests.
+
+### Switching the tiers off, and what a task records about its context
+
+The evaluation compares runs with the tiers on and off (plan section 8), so `context.mode` turns them off one at a time:
+
+| Mode | Tier 1: elide old tool outputs | Tier 2: compact into notes | A full window |
+|---|---|---|---|
+| `full` | on | on | one forced compaction, then the turn is asked again |
+| `no_compaction` | on | off | the run ends with `error` and the summary `context limit` |
+| `none` | off | off | the run ends with `error` and the summary `context limit` |
+
+The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In the two modes without compaction nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+
+`context.mode` in the config is the default of a worker. A single run can ask for its own, and that wins:
+
+```bash
+uv run longhaul run --path tests/fixtures/repos/calc --issue-file tests/fixtures/repos/calc/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/calc_fix.yaml --context-mode none
+```
+
+The run puts the mode in the workflow memo, next to the script. The workflow hands it to every model turn and every compaction, and the header line of `run` says `context mode none`. A run that names no mode uses the config of the worker that picks up each turn, so all workers of a queue should share one `context.mode`.
+
+Each task row keeps five totals for the report (`tasks`, migration `0010_task_context_totals`). Activities write them, and none of them is added to a counter, so a retried activity cannot count a call twice:
+
+| Column | What it holds | Where it comes from |
+|---|---|---|
+| `input_tokens_total` | Tokens the model read that were not in the prompt cache: input plus cache writes | the sum of the `cost_ledger` rows of the task |
+| `output_tokens_total` | Tokens the model wrote | the same rows |
+| `cache_read_total` | Tokens served from the prompt cache | the same rows |
+| `compactions` | Compactions that changed the view | the number of different `compaction` events |
+| `max_fraction` | The largest share of `window_tokens` that one request took, as `llm_turn` projected it before sending | the maximum over the requests |
+
+The three token totals do not overlap, and the compactor's own calls are in them, so they add up to what the task cost to run. Tokens per task is their sum, and the cache ratio is `cache_read_total / (input_tokens_total + cache_read_total)`:
+
+```sql
+SELECT id, input_tokens_total, output_tokens_total, cache_read_total, compactions, max_fraction
+FROM tasks WHERE id = 'lh-acme-calc-42';
+```
+
+A task has these columns only when it has a row in `tasks`. The poller makes the row when it starts a task. `longhaul run` does not, so a task started with it has its calls in `cost_ledger` and its compactions in `events`, and the totals stay at 0. The cost ledger works the same way.
 
 ### Stopping a worker
 
@@ -245,7 +319,7 @@ docker compose --profile full up -d --build worker
 
 The service builds `docker/worker/Dockerfile` and mounts two things from the host. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
 
-**Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and do not publish a port from it (the service has none). The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
+**Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and publish no port from it beyond the metrics port below, which compose binds to `127.0.0.1`. The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
 
 The folder that `--path` names has to exist inside the worker container to be read, and the example folders do not. For local folders use the worker from `uv run`, and use the container for a worker that fixes cloned repos (Phase 3).
 
@@ -346,6 +420,47 @@ LONGHAUL_RECORD=1 LONGHAUL_RECORDINGS_DIR=eval/chaos/recordings/inventory \
 
 Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The full chaos suite plays this folder when it holds recordings. Until then it records a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and plays that.
 
+## Metrics and the dashboard
+
+Each worker serves Prometheus metrics at `/metrics`, and the compose stack shows them in a Grafana dashboard. The metrics are in `src/longhaul/telemetry/metrics.py`.
+
+| What | Where |
+|---|---|
+| The metrics endpoint | `http://127.0.0.1:9464/metrics`. Set the port with `LONGHAUL_METRICS_PORT` (0 lets the system pick one) and the address with `LONGHAUL_METRICS_HOST`. The worker logs the address when it starts. |
+| Prometheus | `http://127.0.0.1:9090`, or `LH_PROMETHEUS_PORT`. It scrapes `host.docker.internal:9464` every 15 seconds (`docker/prometheus/prometheus.yml`). |
+| Grafana | `http://127.0.0.1:3000`, or `LH_GRAFANA_PORT`. Anonymous visitors are viewers. The dashboard is called Longhaul. |
+| The dashboard | `docker/grafana/dashboards/longhaul.json`, loaded by `docker/grafana/provisioning/dashboards/longhaul.yaml`. Grafana reads the file again every 30 seconds. The file is the only copy, so Grafana does not let the dashboard be saved or deleted from its screen. Edit the file instead. |
+
+Check a running worker with `curl -s http://127.0.0.1:9464/metrics | grep '^longhaul_'`.
+
+| Metric | Counts |
+|---|---|
+| `longhaul_tasks_total{outcome,repo}` | Tasks that ended, by outcome (`pr_opened`, `stuck`, `budget_exhausted`, `cancelled`, `error`) |
+| `longhaul_active_tasks` | Tasks the worker is running now |
+| `longhaul_turns_total{role}` | Model calls that returned a reply |
+| `longhaul_llm_cost_usd_total{model,repo}` | Dollars the cost ledger priced for model calls |
+| `longhaul_llm_errors_total{kind}` | Model calls that failed, by provider error kind |
+| `longhaul_tool_duration_seconds{tool}` | How long tool runs took (histogram) |
+| `longhaul_compactions_total` | Transcript compactions (counted from the `compaction` event, LH-404) |
+| `longhaul_stuck_total{reason}` | Stuck detections (counted from the `stuck` event, LH-505) |
+| `longhaul_sandbox_recreated_total` | Sandboxes rebuilt after the container was lost |
+| `longhaul_activity_retries_total{activity}` | Activity attempts after the first |
+| `longhaul_cache_ratio` | The share of a prompt that came from the cache (histogram) |
+
+The activities update the metrics and the workflow never does, because a workflow runs again on every replay. A run reaches the end of its task through one `record_event` call with the type `outcome`, which is also a row in the `events` table. The count is made before the row is written, so a task that ends while Postgres is down is still counted.
+
+Things to know when you read the numbers:
+
+- The counters belong to one worker process and start again at zero when it restarts. Prometheus functions such as `rate()` and `increase()` handle that.
+- `longhaul_active_tasks` counts the tasks a process has seen start, or has seen again after a hand-over. A task that Temporal ends from outside, by a terminate or a timeout, stays in the count until the worker restarts.
+- A task that was started from a local folder has the repo label `local`, whatever the folder. A tool name that the registry does not know is counted as `unknown`.
+- Two workers on one machine need two ports. The second one stops at the start with an error that names `LONGHAUL_METRICS_PORT`. Add its port as a second target under `worker` in `docker/prometheus/prometheus.yml`.
+- On Docker Desktop, Prometheus reaches a worker that listens on `127.0.0.1`, and it reaches the compose service `worker` through the port that service publishes on `127.0.0.1:9464`. On Linux the container comes through the docker bridge, which a port published only on `127.0.0.1` does not answer. A worker on the host needs `LONGHAUL_METRICS_HOST=0.0.0.0` there, with the port closed to the network by a firewall. To scrape the compose service `worker` on Linux, put `worker:9464` in `docker/prometheus/prometheus.yml` in place of `host.docker.internal:9464`, since both services share the compose network. Do not list both on Docker Desktop: it would scrape the compose worker twice, and every sum on the dashboard would double.
+- A checkout that was running before this change has a Grafana without the dashboards folder. Run `docker compose up -d grafana` once. It recreates Grafana and nothing else.
+- Every checkout of the repo, a git worktree included, belongs to the one compose project `longhaul`, and its bind mounts name the folder of the checkout that started the container. `tests/integration/test_grafana.py` runs `docker compose up -d --wait prometheus grafana`, which recreates both containers with the files and the port variables of the checkout it runs in. Run it from a worktree only with `LH_GRAFANA_PORT` and `LH_PROMETHEUS_PORT` exported as in the main checkout, or the new containers ask for ports that another project may hold. When a worktree is deleted, run `docker compose up -d prometheus grafana` once from the main checkout, so that the two containers stop pointing at the deleted folder.
+
+`tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -355,7 +470,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `lint` | `ruff check` and `ruff format --check` |
 | `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
-| `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below) |
+| `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
 | `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |

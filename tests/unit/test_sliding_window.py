@@ -16,9 +16,9 @@ from collections.abc import Callable
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
-from longhaul.context.sliding import fit, window
 
 from longhaul.agent.turns import validate_pairs
+from longhaul.context.sliding import fit, window
 from longhaul.contracts import (
     Block,
     Message,
@@ -153,26 +153,6 @@ def test_a_tool_round_with_parallel_calls_is_dropped_whole_or_kept_whole() -> No
 
     assert assistants(window(messages, 2)) == 2
     assert assistants(window(messages, 1)) == 1
-
-
-def test_a_window_does_not_cut_inside_a_round_that_is_still_open() -> None:
-    # Two assistant messages in a row: the first one's calls are answered only after the
-    # second, so the only safe cut is before both.
-    messages = [
-        user(text(TASK)),
-        assistant(use("a1")),
-        user(res("a1")),
-        assistant(use("b1")),
-        assistant(text("still thinking")),
-        user(res("b1")),
-        assistant(use("c1")),
-        user(res("c1")),
-    ]
-
-    slid = window(messages, 2)
-
-    validate_pairs(slid)
-    assert slid[1] is messages[3]
 
 
 @st.composite

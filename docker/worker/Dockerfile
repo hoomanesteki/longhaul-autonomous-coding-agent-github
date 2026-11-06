@@ -29,12 +29,12 @@ WORKDIR /app
 
 # The dependencies first, so a change to the source does not install them again.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-group eval --no-install-project
 
 COPY src ./src
 COPY config ./config
 COPY templates ./templates
-RUN uv sync --locked --no-dev --no-editable
+RUN uv sync --locked --no-dev --no-group eval --no-editable
 
 # The settings come from LONGHAUL_* variables (see .env.example). The config file is the example
 # one unless LONGHAUL_CONFIG names another.

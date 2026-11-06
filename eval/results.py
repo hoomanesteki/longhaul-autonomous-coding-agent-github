@@ -7,6 +7,11 @@ it belongs to. A result file is written once. The grader fills `resolved` before
 The fields that later phases fill (compactions, verify rounds, stuck reasons) start at honest
 zeros and empty lists. A zero here means "not measured yet" until the phase that counts them has
 landed, and the summary does not report them.
+
+Which definition produced a number (LH-903). Every file holds the sha256 of the config file it ran
+with (eval/configs/<config>.yaml) and the seed of the run, so a result can be traced to the exact
+settings of its config. Runs that are meant to be compared share a `run_set`, and the runner
+refuses to mix models inside one (`models_in_run_set`).
 """
 
 from __future__ import annotations
@@ -15,17 +20,20 @@ import re
 import statistics
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 SUMMARY_FILE = "summary.json"
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 TaskSet = Literal["custom", "swebench"]
 Config = Literal["full", "naive", "single_shot"]
+CONFIG_NAMES: tuple[str, ...] = get_args(Config)
 Switch = Literal["on", "off"]
-ContextMode = Literal["full", "no_compaction", "none"]
+ContextMode = Literal["full", "no_compaction", "none", "sliding"]
+# The sha256 of a config file, in lowercase hex.
+CONFIG_HASH = r"^[0-9a-f]{64}$"
 
 
 class Tokens(BaseModel):
@@ -56,6 +64,11 @@ class TaskResult(BaseModel):
     workflow_id: str
     task_set: TaskSet
     config: Config
+    # The sha256 of eval/configs/<config>.yaml as it was when the run started, and the seed.
+    config_hash: str = Field(pattern=CONFIG_HASH)
+    seed: int
+    # The name the operator gave to the runs that are compared with each other, if any.
+    run_set: str | None = None
     model: str
     git_sha: str
     # Where the answers came from. `scripted` is true when a script played them: such a run is
@@ -98,6 +111,9 @@ class Summary(BaseModel):
     run_id: str
     task_set: TaskSet
     config: Config
+    config_hash: str = Field(pattern=CONFIG_HASH)
+    seed: int
+    run_set: str | None = None
     model: str
     provider: str | None
     scripted: bool
@@ -143,8 +159,34 @@ def read_results(folder: Path) -> list[TaskResult]:
     return sorted(found, key=lambda r: r.task_id)
 
 
+def models_in_run_set(results_dir: Path, run_set: str) -> dict[str, str]:
+    """The model of each run in `results_dir` that belongs to `run_set`, by run id.
+
+    A run is a folder of result files. Its first result file says which run set and model it had,
+    and a run in progress has results as soon as its first task is done. A folder that holds no
+    readable result, such as an empty one or the output of another tool, is not a run and is
+    skipped.
+    """
+    if not results_dir.is_dir():
+        return {}
+    found: dict[str, str] = {}
+    for folder in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+        for path in sorted(folder.glob("*.json")):
+            if path.name == SUMMARY_FILE:
+                continue
+            try:
+                first = TaskResult.model_validate_json(path.read_text(encoding="utf-8"))
+            except (OSError, ValidationError):
+                continue
+            if first.run_set == run_set:
+                found[folder.name] = first.model
+            break
+    return found
+
+
 def _check_one_run(results: list[TaskResult]) -> None:
-    for field in ("run_id", "task_set", "config", "model", "provider", "scripted"):
+    fields = ("run_id", "task_set", "config", "config_hash", "seed", "run_set")
+    for field in (*fields, "model", "provider", "scripted"):
         values = {str(getattr(r, field)) for r in results}
         if len(values) != 1:
             raise ValueError(
@@ -169,6 +211,9 @@ def summarize(results: list[TaskResult], *, started_at: datetime, ended_at: date
         run_id=first.run_id,
         task_set=first.task_set,
         config=first.config,
+        config_hash=first.config_hash,
+        seed=first.seed,
+        run_set=first.run_set,
         model=first.model,
         provider=first.provider,
         scripted=first.scripted,

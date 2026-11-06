@@ -167,8 +167,9 @@ class Context(StrictModel):
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
     # Which of the two tiers run (LH-406). `full` is what the product does, and the default keeps
-    # every config written before the mode existed on that behavior. A run can name its own mode
-    # (`longhaul run --context-mode`), and that wins over this one.
+    # every config written before the mode existed on that behavior. `sliding` runs neither tier
+    # and drops the oldest turns at the hard limit, as the naive baseline does (LH-903). A run can
+    # name its own mode (`longhaul run --context-mode`), and that wins over this one.
     mode: ContextMode = ContextMode.FULL
 
 

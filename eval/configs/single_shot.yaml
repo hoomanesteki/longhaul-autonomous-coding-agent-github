@@ -1,0 +1,14 @@
+# The single-shot baseline (plan section 8.3): no loop and no tools. The runner picks the top
+# files by BM25 between the issue text and the file contents, adds the repo map, asks the model once
+# for a unified diff, and applies it with git apply --recount (patch -p1 --fuzz=2 when git refuses).
+#
+# The switches do not apply to a run with one call, so they are null.
+name: single_shot
+description: One model call that gets the top five files by BM25 and the repo map, and answers with a diff.
+runner: single_shot
+planner: null
+verifier: null
+memory: null
+stuck_detector: null
+context_mode: null
+top_files: 5

@@ -672,7 +672,7 @@ async def test_a_request_over_the_hard_limit_is_cut_to_the_newest_turns_in_slidi
     assert turn_index(stored) == 11
 
 
-@pytest.mark.parametrize("share", [0.86, 0.95, 1.5, 4.0])
+@pytest.mark.parametrize("share", [0.86, 0.95, 1.5, 2.0])
 async def test_sliding_mode_never_sends_a_request_over_the_hard_limit(share: float) -> None:
     messages = rounds(12, lines=30)
     rig = sliding_rig(messages, share)

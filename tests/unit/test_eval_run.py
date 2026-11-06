@@ -801,7 +801,7 @@ def result_for(task: custom_tasks.CustomTask) -> TaskResult:
         workflow_id=f"lh-eval-try1-{task.id}",
         task_set="custom",
         config="full",
-        config_hash="a" * 64,
+        config_hash=config_files.load("full").sha256,
         seed=42,
         model="claude-sonnet-5-5",
         git_sha="f" * 40,
@@ -1054,7 +1054,7 @@ def single_shot_context(
 
     async def repo_map_for(*_args: object) -> str:
         maps.append("asked")
-        return "## Repo map\ncalc: add"
+        return "Python files of this repo (1 of 1 shown):\ncalc: add"
 
     monkeypatch.setattr(run, "repo_map_for", repo_map_for)
     monkeypatch.setattr(run, "RETRY_BASE_S", 0.0)
@@ -1074,8 +1074,7 @@ def single_shot_context(
         wall_limit_s=600.0,
         provider_for=lambda _script: provider,
         ledger=BookKeeper(),
-        max_tokens=8000,
-        call_options=None,
+        cfg=CONFIG,
     )
 
 
@@ -1096,7 +1095,7 @@ async def test_a_single_shot_task_is_one_call_that_is_graded_and_booked(
     (call,) = provider.calls
     assert call["tools"] == []
     prompt = call["messages"][0].content[0].text
-    assert "## Repo map\ncalc: add" in prompt
+    assert "Python files of this repo (1 of 1 shown):\ncalc: add" in prompt
     assert "src/calc/__init__.py" in prompt
     # The call is on the ledger like every other, under the id of the task.
     (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]

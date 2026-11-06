@@ -105,8 +105,10 @@ worker restarts.
 
 The context modes (LH-406). `context.mode` of the worker's config, or the mode a run asks for with
 `longhaul run --context-mode`, switches the tiers off for an ablation: `no_compaction` keeps tier 1
-and `none` has neither (longhaul.context.modes). The workflow cannot read the config, so a run's
-own mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
+and `none` has neither (longhaul.context.modes). `sliding`, the window of the naive baseline
+(LH-903), has neither tier either, and the workflow never sees it as a refusal: `llm_turn` cuts the
+oldest turns before it measures the request. The workflow cannot read the config, so a run's own
+mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
 and `compact`, which resolve it against the config, and it skips the `compact` call itself when the
 memo says the mode has no compaction. When the memo is empty the config decides, and the workflow
 asks as it always did: `compact` answers "unchanged" in a mode without compaction, and

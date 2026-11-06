@@ -46,6 +46,7 @@ WRONG_COUNTS = GOOD.replace("@@ -1,3 +1,3 @@", "@@ -1,9 +1,9 @@")
 # patch takes it with a fuzz of one line.
 WRONG_CONTEXT = GOOD.replace(" def add(a, b):", " def add(x, y):")
 # Nothing like the file at all.
+MAP = "Python files of this repo, most relevant first (1 of 1 shown):\ncalc.py: add, mul"
 UNRELATED = "--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n-import nothing\n+import something\n"
 FIXED = CALC.replace("a - b", "a + b")
 
@@ -134,6 +135,30 @@ def test_a_new_file_and_a_removed_file_are_in_the_patch(tmp_path: Path) -> None:
     assert "+++ b/new.py" in applied.patch
     assert "deleted file mode" in applied.patch
     assert git_apply_check(repo, applied.patch).returncode == 0
+
+
+def test_a_diff_of_several_files_with_wrong_counts_is_applied_by_git(tmp_path: Path) -> None:
+    # --recount takes the header of the next file for a line of the hunk, unless git is given one
+    # file at a time.
+    repo = make_repo(tmp_path, {"calc.py": CALC, "other.py": "X = 1\n"})
+    diff = WRONG_COUNTS + "--- a/other.py\n+++ b/other.py\n@@ -1,7 +1,7 @@\n-X = 1\n+X = 2\n"
+
+    applied = single_shot.apply_diff(repo, diff)
+
+    assert applied.method == "git"
+    assert applied.patch.count("diff --git") == 2
+
+
+def test_a_file_that_the_fallback_empties_is_removed(tmp_path: Path) -> None:
+    # BSD patch leaves an empty file where GNU patch removes it. The patch has to say the same
+    # whichever one the machine has.
+    repo = make_repo(tmp_path, {"calc.py": CALC, "old.py": "VALUE = 1\n"})
+    diff = WRONG_CONTEXT + "--- a/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-VALUE = 1\n"
+
+    applied = single_shot.apply_diff(repo, diff)
+
+    assert applied.method == "patch"
+    assert "deleted file mode" in applied.patch
 
 
 def test_a_diff_that_nothing_can_apply_names_both_attempts(tmp_path: Path) -> None:
@@ -302,14 +327,14 @@ def test_a_repo_without_text_files_gives_no_files(tmp_path: Path) -> None:
 def test_the_prompt_holds_the_problem_the_repo_map_and_each_file(tmp_path: Path) -> None:
     prompt = single_shot.build_prompt(
         "add() subtracts\n\nadd(2, 3) returns -1",
-        "## Repo map\ncalc.py: add, mul",
+        MAP,
         {"calc.py": CALC},
     )
 
     assert "add() subtracts" in prompt
     assert "add(2, 3) returns -1" in prompt
-    assert "## Repo map\ncalc.py: add, mul" in prompt
-    assert "calc.py" in prompt
+    assert f"## Repo map\n\n{MAP}\n" in prompt
+    assert "### calc.py" in prompt
     assert CALC in prompt
 
 
@@ -358,7 +383,7 @@ async def solve(provider: Any, repo: Path, **changes: Any) -> single_shot.Single
         "model": "claude-sonnet-5-5",
         "repo": repo,
         "problem": "add() subtracts\n\nadd(2, 3) returns -1",
-        "repo_map": "## Repo map\ncalc.py: add, mul",
+        "repo_map": MAP,
         "max_tokens": 4000,
     }
     return await single_shot.solve(provider, **{**values, **changes})
@@ -381,7 +406,7 @@ async def test_one_call_without_tools_gives_a_patch(tmp_path: Path) -> None:
     assert isinstance(block, TextBlock)
     prompt = block.text
     assert "add(2, 3) returns -1" in prompt
-    assert "## Repo map\ncalc.py: add, mul" in prompt
+    assert MAP in prompt
     assert CALC in prompt  # the file was retrieved and shown
 
     assert result.error is None
@@ -485,3 +510,29 @@ def test_the_scripted_answers_of_the_dry_run_make_the_change_of_the_reference_fi
     reference = (CUSTOM / "reference" / f"{task}.patch").read_text(encoding="utf-8")
     assert changed_lines(applied.patch) == changed_lines(reference)
     assert changed_lines(applied.patch)
+
+
+# ---------- cutting a diff into files ----------
+def test_a_diff_without_git_lines_is_cut_at_each_file_header() -> None:
+    one = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    two = "--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+
+    assert single_shot.file_sections(one + two) == [one, two]
+
+
+def test_a_diff_with_git_lines_is_cut_at_each_diff_git_line_and_not_inside_it() -> None:
+    one = (
+        "diff --git a/a.py b/a.py\nindex 1..2 100644\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    )
+    two = "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-x\n+y\n"
+
+    assert single_shot.file_sections(one + two) == [one, two]
+
+
+def test_the_text_before_the_first_header_is_not_part_of_a_section() -> None:
+    body = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+    assert single_shot.file_sections("Here you go:\n" + body) == [body]
+
+
+def test_a_text_with_no_header_comes_back_whole() -> None:
+    assert single_shot.file_sections("nothing here\n") == ["nothing here\n"]

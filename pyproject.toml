@@ -62,6 +62,14 @@ dev = [
     "types-pyyaml>=6.0.12.20260906",
     "uvicorn>=0.54.0",
 ]
+# What the evaluation harness (eval/) needs and the product does not. The worker image leaves
+# the group out (docker/worker/Dockerfile), so numpy stays out of it.
+eval = [
+    "rank-bm25>=0.2.2",
+]
+
+[tool.uv]
+default-groups = ["dev", "eval"]
 
 [tool.ruff]
 line-length = 100
@@ -115,6 +123,11 @@ extra_checks = true
 module = ["longhaul.db.migrations.*"]
 disallow_untyped_defs = false
 disallow_untyped_calls = false
+
+# rank_bm25 ships no type information.
+[[tool.mypy.overrides]]
+module = ["rank_bm25"]
+ignore_missing_imports = true
 
 # fastembed is the optional "memory" extra, so the base install that CI type-checks does not
 # have it. LocalEmbedder imports it lazily.

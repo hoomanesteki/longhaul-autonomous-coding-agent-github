@@ -77,6 +77,7 @@ The plan summary of this ADR said "a Docker volume". It is a host folder here, b
 - A restore deletes untracked and ignored files, except the folders in `keep`. A `node_modules` folder is lost unless the story that installs it adds it to `keep`.
 - A bundle holds the whole history, not just the task's commits. Large repos hit the cap, and an incremental bundle on top of a fresh clone is the way out.
 - A retried commit replaces the branch head. The replaced commit stays in the repo and can still be restored by sha, but it is no longer on the branch.
+- The sandbox mounts the repo read-write, so the agent can move the `base` tag. The host does not trust the tag for the base of a pull request. The workflow keeps the sha the workspace was prepared at (`state.spec.base_sha`), and `build_pr_branch` takes it as an argument.
 - Auto gc is off, so a repo only grows. `cleanup_task` removes it when the task ends, and the leftovers of a crashed `init_task` are removed by the next `cleanup_task` of that task.
 - The repo is world writable inside a private root. A second user on the same host cannot reach it, but root and anyone who gets the worker's account can.
 

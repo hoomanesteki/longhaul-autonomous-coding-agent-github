@@ -823,7 +823,9 @@ def test_tuning_shortens_the_heartbeat_of_deliver_only() -> None:
 
 
 GITHUB_SAMPLES: list[BaseModel] = [
-    acts.BuildPrBranchInput(task_id="lh-x", repo="acme/calc", summary="Fixed it.", head_sha=SHA),
+    acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="Fixed it.", base_sha="b" * 40, head_sha=SHA
+    ),
     acts.PrBranchOutput(
         branch="longhaul-pr/42",
         head_sha=SHA,

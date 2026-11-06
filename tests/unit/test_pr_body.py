@@ -144,6 +144,22 @@ def test_an_issue_reference_in_the_summary_cannot_close_another_issue() -> None:
     assert re.findall(r"(?i)\bcloses\s+#\d+", body) == ["Closes #4"]
 
 
+def test_a_gh_reference_in_the_summary_cannot_close_another_issue() -> None:
+    # GitHub reads "GH-7" as a reference to issue 7 in the same repo, so "fixes GH-7" closes it.
+    body = render(summary="This also fixes GH-7 and gh-8.", issue=4)
+
+    assert f"GH-{ZWSP}7" in body
+    assert f"gh-{ZWSP}8" in body
+    assert not re.search(r"(?i)\bGH-\d", body)
+
+
+def test_a_link_to_an_issue_in_the_summary_cannot_close_it() -> None:
+    body = render(summary="Resolves https://github.com/acme/other/issues/9")
+
+    assert f"https://{ZWSP}github.com/acme/other/issues/9" in body
+    assert "://github" not in body
+
+
 def test_html_in_the_summary_is_shown_as_text() -> None:
     body = render(summary="<!-- hidden --> <img src=x onerror=y>")
 
@@ -163,3 +179,11 @@ def test_a_long_summary_is_cut_and_says_so() -> None:
 def test_defuse_leaves_ordinary_text_alone() -> None:
     text = "Changed add() to return a + b; mail a@b.com about v1.2 (section 3) and C# code."
     assert defuse(text) == text
+    assert defuse("A GH-style gate and a GHz clock") == "A GH-style gate and a GHz clock"
+
+
+def test_defuse_ends_each_kind_of_reference() -> None:
+    assert defuse("closes #7 fixes o/r#8 resolves GH-9 see @alice at https://x.dev") == (
+        f"closes #{ZWSP}7 fixes o/r#{ZWSP}8 resolves GH-{ZWSP}9 see @{ZWSP}alice "
+        f"at https://{ZWSP}x.dev"
+    )

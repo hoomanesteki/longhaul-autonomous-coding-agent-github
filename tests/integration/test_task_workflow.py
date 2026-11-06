@@ -23,13 +23,13 @@ number and so is not delivered; `github_spec` has one.
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
@@ -410,13 +410,15 @@ async def start_cancelled(
 
 
 @asynccontextmanager
-async def running(env: WorkflowEnvironment, stubs: Stubs) -> AsyncIterator[str]:
-    """A worker for the workflow and the stubs. Yields the task queue it polls."""
+async def running(
+    env: WorkflowEnvironment, stubs: Stubs, workflows: Sequence[type] = (TaskWorkflow,)
+) -> AsyncIterator[str]:
+    """A worker for the workflows (TaskWorkflow) and the stubs. Yields the task queue it polls."""
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     async with Worker(
         env.client,
         task_queue=queue,
-        workflows=[TaskWorkflow],
+        workflows=workflows,
         activities=stubs.activities,
         workflow_runner=workflow_runner(),
     ):
@@ -2151,7 +2153,11 @@ async def test_the_pull_request_is_built_from_the_last_checkpoint_and_the_finish
 
     (build,) = stubs.payloads(acts.BUILD_PR_BRANCH.name)
     assert build == acts.BuildPrBranchInput(
-        task_id=gh_spec.task_id, repo="acme/calc", summary="all done", head_sha=sha(1)
+        task_id=gh_spec.task_id,
+        repo="acme/calc",
+        summary="all done",
+        base_sha=BASE,
+        head_sha=sha(1),
     )
     (deliver,) = stubs.payloads(acts.DELIVER.name)
     assert deliver == acts.DeliverInput(
@@ -2216,6 +2222,22 @@ async def test_the_pickup_is_not_repeated_after_a_hand_over(env: WorkflowEnviron
     assert outcome == FINISHED
     assert len(stubs.run_ids) == 2
     assert stubs.github_names() == [*PICKUP, *DELIVERY]
+
+
+async def test_the_base_of_the_pull_request_is_kept_across_a_hand_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # The workspace is prepared in the first run and the pull request is built in the second.
+    # The base is the one the workspace was prepared at, and the workflow state carries it.
+    stubs = Stubs(edits_then_finishes(4))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, github_spec(), task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == 2
+    (build,) = stubs.payloads(acts.BUILD_PR_BRANCH.name)
+    assert build.base_sha == BASE
+    assert build.head_sha == sha(4)
 
 
 async def test_a_task_that_cannot_be_picked_up_does_no_work(
@@ -2335,10 +2357,68 @@ async def test_the_github_activities_get_the_policies_of_section_3_7(
     assert acts.CREATE_PR.name not in sched, "deliver calls create_pr itself, inside the activity"
 
 
-async def test_the_helpers_for_a_pause_and_a_resume_are_workflow_methods(
-    gh_spec: TaskSpec,
+@workflow.defn(sandboxed=False)
+class PauseProbe:
+    """Pauses and resumes a task twice with the helpers that Phases 5 and 7 will call.
+
+    Nothing calls `_needs_human` and `_human_done` yet, so this workflow builds a TaskWorkflow
+    from the state it is given and calls them, the way the loop will. It is not sandboxed: the
+    sandbox would load this test module a second time.
+    """
+
+    @workflow.run
+    async def run(self, state: CarryState) -> None:
+        task = TaskWorkflow(state)
+        await task._needs_human(1)
+        await task._human_done(1)
+        await task._needs_human(2)
+
+
+async def pause_and_resume(env: WorkflowEnvironment, stubs: Stubs, task: TaskSpec) -> None:
+    async with running(env, stubs, workflows=[PauseProbe]) as queue:
+        await env.client.execute_workflow(
+            PauseProbe.run,
+            initial_state(task),
+            id=f"pause-{uuid.uuid4().hex[:8]}",
+            task_queue=queue,
+        )
+
+
+async def test_a_pause_adds_the_needs_human_label_and_a_resume_removes_it(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:
-    # Phases 5 and 7 call these when a task pauses and resumes. They run the same label steps
-    # that lifecycle gives, as activities, so there is nothing else to wire.
-    assert callable(TaskWorkflow._needs_human)
-    assert callable(TaskWorkflow._human_done)
+    stubs = Stubs()
+    await pause_and_resume(env, stubs, gh_spec)
+
+    # Three label activities, in the order of the calls. Each pause has a key of its own, and the
+    # resume of a pause has another, so a repeated step is a no-op on GitHub and a new pause is
+    # a new effect.
+    assert stubs.every == [acts.ADD_LABEL.name, acts.REMOVE_LABEL.name, acts.ADD_LABEL.name]
+    first_pause, second_pause = stubs.payloads(acts.ADD_LABEL.name)
+    (resume,) = stubs.payloads(acts.REMOVE_LABEL.name)
+    assert first_pause == lifecycle.on_pause(gh_spec, 1)[0].label
+    assert resume == lifecycle.on_resume(gh_spec, 1)[0].label
+    assert second_pause == lifecycle.on_pause(gh_spec, 2)[0].label
+    assert {first_pause.label, resume.label, second_pause.label} == {lifecycle.NEEDS_HUMAN}
+    assert (first_pause.repo, first_pause.number) == ("acme/calc", 42)
+    assert (
+        len({first_pause.idempotency_key, resume.idempotency_key, second_pause.idempotency_key})
+        == 3
+    )
+    assert stubs.names() == [], "nothing but labels is written"
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param(make_spec(repo="local:/work/calc", issue=42), id="local folder with issue"),
+        pytest.param(make_spec(repo="acme/calc", issue=None), id="repo without issue"),
+    ],
+)
+async def test_a_task_that_is_not_an_issue_has_no_label_to_change_on_a_pause(
+    env: WorkflowEnvironment, task: TaskSpec
+) -> None:
+    stubs = Stubs()
+    await pause_and_resume(env, stubs, task)
+
+    assert stubs.every == []

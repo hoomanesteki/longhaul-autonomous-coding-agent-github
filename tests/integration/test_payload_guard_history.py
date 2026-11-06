@@ -75,7 +75,9 @@ def make_spec(body: str = "`calc.add` subtracts its arguments instead of adding 
     return TaskSpec(
         task_id=f"lh-acme-calc-{uuid.uuid4().hex[:8]}",
         repo="acme/calc",
-        issue_number=42,
+        # No issue number: the task of an issue on an owner/name repo is delivered as a pull
+        # request (LH-306), and this test runs the loop on stub activities with no GitHub.
+        issue_number=None,
         title="add() subtracts",
         body=body,
         settings=RepoSettings(repo="acme/calc", budgets=Budgets(task_turns=3)),

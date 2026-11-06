@@ -11,15 +11,17 @@ setup:
 	uv sync
 	uv run pre-commit install
 
+# ruff runs without its cache. The cache keeps the import order of a test that was linted before
+# the module it imports existed, so a local check passes while CI, which has no cache, fails.
 check:
-	uv run ruff check .
+	uv run ruff check --no-cache .
 	uv run ruff format --check .
 	uv run mypy src
 	uv run pytest tests/unit -q --cov=longhaul --cov-fail-under=80
 
 ci-local:
 	uv sync --locked
-	uv run ruff check .
+	uv run ruff check --no-cache .
 	uv run ruff format --check .
 	uv run mypy src
 	uv run pytest tests/unit -q --cov=longhaul --cov-report=term-missing --cov-fail-under=80

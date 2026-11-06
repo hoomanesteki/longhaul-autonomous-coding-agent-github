@@ -242,6 +242,17 @@ def step_index(job: dict[str, Any], fragment: str) -> int | None:
     return next((i for i, run in enumerate(runs) if fragment in run), None)
 
 
+@pytest.mark.parametrize("target", ["check", "ci-local"])
+def test_make_lints_without_the_ruff_cache(target: str) -> None:
+    # The cache keeps the import order of a test that was linted before the module it imports
+    # existed, so a local check passed on a branch that CI, which has no cache, rejected. `gate`
+    # runs `check`, so it is covered by the same line.
+    makefile = MAKEFILE.read_text(encoding="utf-8")
+    recipe = re.search(rf"^{re.escape(target)}:\n((?:\t.+\n)+)", makefile, re.M)
+    assert recipe, f"the Makefile has no {target} target"
+    assert "ruff check --no-cache ." in recipe.group(1)
+
+
 @pytest.mark.parametrize(("job", "target"), [("integration", "itest"), ("e2e", "e2e")])
 def test_ci_runs_the_tests_that_make_runs(job: str, target: str) -> None:
     # The comment in ci.yml says "same selection as make". Without this check the two could

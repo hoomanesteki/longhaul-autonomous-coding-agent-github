@@ -17,10 +17,18 @@ doing: a "started" line means it was inside that activity, and an "ended" or "fa
 it was between two activities. The kill points in a report come from that line and from nothing
 else, so they say what happened and not what the test hoped for.
 
-A kill waits for a line of the worker's log (`after`), then optionally for a condition
-(`until`), then for a pause (`delay_s`). The wait runs in a thread with a short poll, because an
-event loop that is busy with the run adds tens of milliseconds, which is the whole window of a
-kill between two activities.
+A kill waits for a line of the worker's log (`after`, the `nth` time it matches), then optionally
+for a condition (`until`), then for a pause (`delay_s`). The wait runs in a thread with a short
+poll, because an event loop that is busy with the run adds tens of milliseconds, which is the whole
+window of a kill between two activities.
+
+A seeded plan follows the progress of the worker and not the clock. It is drawn from the activities
+of a run that was never killed (`plan_kills`): the kill waits for the k-th activity to start and
+then pauses for no longer than that activity took in the reference. A run that is faster or slower
+than the reference, because the machine is idle or loaded, still reaches that line, and the kill
+still falls in or just after the same work. A plan made of seconds does not: a reference measured
+under load gives pauses that outlast a run measured when the machine is quiet, and the task
+finishes before its kill.
 """
 
 from __future__ import annotations
@@ -38,7 +46,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -83,10 +91,9 @@ KILL_WAIT_S = 400
 POLL_S = 0.002
 SLOW_POLL_S = 0.25
 
-# Kills are drawn from [MIN_DELAY_S, WINDOW_SHARE * expected duration]. The last share of the
-# expected duration is left out, so that a run which happens to be faster than the reference does
-# not finish before its kill is due.
-MIN_DELAY_S = 0.5
+# The first kill of a plan waits for one of the first WINDOW_SHARE of the activities of the
+# reference to start for the first time. The activities after that are left out, so that work
+# remains after the kill and a pause that runs a little long does not outlast the run.
 WINDOW_SHARE = 0.85
 
 # Where a worker was, as the kill points name it. An activity that was running is named by its
@@ -99,7 +106,11 @@ WORKER_READY = "worker running"
 _STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{3}) ")
 
 # The lines the kills wait for. Each is a regular expression over one line of the worker's log.
-FIRST_TURN = re.compile(r"activity llm_turn started")
+ANY_STARTED = re.compile(r"activity \w+ started")
+# A retried activity writes a started line for each attempt. A seeded kill counts only the first
+# attempts, because the reference has the same first attempts in the same order whatever was
+# retried on the way.
+FIRST_ATTEMPT_STARTED = re.compile(r"activity \w+ started: task \S+, attempt 1\b")
 ANY_ENDED = re.compile(r"activity \w+ ended")
 # Turn 3 of inventory_fix.yaml waits 3 s before the model answers.
 SLOW_TURN_STARTED = re.compile(r"activity llm_turn started: .*, turn 3$", re.MULTILINE)
@@ -155,14 +166,20 @@ def stamp(line: str) -> datetime | None:
 class Kill:
     """One kill of the worker that is running.
 
-    It waits for a line that matches `after` in the log of that worker, then for `until(task_id)`
-    to hold, then for `delay_s` seconds, and then sends SIGKILL.
+    It waits for the `nth` line that matches `after` in the log of that worker (the worker's own
+    log, so a new worker counts from its first line), then for `until(task_id)` to hold, then for
+    `delay_s` seconds, and then sends SIGKILL.
     """
 
     after: re.Pattern[str]
+    nth: int = 1
     delay_s: float = 0.0
     until: Callable[[str], bool] | None = None
     note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.nth < 1:
+            raise ValueError(f"nth counts from 1, not {self.nth}")
 
 
 @dataclass(frozen=True)
@@ -172,25 +189,80 @@ class KillPoint:
     after_s: float  # seconds from the start of the task
 
 
-def plan_kills(seed: int, count: int, expected_s: float) -> list[Kill]:
-    """`count` kills with delays drawn from a seeded generator, so a seed is a repeatable plan.
+@dataclass(frozen=True)
+class Activity:
+    """One activity of a worker, as its log shows it."""
 
-    The first kill is due after the first model turn starts, so the long preparation of the
-    sandbox is not part of the window. A later kill is due after the new worker has finished an
-    activity, so that it falls in new work and not in the retry of the activity that was killed:
-    an activity gives up after three attempts, and three kills on one tool call would end the
-    run for a reason that is not a bug.
+    name: str
+    line: str  # the line that says it started, without the time
+    took_s: float  # from that line to the line that ended or failed it; 0 if neither came
+    attempt: int = 1
+
+
+def activities_of(log: str) -> list[Activity]:
+    """The activities in a worker's log, in the order they started, and how long each took.
+
+    An activity is closed by the next "ended" or "failed" line of the same name, task and attempt.
+    A worker runs one activity of a task at a time, so that key is enough. A failed line adds the
+    name of the error after the detail, which is why the detail is not part of the key.
     """
+    found: list[Activity] = []
+    open_at: dict[tuple[str, str, str], tuple[int, datetime | None]] = {}
+    for text in log.splitlines():
+        match = ACTIVITY_LINE.search(text)
+        if match is None:
+            continue
+        key = (match["name"], match["task"], match["attempt"])
+        when = stamp(text)
+        if match["event"] == "started":
+            open_at[key] = (len(found), when)
+            found.append(Activity(match["name"], match.group(0), 0.0, int(match["attempt"])))
+        elif key in open_at:
+            index, began = open_at.pop(key)
+            if began is not None and when is not None:
+                found[index] = replace(found[index], took_s=(when - began).total_seconds())
+    return found
+
+
+def plan_kills(seed: int, count: int, reference: Sequence[Activity]) -> list[Kill]:
+    """`count` kills drawn from a seeded generator and the activities of a run that was not killed.
+
+    The first kill waits for the k-th activity to start. Only first attempts count, on both
+    sides: a worker that retries an activity writes more started lines than the reference did, and
+    counting those would move the kill to an earlier activity, into the preparation of the sandbox
+    when that was retried. The k-th first attempt of any worker is the k-th activity of the
+    reference.
+
+    The seed draws k from the first attempts from the first model turn to the first WINDOW_SHARE
+    of them, so the long preparation of the sandbox is not part of the window and work is left
+    after the kill. The kill then pauses for a seeded time that is no longer than that activity
+    took in the reference, which puts it inside the activity or just after it.
+
+    A later kill waits for the new worker to finish an activity, so that it falls in new work and
+    not in the retry of the activity that was killed: an activity gives up after three attempts,
+    and three kills on one tool call would end the run for a reason that is not a bug. Its pause
+    is drawn the same way, from an activity of the window.
+
+    The plan reads nothing but the seed and the reference's activities, so a seed is a repeatable
+    plan and a run of any speed meets it.
+    """
+    firsts = [a for a in reference if a.attempt == 1]
+    first_turn = next((n for n, a in enumerate(firsts, 1) if a.name == "llm_turn"), None)
+    if first_turn is None:
+        raise ValueError("the reference has no model turn to aim a kill after")
+    last = max(first_turn, int(WINDOW_SHARE * len(firsts)))
     rng = random.Random(seed)
-    high = max(MIN_DELAY_S + 1, WINDOW_SHARE * expected_s)
-    return [
-        Kill(
-            after=FIRST_TURN if n == 0 else ANY_ENDED,
-            delay_s=round(rng.uniform(MIN_DELAY_S, high), 2),
-            note=f"seed {seed}, kill {n + 1} of {count}",
-        )
-        for n in range(count)
-    ]
+    kills: list[Kill] = []
+    for n in range(count):
+        nth = rng.randint(first_turn, last)
+        delay_s = round(rng.uniform(0.0, firsts[nth - 1].took_s), 3)
+        note = f"seed {seed}, kill {n + 1} of {count}"
+        if n == 0:
+            note += f", after activity {nth} started ({firsts[nth - 1].line})"
+            kills.append(Kill(after=FIRST_ATTEMPT_STARTED, nth=nth, delay_s=delay_s, note=note))
+        else:
+            kills.append(Kill(after=ANY_ENDED, delay_s=delay_s, note=note))
+    return kills
 
 
 def kills_in_run(seed: int) -> int:
@@ -301,7 +373,7 @@ class Run:
     ledger_attempts: dict[int, list[int]]  # turn index -> the attempts on the cost ledger
     kills: list[KillPoint]
     planned_kills: int
-    work_s: float  # from the first model turn to the last activity
+    activities: list[Activity]  # of the first worker, in the order they started
     logs: dict[str, str] = field(default_factory=dict)
 
     def report(self) -> str:
@@ -463,9 +535,9 @@ class Stack:
     ) -> KillPoint | None:
         """Wait until the kill is due, then SIGKILL the worker by its pid and read where it was."""
         if not self._wait(
-            lambda: kill.after.search(worker.text()) is not None,
+            lambda: len(kill.after.findall(worker.text())) >= kill.nth,
             stop,
-            f"a line like {kill.after.pattern!r} ({kill.note})",
+            f"line {kill.nth} like {kill.after.pattern!r} ({kill.note})",
             POLL_S,
         ):
             return None
@@ -555,7 +627,7 @@ class Stack:
             ledger_attempts=await asyncio.to_thread(self._ledger, task_id),
             kills=points,
             planned_kills=len(kills),
-            work_s=self._work_seconds(),
+            activities=activities_of(self.workers[0].text()),
             logs={w.log.name: w.text() for w in self.workers},
         )
 
@@ -613,28 +685,6 @@ class Stack:
             check=True,
         )
         return listed.stdout.split()
-
-    def _work_seconds(self) -> float:
-        """From the first model turn of the first worker to the last activity line of the last."""
-        first = next(
-            (
-                when
-                for line in self.workers[0].text().splitlines()
-                if FIRST_TURN.search(line) and (when := stamp(line))
-            ),
-            None,
-        )
-        last = next(
-            (
-                when
-                for line in reversed(self.workers[-1].text().splitlines())
-                if ACTIVITY_LINE.search(line) and (when := stamp(line))
-            ),
-            None,
-        )
-        if first is None or last is None:
-            return 0.0
-        return (last - first).total_seconds()
 
     # ----- clean-up -----
     def close(self) -> None:

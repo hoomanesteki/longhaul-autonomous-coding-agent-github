@@ -394,15 +394,18 @@ class PollResult(BaseModel):
 
 
 class BuildPrBranchInput(BaseModel):
-    """What build_pr_branch needs: the finish summary, which titles the commit, and the checkpoint.
+    """What build_pr_branch needs: the finish summary, which titles the commit, and the two ends.
 
-    `head_sha` is the latest checkpoint the workflow knows. The work of the whole task is the
-    change from the base commit to it.
+    `base_sha` is the commit the workspace was prepared at (PrepareWorkspaceOutput.base_sha),
+    which the workflow keeps. The activity does not read it from the checkpoint repo, where the
+    sandbox could move the `base` tag. `head_sha` is the latest checkpoint the workflow knows.
+    The work of the whole task is the change from the base to the head.
     """
 
     task_id: str
     repo: str
     summary: str
+    base_sha: str
     head_sha: str
 
 

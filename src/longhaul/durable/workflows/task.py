@@ -47,9 +47,11 @@ A task of an issue (LH-306) is one whose repo is owner/name and whose spec has a
    already and does not repeat it. The keys would make a repeat harmless, but each one costs an
    activity and a place in the history.
 2. When the model calls `finish`, the phase becomes DELIVERING and the task is not over. The
-   `build_pr_branch` activity makes the pull request branch, and `deliver` pushes it and opens
-   a draft pull request. The task then swaps the label (`longhaul:working` out, `longhaul:pr-open`
-   in) and ends with PR_OPENED carrying the URL. `status()` shows no outcome until then.
+   `build_pr_branch` activity makes the pull request branch on the base the workspace was
+   prepared at (kept in `state.spec.base_sha`, because the `base` tag in the checkpoint repo is
+   the agent's to move), and `deliver` pushes it and opens a draft pull request. The task then
+   swaps the label (`longhaul:working` out, `longhaul:pr-open` in) and ends with PR_OPENED
+   carrying the URL. `status()` shows no outcome until then.
 3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
    because GitHub refuses a pull request with no commit.
 
@@ -341,6 +343,18 @@ class TaskWorkflow:
         prepared = await self._call(acts.PREPARE_WORKSPACE, state.spec)
         state.sandbox_id = prepared.sandbox_id
         state.head_sha = prepared.head_sha
+        self._keep_base(prepared.base_sha)
+
+    def _keep_base(self, base_sha: str) -> None:
+        """Keep the commit the workspace was prepared at, for the base of the pull request.
+
+        The checkpoint repo cannot say it: the sandbox has the repo read-write and can move its
+        `base` tag. The state can, and it reaches the run that delivers, across hand-overs.
+        CarryState has no field for it, so it goes on the spec, which is part of the state and
+        has the field `base_sha`. Only the task of an issue is delivered, so only it keeps one.
+        """
+        if lifecycle.is_github_task(self.state.spec):
+            self.state.spec = self.state.spec.model_copy(update={"base_sha": base_sha})
 
     async def _ensure_sandbox(self) -> None:
         """Have a running sandbox at the latest checkpoint, and keep its id."""
@@ -695,10 +709,11 @@ class TaskWorkflow:
         """Open the draft pull request and move the label. Ends the task with its URL."""
         state = self.state
         issue = state.spec.issue_number
-        if state.head_sha is None or issue is None:
-            # Both are set for a task of an issue that has run. Asking again changes nothing.
+        base_sha = state.spec.base_sha
+        if state.head_sha is None or base_sha is None or issue is None:
+            # All three are set for a task of an issue that has run. Asking again changes nothing.
             raise ApplicationError(
-                "a pull request cannot be built: the task has no checkpoint or no issue",
+                "a pull request cannot be built: the task has no base, no checkpoint or no issue",
                 non_retryable=True,
             )
         task_id, repo = state.spec.task_id, state.spec.repo
@@ -706,7 +721,11 @@ class TaskWorkflow:
             built = await self._call(
                 acts.BUILD_PR_BRANCH,
                 acts.BuildPrBranchInput(
-                    task_id=task_id, repo=repo, summary=finished.summary, head_sha=state.head_sha
+                    task_id=task_id,
+                    repo=repo,
+                    summary=finished.summary,
+                    base_sha=base_sha,
+                    head_sha=state.head_sha,
                 ),
             )
         except ActivityError as err:

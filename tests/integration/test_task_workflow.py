@@ -21,6 +21,7 @@ number and so is not delivered; `github_spec` has one.
 """
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -2746,3 +2747,50 @@ async def test_histories_with_and_without_the_memory_call_replay(env: WorkflowEn
     )
     for history in histories:
         await replayer.replay_workflow(history)
+
+
+def _with_prepare_result(history: WorkflowHistory, **fields: Any) -> WorkflowHistory:
+    """The history with `fields` added to the recorded result of prepare_workspace."""
+    scheduled = next(
+        event.event_id
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+        and event.activity_task_scheduled_event_attributes.activity_type.name
+        == acts.PREPARE_WORKSPACE.name
+    )
+    completed = next(
+        event.activity_task_completed_event_attributes
+        for event in history.events
+        if event.HasField("activity_task_completed_event_attributes")
+        and event.activity_task_completed_event_attributes.scheduled_event_id == scheduled
+    )
+    payload = completed.result.payloads[0]
+    payload.data = json.dumps({**json.loads(payload.data), **fields}).encode()
+    return history
+
+
+async def test_a_history_in_which_old_code_saw_the_memory_flag_replays(
+    env: WorkflowEnvironment,
+) -> None:
+    """A rolling upgrade can hand the prepare result of a new worker to old workflow code.
+
+    The new worker returns memory_enabled=true. The old workflow code ignores the field and goes
+    on to llm_turn, so that is the command the history holds. A worker that runs the new code
+    must replay it without a load_memory call, which `workflow.patched` decides: the history has
+    no marker for it. The history is recorded with the flag off and its recorded result is then
+    edited to carry the flag, which gives the history that the old code would have written.
+    """
+    stubs = Stubs(reads_then_finishes(1))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, make_spec("lh-acme-calc-63"), task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert stubs.memory_loads == []
+    seen = _with_prepare_result(history, memory_enabled=True, repo_map_ref=MAP_REF.model_dump())
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=pydantic_data_converter,
+    )
+    await replayer.replay_workflow(seen)

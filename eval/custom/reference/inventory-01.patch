@@ -1,0 +1,45 @@
+diff --git a/src/inventory/__init__.py b/src/inventory/__init__.py
+index 828da0d..1aeb112 100644
+--- a/src/inventory/__init__.py
++++ b/src/inventory/__init__.py
+@@ -1,7 +1,8 @@
+ """In-memory stock levels per SKU."""
+ 
++from inventory.errors import InventoryError
+ from inventory.export import dump_json, dump_yaml
+ from inventory.reservations import Reservations
+ from inventory.store import Inventory
+ 
+-__all__ = ["Inventory", "Reservations", "dump_json", "dump_yaml"]
++__all__ = ["Inventory", "InventoryError", "Reservations", "dump_json", "dump_yaml"]
+diff --git a/src/inventory/errors.py b/src/inventory/errors.py
+new file mode 100644
+index 0000000..d58e7bf
+--- /dev/null
++++ b/src/inventory/errors.py
+@@ -0,0 +1,2 @@
++class InventoryError(ValueError):
++    """Raised when an inventory operation would break a stock rule."""
+diff --git a/src/inventory/store.py b/src/inventory/store.py
+index b152ae6..c61803c 100644
+--- a/src/inventory/store.py
++++ b/src/inventory/store.py
+@@ -1,3 +1,6 @@
++from inventory.errors import InventoryError
++
++
+ class Inventory:
+     """Tracks the on-hand quantity of each SKU."""
+ 
+@@ -14,7 +17,10 @@ class Inventory:
+         """Decrease the stock of sku by quantity."""
+         if quantity <= 0:
+             raise ValueError("quantity must be positive")
+-        self._stock[sku] = self.quantity(sku) - quantity
++        current = self.quantity(sku)
++        if quantity > current:
++            raise InventoryError(f"{sku}: cannot remove {quantity}, only {current} in stock")
++        self._stock[sku] = current - quantity
+ 
+     def quantity(self, sku: str) -> int:
+         """Return the on-hand quantity of sku, or 0 if it is unknown."""

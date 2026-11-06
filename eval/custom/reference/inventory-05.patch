@@ -1,0 +1,42 @@
+diff --git a/src/inventory/reservations.py b/src/inventory/reservations.py
+index 527ba2f..7ad7b1d 100644
+--- a/src/inventory/reservations.py
++++ b/src/inventory/reservations.py
+@@ -1,6 +1,7 @@
+ """Short holds on stock, for orders that are still being paid."""
+ 
+ import time
++from collections.abc import Callable
+ from dataclasses import dataclass
+ 
+ from inventory.store import Inventory
+@@ -16,8 +17,11 @@ class _Hold:
+ class Reservations:
+     """Reserve stock for a number of seconds. An expired hold frees its stock again."""
+ 
+-    def __init__(self, inventory: Inventory) -> None:
++    def __init__(
++        self, inventory: Inventory, clock: Callable[[], float] = time.monotonic
++    ) -> None:
+         self._inventory = inventory
++        self._clock = clock
+         self._holds: dict[str, _Hold] = {}
+ 
+     def reserve(self, sku: str, quantity: int, ttl_s: float) -> str:
+@@ -28,7 +32,7 @@ class Reservations:
+         if quantity > free:
+             raise ValueError(f"{sku}: only {free} available")
+         reservation_id = f"res-{int(time.time())}"
+-        self._holds[reservation_id] = _Hold(sku, quantity, time.time() + ttl_s)
++        self._holds[reservation_id] = _Hold(sku, quantity, self._clock() + ttl_s)
+         return reservation_id
+ 
+     def release(self, reservation_id: str) -> None:
+@@ -42,6 +46,6 @@ class Reservations:
+         return self._inventory.quantity(sku) - held
+ 
+     def _drop_expired(self) -> None:
+-        now = time.time()
++        now = self._clock()
+         for reservation_id in [r for r, h in self._holds.items() if h.expires_at <= now]:
+             del self._holds[reservation_id]

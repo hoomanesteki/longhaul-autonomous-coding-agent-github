@@ -1,0 +1,41 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index 5d49d8b..2324e6f 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
+ name = "inventory"
+ version = "0.1.0"
+ requires-python = ">=3.12"
+-dependencies = ["pyyaml>=6"]
+ 
+ [project.optional-dependencies]
+-dev = ["pytest>=8"]
++dev = ["pytest>=8", "pyyaml>=6"]
++yaml = ["pyyaml>=6"]
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+diff --git a/src/inventory/export.py b/src/inventory/export.py
+index 0ebb0c9..daafee1 100644
+--- a/src/inventory/export.py
++++ b/src/inventory/export.py
+@@ -2,8 +2,6 @@
+ 
+ import json
+ 
+-import yaml
+-
+ from inventory.store import Inventory
+ 
+ 
+@@ -13,5 +11,9 @@ def dump_json(inventory: Inventory) -> str:
+ 
+ 
+ def dump_yaml(inventory: Inventory) -> str:
+-    """Return the stock levels as YAML, sorted by SKU."""
++    """Return the stock levels as YAML, sorted by SKU. It needs the optional PyYAML."""
++    try:
++        import yaml
++    except ImportError as exc:
++        raise ImportError("dump_yaml() needs PyYAML: install inventory[yaml]") from exc
+     return yaml.safe_dump(inventory.snapshot(), sort_keys=True)

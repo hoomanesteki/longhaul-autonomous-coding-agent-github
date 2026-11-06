@@ -1,0 +1,36 @@
+diff --git a/src/textkit/__init__.py b/src/textkit/__init__.py
+index 8eda98e..c2a684a 100644
+--- a/src/textkit/__init__.py
++++ b/src/textkit/__init__.py
+@@ -1,6 +1,6 @@
+ """Text helpers for building identifiers and labels."""
+ 
+-from textkit.slug import slugify
++from textkit.slug import make_slug, slugify
+ from textkit.truncate import truncate
+ 
+-__all__ = ["slugify", "truncate"]
++__all__ = ["make_slug", "slugify", "truncate"]
+diff --git a/src/textkit/slug.py b/src/textkit/slug.py
+index 242c110..5f4308c 100644
+--- a/src/textkit/slug.py
++++ b/src/textkit/slug.py
+@@ -1,8 +1,17 @@
+ import re
++import warnings
+ 
+ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
+ 
+ 
+-def slugify(text: str) -> str:
++def make_slug(text: str) -> str:
+     """Turn text into a lowercase, dash-separated slug."""
+     return _NON_ALNUM.sub("-", text.lower()).strip("-")
++
++
++def slugify(text: str) -> str:
++    """The old name of make_slug(). It still works and warns."""
++    warnings.warn(
++        "slugify() was renamed to make_slug()", DeprecationWarning, stacklevel=2
++    )
++    return make_slug(text)

@@ -452,6 +452,74 @@ Things to know when you read the numbers:
 
 `tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 
+## Run the evaluation
+
+`eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.
+
+```bash
+make up && make sandbox-image && make migrate
+# shell 1: the worker, with the config you mean to measure
+uv run longhaul worker
+
+# shell 2: a dry run on two tasks with scripted answers (its results go to a scratch folder,
+# because they are not model results), then a real run
+uv run python eval/run.py --set custom --config full --limit 2 --run-id dry-1 \
+  --script tests/fixtures/scripts/eval --results-dir "${TMPDIR:-/tmp}/longhaul-dry"
+uv run python eval/run.py --set custom --config full --run-id headline-1
+```
+
+The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE_URL`, because the cost of a task is the sum of its rows in the cost ledger. It must see the same `LONGHAUL_CKPT_DIR` as the worker, because it reads the agent's patch from the checkpoint repo.
+
+| Flag | Meaning |
+|---|---|
+| `--set custom` | The 15 custom tasks. `swebench` is accepted and refused until LH-902. |
+| `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
+| `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
+| `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
+| `--concurrency K` | How many tasks run at once. The default is 1. |
+| `--model ID` | Checked against the coder model in the worker's config, and recorded. |
+| `--memory on\|off`, `--context-mode full\|no_compaction\|none` | Recorded in each result file. The worker reads memory and context settings from its own config, so start it with the settings you mean to measure. |
+| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. Every other `--provider` is only recorded: the worker answers with its own provider. |
+| `--results-dir`, `--pause-timeout-s` | Where results go (default `eval/results`), and how long a pause lasts before the runner ends the task (default 60). |
+
+### What a run does
+
+1. Checks everything it can before it starts a task: the model, each repo folder (it must match the `base_sha` in `tasks.yaml`, and must hold no hidden test), the scripts, and that the run id is new. The results folder is made last, so a run that stops here leaves nothing behind.
+2. Starts each task as a workflow with id `lh-eval-<run id>-<task id>`. The task is a folder on this machine (`local:/abs/path`), so nothing is written to GitHub. The plan gate is off, no hints are sent, and the caps are the ones of plan section 8.4: 2 dollars, 150 turns, 120 minutes.
+3. Watches the task. A pause marks it `intervention_needed`. A pause that lasts a minute ends the task with a cancel, because nobody is there to answer. A task that runs past its time limit is ended the same way, and one that ignores the cancel for 30 seconds is terminated.
+4. Reads the patch from the checkpoint repo and grades it. A task counts as resolved when the agent finished (outcome `pr_opened`) and the grader passed the patch. A task that ended any other way is not graded and is not resolved.
+5. Writes `<task id>.json` and `<task id>.patch`, removes the sandbox and the checkpoint repo of the task, and at the end writes `summary.json`.
+
+When the runner itself fails on a task, for example a lost connection or a database error, that task gets a result with outcome `error` and `resolved` null, and the other tasks go on. The summary counts it as attempted and not graded. Ctrl-C ends the whole run: the tasks that are running are terminated, no summary is written, and the run id cannot be used again.
+
+A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+
+### The custom task set
+
+`eval/custom/tasks.yaml` lists 15 tasks on three small repos that we own, five on each: `calc`, `textkit` and `inventory`. They are 5 bug fixes, 3 features, 3 refactors, 2 dependency changes and 2 flaky-test fixes, as plan section 8.2 asks.
+
+| Folder | What it holds |
+|---|---|
+| `eval/custom/repos/<repo>` | The repo as the agent gets it. Its own tests pass. |
+| `eval/custom/hidden_tests/<repo>` | The test file of each task. It fails on the repo as it is and passes on a correct fix. The agent never sees it. |
+| `eval/custom/reference/<id>.patch` | A fix that passes the hidden tests. It is kept to prove the tests can pass, and the agent never sees it either. |
+
+`base_sha` is the commit that `scripts/make_fixture_git.py` makes of the repo folder, so it changes whenever a file in the folder changes. Run `uv run python eval/custom_tasks.py` for the current values and copy them into `tasks.yaml`. A unit test and the runner both refuse to go on while they differ.
+
+Hidden tests stay out of the sandbox in three ways. The repo folders hold none of them. The runner reads each folder the way the worker copies it, and stops when it finds a hidden test or a reference patch there, by name or by content. And the integration test `test_hidden_tests_not_visible` searches a real sandbox for them.
+
+### The grader
+
+`eval/grade_custom.py` starts a fresh sandbox, builds the base commit of the task in it from a git bundle, runs the setup with the network on, and cuts the network. It then applies the patch, copies in the hidden tests and runs the repo tests and the hidden tests. Both runs must pass. Nothing of the repo runs on the host. Grade a patch by hand with:
+
+```bash
+uv run python eval/grade_custom.py calc-01 --patch eval/custom/reference/calc-01.patch
+```
+
+A failed setup raises an error and does not mark the patch as wrong, because the setup does not depend on the patch.
+
+`make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -459,7 +527,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | Job | What it does |
 |---|---|
 | `lint` | `ruff check` and `ruff format --check` |
-| `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
+| `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
 | `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |

@@ -16,14 +16,14 @@ setup:
 check:
 	uv run ruff check --no-cache .
 	uv run ruff format --check .
-	uv run mypy src
+	uv run mypy src eval
 	uv run pytest tests/unit -q --cov=longhaul --cov-fail-under=80
 
 ci-local:
 	uv sync --locked
 	uv run ruff check --no-cache .
 	uv run ruff format --check .
-	uv run mypy src
+	uv run mypy src eval
 	uv run pytest tests/unit -q --cov=longhaul --cov-report=term-missing --cov-fail-under=80
 
 itest:

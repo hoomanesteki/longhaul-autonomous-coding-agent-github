@@ -44,7 +44,7 @@ jobs:
           python-version: "3.12"
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run mypy src
+      - run: uv run mypy src eval
 
   unit:
     runs-on: ubuntu-latest

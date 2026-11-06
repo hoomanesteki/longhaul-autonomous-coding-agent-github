@@ -1,0 +1,18 @@
+diff --git a/src/calc/__init__.py b/src/calc/__init__.py
+index e4e9e1f..c0a9e15 100644
+--- a/src/calc/__init__.py
++++ b/src/calc/__init__.py
+@@ -14,3 +14,13 @@ def multiply(a: int, b: int) -> int:
+ def divide(a: float, b: float) -> float:
+     """Return a divided by b. Dividing by zero raises ZeroDivisionError."""
+     return a // b
++
++
++def percent_change(old: float, new: float) -> float:
++    """Return the change from old to new as a percentage of old.
++
++    A starting value of zero has no percentage, so it raises ValueError.
++    """
++    if old == 0:
++        raise ValueError("percent_change() needs a starting value other than zero")
++    return (new - old) / old * 100

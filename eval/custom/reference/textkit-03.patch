@@ -1,0 +1,27 @@
+diff --git a/src/textkit/__init__.py b/src/textkit/__init__.py
+index 8eda98e..32aaede 100644
+--- a/src/textkit/__init__.py
++++ b/src/textkit/__init__.py
+@@ -1,6 +1,7 @@
+ """Text helpers for building identifiers and labels."""
+ 
++from textkit.case import camel_to_snake
+ from textkit.slug import slugify
+ from textkit.truncate import truncate
+ 
+-__all__ = ["slugify", "truncate"]
++__all__ = ["camel_to_snake", "slugify", "truncate"]
+diff --git a/src/textkit/case.py b/src/textkit/case.py
+new file mode 100644
+index 0000000..2d1394d
+--- /dev/null
++++ b/src/textkit/case.py
+@@ -0,0 +1,8 @@
++import re
++
++_WORD_EDGE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
++
++
++def camel_to_snake(text: str) -> str:
++    """Turn camelCase or PascalCase into snake_case. Text that is already snake_case is kept."""
++    return _WORD_EDGE.sub("_", text).lower()

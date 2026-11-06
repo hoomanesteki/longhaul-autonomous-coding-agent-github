@@ -118,10 +118,19 @@ with the spec and the repo map that prepare_workspace wrote. The activity return
 memory block, the notes about the repo that end the system prompt, and the workflow hands it to
 every `llm_turn` and `compact`. The block is loaded once and not on each turn because the prompt
 must be the same bytes for the whole task, or the prompt cache of every turn is lost (ADR-0013).
-Nothing else decides whether to call it. It is read from the recorded result of prepare_workspace,
-so a history from before this story, whose result has no flag, replays without the call, and a
-worker with no store adds no activity to its tasks. A `load_memory` that fails after its retries
-does not fail the task: the notes are hints, and the task goes on with a prompt that has no block.
+It is read from the recorded result of prepare_workspace, so a history from before this story,
+whose result has no flag, replays without the call, and a worker with no store adds no activity to
+its tasks. The flag alone is not enough (F13). During a rolling upgrade a new worker can write a
+prepare result with the flag on, and the next workflow task can run on an old worker, which ignores
+the flag and schedules `llm_turn`. A new worker that replays that history would schedule
+`load_memory` in its place, and the replay would fail. So the call is also behind
+`workflow.patched(LOAD_MEMORY_PATCH)`: a history that has no marker for it replays without the
+call, and every task that loads memory records the marker. Drop the patch with
+`workflow.deprecate_patch` once no run that began before this story is open.
+
+A `load_memory` that fails after its retries does not fail the task: the notes are hints, and the
+task goes on with a prompt that has no block.
+
 If prepare_workspace found a test command for a repo whose settings name none, it goes into the
 spec for the whole task, so every prompt names it.
 
@@ -228,6 +237,9 @@ def cancel_summary(by: str, reason: str) -> str:
 SANDBOX_LOST = "sandbox lost"
 # The summary of the outcome of a task of an issue whose work changes no file.
 NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
+
+# The patch marker of the load_memory call (LH-604, failure mode F13). See "Memory" above.
+LOAD_MEMORY_PATCH = "lh-604-load-memory"
 
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
@@ -429,7 +441,7 @@ class TaskWorkflow:
         state.sandbox_id = prepared.sandbox_id
         state.head_sha = prepared.head_sha
         self._use_test_command(prepared.test_command)
-        if prepared.memory_enabled:
+        if prepared.memory_enabled and workflow.patched(LOAD_MEMORY_PATCH):
             state.memory_ref = await self._load_memory(prepared.repo_map_ref)
 
     def _use_test_command(self, found: str | None) -> None:

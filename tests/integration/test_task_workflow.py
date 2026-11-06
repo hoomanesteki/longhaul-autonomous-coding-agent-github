@@ -2794,3 +2794,33 @@ async def test_a_history_in_which_old_code_saw_the_memory_flag_replays(
         data_converter=pydantic_data_converter,
     )
     await replayer.replay_workflow(seen)
+
+
+def _patch_markers(history: WorkflowHistory) -> list[str]:
+    return [
+        event.marker_recorded_event_attributes.marker_name
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+        and event.marker_recorded_event_attributes.marker_name == "core_patch"
+    ]
+
+
+async def test_a_task_with_memory_records_the_patch_marker_and_one_without_does_not(
+    env: WorkflowEnvironment,
+) -> None:
+    # The marker is what lets a worker tell a history of this code from a history of old code.
+    # A task that never asks about memory has no use for it, which keeps the history of every
+    # task on a worker with no store as it was.
+    with_memory, without = Stubs(reads_then_finishes(1)), Stubs(reads_then_finishes(1))
+    with_memory.prepared_with = WITH_MEMORY
+    async with running(env, with_memory) as queue:
+        first = await start_task(env.client, make_spec("lh-acme-calc-64"), task_queue=queue)
+        await result_of(first)
+        marked = await first.fetch_history()
+    async with running(env, without) as queue:
+        second = await start_task(env.client, make_spec("lh-acme-calc-65"), task_queue=queue)
+        await result_of(second)
+        plain = await second.fetch_history()
+
+    assert len(_patch_markers(marked)) == 1
+    assert _patch_markers(plain) == []

@@ -186,6 +186,7 @@ WHERE repo = 'acme/calc' AND ts >= date_trunc('day', now() AT TIME ZONE 'UTC') A
 
 ```bash
 make up && make sandbox-image && make migrate
+uv sync --extra memory   # the example config turns memory on with the local embedder
 # shell 1: the worker stays in the foreground
 uv run longhaul worker
 
@@ -195,6 +196,8 @@ uv run longhaul run \
   --issue-file tests/fixtures/repos/calc/ISSUE.md \
   --provider scripted --script tests/fixtures/scripts/calc_fix.yaml
 ```
+
+The worker stops at its start with a message that names `uv sync --extra memory` when the extra is missing. Plain `uv sync` and `make setup` leave it out, so run the line above after them. To go without the extra, set `memory.embedder: hash` in your config (see "The memory embedder"), which finds notes by shared words only, or `memory.enabled: false`. The first start with the local embedder downloads the model (66 MB), unless it is cached already.
 
 `make migrate` creates the tables the worker writes to. Both commands read the `LONGHAUL_*` settings from your shell or from `.env` (copy `.env.example`). The worker needs the database, Temporal, the blob store and, for a real model, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. `run` needs Temporal, the blob store and the checkpoint folder, but not the database.
 
@@ -332,7 +335,7 @@ mkdir -p "$HOME/.longhaul/ckpt"
 docker compose --profile full up -d --build worker
 ```
 
-The service builds `docker/worker/Dockerfile` and mounts two things from the host. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
+The service builds `docker/worker/Dockerfile` and mounts two things from the host. The image installs the memory extra and loads the embedding model into `/opt/fastembed` when it is built, so the example config (`memory.embedder: local`) starts in a container with no network. The build downloads the model, which adds about 200 MB to the image. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
 
 **Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and publish no port from it beyond the metrics port below, which compose binds to `127.0.0.1`. The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
 

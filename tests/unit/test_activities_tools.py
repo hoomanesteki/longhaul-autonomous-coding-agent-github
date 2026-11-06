@@ -1184,7 +1184,9 @@ async def test_a_page_of_read_file_fits_the_cap_of_the_run(sandbox: FakeSandbox)
     whole = await rig.exec(read)
     small = await rig.exec(read.model_copy(update={"window_tokens": 3_200}))
 
-    assert len(small.output) < len(whole.output) / 10
+    # The output that travels inline is a preview, so the whole page is about 2,000 characters
+    # and the small one under 300.
+    assert len(small.output) < len(whole.output) / 5
     # The page is cut by the cap of the run, plus the line that says where to go on.
     assert estimate_tokens(small.output) <= 100 + 60
 

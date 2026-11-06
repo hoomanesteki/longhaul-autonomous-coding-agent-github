@@ -22,6 +22,7 @@ from longhaul.context.tokens import (
     count_request_chars,
     estimate_tokens,
     prompt_tokens,
+    result_cap,
 )
 from longhaul.contracts import (
     Message,
@@ -504,6 +505,26 @@ async def test_the_turn_recipe_in_the_module_docstring(tmp_path: Path) -> None:
 
     assert meter.observe(response.usage, chars)
     assert meter.chars_per_token == pytest.approx(chars / exact)
+
+
+# ---------- the cap for one result in a window of the run's own (LH-407) ----------
+def test_a_result_may_take_a_32nd_of_a_small_window() -> None:
+    assert result_cap(4_000, 8_000) == 250
+    assert result_cap(4_000, 64_000) == 2_000
+
+
+def test_a_window_with_room_leaves_the_configured_cap() -> None:
+    assert result_cap(4_000, 128_000) == 4_000
+    assert result_cap(4_000, 200_000) == 4_000
+
+
+def test_a_run_without_a_window_of_its_own_has_the_configured_cap() -> None:
+    assert result_cap(4_000, None) == 4_000
+
+
+@pytest.mark.parametrize("window", [1, 10, 31])
+def test_the_cap_is_never_below_one_token(window: int) -> None:
+    assert result_cap(4_000, window) == 1
 
 
 # ---------- the module stays pure ----------

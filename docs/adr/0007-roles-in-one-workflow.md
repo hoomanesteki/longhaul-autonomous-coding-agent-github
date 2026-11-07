@@ -37,13 +37,24 @@ LH-503 adds the coder's side of the plan. A coder with a plan is the same role i
 - **`status()` carries the plan** as `PlannedStatus`, a `TaskStatus` with one more field, because `TaskStatus` is a contract.
 - **A question ends the task for now.** `ask_human` records a `paused` event with the question and ends the task as `stuck` in the phase `paused`. LH-506 replaces `_ask_human` in the workflow with the wait for an answer.
 
+LH-504 adds the third role, the verifier. A coder with a plan no longer ends the task by itself:
+
+- **Phase VERIFYING follows `submit_for_review`.** A `finish` in a task with a plan still ends it without a review, as it did before, and the pull request stays a draft. The coder is not offered `finish`, so only a history from before LH-503 or a model that invents the call takes that path, and neither can mark a pull request ready.
+- **Two halves, and the work passes only if both say so.** The pre-check runs the test command of the repo and every acceptance check of the plan that is a command through `tool_exec`, then takes the diff with `git_diff`. The verdict is a verifier's reading of the plan, the diff and those results. A command that failed fails the review whatever the verifier says, because tests are ground truth and the model reviews what a test run cannot show. A repo with no test command runs none, and the verdict decides alone.
+- **The plan says which checks are commands.** A check that starts with `$ `, or is a command in backticks and nothing else, is run. Anything else is read by the verifier only. A command that is missed is still seen by the verifier, but a sentence run as a command would fail the review for nothing, so the rule leans to missing. The planner's prompt tells it the mark.
+- **The verifier has a transcript of its own.** It does not read the coder's history, so it does not inherit the coder's assumptions. Its first message holds the plan with the statuses the coder left, the pre-check and the diff, each output cut to a head, a tail and a handle like any tool output. The workflow cannot write blobs, so `llm_turn` builds that message from `LlmTurnInput.review`, which names the stored outputs by ref. The coder's transcript and notes are set aside in the workflow while the verifier has the view and put back before the coder is sent back.
+- **The verifier cannot change the tree.** Its tools are `list_dir`, `read_file`, `search`, `git_diff`, `run_tests` and `read_output`, and `submit_verdict`. Every call of the review, the pre-check included, is marked read-only, so `tool_exec` puts back whatever a command wrote, as it does for the planner. It has at most 15 turns for a round.
+- **The workflow judges `submit_verdict` itself.** The input schema is the `VerifierVerdict` contract. The rules a schema cannot say are the command in `tests_run`, the counts in `tests_summary`, `issues` on a verdict that fails and a `send_back_step` that is a step of the plan. An invalid verdict gets one repair turn (F14), and a second ends the task with an `error` outcome. A verifier that submits nothing in its turns ends it the same way. Neither counts as a pass or as a failed round.
+- **A failed review sends the coder back.** It adds one to `CarryState.verify_rounds`, which crosses hand-overs, records a `verdict` event and puts "Review failed: <issues>. Fix step <id>." at the end of the coder's transcript, after the answers to its last calls. The coder goes on with the plan and the transcript it had. At `max_verify_rounds` the task ends as `stuck` with the reason and the last issues in the summary. The workflow cannot read the config, so `acts.MAX_VERIFY_ROUNDS` copies the number, a unit test keeps the two equal and a worker whose config holds another number stops at the start.
+- **A verified pull request is ready for review.** `DeliverInput.verified_tests` carries the counts of the verdict. `deliver` opens the pull request as ready when it is set and as a draft when it is not, and the body says "Verified: <counts>". The value is part of the input, so a retry builds the same body and the same request under the same key.
+
 ## Consequences
 
 Easier:
 
 - Cancel, hints, budgets, cost and the hand-over every 40 turns work for every role with no new plumbing, because there is one workflow and one history.
 - The handoff from the planner to the coder is a value in `CarryState`. The sandbox needs no handoff, and the coder starts where the planner left the tree: the checkpoint.
-- The plan gate (LH-502) is a wait inside the same workflow, and the verifier (LH-504) can send work back to the coder by changing the phase.
+- The plan gate (LH-502) is a wait inside the same workflow, and the verifier (LH-504) sends work back to the coder by changing the phase and adding a message to the coder's transcript, which it keeps.
 
 Harder:
 
@@ -55,7 +66,11 @@ Harder:
 - A coder with a plan has its own system prompt and tool list, so it has a cache prefix of its own. A step update rewrites the first message, which gives up the cached conversation after it once for each update. A plan has 2 to 8 steps, so that is a handful of writes in a task.
 - The histories of tasks replay as they were. A task without a plan makes the same commands. A task that was planned before LH-503 still ends on `finish`, and its other coder calls run as before, because the one new activity, `record_step`, is called only for `update_step`.
 
-Watch from now on: the cost of the planner on short tasks. The planner's `effort` is the setting to lower. The turn limit is fixed at 20 until the workflow can take it from the config.
+- The verifier is a phase that planned tasks gain when they submit for review. Adding a phase to a deployed workflow needs `workflow.patched` (F13), and this change goes in without one: no release has run the coder of LH-503 yet, so no history of a planned task that submitted for review is in flight. A planned task that ends on `finish`, and a task without a plan, make the same commands as before. From the first release on, a change like this needs the patch marker.
+- A review costs turns. The pre-check adds a tool call for each command, and the verifier takes up to 15 turns for a round. They count against `task_turns` like any other, and so does the message that sends the coder back, which takes a turn index of its own because the log of the task keeps one results part for each turn.
+- A plan whose acceptance command can never pass, or a verifier that keeps finding the same fault, spends three rounds before the task ends. That is the cost of not letting a model overrule a failing command.
+
+Watch from now on: the cost of the planner and the verifier on short tasks. The `effort` of each role is the setting to lower. The planner's turn limit is fixed at 20 and the number of failed reviews at 3, until the workflow can take them from the config.
 
 ## Alternatives
 

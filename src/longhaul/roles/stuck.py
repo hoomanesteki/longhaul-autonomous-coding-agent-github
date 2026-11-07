@@ -5,13 +5,18 @@ going in circles, from facts that are cheap to keep:
 
 - NO_PROGRESS: in the last `no_progress_turns` turns no test run passed more tests than any run
   before it, and no plan step was finished. The first test count the detector sees counts as a
-  gain, because the agent has learned something it did not know.
+  gain, because the agent has learned something it did not know. The steps done so far count as
+  a gain on the first turn of a window in the same way, so a step finished on that turn is
+  never missed. A window that starts again after a signal can be one turn late for it, and
+  never early.
 - REPEATED_FAILURE: the same command failed the same way `repeated_failure_count` times. Turns
   that ran no failing command do not break the streak, because an agent edits between two runs
   of its tests. A different failure does.
 - EDIT_CHURN: one region of a file was edited `churn_edits` times in the last 10 turns and the
-  count of passing tests did not move. Two regions are the same when the shorter one shares half
-  or more of its lines with the other, so a small fix inside an earlier edit counts.
+  count of passing tests did not move. Two regions are the same when they share half or more of
+  the lines of the longer one. A small fix inside a big region is not the same region: a
+  `write_file` covers its whole file, and three fixes in three places of a new file are the
+  normal way to build it.
 - TOOL_ERRORS: the last `consecutive_tool_errors` tool calls all failed. A turn with one good
   call ends the run of errors, even if its other calls failed.
 
@@ -53,9 +58,11 @@ WINDOW_TURNS = 30
 CHURN_TURNS = 10
 
 # What one turn keeps of its edits and what a note keeps of a text, so that the window is small
-# whatever the agent does. A path is cut from the front: its end names the file.
+# whatever the agent does. A path is cut from the front: its end names the file. The limit on a
+# path is in bytes of JSON, the form the state is stored in, since the limit on the state is in
+# bytes too and a file name can be in any script.
 MAX_REGIONS_PER_TURN = 3
-MAX_PATH_CHARS = 48
+MAX_PATH_BYTES = 48
 MAX_TEXT_CHARS = 80
 
 Region = tuple[str, int, int]  # path, first line, last line
@@ -136,8 +143,30 @@ def short(text: str, limit: int = MAX_TEXT_CHARS) -> str:
     return line if len(line) <= limit else line[: limit - 3].rstrip() + "..."
 
 
+def _json_bytes(char: str) -> int:
+    """The bytes that one character of a string takes in the JSON of the state."""
+    code = ord(char)
+    if char in '"\\':
+        return 2
+    if code < 0x20:
+        return 6  # most control characters are written as \u00xx
+    if code < 0x80:
+        return 1
+    return 2 if code < 0x800 else 3 if code < 0x10000 else 4
+
+
 def short_path(path: str) -> str:
-    return path if len(path) <= MAX_PATH_CHARS else "..." + path[-(MAX_PATH_CHARS - 3) :]
+    """The path, or its end behind "..." when it takes more than MAX_PATH_BYTES of JSON."""
+    if sum(_json_bytes(char) for char in path) <= MAX_PATH_BYTES:
+        return path
+    room = MAX_PATH_BYTES - len("...")
+    kept: list[str] = []
+    for char in reversed(path):
+        room -= _json_bytes(char)
+        if room < 0:
+            break
+        kept.append(char)
+    return "..." + "".join(reversed(kept))
 
 
 def read_turn(
@@ -224,11 +253,17 @@ def _tool_errors(window: list[TurnSignal], limits: Limits, notes: TurnNotes) -> 
 
 
 def _same_region(a: Region, b: Region) -> bool:
+    """True when the two edits share half or more of the lines of the longer one.
+
+    The longer one sets the measure so that a region which covers a whole file (a write_file)
+    does not take in every small edit of that file: two edits that both overlap it need not
+    overlap each other.
+    """
     if a[0] != b[0]:
         return False
     shared = min(a[2], b[2]) - max(a[1], b[1]) + 1
-    shorter = max(min(a[2] - a[1], b[2] - b[1]) + 1, 1)
-    return shared > 0 and shared * 2 >= shorter
+    longer = max(a[2] - a[1], b[2] - b[1]) + 1
+    return shared > 0 and shared * 2 >= longer
 
 
 def _tests_unchanged(window: list[TurnSignal]) -> bool:
@@ -264,13 +299,17 @@ def _edit_churn(window: list[TurnSignal], limits: Limits, notes: TurnNotes) -> l
 def _progress(window: list[TurnSignal]) -> list[bool]:
     """For each turn, whether it passed more tests than any turn before it or finished a step."""
     best: int | None = None
-    steps: int | None = None  # the first turn sets the baseline, so it is no gain in steps
+    # A plan starts with no step done, and the window does not say how many were done before its
+    # first turn. Counting from 0 means that a step finished on the first turn is a gain, as the
+    # first test count is. A window that starts again after a signal can count a step that was
+    # done before it, and is then one turn late for NO_PROGRESS, never early.
+    steps = 0
     gained: list[bool] = []
     for turn in window:
         more_tests = turn.tests_passed is not None and (best is None or turn.tests_passed > best)
         if turn.tests_passed is not None:
             best = turn.tests_passed if best is None else max(best, turn.tests_passed)
-        more_steps = steps is not None and turn.steps_done > steps
+        more_steps = turn.steps_done > steps
         steps = turn.steps_done
         gained.append(more_tests or more_steps)
     return gained

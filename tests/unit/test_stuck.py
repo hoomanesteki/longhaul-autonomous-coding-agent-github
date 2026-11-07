@@ -497,7 +497,7 @@ def test_read_turn_keeps_a_few_short_regions() -> None:
     signal, _ = stuck.read_turn(0, 0, [CallSignal(edited_regions=regions)], [], {})
     assert len(signal.edited_regions) == stuck.MAX_REGIONS_PER_TURN
     path = signal.edited_regions[0][0]
-    assert len(path) <= stuck.MAX_PATH_CHARS
+    assert len(path) <= stuck.MAX_PATH_BYTES
     assert path.endswith("m.py")  # the end of a path says more than its start
 
 

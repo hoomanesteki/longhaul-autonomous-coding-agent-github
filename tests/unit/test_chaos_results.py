@@ -182,6 +182,12 @@ def test_a_kill_with_no_later_activity_has_no_latency_and_is_left_out_of_the_sta
 
 
 # ---------- the files ----------
+def test_the_summary_says_how_often_the_watchdog_restarted_temporal() -> None:
+    # A restart that the plan did not draw is part of what the runs met, so it is reported.
+    assert summary_of([run_result()]).temporal_heals == 0
+    assert summary_of([run_result()], temporal_heals=2).temporal_heals == 2
+
+
 def test_a_summary_cannot_be_made_of_no_runs() -> None:
     with pytest.raises(ValueError, match="no runs"):
         summary_of([])

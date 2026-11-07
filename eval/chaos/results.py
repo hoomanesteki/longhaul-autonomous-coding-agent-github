@@ -108,6 +108,8 @@ class Summary(BaseModel):
     # Where the model answers came from, for each task: "scripted", or the model that was recorded.
     recordings: dict[str, str]
     compose_project: str  # the private Temporal and Postgres, removed when the suite ended
+    # Restarts of Temporal that the watchdog made because it stopped answering, which no plan drew.
+    temporal_heals: int = 0
     started_at: AwareDatetime
     ended_at: AwareDatetime
     wall_time_s: float
@@ -175,6 +177,7 @@ def summarize(
     ended_at: datetime,
     clock_offset_s: float,
     compose_project: str,
+    temporal_heals: int = 0,
 ) -> Summary:
     """Add up the runs of one suite."""
     if not found:
@@ -194,6 +197,7 @@ def summarize(
         tasks=list(tasks),
         recordings=recordings,
         compose_project=compose_project,
+        temporal_heals=temporal_heals,
         started_at=started_at,
         ended_at=ended_at,
         wall_time_s=(ended_at - started_at).total_seconds(),

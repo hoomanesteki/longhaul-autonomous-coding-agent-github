@@ -8,6 +8,7 @@ compose file keeps the state of Temporal across the restarts that the suite make
 
 import socket
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -134,3 +135,87 @@ def test_every_published_port_of_the_two_services_is_bound_to_this_machine() -> 
     for name in services.SERVICES:
         for published in COMPOSE["services"][name]["ports"]:
             assert published.startswith("127.0.0.1:"), (name, published)
+
+
+# ---------- the watchdog ----------
+class FakeContainer:
+    def __init__(self, log: list[str]) -> None:
+        self.log = log
+
+    def restart(self, timeout: int) -> None:
+        self.log.append("restart")
+
+
+class FakeDocker:
+    """Enough of the docker client for a restart: it holds the containers it is asked for."""
+
+    def __init__(self, count: int = 1) -> None:
+        self.log: list[str] = []
+        self.count = count
+        self.filters: list[Any] = []
+        self.containers = self
+
+    def list(self, filters: Any = None, **_: Any) -> list[FakeContainer]:
+        self.filters.append(filters)
+        return [FakeContainer(self.log) for _ in range(self.count)]
+
+    def close(self) -> None:
+        pass
+
+
+def test_the_services_have_a_watchdog_that_is_not_running_until_they_start() -> None:
+    private = services.PrivateServices(PROJECT, PORTS)
+
+    assert private.watchdog.heals == 0
+    assert not private.watchdog.running
+
+
+def test_a_restart_that_a_kill_makes_resets_the_watchdog(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeDocker()
+    monkeypatch.setattr(services.docker, "from_env", lambda: fake)
+    private = services.PrivateServices(PROJECT, PORTS)
+    resets: list[str] = []
+    monkeypatch.setattr(private.watchdog, "reset", lambda: resets.append("reset"))
+
+    assert private.restart("temporal") is True
+    assert private.restart("postgres") is True
+
+    assert fake.log == ["restart", "restart"]
+    assert resets == ["reset"], "only a restart of Temporal says anything about the watchdog"
+
+
+def test_the_watchdog_restarts_the_container_of_its_own_project_and_counts_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeDocker()
+    monkeypatch.setattr(services.docker, "from_env", lambda: fake)
+    private = services.PrivateServices(PROJECT, PORTS)
+
+    private.heal_temporal()
+
+    assert fake.log == ["restart"]
+    assert fake.filters == [services.label_filters(PROJECT, "temporal")]
+
+
+def test_a_missing_container_is_a_failed_restart_and_not_a_counted_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(services.docker, "from_env", lambda: FakeDocker(count=0))
+    private = services.PrivateServices(PROJECT, PORTS)
+
+    with pytest.raises(RuntimeError, match="no Temporal container"):
+        private.heal_temporal()
+
+
+def test_the_watchdog_probes_the_private_temporal_and_not_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[str] = []
+    monkeypatch.setattr(
+        services.watchdog, "temporal_answers", lambda address: asked.append(address) or True
+    )
+    private = services.PrivateServices(PROJECT, PORTS)
+
+    assert private.watchdog.check() is False
+
+    assert asked == ["127.0.0.1:50472"]

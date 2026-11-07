@@ -11,6 +11,9 @@ Every container, volume and network the suite touches is found by the label of i
 `check_project` refuses any name without the prefix, which rules out the default project
 (`longhaul`), so no call here can reach the shared stack.
 
+A watchdog (watchdog.py) restarts the private Temporal if it stops answering, which a busy machine
+can cause in the dev server's SQLite connection. It never touches another project's containers.
+
 The suite removes what it started object by object, found by the label of its project. It does not
 run `docker compose down`, so a wrong project name could not take the shared stack down with it.
 """
@@ -22,6 +25,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -32,7 +36,7 @@ from docker.errors import DockerException, NotFound
 from docker.models.containers import Container
 
 from eval import custom_tasks
-from eval.chaos import history
+from eval.chaos import history, watchdog
 
 ROOT = custom_tasks.ROOT
 COMPOSE_FILE = ROOT / "docker-compose.yml"
@@ -140,6 +144,11 @@ class PrivateServices:
     def __init__(self, project: str, ports: Ports) -> None:
         self.project = check_project(project)
         self.ports = ports
+        # One restart at a time: a kill and the watchdog must not stop the same container twice.
+        self._restarting = threading.Lock()
+        self.watchdog = watchdog.Watchdog(
+            lambda: watchdog.temporal_answers(self.temporal), self.heal_temporal
+        )
 
     @classmethod
     def start(cls) -> PrivateServices:
@@ -166,6 +175,7 @@ class PrivateServices:
         except BaseException:
             services.remove()
             raise
+        services.watchdog.start()
         return services
 
     def wait_for_postgres(self) -> None:
@@ -197,14 +207,24 @@ class PrivateServices:
 
     def restart(self, service: str) -> bool:
         """Restart a container of the project, and return when it is running again."""
-        client = docker.from_env()
-        try:
-            found = client.containers.list(filters=label_filters(self.project, service))
-            for container in found:
-                container.restart(timeout=STOP_TIMEOUT_S)
+        with self._restarting:
+            client = docker.from_env()
+            try:
+                found = client.containers.list(filters=label_filters(self.project, service))
+                for container in found:
+                    container.restart(timeout=STOP_TIMEOUT_S)
+            finally:
+                client.close()
+            if service == "temporal":
+                # The server is down for a moment, which the watchdog must not take for a wedge.
+                self.watchdog.reset()
             return bool(found)
-        finally:
-            client.close()
+
+    def heal_temporal(self) -> None:
+        """Restart a Temporal that has stopped answering. The watchdog calls this."""
+        print("watchdog: Temporal stopped answering, restarting it", flush=True)
+        if not self.restart("temporal"):
+            raise RuntimeError(f"no Temporal container of {self.project} to restart")
 
     def clock_offset_s(self) -> float:
         """Seconds the clock of the Docker VM is ahead of this machine's."""
@@ -223,6 +243,7 @@ class PrivateServices:
 
     def remove(self) -> None:
         """Remove the containers, volumes and networks of this project and nothing else."""
+        self.watchdog.stop()  # before the containers go, or it would restart one that is leaving
         client = docker.from_env()
         try:
             filters = label_filters(self.project)

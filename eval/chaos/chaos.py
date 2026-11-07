@@ -410,13 +410,15 @@ def run_suite(options: ChaosOptions) -> int:
         ended_at=datetime.now(UTC),
         clock_offset_s=offset_s,
         compose_project=private.project,
+        temporal_heals=private.watchdog.heals,
     )
     results.write_summary(folder, summary)
     print(
         f"{summary.survived} of {summary.runs} runs survived, {summary.completed} completed, "
         f"{summary.duplicate_side_effects} duplicate writes, "
         f"{summary.extra_ledger_rows} extra ledger rows (${summary.extra_cost_usd:.4f}), "
-        f"resume median {summary.resume_latency.median_s} s ({folder / results.SUMMARY_FILE})"
+        f"resume median {summary.resume_latency.median_s} s, "
+        f"{summary.temporal_heals} restarts by the watchdog ({folder / results.SUMMARY_FILE})"
     )
     return 0
 

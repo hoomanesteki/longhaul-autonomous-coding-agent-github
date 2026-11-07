@@ -13,7 +13,9 @@ once, however often they are recorded: the first two as upserts on their key, th
 looking for the same sha first, because its table has no natural key. An event is a log line.
 The same event twice means that the thing happened twice, so it is written every time. A plan is
 an upsert on its task and version, and it only ever rewrites the plan itself: the status and the
-decision of a row that someone has already decided on are left as they are.
+decision of a row that someone has already decided on are left as they are. The decision itself
+(`record_plan_decision`, LH-502) is written once: it only changes a row that is still proposed,
+so the first answer stands and its time does not move when the activity runs again.
 
 Two of the totals in `tasks` come from here (LH-406). `record_request_fraction` keeps the largest
 share of the window that a request took, as a maximum, so it cannot count a request twice. A
@@ -45,6 +47,8 @@ from longhaul.db.models import Checkpoint, Event, PlanRow, Task, ToolCallRow, Tu
 # The workflow cannot import this module, so each side has the name, and a unit test keeps the two
 # equal.
 COMPACTION_EVENT = "compaction"
+# The status of a plan that nobody has decided on yet (plan section 3.5).
+PROPOSED = "proposed"
 
 
 @dataclass(frozen=True)
@@ -121,13 +125,15 @@ class EventRecord:
 class PlanRecord:
     """One version of the plan of a task, as store_plan writes it (LH-501).
 
-    A plan starts as `proposed`. Approving and rejecting it is the plan gate (LH-502).
+    A plan starts as `proposed`. A person approves or rejects it at the plan gate (LH-502), and
+    the row then holds the status and the login of whoever decided.
     """
 
     task_id: str
     version: int
     plan: Plan
-    status: str = "proposed"
+    status: str = PROPOSED
+    decided_by: str | None = None
 
 
 class Recorder(Protocol):
@@ -160,6 +166,15 @@ class Recorder(Protocol):
 
     async def record_plan(self, record: PlanRecord) -> None:
         """Save a version of the plan. Saving the same version again rewrites only its plan."""
+        ...
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        """Mark a proposed version `approved` or `rejected`, with who decided and when.
+
+        A version that is already decided, or was never stored, is left as it is.
+        """
         ...
 
 
@@ -200,6 +215,15 @@ class MemoryRecorder:
         kept = self.plans.get(key)
         # A row that has a status already keeps it, as the SQL upsert does.
         self.plans[key] = record if kept is None else replace(kept, plan=record.plan)
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        kept = self.plans.get((task_id, version))
+        if kept is None or kept.status != PROPOSED:
+            return
+        status = "approved" if approved else "rejected"
+        self.plans[(task_id, version)] = replace(kept, status=status, decided_by=decided_by)
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
@@ -303,6 +327,25 @@ class SqlRecorder:
         # plan that has been approved in the meantime stays approved.
         stmt = stmt.on_conflict_do_update(
             index_elements=["task_id", "version"], set_={"plan": stmt.excluded.plan}
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(stmt)
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        # Only a proposed row changes, in one statement, so a rerun finds the answer already
+        # there and leaves the author and the time of the first one.
+        stmt = (
+            update(PlanRow)
+            .where(
+                PlanRow.task_id == task_id, PlanRow.version == version, PlanRow.status == PROPOSED
+            )
+            .values(
+                status="approved" if approved else "rejected",
+                decided_by=decided_by,
+                decided_at=func.now(),
+            )
         )
         async with self._sessions.begin() as session:
             await session.execute(stmt)

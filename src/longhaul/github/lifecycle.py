@@ -13,6 +13,12 @@ goes:
 Pause and resume arrive in Phases 5 and 7. Their helpers are here so that those stories only
 have to call them.
 
+The plan gate (LH-502) asks for a person in the same way, with its own helpers and its own keys.
+A key is final: the ledger of side_effects.py calls a write with a key done and does not repeat
+it, so a pause that counted from 1 and met the key of the first plan review would never add its
+label. The review keys carry the version of the plan, and their purposes are not the ones of a
+pause.
+
 The commands of LH-308 add two comments. `status_comment` is what a task posts when a
 maintainer asks `/longhaul status`, and `denied_comment` is the answer to a command from
 someone who may not steer the task. The workflow posts the first, as the `post_comment`
@@ -43,9 +49,12 @@ __all__ = [
     "is_github_task",
     "on_pause",
     "on_pickup",
+    "on_plan_decided",
+    "on_plan_review",
     "on_pr_opened",
     "on_resume",
     "pickup_comment",
+    "plan_review_comment",
     "status_comment",
 ]
 
@@ -133,6 +142,35 @@ def on_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
 def on_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
     """The person answered. `pause` is the number that on_pause was given."""
     return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off", pause))]
+
+
+def on_plan_review(spec: TaskSpec, version: int) -> list[LabelStep]:
+    """Ask for a decision on version `version` of the plan: the needs-human label goes on."""
+    return [LabelStep(True, _label(spec, NEEDS_HUMAN, "label_plan_review_on", version))]
+
+
+def on_plan_decided(spec: TaskSpec, version: int) -> list[LabelStep]:
+    """The person answered about that version, so the label comes off."""
+    return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_plan_review_off", version))]
+
+
+def plan_review_comment(spec: TaskSpec, version: int, *, hours: int) -> CommentInput:
+    """Tell the maintainer what the label asks for, and how to answer.
+
+    The plan itself is the comment above this one. The commands are in code spans, so this text
+    is not a command and mentions no one.
+    """
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=(
+            f"The plan above (version {version}) needs a decision before the work starts. "
+            "Reply with `/longhaul approve` to start, or `/longhaul reject <feedback>` to have "
+            f"it revised. The task waits {hours} hours for an answer and then stops as stuck."
+        ),
+        idempotency_key=key_of(spec.task_id, "plan_review", version),
+    )
 
 
 def status_comment(spec: TaskSpec, status: TaskStatus, *, by: str, n: int) -> CommentInput:

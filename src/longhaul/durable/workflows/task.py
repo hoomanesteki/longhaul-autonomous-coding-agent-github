@@ -64,6 +64,42 @@ coding.
 A run that starts with a plan, because an earlier run made it and handed over, does not plan
 again.
 
+The plan gate (LH-502). A repo whose settings have `plan_approval_required` holds the plan after
+step 3 until a person has answered, and a repo without it goes on to CODING as before. The gate
+applies to a task that plans: a task without the plan switch has no plan to hold.
+
+1. Phase AWAITING_PLAN_APPROVAL. A task of an issue adds `longhaul:needs-human` and comments how
+   to answer (github/lifecycle.py, keys with the version of the plan), and the workflow waits for
+   `approve_plan`, `reject_plan`, a cancel, or acts.HINT_WAIT_HOURS (24, the config's
+   `stuck.hint_wait_hours`). A task on a folder waits the same way and asks nobody.
+2. `approve_plan` ends the wait. The `decide_plan` activity records the status and the login in
+   the `plans` table (the workflow does not write to the database), the label comes off, and the
+   coder starts from this version.
+3. `reject_plan(by, feedback)` records the rejection and takes the label off, then sends the
+   planner back for the next version. The feedback reaches the planner as a hint from the
+   person, so it is a user message in the planner's own transcript, which the planner keeps: the
+   revision starts from what it had read. It goes in `self.revision_hints` and not in
+   `state.hints`, so the coder, which has a transcript of its own, never sees it. The new version
+   is stored and posted like the first, and put to the same wait. Each version has its own
+   allowance of acts.PLANNER_MAX_TURNS planner turns and one repair turn (F14). The planner is
+   asked for at most planner.MAX_PLAN_VERSIONS (3) versions. The third rejection ends the task
+   as STUCK "plan not approved", and so does a wait that runs out, as STUCK "plan not approved:
+   no decision in 24 hours". On the timeout the label stays, because a person is still needed.
+4. A decision that arrives before the wait is not lost. The signal handlers keep the last
+   decision in `self.plan_decision`, and the gate takes it when it asks for one, without waiting.
+   That covers an approval sent while the planner works, and one sent while it revises. The gate
+   clears the decision when it takes it, so a decision applies to one version, and an approval or
+   a rejection that arrives after the coder started finds nobody to read it. Two decisions that
+   arrive in the same workflow task are one: the later one counts. The poller sends a command a
+   second time only after a crash between the signal and its cursor, and a repeated rejection
+   then costs one more revision.
+5. Replay (F13). The gate is behind `workflow.patched(PLAN_GATE_PATCH)`, asked only when the
+   repo's setting is on, so a history without the gate has no marker and a history from before
+   this story replays without it. The marker is in every history that passes the gate. Drop the
+   patch with `workflow.deprecate_patch` once no run that began before this story is open. The
+   wait and the revision loop issue the same commands in the same order on every replay: the
+   decision is read from the state that the signals changed, never from a clock or a lookup.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -106,10 +142,12 @@ can tell them apart without reading prose:
   "context limit", "pause limit" and "unexpected stop reason: ...".
 
 The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
-ERROR "planner submitted no plan in 20 turns".
+ERROR "planner submitted no plan in 20 turns". The plan gate adds two more, both STUCK: "plan not
+approved" after the third rejection and "plan not approved: no decision in 24 hours" after a wait
+that ran out.
 
-Not here yet, each in its own story: the plan gate, the coder's use of the plan and the verifier
-phase (Phase 5), budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs
+Not here yet, each in its own story: the coder's use of the plan and the verifier phase
+(Phase 5), budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs
 that end any way but a cancel (LH-507). An activity that fails for good, after its retries, fails
 the workflow with that error. A prompt over the context window is the exception, and it is
 handled as described next.
@@ -227,8 +265,9 @@ What does not cross, and why that is fine:
 - The count of turns without a tool call (`self.idle`) is not in CarryState, which this story may
   not change. After a hand-over that follows a nudge, the model gets one more nudge before the run
   ends with "no tool calls".
-- `plan_decision` is not carried. The plan gate (Phase 5) waits and reads the decision inside one
-  run, before any hand-over, and CarryState keeps `plan_approved`.
+- `plan_decision` and `revision_hints` are not carried. The plan gate waits, reads the decision and
+  revises inside one run, before any hand-over: a run hands over only between coder turns. The
+  approval that remains is `plan_approved` in CarryState.
 - `outcome` is never set at a hand-over, because a run that has an outcome ends.
 """
 
@@ -290,6 +329,8 @@ NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 
 # The patch marker of the load_memory call (LH-604, failure mode F13). See "Memory" above.
 LOAD_MEMORY_PATCH = "lh-604-load-memory"
+# The patch marker of the plan gate (LH-502, failure mode F13). See "The plan gate" above.
+PLAN_GATE_PATCH = "lh-502-plan-gate"
 
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
@@ -372,7 +413,11 @@ class TaskWorkflow:
         self.state = state
         self.outcome: Outcome | None = None
         self.cancel_request: CancelRequest | None = None
+        # The last decision a person sent about the plan, until the gate takes it (LH-502).
         self.plan_decision: PlanDecision | None = None
+        # What the planner is told about rejected versions of its plan. Not carried: planning
+        # ends before any hand-over.
+        self.revision_hints: list[str] = []
         self.idle = 0  # turns in a row that ended without a tool call
         # The status comments posted so far, which a hand-over carries in the memo. None until
         # the first request of this run: only then is the memo read (see _next_status_number).
@@ -599,11 +644,40 @@ class TaskWorkflow:
         return bool(workflow.memo_value(acts.PLAN_MEMO_KEY, False, type_hint=bool))
 
     async def _plan(self) -> Outcome | None:
-        """Run the planner until it submits a plan. Returns None once the plan is in place.
+        """Plan until the coder can start. Returns None then, or the outcome that ends the task.
+
+        The planner writes a version of the plan. On a repo with the plan gate a person decides
+        on it, and a rejection sends the planner back for the next version, in its own
+        transcript, until the version is approved or the gate ends the task (see "The plan gate"
+        in the module docstring). Without the gate the first version is the one the coder gets.
+        """
+        while True:
+            ended = await self._write_plan()
+            if ended is not None:
+                return ended
+            if not self._gated():
+                break
+            version = self.state.plan_version
+            decision = await self._review(version)
+            if isinstance(decision, Outcome):
+                return decision
+            if decision.approved:
+                break
+            if version >= planner.MAX_PLAN_VERSIONS:
+                return self._end(planner.not_approved_outcome(), Phase.FAILED)
+            self.revision_hints.append(
+                f"{decision.by}: {planner.revision_request(version, decision.feedback)}"
+            )
+        self._start_coding()
+        return None
+
+    async def _write_plan(self) -> Outcome | None:
+        """Run the planner until it submits a plan. Returns None once the plan is stored.
 
         An outcome means the task ends here: the planner failed its repair turn, used up its
         turns, ran out of the task's turn budget, or was stopped by one of the ends that the coder
-        shares (a refusal, a full window, a lost sandbox).
+        shares (a refusal, a full window, a lost sandbox). Each call is a version of its own,
+        with its own turns and its own repair turn.
         """
         state = self.state
         state.phase = Phase.PLANNING
@@ -705,7 +779,8 @@ class TaskWorkflow:
 
         The plan is written to the `plans` table and, for a task of an issue, posted on the issue,
         before it is in `state`: `status()` shows a plan version only once the plan is stored and
-        out. The coder starts a transcript of its own, with no notes of the planner's.
+        out. The planner's transcript stays in the state, because a person may reject the plan
+        and the planner then revises it from what it has read. `_start_coding` drops it.
         """
         state = self.state
         version = state.plan_version + 1
@@ -723,8 +798,79 @@ class TaskWorkflow:
             )
         state.plan = plan
         state.plan_version = version
-        state.transcript_ref = None
-        state.notes = None
+
+    def _start_coding(self) -> None:
+        """The plan is final. The coder starts a transcript of its own, with no planner notes."""
+        self.state.transcript_ref = None
+        self.state.notes = None
+
+    # ---------- the plan gate ----------
+    def _gated(self) -> bool:
+        """True when a person has to approve the plan before the coder starts (LH-502)."""
+        if not self.state.spec.settings.plan_approval_required:
+            return False
+        # A history from before the gate has no marker for it and replays without it (F13). The
+        # call is made only when the setting is on, so no other history gets a marker.
+        return workflow.patched(PLAN_GATE_PATCH)
+
+    async def _review(self, version: int) -> PlanDecision | Outcome:
+        """Hold version `version` of the plan for a person. Returns the decision, or the outcome.
+
+        The outcome is the end of a wait that ran out. A cancel unwinds to the cancel path. The
+        decision is recorded by an activity before the label comes off, and the label comes off
+        for a rejection too: the person has answered, and the planner is at work on the next
+        version. The label stays when the wait runs out, because a person is still needed.
+        """
+        state = self.state
+        state.phase = Phase.AWAITING_PLAN_APPROVAL
+        await self._ask_for_review(version)
+        decision = await self._decision()
+        if decision is None:
+            return self._end(planner.undecided_outcome(acts.HINT_WAIT_HOURS), Phase.FAILED)
+        await self._call(
+            acts.DECIDE_PLAN,
+            acts.DecidePlanInput(
+                task_id=state.spec.task_id,
+                version=version,
+                approved=decision.approved,
+                by=decision.by,
+            ),
+        )
+        if lifecycle.is_github_task(state.spec):
+            await self._label(lifecycle.on_plan_decided(state.spec, version))
+        return decision
+
+    async def _ask_for_review(self, version: int) -> None:
+        """Put the needs-human label on the issue and say how to answer. A local task has none."""
+        spec = self.state.spec
+        if not lifecycle.is_github_task(spec):
+            return
+        await self._label(lifecycle.on_plan_review(spec, version))
+        await self._call(
+            acts.POST_COMMENT,
+            lifecycle.plan_review_comment(spec, version, hours=acts.HINT_WAIT_HOURS),
+        )
+
+    async def _decision(self) -> PlanDecision | None:
+        """Take the decision a person sent, waiting for it if none has arrived yet.
+
+        None means the wait ran out. A decision that is already there is taken without a timer, so
+        an approval sent during planning costs the history nothing. The decision is cleared when
+        it is taken: it applies to one version.
+        """
+        self._stop_if_cancelled()
+        if self.plan_decision is None:
+            try:
+                await workflow.wait_condition(
+                    lambda: self.plan_decision is not None or self.cancel_request is not None,
+                    timeout=acts.hint_wait(),
+                )
+            except TimeoutError:
+                self._stop_if_cancelled()
+                return None
+            self._stop_if_cancelled()
+        decision, self.plan_decision = self.plan_decision, None
+        return decision
 
     # ---------- the coding phase ----------
     async def _code(self) -> Outcome:
@@ -917,6 +1063,13 @@ class TaskWorkflow:
         state.turn_index = index + 1
         return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
 
+    def _hints_for(self, role: Role) -> list[str]:
+        """The hints a model turn is given: the task's, and for the planner the rejections too."""
+        hints = list(self.state.hints)
+        if role is Role.PLANNER:
+            hints.extend(self.revision_hints)
+        return hints
+
     async def _sample(self, index: int, role: Role = Role.CODER) -> acts.LlmTurnOutput | Outcome:
         """Call the model until one reply can be used, or the run has to end (D8, D9).
 
@@ -941,7 +1094,7 @@ class TaskWorkflow:
                         notes=state.notes,
                         plan=state.plan,
                         memory_ref=state.memory_ref,
-                        hints=list(state.hints),
+                        hints=self._hints_for(role),
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
                         script_ref=self._script(),

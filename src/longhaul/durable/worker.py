@@ -47,7 +47,10 @@ What it is built from, and why each piece is what it is:
   `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
   Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
-  another number stops before it takes a task.
+  another number stops before it takes a task. The plan gate (LH-502) records who decided a plan
+  through `decide_plan`, which every worker registers with `store_plan`. Its wait is the
+  workflow's own copy of `stuck.hint_wait_hours`, and a worker whose config holds another
+  number stops before it takes a task for the same reason.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. It also carries out the slash commands in the comments of the task issues (LH-308),
   and posts the one reply to a command from someone who may not steer, through the same
@@ -244,6 +247,13 @@ def build_parts(
             f"loop.planner_max_turns is {cfg.loop.planner_max_turns}, but the workflow gives the "
             f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
             f"Set it to {acts.PLANNER_MAX_TURNS}"
+        )
+    if cfg.stuck.hint_wait_hours != acts.HINT_WAIT_HOURS:
+        # Same reason: the plan gate waits as long as the workflow's copy says (LH-502).
+        raise ValueError(
+            f"stuck.hint_wait_hours is {cfg.stuck.hint_wait_hours}, but the workflow waits "
+            f"{acts.HINT_WAIT_HOURS} hours for a person and cannot be told otherwise. "
+            f"Set it to {acts.HINT_WAIT_HOURS}"
         )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")

@@ -9,6 +9,7 @@ tests/integration/test_baselines.py.
 from __future__ import annotations
 
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -204,6 +205,149 @@ def test_a_diff_that_leaves_the_repo_is_refused_before_anything_runs(
         single_shot.apply_diff(repo, diff)
 
     assert not (tmp_path / "outside.py").exists()
+
+
+def climb(target: Path) -> str:
+    """A relative path that reaches `target` from any depth, as `x/../../..` would."""
+    return "../" * 30 + str(target).lstrip("/")
+
+
+NO_FILE = "--- /dev/null\n+++ /dev/null\n@@ -0,0 +1 @@\n+text\n"
+# A name in a place other than the --- and +++ lines of a section that git would take. The
+# {climb} and {absolute} parts name the file that the test looks for afterwards.
+OTHER_NAME_SOURCES = [
+    pytest.param("Index: x/{climb}\n" + NO_FILE, id="index-climbing-to-an-absolute-path"),
+    pytest.param("Index: /{absolute}\n" + NO_FILE, id="index-absolute"),
+    pytest.param("Index: x/../../planted.txt\n" + NO_FILE, id="index-short-climb"),
+    pytest.param("*** x/{climb}\n" + NO_FILE, id="context-header-climbing"),
+    pytest.param("*** x/../../planted.txt\n" + NO_FILE, id="context-header-short-climb"),
+    pytest.param(
+        '--- "a/\\056\\056/\\056\\056/planted.txt"\n+++ "b/\\056\\056/planted.txt"\n'
+        "@@ -0,0 +1 @@\n+text\n",
+        id="quoted-escapes-for-dots",
+    ),
+]
+
+
+@pytest.mark.parametrize("attack", OTHER_NAME_SOURCES)
+def test_a_name_in_any_header_line_is_checked_before_patch_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attack: str
+) -> None:
+    # patch -p1 takes a file name from an Index: line and from a context diff header as well as
+    # from the --- and +++ lines, and the patch of macOS follows a .. in it. The first section
+    # is one that git refuses, so the second tool runs; the second section is the attack.
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    repo = make_repo(tmp_path / "work")
+    target = tmp_path / "planted.txt"
+    named = attack.format(climb=climb(target), absolute=str(target).lstrip("/"))
+
+    with pytest.raises(PatchError, match="outside the repo|escapes"):
+        single_shot.apply_diff(repo, WRONG_CONTEXT + named)
+
+    written = [p for p in tmp_path.rglob("*") if "planted" in p.name]
+    assert written == []  # no file, and no .rej or .orig next to one
+    assert list(scratch.iterdir()) == []  # the throwaway copy is gone
+
+
+def test_patch_is_given_only_headers_and_hunks() -> None:
+    # Whatever else is in the reply is not text that patch gets to read: not an Index: line, not
+    # a context diff header, not an ed command, not prose.
+    noise = (
+        "Here is the fix:\n"
+        "Index: calc.py\n"
+        "===================================================================\n"
+        "diff --git a/calc.py b/calc.py\n"
+        "index 1..2 100644\n"
+        "*** a/calc.py\n"
+        "--- a/calc.py\n"
+        "+++ b/calc.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a, b):\n"
+        "-    return a - b\n"
+        "+    return a + b\n"
+        "\\ No newline at end of file\n"
+        "Prereq: 1.0\n"
+        "1,2c\n"
+        "!echo hello\n"
+        "Index: other.py\n"
+        "--- a/other.py\n"
+        "+++ b/other.py\n"
+        "@@ -1 +1 @@\n"
+        "-X = 1\n"
+        "+X = 2\n"
+        "\n"
+        "Thanks.\n"
+    )
+
+    assert single_shot.patch_input(noise) == (
+        "--- a/calc.py\n"
+        "+++ b/calc.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def add(a, b):\n"
+        "-    return a - b\n"
+        "+    return a + b\n"
+        "\\ No newline at end of file\n"
+        "--- a/other.py\n"
+        "+++ b/other.py\n"
+        "@@ -1 +1 @@\n"
+        "-X = 1\n"
+        "+X = 2\n"
+        "\n"
+    )
+
+
+def test_a_diff_with_a_harmless_index_line_still_falls_back(tmp_path: Path) -> None:
+    # svn and cvs write Index: lines, so a diff that holds one is not a reason to refuse it.
+    repo = make_repo(tmp_path)
+    diff = "Index: calc.py\n" + "=" * 67 + "\n" + WRONG_CONTEXT
+
+    applied = single_shot.apply_diff(repo, diff)
+
+    assert applied.method == "patch"
+    assert "+    return a + b" in applied.patch
+
+
+def test_a_git_command_that_times_out_in_the_copy_is_a_failed_apply_and_not_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The copy of a big repo can take a while on a busy machine. The caller has paid for the
+    # reply already, so it gets a PatchError that it can write into a result, not a traceback.
+    def checkout(_source: Path, _dest: Path) -> None:
+        raise subprocess.TimeoutExpired("git add", 60)
+
+    monkeypatch.setattr(single_shot, "_checkout", checkout)
+
+    with pytest.raises(PatchError, match="did not finish"):
+        single_shot.apply_diff(make_repo(tmp_path), GOOD)
+
+
+def test_a_git_diff_that_times_out_after_the_apply_is_a_failed_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = single_shot._git
+
+    def git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+        if args[:1] == ("diff",):
+            raise subprocess.TimeoutExpired("git diff", 60)
+        return real(cwd, *args, stdin=stdin)
+
+    monkeypatch.setattr(single_shot, "_git", git)
+
+    with pytest.raises(PatchError, match="did not finish"):
+        single_shot.apply_diff(make_repo(tmp_path), GOOD)
+
+
+def test_a_change_beside_a_file_that_is_not_utf8_text_is_a_failed_apply(tmp_path: Path) -> None:
+    # git diff prints the context lines of a hunk as they are in the file, so a latin-1 byte next
+    # to the change reaches the decoder of the pipe.
+    repo = make_repo(tmp_path, {"calc.py": CALC})
+    (repo / "legacy.py").write_bytes(b"# caf\xe9\nVALUE = 1\n")
+    diff = "--- a/legacy.py\n+++ b/legacy.py\n@@ -2 +2 @@\n-VALUE = 1\n+VALUE = 2\n"
+
+    with pytest.raises(PatchError, match="UTF-8"):
+        single_shot.apply_diff(repo, diff)
 
 
 def test_an_empty_diff_is_an_error_and_not_an_empty_patch(tmp_path: Path) -> None:
@@ -454,6 +598,47 @@ async def test_a_provider_error_goes_up_to_the_caller(tmp_path: Path) -> None:
     error = ProviderError(ProviderErrorKind.OVERLOADED, "busy")
     with pytest.raises(ProviderError):
         await solve(FakeProvider(error), make_repo(tmp_path))
+
+
+async def test_the_reply_is_in_hand_before_anything_is_applied(tmp_path: Path) -> None:
+    # The runner books the usage of the call as soon as the provider has answered, so a failure
+    # of the apply step cannot lose it. ask() is the half of solve() that costs money.
+    provider = FakeProvider(f"```diff\n{GOOD}```")
+    repo = make_repo(tmp_path)
+
+    asked = await single_shot.ask(
+        provider,
+        model="claude-sonnet-5-5",
+        repo=repo,
+        problem="add() subtracts",
+        repo_map=MAP,
+        max_tokens=4000,
+    )
+
+    assert asked.usage == Usage(input_tokens=1200, output_tokens=80)
+    assert asked.files == ["calc.py"]
+    assert asked.stop_reason == "end_turn"
+    assert GOOD in asked.reply
+    assert len(provider.calls) == 1
+
+    applied = await single_shot.apply_reply(repo, asked)
+
+    assert applied.error is None
+    assert applied.usage == asked.usage
+    assert "+    return a + b" in applied.patch
+    assert len(provider.calls) == 1  # applying asks nothing
+
+
+async def test_the_top_argument_limits_the_files_in_the_prompt(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path, {"calc.py": CALC, "other.py": "X = 1\n", "more.py": "Y = 2\n"})
+    provider = FakeProvider(GOOD)
+
+    result = await solve(provider, repo, top=2)
+
+    assert len(result.files) == 2
+    (call,) = provider.calls
+    prompt = call["messages"][0].content[0].text
+    assert sum(f"### {name}\n" in prompt for name in ("calc.py", "other.py", "more.py")) == 2
 
 
 async def test_the_scripted_provider_gives_the_diff_from_its_script(tmp_path: Path) -> None:

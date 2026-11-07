@@ -7,6 +7,8 @@ tests/integration/test_eval_runner.py.
 
 import asyncio
 import hashlib
+import re
+import subprocess
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +19,7 @@ import pytest
 from temporalio.service import RPCError, RPCStatusCode
 
 from eval import config_files, custom_tasks, results, run
+from eval.baselines import single_shot
 from eval.grade_custom import GradeResult
 from eval.results import TaskResult, Tokens
 from eval.run import RunOptions
@@ -917,6 +920,15 @@ def test_the_identity_names_the_run_set() -> None:
     assert run.identity(ctx_of(options_for("full")), first_task())["run_set"] is None
 
 
+def test_the_identity_records_whether_mixed_models_were_allowed() -> None:
+    # A run with no run set is compared with nothing by the runner, so the result file is what
+    # tells a later comparison whether a pair of models was meant.
+    plain = run.identity(ctx_of(options_for("full")), first_task())
+    assert plain["allow_mixed_models"] is False
+    mixed = run.identity(ctx_of(options_for("full", "--allow-mixed-models")), first_task())
+    assert mixed["allow_mixed_models"] is True
+
+
 async def test_a_durable_task_is_started_with_the_context_mode_of_its_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1170,6 +1182,76 @@ async def test_a_provider_that_keeps_failing_ends_the_task_with_an_error_result(
     assert "bad key" in result.outcome_summary
     assert len(provider.calls) == 1  # an error that asking again cannot change is not retried
     assert grader.graded == []
+
+
+async def test_the_top_files_of_the_config_decide_how_many_files_are_in_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # top_files is part of the definition that the hash of the file stands for, so the runner has
+    # to use the value in the file and not a constant of its own.
+    real_load = config_files.load
+    shot = real_load("single_shot")
+    one = config_files.LoadedConfig(shot.config.model_copy(update={"top_files": 1}), shot.sha256)
+    monkeypatch.setattr(
+        config_files, "load", lambda name: one if name == "single_shot" else real_load(name)
+    )
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    ctx = single_shot_context(
+        monkeypatch, tmp_path, provider, FakeGrader(GradeResult(True, "all tests passed"))
+    )
+
+    await run.run_one(ctx, first_task())
+
+    (call,) = provider.calls
+    prompt = call["messages"][0].content[0].text
+    assert re.findall(r"^### (\S+)\n`{3,}\n", prompt, re.MULTILINE) == ["README.md"]
+
+
+async def test_the_default_config_puts_five_files_in_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    ctx = single_shot_context(
+        monkeypatch, tmp_path, provider, FakeGrader(GradeResult(True, "all tests passed"))
+    )
+
+    await run.run_one(ctx, first_task())
+
+    (call,) = provider.calls
+    prompt = call["messages"][0].content[0].text
+    assert len(re.findall(r"^### (\S+)\n`{3,}\n", prompt, re.MULTILINE)) == 5
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired("git add", 60),
+        UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid continuation byte"),
+        RuntimeError("git init failed in the throwaway copy"),
+    ],
+    ids=["git-timeout", "undecodable-git-output", "git-failure"],
+)
+async def test_a_call_is_booked_even_when_applying_the_diff_fails_for_another_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    # The call was billed when the provider answered. What happens to the reply afterwards, in a
+    # git command that times out or prints bytes that are not text, must not take its row off the
+    # ledger (invariant I6).
+    def apply_diff(_repo: Path, _diff: str) -> single_shot.AppliedPatch:
+        raise error
+
+    monkeypatch.setattr(single_shot, "apply_diff", apply_diff)
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path, provider, grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert result.outcome == "error"
+    assert grader.graded == []
+    (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]
+    assert (entry.task_id, entry.turn_index, entry.attempt) == ("lh-eval-try1-calc-01", 0, 1)
+    assert entry.usage == Usage(input_tokens=900, output_tokens=60)
 
 
 def main_with_a_stub(

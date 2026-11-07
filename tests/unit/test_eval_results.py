@@ -233,6 +233,55 @@ def test_results_of_two_config_files_or_seeds_are_not_one_run(field: str, other:
         summary_of(make_result("a"), make_result("b", **{field: other}))
 
 
+def test_a_result_says_whether_mixed_models_were_allowed() -> None:
+    assert make_result().allow_mixed_models is False
+    assert make_result(allow_mixed_models=True).model_dump()["allow_mixed_models"] is True
+
+
+def test_a_result_file_from_before_the_switch_was_recorded_still_reads(tmp_path: Path) -> None:
+    results.write_result(tmp_path, make_result())
+    path = tmp_path / "calc-01.json"
+    old = path.read_text(encoding="utf-8").replace('  "allow_mixed_models": false,\n', "")
+    assert "allow_mixed_models" not in old
+    path.write_text(old, encoding="utf-8")
+
+    assert results.read_results(tmp_path)[0].allow_mixed_models is False
+
+
+def test_the_summary_says_whether_mixed_models_were_allowed() -> None:
+    assert summary_of(make_result("a")).allow_mixed_models is False
+    allowed = summary_of(
+        make_result("a", allow_mixed_models=True), make_result("b", allow_mixed_models=True)
+    )
+    assert allowed.allow_mixed_models is True
+
+
+def test_results_that_disagree_on_mixed_models_are_not_one_run() -> None:
+    with pytest.raises(ValueError, match="allow_mixed_models"):
+        summary_of(make_result("a"), make_result("b", allow_mixed_models=True))
+
+
+def summary_on(model: str, run_id: str, *, mixed: bool = False) -> results.Summary:
+    return summary_of(make_result("a", model=model, run_id=run_id, allow_mixed_models=mixed))
+
+
+def test_runs_on_one_model_can_be_compared() -> None:
+    results.check_comparable(
+        [summary_on("claude-sonnet-5-5", "full-1"), summary_on("claude-sonnet-5-5", "naive-1")]
+    )
+
+
+def test_runs_on_two_models_cannot_be_compared_unless_a_run_allowed_it() -> None:
+    sonnet = summary_on("claude-sonnet-5-5", "full-1")
+    haiku = summary_on("claude-haiku-5-5", "naive-1")
+
+    with pytest.raises(ValueError, match="full-1.*naive-1|naive-1.*full-1") as caught:
+        results.check_comparable([sonnet, haiku])
+    assert "--allow-mixed-models" in str(caught.value)
+
+    results.check_comparable([sonnet, summary_on("claude-haiku-5-5", "naive-1", mixed=True)])
+
+
 def test_the_summary_names_the_run_and_its_tasks() -> None:
     summary = summary_of(make_result("a"), make_result("b"))
     assert (summary.run_id, summary.task_set, summary.config) == ("r1", "custom", "full")

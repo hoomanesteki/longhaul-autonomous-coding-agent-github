@@ -216,6 +216,15 @@ def test_a_planner_turn_limit_the_workflow_cannot_follow_stops_the_worker(tmp_pa
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
+def test_stuck_limits_the_workflow_cannot_follow_stop_the_worker(tmp_path: Path) -> None:
+    # Same reason as the planner limit: the detector in the workflow has its own copy of the four
+    # numbers, so a different one in the file would be read, accepted and ignored.
+    stuck = CONFIG.stuck.model_copy(update={"repeated_failure_count": 2})
+    config = CONFIG.model_copy(update={"stuck": stuck})
+    with pytest.raises(ValueError, match=r"stuck\.repeated_failure_count.*2.*3"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.blobs, S3BlobStore)

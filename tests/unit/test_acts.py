@@ -37,6 +37,7 @@ from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, 
 from longhaul.github import side_effects
 from longhaul.github.client import GitHubFatal, GitHubRetryable
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
+from longhaul.roles.stuck import CallSignal
 from longhaul.settings import load_config
 from longhaul.tools.control import FINISH
 
@@ -90,7 +91,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.PREPARE_WORKSPACE, TaskSpec, acts.PrepareWorkspaceOutput),
         (acts.ENSURE_SANDBOX, acts.EnsureSandboxInput, str),
         (acts.LLM_TURN, acts.LlmTurnInput, acts.LlmTurnOutput),
-        (acts.TOOL_EXEC, acts.ToolExecInput, ToolResult),
+        (acts.TOOL_EXEC, acts.ToolExecInput, acts.ToolExecResult),
         (acts.APPEND_RESULTS, acts.AppendResultsInput, BlobRef),
         (acts.CLEANUP, acts.CleanupInput, NoneType),
         (acts.BUNDLE_CHECKPOINT, acts.BundleCheckpointInput, BlobRef),
@@ -1002,3 +1003,26 @@ def test_a_client_reads_the_plan_when_it_asks_for_it_and_the_status_when_it_does
 
     assert converter.from_payloads(payloads, [acts.PlannedStatus]) == [planned]
     assert converter.from_payloads(payloads, [TaskStatus]) == [plain]
+
+
+# ---------- what tool_exec says to the stuck detector (LH-505) ----------
+def test_a_tool_exec_result_is_a_tool_result_with_one_more_field() -> None:
+    result = acts.ToolExecResult(call_id="c1", ok=True, output="o")
+    assert isinstance(result, ToolResult)
+    assert result.signal is None
+    fact = CallSignal(tests_passed=3, edited_regions=[("a.py", 1, 2)])
+    back = pydantic_data_converter.payload_converter.from_payload(
+        pydantic_data_converter.payload_converter.to_payload(
+            result.model_copy(update={"signal": fact})
+        ),
+        acts.ToolExecResult,
+    )
+    assert back.signal == fact
+
+
+def test_a_plain_tool_result_reads_as_one_without_facts() -> None:
+    # A history from before the detector, and the stubs of the workflow tests, return a ToolResult.
+    plain = ToolResult(call_id="c1", ok=True, output="o")
+    converter = pydantic_data_converter.payload_converter
+    back = converter.from_payload(converter.to_payload(plain), acts.ToolExecResult)
+    assert back.signal is None and back.output == "o"

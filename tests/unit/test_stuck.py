@@ -85,6 +85,17 @@ def test_a_finished_step_is_progress() -> None:
     assert feed(turns) == [None] * 16
 
 
+def test_a_step_finished_on_the_first_turn_is_progress() -> None:
+    # A plan starts with no step done, so the first turn that finishes one has made progress,
+    # and it keeps the next 14 turns quiet. The 16th signal is the first that can fire.
+    turns = [sig(i, steps_done=1) for i in range(16)]
+    answers = feed(turns)
+    assert answers[:15] == [None] * 15
+    assert answers[15] is not None
+    assert answers[15].reason is StuckReason.NO_PROGRESS
+    assert "steps done: 1" in answers[15].evidence[1]
+
+
 def test_a_fall_in_passing_tests_is_not_progress() -> None:
     # 5 passed, then 3, then back to 5: the second 5 is not above the best, so it is no gain.
     turns = [sig(0, tests_passed=5), sig(1, tests_passed=3)]
@@ -211,9 +222,31 @@ def test_half_an_overlap_is_the_same_region_and_less_is_not() -> None:
     assert feed(apart) == [None] * 4
 
 
-def test_a_small_edit_inside_an_earlier_big_one_is_the_same_region() -> None:
-    turns = [edit(0, 10, 40), edit(1, 20, 20), edit(2, 25, 26), edit(3, 30, 30)]
+def test_edits_that_share_most_of_their_lines_with_each_other_are_one_region() -> None:
+    # Each edit sits inside the others and is more than half as long as the longest.
+    turns = [edit(0, 10, 40), edit(1, 12, 38), edit(2, 15, 35), edit(3, 11, 39)]
     assert only_last(feed(turns)).reason is StuckReason.EDIT_CHURN
+
+
+def test_small_edits_in_different_parts_of_a_big_one_are_not_the_same_region() -> None:
+    # Lines 20, 25-26 and 30 each lie inside lines 10-40, but they do not touch one another, so
+    # the agent is working through the block and not going round the same lines.
+    turns = [edit(0, 10, 40), edit(1, 20, 20), edit(2, 25, 26), edit(3, 30, 30)]
+    assert feed(turns) == [None] * 4
+
+
+def test_a_new_file_followed_by_edits_in_other_places_is_not_churn() -> None:
+    # write_file covers the whole file (lines 1-87). Three fixes to lines that are far apart
+    # are the normal way to build a module, with or without tests that run.
+    turns = [edit(0, 1, 87), edit(1, 11, 11), edit(2, 44, 44), edit(3, 80, 80)]
+    assert feed(turns) == [None] * 4
+
+
+def test_four_rewrites_of_a_whole_file_are_churn_whatever_their_length() -> None:
+    turns = [edit(0, 1, 80), edit(1, 1, 87), edit(2, 1, 60), edit(3, 1, 87)]
+    assert only_last(feed(turns)).evidence == [
+        "src/inv.py lines 1-87 edited 4 times in the last 10 turns with no test change"
+    ]
 
 
 def test_edits_older_than_ten_turns_do_not_count() -> None:
@@ -324,17 +357,22 @@ def test_lower_limits_fire_sooner() -> None:
 # ---------- the state ----------
 # The window as CarryState holds it, dumped the way Temporal dumps the state.
 WINDOW_JSON = TypeAdapter(list[TurnSignal])
+PATH_JSON = TypeAdapter(str)
 
 
-def worst_turn(turn: int) -> TurnSignal:
-    """A turn with every field at its largest, as read_turn would build it."""
+def worst_turn(turn: int, glyph: str = "d") -> TurnSignal:
+    """A turn with every field at its largest, as read_turn would build it.
+
+    The paths are made of `glyph`, so that a test can use the characters that take the most
+    bytes once they are written as JSON.
+    """
     facts = [
         CallSignal(
             tests_passed=99_999,
             failed_cmd_hash=f"{turn:040x}",
             failed_command="x" * 500,
             failed_error="y" * 500,
-            edited_regions=[(f"{'d' * 200}/{k}.py", 99_999, 99_999) for k in range(9)],
+            edited_regions=[(f"{glyph * 200}/{k}.py", 99_999, 99_999) for k in range(9)],
         )
     ]
     results = [ToolResult(call_id=f"c{k}", ok=False, output="z" * 500) for k in range(40)]
@@ -353,6 +391,42 @@ def test_state_size_bound() -> None:
     assert len(window) == stuck.WINDOW_TURNS == 30
     size = len(WINDOW_JSON.dump_json(window))
     assert size < 8_000, f"the full window is {size} bytes"
+
+
+@pytest.mark.parametrize(
+    "glyph",
+    [
+        pytest.param("d", id="ascii"),
+        pytest.param("\u00e9", id="two-byte"),
+        pytest.param("\u4e2d", id="three-byte"),
+        pytest.param("\U0001f600", id="four-byte"),
+        pytest.param('"', id="quote"),
+        pytest.param("\\", id="backslash"),
+        pytest.param("\x01", id="control"),
+    ],
+)
+def test_state_size_bound_holds_for_paths_that_take_many_bytes(glyph: str) -> None:
+    # The bound on a path is in bytes of JSON, not in characters: a repo with file names in
+    # another script, or with a name that needs escapes, must not push the window over 8 KB.
+    detector = StuckDetector(NEVER)
+    for turn in range(200):
+        detector.observe(worst_turn(turn, glyph))
+    window = detector.window
+    assert len(window) == stuck.WINDOW_TURNS
+    size = len(WINDOW_JSON.dump_json(window))
+    assert size < 8_000, f"the full window is {size} bytes for paths of {glyph!r}"
+    for turn in window:
+        for path, _, _ in turn.edited_regions:
+            assert len(PATH_JSON.dump_json(path)) - 2 <= stuck.MAX_PATH_BYTES
+
+
+def test_a_path_is_cut_from_the_front_on_a_whole_character() -> None:
+    path = "src/" + "\u4e2d" * 40 + "/m.py"
+    cut = stuck.short_path(path)
+    assert cut.startswith("...") and cut.endswith("/m.py")
+    assert len(cut.encode()) <= stuck.MAX_PATH_BYTES
+    assert stuck.short_path(cut) == cut  # cutting a short path again changes nothing
+    assert stuck.short_path("src/inv.py") == "src/inv.py"
 
 
 def test_a_typical_full_window_is_far_below_the_bound() -> None:

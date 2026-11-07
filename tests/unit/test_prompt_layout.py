@@ -392,3 +392,23 @@ async def test_an_empty_memory_block_leaves_the_system_prompt_as_it_was() -> Non
 
     assert nothing == ""
     assert build_system_prompt(Role.CODER, SPEC, nothing) == build_system_prompt(Role.CODER, SPEC)
+
+
+@pytest.mark.phase6
+async def test_the_planner_ends_its_prompt_with_the_same_rendered_block() -> None:
+    # The planner (LH-501) reads the notes too. The block is block 4 of its prompt as it is of the
+    # coder's: a pure suffix, after the task block, which the two roles share byte for byte.
+    memory = FakeMemory([row("Raise InventoryError, not ValueError, from remove.", kind="lesson")])
+    block = await render_memory_block(memory, MEMORY_REPO, "remove raises")
+    assert block.startswith(HEADER)
+
+    planner_system = build_system_prompt(Role.PLANNER, SPEC, block)
+    coder_system = build_system_prompt(Role.CODER, SPEC, block)
+
+    assert (
+        planner_system == f"{build_system_prompt(Role.PLANNER, SPEC)}\n\n{FACTS_HEADING}\n{block}"
+    )
+    assert [planner_system.count(heading) for heading in SECTION_HEADINGS] == [1, 1, 1, 1]
+    tail = coder_system[coder_system.index(TASK_HEADING) :]
+    assert planner_system.endswith(tail)
+    assert planner_system.index(HEADER) > planner_system.index(SPEC.body)

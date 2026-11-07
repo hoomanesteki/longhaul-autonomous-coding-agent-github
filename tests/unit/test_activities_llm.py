@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import FACTS_HEADING, FIRST_USER_MESSAGE, build_system_prompt
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import (
@@ -838,6 +838,28 @@ async def test_without_role_tools_every_role_gets_the_default_list() -> None:
     rig = Rig(reply("end_turn"))
     await rig.run(turn_input(role=Role.CODER))
     assert rig.provider.calls[0]["tools"] == TOOLS
+
+
+@pytest.mark.phase6
+async def test_the_planner_ends_its_system_prompt_with_the_memory_block_of_the_task() -> None:
+    # Block 4 belongs to the task, not to a role (LH-604): the planner reads the same notes as
+    # the coder, at the end of a system prompt whose blocks 1 and 2 are its own.
+    rig = planner_rig(reply("end_turn"), reply("end_turn"))
+    block = await rig.blobs.put(
+        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "memory-block.txt")
+    )
+
+    await rig.run(turn_input(role=Role.PLANNER, memory_ref=block))
+    await rig.run(turn_input(role=Role.CODER, memory_ref=block))
+
+    planning, coding = rig.provider.calls
+    assert planning["system"] == build_system_prompt(Role.PLANNER, SPEC, BLOCK)
+    assert (
+        planning["system"]
+        == f"{build_system_prompt(Role.PLANNER, SPEC)}\n\n{FACTS_HEADING}\n{BLOCK}"
+    )
+    assert planning["system"].endswith(BLOCK) and coding["system"].endswith(BLOCK)
+    assert planning["system"] != coding["system"]
 
 
 async def test_a_submit_plan_call_is_returned_like_any_call() -> None:

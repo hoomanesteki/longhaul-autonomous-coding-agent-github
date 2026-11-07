@@ -33,9 +33,10 @@ from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
+from tests.fakes.memory import FakeMemory, row
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE
+from longhaul.agent.prompts import FACTS_HEADING, FIRST_USER_MESSAGE, build_system_prompt
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.contracts import (
@@ -60,6 +61,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.memory import MemoryActivities
 from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.durable.activities.tools import PLANNING_NOTE, NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -68,6 +70,7 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities, effect_key
+from longhaul.memory.retrieve import render_memory_block
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import planner
@@ -165,6 +168,7 @@ class Request:
     role: str | None
     messages: list[Message]
     tool_names: list[str]
+    system: str = ""
 
 
 class Gated(ScriptedProvider):
@@ -182,7 +186,12 @@ class Gated(ScriptedProvider):
     async def complete(self, **kwargs: Any) -> LLMResponse:
         role = parse_role_line(kwargs["system"])
         self.requests.append(
-            Request(role, list(kwargs["messages"]), [t.name for t in kwargs["tools"]])
+            Request(
+                role,
+                list(kwargs["messages"]),
+                [t.name for t in kwargs["tools"]],
+                kwargs["system"],
+            )
         )
         gate = self.gates.get(role or "")
         if gate is not None:
@@ -199,6 +208,9 @@ class Boxes:
 
     def __init__(self) -> None:
         self.boxes: dict[str, FakeSandbox] = {}
+        # What prepare_workspace says of the worker's memory (LH-604). With it on, the workflow
+        # calls load_memory next.
+        self.memory_enabled = False
 
     async def get(self, sandbox_id: str) -> Sandbox | None:
         return self.boxes.get(sandbox_id)
@@ -211,7 +223,9 @@ class Boxes:
             if path.is_file() and not parts & {"REFERENCE.patch", "__pycache__", ".pytest_cache"}:
                 await box.write_file(str(path.relative_to(CALC)), path.read_bytes())
         self.boxes[box.id] = box
-        return acts.PrepareWorkspaceOutput(sandbox_id=box.id, base_sha=BASE, head_sha=BASE)
+        return acts.PrepareWorkspaceOutput(
+            sandbox_id=box.id, base_sha=BASE, head_sha=BASE, memory_enabled=self.memory_enabled
+        )
 
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
@@ -303,8 +317,13 @@ async def running(
     fake: FakeGitHub,
     *,
     gates: dict[str, asyncio.Event] | None = None,
+    memory: FakeMemory | None = None,
 ) -> AsyncIterator[World]:
-    """A worker with the real activities for one test. Yields what the test looks at."""
+    """A worker with the real activities for one test. Yields what the test looks at.
+
+    `memory` is the store that load_memory reads, for a worker that keeps memory. Without it the
+    worker has none, and the workflow does not call load_memory.
+    """
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     provider = Gated(script, gates)
@@ -318,6 +337,7 @@ async def running(
         role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
     )
     boxes = Boxes()
+    boxes.memory_enabled = memory is not None
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
     client = GitHubClient(FAKE_BASE_URL, PatAuth(TOKEN), transport=fake.transport())
     ledger = MemoryLedger()
@@ -334,6 +354,7 @@ async def running(
                 *PlanActivities(recorder).activities,
                 *PlanCommentActivities(client, ledger, templates=TEMPLATES).activities,
                 *SideEffectActivities(client, ledger).activities,
+                *MemoryActivities(memory, blobs).activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,
@@ -502,6 +523,39 @@ async def test_a_task_started_without_the_plan_switch_goes_straight_to_coding(
     assert world.provider.of("planner") == []
     assert world.recorder.plans == {}
     assert status.plan_version is None
+
+
+# ---------- the memory block reaches the planner (LH-604) ----------
+async def test_the_planner_and_the_coder_end_their_prompts_with_the_same_memory_block(
+    env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
+) -> None:
+    """load_memory runs once, before the planner's first turn, and every request of both roles
+    ends with the block it wrote. Block 4 belongs to the task, not to a role."""
+    spec = local_spec()
+    lesson = "add() and multiply() share the operators at the top of src/calc/__init__.py."
+    memory = FakeMemory([row(lesson, repo=spec.repo)])
+    script = write_script(tmp_path, planning_steps())
+    async with running(env, script, fake, memory=memory) as world:
+        handle = await start_task(
+            env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
+        )
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    # One search for the whole task: the block is written once and read on every turn.
+    (search,) = memory.searches
+    assert search["repo"] == spec.repo
+    block = await render_memory_block(
+        FakeMemory([row(lesson, repo=spec.repo)]), spec.repo, f"{spec.title}\n\n{spec.body}"
+    )
+    assert lesson in block
+
+    planned, coded = world.provider.of("planner"), world.provider.of("coder")
+    assert (len(planned), len(coded)) == (3, 1)
+    assert {r.system for r in planned} == {build_system_prompt(Role.PLANNER, spec, block)}
+    assert {r.system for r in coded} == {build_system_prompt(Role.CODER, spec, block)}
+    for request in (*planned, *coded):
+        assert request.system.endswith(f"{FACTS_HEADING}\n{block}")
 
 
 # ---------- F14: an invalid plan ----------

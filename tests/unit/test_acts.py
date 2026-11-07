@@ -70,6 +70,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "bundle_checkpoint",
         "cleanup",
         "compact",
+        "decide_plan",
         "ensure_sandbox",
         "llm_turn",
         "load_memory",
@@ -96,6 +97,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
+        (acts.DECIDE_PLAN, acts.DecidePlanInput, NoneType),
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
@@ -136,6 +138,8 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
         # Not in the table. A plan is one row, so it is sized like append_results.
         pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
+        # Not in the table. A decision updates one row, so it is sized like store_plan (LH-502).
+        pytest.param(acts.DECIDE_PLAN, 2 * 60, None, 3, id="decide_plan"),
         # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
         pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
     ],
@@ -1053,3 +1057,37 @@ def test_the_model_turn_and_the_compaction_see_the_same_memory_block() -> None:
     )
     assert compact.memory_ref is None
     assert acts.CompactInput(**{**compact.model_dump(), "memory_ref": REF}).memory_ref == REF
+
+
+# ---------- LH-502: the plan gate ----------
+@pytest.mark.phase5
+def test_the_plan_wait_follows_the_configured_hint_wait() -> None:
+    # Same reason as the tool timeout: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.stuck.hint_wait_hours == acts.HINT_WAIT_HOURS == 24
+
+
+@pytest.mark.phase5
+def test_the_plan_wait_is_a_duration_in_hours() -> None:
+    assert acts.hint_wait() == timedelta(hours=24)
+
+
+@pytest.mark.phase5
+def test_the_decision_is_registered_where_its_input_needs_only_the_database() -> None:
+    # Recording who decided a plan needs the database and no GitHub token.
+    assert acts.DECIDE_PLAN in acts.ALL
+    assert acts.DECIDE_PLAN not in acts.GITHUB
+
+
+@pytest.mark.phase5
+def test_a_decision_names_a_plan_version_from_one() -> None:
+    with pytest.raises(ValidationError):
+        acts.DecidePlanInput(task_id="lh-x", version=0, approved=True, by="alice")
+    inp = acts.DecidePlanInput(task_id="lh-x", version=2, approved=False, by="alice")
+    assert acts.DecidePlanInput.model_validate_json(inp.model_dump_json()) == inp
+    assert_small(inp)
+
+
+@pytest.mark.phase5
+def test_a_decision_does_not_retry_an_oversized_payload() -> None:
+    assert PayloadTooLargeError.__name__ in (acts.DECIDE_PLAN.retry.non_retryable_error_types or [])

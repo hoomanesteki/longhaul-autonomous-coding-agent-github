@@ -285,6 +285,25 @@ async def test_four_rewrites_of_one_file_with_no_test_run_are_edit_churn(
     ]
 
 
+async def test_a_new_file_and_three_fixes_in_other_places_is_not_edit_churn(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    # write_file marks the whole file as its region. The three edits that follow are far apart,
+    # so this is a module being built and not a loop.
+    body = "".join(f"value_{n} = {n}\n" for n in range(1, 88))
+    calls = [tool("write_file", path="feature.py", content=body)]
+    for n in (11, 44, 80):
+        old, new = f"value_{n} = {n}\n", f"value_{n} = {n + 1000}\n"
+        calls.append(tool("edit_file", path="feature.py", old_str=old, new_str=new))
+    script = write_script(tmp_path, coder_turns(*calls, then=FINISH))
+    async with light(env, script) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue)
+        outcome = await result_of(handle)
+
+    assert world.stuck_events() == []
+    assert outcome.kind is OutcomeKind.PR_OPENED
+
+
 async def test_fifteen_turns_of_reading_are_no_progress(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:

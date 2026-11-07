@@ -444,8 +444,12 @@ class WorkspaceActivities:
         # this activity made and did not get to report. Exactly one container may be live.
         await self._sandboxes.remove_containers(task_id)
         try:
-            sandbox = await self._boot(task_id, await self._image_of(inp.spec))
-            await self._store.restore(sandbox, inp.head_sha)
+            image = await self._image_of(inp.spec)
+            sandbox = await self._boot(task_id, image)
+            # An image brings its own environment, built when the image was made, and the task has
+            # no setup command that could build it again. A volume that survived holds the only
+            # copy of what git ignores there, such as compiled extensions, so a restore keeps it.
+            await self._store.restore(sandbox, inp.head_sha, keep_ignored=image is not None)
             await self._set_up(sandbox, inp.spec)
             await self._sandboxes.set_network(sandbox.id, False)
         except BaseException:

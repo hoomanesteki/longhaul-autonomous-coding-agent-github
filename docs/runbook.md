@@ -325,7 +325,7 @@ A coder that has a plan works it one step at a time (LH-503). It reads the plan 
 | `submit_for_review(summary)` | Ends the coding, as `finish` does. A task of an issue goes on to open the draft pull request. |
 | `ask_human(question)` | Asks a person. The pause flow is not built yet (LH-506), so the task records the question and ends as `stuck`, in the phase `paused`, with the question in the summary. |
 
-A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, as `submit_for_review`, for a worker or a history from before this story.
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, as `submit_for_review`, for a worker or a history from before this story. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
 
 An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
 

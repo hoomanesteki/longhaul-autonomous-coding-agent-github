@@ -2191,6 +2191,25 @@ The first `make gate PHASE=2` and the independent gate review found the problems
 3. **How do you stop strangers from steering the agent?** Commands are honoured only from users with write permission, checked through the collaborator permission API on every command.
 4. **Why does the poller not post comments itself?** Each task workflow owns its own side effects and idempotency keys. If the poller posted too, the two could race and double-post.
 
+### Phase 3 fix stories (from the review of LH-306)
+
+The review of LH-306 found the problems below before the Phase 3 gate. Each was reproduced with a failing test before it was fixed.
+
+#### LH-391 · PR title and base hardening
+- **Epic:** E6 · **Points:** 2 · **Branch:** `fix/lh-391-pr-title-and-base` · **Depends on:** LH-306
+- **Story:** As a maintainer, I want the pull request to close only the issue it was made for and to start from the commit the task started from, so that a model's summary or a sandbox command cannot change either.
+- **Build:**
+  - The commit subject and the PR title lose the effect of closing keywords, issue references and @mentions from the finish summary, as the body already does.
+  - A scope the model writes is capped, and the subject never passes 72 characters, whatever the summary and the scope.
+  - `build_pr_branch` takes the base from the workflow state (`BuildPrBranchInput.base_sha`), not from the `base` tag in the bare repo, which the sandbox can write.
+  - The pause and resume label helpers are tested by running them.
+- **Acceptance criteria:**
+  - [ ] A summary such as "fixes #7, see @alice" gives a title that closes nothing and notifies no one.
+  - [ ] Every subject is at most 72 characters for any summary and scope (property test).
+  - [ ] Moving the `base` tag in the bare repo does not change the base of the PR branch.
+- **Tests:** `tests/unit/test_squash.py`, `tests/unit/test_pr_body.py`, `tests/integration/test_deliver.py`, `tests/integration/test_task_workflow.py`
+- **Files:** `src/longhaul/checkpoints/squash.py`, `src/longhaul/durable/activities/delivery.py`, `src/longhaul/durable/workflows/task.py`, tests
+
 ---
 
 ## Phase 4: Context engineering (tag v0.4.0)

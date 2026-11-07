@@ -313,7 +313,32 @@ The planner has 20 turns to submit. That number is `acts.PLANNER_MAX_TURNS`, and
 | `planner submitted no plan in 20 turns` | The planner used all its turns reading and running commands. |
 | `no tool calls` | Two replies in a row had no tool call. The first one gets a nudge to call `submit_plan`. |
 
-The turns of the planner count against `task_turns` like any other. The coder does not read the plan yet (LH-503).
+The turns of the planner count against `task_turns` like any other.
+
+### The coder and the steps of the plan
+
+A coder that has a plan works it one step at a time (LH-503). It reads the plan in the first message of its transcript, after the line that starts the work, with the status of each step: `todo`, `doing`, `done` or `skipped`. It is offered three tools in place of `finish`:
+
+| Tool | What it does |
+|---|---|
+| `update_step(step_id, status, note)` | Sets the status of one step. A step that is `done` gets a checkpoint. A step id or a status the plan does not have is answered with an error and changes nothing. |
+| `submit_for_review(summary)` | Ends the coding, as `finish` does. A task of an issue goes on to open the draft pull request. |
+| `ask_human(question)` | Asks a person. The pause flow is not built yet (LH-506), so the task records the question and ends as `stuck`, in the phase `paused`, with the question in the summary. |
+
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, as `submit_for_review`, for a worker or a history from before this story.
+
+An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
+
+| Where | What shows the steps |
+|---|---|
+| `status()` of the workflow | The plan with the status of each step. `TaskStatus` has no field for it, so ask for the query by name with the type: `handle.query("status", result_type=acts.PlannedStatus)`. A plain `TaskStatus` read still works. |
+| Postgres, `events` | One `step_updated` event for each update, with the step, the status, the note and the head of the work. |
+| Postgres, `checkpoints` | One row of kind `step` for each step marked `done`, with its `step_id`. |
+| The pull request | One commit for each done step, in the order the steps were finished, titled from the step's description (`fix(calc): change the operator in add()`). The work after the last step is a last commit titled from the summary. A step with no change of its own makes no commit, and together the commits are the change of the scratch branch to the byte. |
+
+```sql
+SELECT step_id, sha, turn_index FROM checkpoints WHERE task_id = 'lh-acme-calc-42' AND kind = 'step' ORDER BY id;
+```
 
 ### Stopping a worker
 

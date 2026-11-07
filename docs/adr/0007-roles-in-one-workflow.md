@@ -28,6 +28,15 @@ LH-501 adds the first of the other roles, the planner:
 - **A valid plan is stored twice.** `store_plan` writes version 1 to the `plans` table, and the workflow keeps it in `CarryState.plan` with `plan_version`, which `status()` shows. For a task of an issue, `post_plan` posts the plan as a checklist under the idempotency key `<task>:plan_comment:<version>`.
 - **Planning is a switch of the task.** A task started with `plan=True` has the key `plan` in its workflow memo, and runs the planner. The poller and `longhaul run --plan` set it. A task started without it goes straight to coding. The memo carries over Continue-As-New, and a run that has a plan does not plan again.
 
+LH-503 adds the coder's side of the plan. A coder with a plan is the same role in a second form:
+
+- **Three control tools in place of `finish`.** `update_step(step_id, status, note)` sets the status of one step, `submit_for_review(summary)` ends the coding, and `ask_human(question)` asks a person. The workflow handles all three itself, as it does `finish` and `submit_plan`. The coder's prompt, its first message and its tool list are those of a coder with a plan whenever the task has one (`roles/coder.py`). A task without a plan is not touched.
+- **The plan is in the first message, not in the system prompt.** The statuses change on every update, and a change to the system prompt would give up the cache of the whole conversation (ADR-0013). `llm_turn` brings the plan block of the first message up to date from `LlmTurnInput.plan` before each call, so the workflow only has to keep `CarryState.plan` current.
+- **A step that is `done` gets a checkpoint of kind `step`.** The `record_step` activity writes it at `state.head_sha`, with the step id, and an event for every update. The new status goes into the state after the record is written.
+- **The pull request has a commit for each done step.** `build_pr_branch` takes the plan with its statuses and reads the step checkpoints from the table. The groups follow the order the steps were finished in, which is step order when the plan is worked in order. The work after the last step is a final commit titled from the summary, and the commits together are the change of the scratch branch.
+- **`status()` carries the plan** as `PlannedStatus`, a `TaskStatus` with one more field, because `TaskStatus` is a contract.
+- **A question ends the task for now.** `ask_human` records a `paused` event with the question and ends the task as `stuck` in the phase `paused`. LH-506 replaces `_ask_human` in the workflow with the wait for an answer.
+
 ## Consequences
 
 Easier:
@@ -43,6 +52,8 @@ Harder:
 - Each role has its own system prompt and tool list, so each transcript has its own prompt cache prefix. The coder does not reuse the planner's cache.
 - The read-only guarantee rests on the reset after each call, and not on the planner being unable to run a command that writes. A command that writes outside `/workspace`, in `/tmp` for example, is not undone. That is the same reach a coder's command has.
 - Adding a phase to a deployed workflow needs `workflow.patched` (F13). The planning switch in the memo keeps the runs that started without it as they were.
+- A coder with a plan has its own system prompt and tool list, so it has a cache prefix of its own. A step update rewrites the first message, which gives up the cached conversation after it once for each update. A plan has 2 to 8 steps, so that is a handful of writes in a task.
+- The histories of tasks replay as they were. A task without a plan makes the same commands. A task that was planned before LH-503 still ends on `finish`, and its other coder calls run as before, because the one new activity, `record_step`, is called only for `update_step`.
 
 Watch from now on: the cost of the planner on short tasks. The planner's `effort` is the setting to lower. The turn limit is fixed at 20 until the workflow can take it from the config.
 

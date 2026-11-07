@@ -70,6 +70,8 @@ def make_run(folder: Path, ids: list[str], predictions: list[dict[str, str]]) ->
                 workflow_id=f"lh-eval-{folder.name}-{task_id}",
                 task_set="swebench",
                 config="full",
+                config_hash="a" * 64,
+                seed=42,
                 model="sanity",
                 git_sha="f" * 40,
                 provider=None,

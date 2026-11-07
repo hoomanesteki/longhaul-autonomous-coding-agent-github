@@ -317,6 +317,8 @@ def result_in(folder: Path, task_id: str, outcome: str, patch: str | None) -> No
             workflow_id=f"lh-eval-r1-{task_id}",
             task_set="swebench",
             config="full",
+            config_hash="a" * 64,
+            seed=42,
             model="claude-sonnet-5-5",
             git_sha="f" * 40,
             provider=None,

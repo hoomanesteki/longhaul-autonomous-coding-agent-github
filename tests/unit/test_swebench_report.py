@@ -172,6 +172,8 @@ def make_run(
                 workflow_id=f"lh-eval-{folder.name}-{task_id}",
                 task_set=task_set,  # type: ignore[arg-type]
                 config="full",
+                config_hash="a" * 64,
+                seed=42,
                 model="claude-sonnet-5-5",
                 git_sha="f" * 40,
                 provider=None,

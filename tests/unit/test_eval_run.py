@@ -6,9 +6,12 @@ tests/integration/test_eval_runner.py.
 """
 
 import asyncio
+import contextlib
 import hashlib
 import re
+import shutil
 import subprocess
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -32,6 +35,7 @@ from longhaul.contracts import (
     Phase,
     ProviderError,
     ProviderErrorKind,
+    TaskSpec,
     TaskStatus,
     TextBlock,
     Usage,
@@ -1085,6 +1089,7 @@ def single_shot_context(
         model="claude-sonnet-5-5",
         commit="f" * 40,
         folder=tmp_path,
+        driver=None,
         wall_limit_s=600.0,
         provider_for=lambda _script: provider,
         ledger=BookKeeper(),
@@ -1124,6 +1129,66 @@ async def test_a_single_shot_task_is_one_call_that_is_graded_and_booked(
     assert results.read_results(tmp_path) == [result]
     # The sandbox of the repo map is removed.
     assert ctx.sandboxes.removed == ["lh-eval-try1-calc-01"]  # type: ignore[attr-defined]
+
+
+class CopyDriver:
+    """A task set with a driver, as the SWE-bench set has: its own copy of the repo, its own cut
+    of the patch and a verdict that comes later."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.cut: list[str] = []
+        self.removed = False
+
+    @contextlib.asynccontextmanager
+    async def prepared(self, task: Any, workflow_id: str) -> AsyncIterator[TaskSpec]:
+        spec = run.build_spec(task, workflow_id)
+        repo = f"local:{self.folder}"
+        settings = spec.settings.model_copy(update={"repo": repo})
+        try:
+            yield spec.model_copy(update={"repo": repo, "settings": settings})
+        finally:
+            self.removed = True
+
+    def patch(self, task: Any, patch: str) -> str:
+        self.cut.append(patch)
+        return patch.replace("+    return a + b", "+    return b + a")
+
+    async def grade(self, task: Any, patch: str) -> tuple[bool | None, str]:
+        return None, "not graded yet"
+
+
+async def test_a_single_shot_task_of_a_set_with_a_driver_reads_its_copy_and_is_graded_later(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The SWE-bench set brings its own folder for each task, cuts the patch and grades the run
+    # afterwards. A single-shot task of such a set goes through the same three steps.
+    copy = tmp_path / "copy"
+    shutil.copytree(custom_tasks.REPOS_DIR / first_task().repo, copy)
+    driver = CopyDriver(copy)
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path / "results", provider, grader)
+    ctx.folder.mkdir()
+    ctx.driver = driver
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved, result.grading) == (
+        "pr_opened",
+        None,
+        "not graded yet",
+    )
+    assert grader.graded == []  # the custom grader is not the one of this set
+    # The call read the copy of the driver and was booked against it.
+    (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]
+    assert entry.repo == f"local:{copy}"
+    # The patch that is kept is the one the driver cut, and the copy is gone after the task.
+    (applied,) = driver.cut
+    assert "+    return a + b" in applied
+    kept = (ctx.folder / "calc-01.patch").read_text(encoding="utf-8")
+    assert "+    return b + a" in kept
+    assert driver.removed
 
 
 async def test_a_reply_without_a_diff_is_an_error_result_that_is_not_graded(

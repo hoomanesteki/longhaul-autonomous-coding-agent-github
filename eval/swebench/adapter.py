@@ -48,6 +48,7 @@ from eval import results
 from eval.swebench import select_subset
 from longhaul.agent.workspace import IMAGE_FILE
 from longhaul.contracts import Budgets, RepoSettings, TaskSpec
+from longhaul.github.intake import MAX_BODY_BYTES, clip_text
 
 DATASET = select_subset.DATASET
 PREDICTIONS_FILE = "predictions.jsonl"
@@ -57,6 +58,9 @@ BUDGETS = Budgets(task_usd=4.0, task_turns=150, task_wall_minutes=120)
 START_MARK = ">>>>> Start Test Output"
 END_MARK = ">>>>> End Test Output"
 NOT_GRADED = "not graded yet: run eval/swebench/grade.sh on this run"
+# Ends a problem statement that was cut to MAX_BODY_BYTES. FILE_CUT_NOTE says the rest is in the
+# issue file, and an instance has no such file, so this note only says that text is missing.
+PROBLEM_CUT_NOTE = "\n\n[cut here: the rest of the problem statement is not shown]"
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 _INSTANCE_ID = re.compile(r"[A-Za-z0-9][\w.-]*__[\w.-]+-\d+")
@@ -213,7 +217,12 @@ def test_command_hint(eval_script: str, test_patch: str) -> str | None:
 
 # ---------- the task ----------
 def build_spec(instance: Instance, workflow_id: str, folder: Path) -> TaskSpec:
-    """The task as the workflow gets it: a local folder at the base commit, no plan gate."""
+    """The task as the workflow gets it: a local folder at the base commit, no plan gate.
+
+    The spec goes inline into several activities of every turn, so the body is cut to the limit
+    that a GitHub issue and `longhaul run --issue-file` obey (CONTRIBUTING rule 5). The long
+    statements of the subset are cut too (README, "Known limits").
+    """
     first, _, rest = instance.problem_statement.strip().partition("\n")
     title = first.strip() or instance.instance_id
     repo = f"local:{folder}"
@@ -222,7 +231,7 @@ def build_spec(instance: Instance, workflow_id: str, folder: Path) -> TaskSpec:
         repo=repo,
         issue_number=None,
         title=title,
-        body=rest.strip() or title,
+        body=clip_text(rest.strip() or title, MAX_BODY_BYTES, PROBLEM_CUT_NOTE),
         base_sha=instance.base_commit,
         settings=RepoSettings(
             repo=repo,

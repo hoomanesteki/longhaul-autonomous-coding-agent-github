@@ -16,6 +16,12 @@ The harness sorts every instance of the dataset into lists. A task of the run la
   (null), because the harness itself failed.
 
 A task that is in none of the lists is left not graded: the report does not know it.
+
+Only a task that ended as `pr_opened` gets a verdict. The predictions give every task a row, with
+an empty patch for the ones that delivered nothing, so the harness lists them all as empty
+patches. The runner knows why such a task has no patch: the agent got stuck, ran out of budget or
+was cancelled (not resolved), or the runner failed before the agent could work (not graded). The
+harness knows none of that, so those result files stay as the runner wrote them.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from eval import results
+from longhaul.contracts import OutcomeKind
 
 # The lists of the report that this module reads. An integration test checks that the installed
 # swebench still writes them.
@@ -122,7 +129,10 @@ def _run_times(run_dir: Path, found: Sequence[results.TaskResult]) -> tuple[date
 
 
 def apply(run_dir: Path, report_path: Path, logs_dir: Path | None = None) -> results.Summary:
-    """Set the verdicts in the result files of `run_dir` and rebuild its summary."""
+    """Set the verdicts in the result files of `run_dir` and rebuild its summary.
+
+    Only the tasks that ended as `pr_opened` are graded. The others keep what the runner wrote.
+    """
     found = results.read_results(run_dir)
     if not found:
         raise ValueError(f"no result files in {run_dir}")
@@ -130,7 +140,8 @@ def apply(run_dir: Path, report_path: Path, logs_dir: Path | None = None) -> res
         if result.task_set != "swebench":
             raise ValueError(f"{run_dir} is a run of the {result.task_set} set, not of swebench")
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    decided = verdicts(report, [r.task_id for r in found], logs_dir)
+    delivered = [r.task_id for r in found if r.outcome == OutcomeKind.PR_OPENED.value]
+    decided = verdicts(report, delivered, logs_dir)
     for task_id, verdict in decided.items():
         results.set_verdict(run_dir, task_id, resolved=verdict.resolved, grading=verdict.reason)
     started_at, ended_at = _run_times(run_dir, found)

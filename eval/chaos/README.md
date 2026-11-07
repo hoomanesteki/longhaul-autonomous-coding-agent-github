@@ -49,6 +49,8 @@ With seed 7 every kind is hit at least four times across the twenty runs.
 | `duplicate_side_effects`, `missing_side_effects` | the writes beyond and below the expected ones |
 | `problems` | why a run does not count as survived: a fork in the checkpoints, a different diff, a run that did not finish |
 
+The summary adds `temporal_heals`, the restarts of Temporal that the watchdog made (see below).
+
 The side effects are counted from the state of the FakeGitHub and never from our own
 `side_effects` table, which is where a retry decides whether a write already happened. A table
 that is also the witness could hide its own mistake.
@@ -65,6 +67,19 @@ The cost of the extra ledger rows is priced from the tokens of each call at the 
 The heartbeat timeout of the runs is 20 seconds, so a killed worker is noticed after about that
 long, and the latency of a `worker` kill is mostly that. A shorter timeout made a live activity
 look dead on a loaded machine, and its retry then ran beside it.
+
+## A Temporal that stops answering
+
+The Temporal dev server keeps its state in one SQLite connection. On a busy machine a query can
+run out of time and leave that connection interrupted: from then on every call fails with
+"interrupted (9)" and the run waits for a server that does not recover by itself. This was met in
+the first try of the full suite, 20 seconds into a run that had no kill.
+
+`watchdog.py` asks the private Temporal every 10 seconds for a count of workflows, which reads its
+database. When that has failed for 60 seconds in a row, it restarts the container. The state is in
+a file on a volume, so the workflows come back. A restart that a kill makes is told to the
+watchdog and never counts as a wedge. The restarts of the watchdog are in `temporal_heals` of the
+summary, because a run that met one saw a restart that the plan did not draw.
 
 ## Recordings
 

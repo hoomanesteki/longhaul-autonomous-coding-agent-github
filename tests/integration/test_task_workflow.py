@@ -1542,7 +1542,10 @@ async def test_a_burst_of_hints_survives_many_hand_overs(
     # (ADR-0004, appendix section 4).
     last, sent = 9, 30
     stubs = Stubs(edits_then_finishes(last))
-    stubs.hold_turn(last)  # keeps the workflow open until the last hint is in
+    # The turn before the last one waits until every hint is sent, so the last turn is scheduled
+    # after all of them and its input must carry all of them. Holding the last turn itself was
+    # not enough: on a fast machine it could start before the burst was over.
+    stubs.hold_turn(last - 1)
     async with running(env, stubs) as queue:
         handle = await start_task(
             env.client,
@@ -1553,8 +1556,8 @@ async def test_a_burst_of_hints_survives_many_hand_overs(
         for n in range(sent):
             await handle.signal("hint", args=["alice", f"hint {n}"])
             await asyncio.sleep(0.01)
-        await wait_until(lambda: stubs.started(last), "the last turn")
-        stubs.release_turn(last)
+        await wait_until(lambda: stubs.started(last - 1), "the turn before the last")
+        stubs.release_turn(last - 1)
         await result_of(handle)
 
     assert len(stubs.run_ids) == last + 1

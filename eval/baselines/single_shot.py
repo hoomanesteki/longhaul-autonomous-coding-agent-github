@@ -199,7 +199,7 @@ _MOVE_LINE = re.compile(r"^(?:rename|copy) (?:from|to) (?P<path>[^\n]+)", re.MUL
 _GIT_LINE = re.compile(r"^diff --git (?P<a>\S+) (?P<b>\S+)", re.MULTILINE)
 # Names that patch reads and git does not: svn and cvs write `Index:`, and the old header of a
 # context diff is a `*** ` line. They are checked, but never staged, so they are not in diff_paths.
-_OTHER_NAME_LINE = re.compile(r"^(?:Index:|\*\*\*) (?P<path>[^\t\n]+)", re.MULTILINE)
+_OTHER_NAME_LINE = re.compile(r"^(?:Index:[ \t]*|\*\*\*[ \t]+)(?P<path>[^\t\n]+)", re.MULTILINE)
 # The escapes that git and GNU patch decode inside a quoted name: \056 is a dot.
 _ESCAPE = re.compile(r'\\(?:(?P<octal>[0-7]{1,3})|(?P<letter>[abfnrtv\\"]))')
 _LETTERS = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34}

@@ -219,6 +219,8 @@ OTHER_NAME_SOURCES = [
     pytest.param("Index: x/{climb}\n" + NO_FILE, id="index-climbing-to-an-absolute-path"),
     pytest.param("Index: /{absolute}\n" + NO_FILE, id="index-absolute"),
     pytest.param("Index: x/../../planted.txt\n" + NO_FILE, id="index-short-climb"),
+    pytest.param("Index:\tx/../../planted.txt\n" + NO_FILE, id="index-after-a-tab"),
+    pytest.param("Index:x/../../planted.txt\n" + NO_FILE, id="index-without-a-space"),
     pytest.param("*** x/{climb}\n" + NO_FILE, id="context-header-climbing"),
     pytest.param("*** x/../../planted.txt\n" + NO_FILE, id="context-header-short-climb"),
     pytest.param(

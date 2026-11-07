@@ -1355,6 +1355,18 @@ async def test_the_planner_is_told_that_its_changes_were_undone(repo: Repo) -> N
     assert PLANNING_NOTE.isascii()
 
 
+async def test_the_note_of_an_undone_call_does_not_name_the_planning_phase(repo: Repo) -> None:
+    """The verifier's calls are read-only too, and its output must not talk about planning."""
+    rig = repo.rig()
+    result = await rig.exec(planning("run_command", repo.base_sha, command="echo x > note.txt"))
+
+    assert result.output_ref is not None
+    stored = (await rig.blobs.get(result.output_ref)).decode()
+    note = stored.splitlines()[-1]
+    assert note.startswith("[read-only: ") and note.endswith("was undone]")
+    assert "planning" not in stored.lower()
+
+
 async def test_a_command_of_the_planning_phase_that_edits_a_tracked_file_is_undone(
     repo: Repo,
 ) -> None:

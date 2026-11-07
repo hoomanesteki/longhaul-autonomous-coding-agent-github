@@ -36,6 +36,8 @@ from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 
+TASK = "lh-acme-calc-42"
+OTHER_TASK = "lh-acme-calc-43"
 TOOLS_OF_THE_STORY = {"list_dir", "read_file", "search", "git_diff", "run_tests", "read_output"}
 
 
@@ -170,7 +172,7 @@ def test_only_a_marked_acceptance_check_is_a_command(check: str, command: str | 
 
 def test_the_test_command_comes_first_and_runs_through_run_command() -> None:
     plan = make_plan("pytest -q")
-    (first,) = verifier.precheck_commands(plan, "pytest -q", 1)
+    (first,) = verifier.precheck_commands(plan, "pytest -q", TASK, 1)
     assert first.tool == "run_command"
     assert first.arguments == {"command": "pytest -q", "timeout_s": verifier.COMMAND_TIMEOUT_S}
     assert first.label == "pytest -q"
@@ -178,44 +180,63 @@ def test_the_test_command_comes_first_and_runs_through_run_command() -> None:
 
 def test_the_acceptance_commands_follow_in_the_order_of_the_plan() -> None:
     plan = make_plan("$ ruff check .", "add(2, 3) returns 5", "`mypy src`")
-    commands = verifier.precheck_commands(plan, "pytest -q", 2)
+    commands = verifier.precheck_commands(plan, "pytest -q", TASK, 2)
     assert [c.arguments["command"] for c in commands] == ["pytest -q", "ruff check .", "mypy src"]
 
 
 def test_a_check_that_repeats_the_test_command_runs_once() -> None:
     plan = make_plan("$ pytest -q", "`pytest -q`", "$ ruff check .", "$ ruff check .")
-    commands = verifier.precheck_commands(plan, "pytest -q", 1)
+    commands = verifier.precheck_commands(plan, "pytest -q", TASK, 1)
     assert [c.arguments["command"] for c in commands] == ["pytest -q", "ruff check ."]
 
 
 def test_a_repo_without_a_test_command_runs_the_acceptance_commands_only() -> None:
     plan = make_plan("$ ruff check .", "add(2, 3) returns 5")
-    commands = verifier.precheck_commands(plan, None, 1)
+    commands = verifier.precheck_commands(plan, None, TASK, 1)
     assert [c.arguments["command"] for c in commands] == ["ruff check ."]
-    assert verifier.precheck_commands(make_plan("add(2, 3) returns 5"), None, 1) == []
-    assert verifier.precheck_commands(make_plan("add(2, 3) returns 5"), "  ", 1) == []
+    assert verifier.precheck_commands(make_plan("add(2, 3) returns 5"), None, TASK, 1) == []
+    assert verifier.precheck_commands(make_plan("add(2, 3) returns 5"), "  ", TASK, 1) == []
 
 
 def test_at_most_five_acceptance_commands_run() -> None:
     plan = make_plan(*(f"$ check-{n}" for n in range(9)))
-    commands = verifier.precheck_commands(plan, None, 1)
+    commands = verifier.precheck_commands(plan, None, TASK, 1)
     assert [c.arguments["command"] for c in commands] == [f"check-{n}" for n in range(5)]
     assert len(commands) == verifier.MAX_CHECKS
 
 
 def test_call_ids_are_stable_and_differ_between_rounds() -> None:
     plan = make_plan("$ ruff check .")
-    one = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", 1)]
-    again = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", 1)]
-    two = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", 2)]
-    assert one == again == ["verify1-tests", "verify1-check1"]
-    assert two == ["verify2-tests", "verify2-check1"]
-    assert verifier.diff_call_id(1) == "verify1-diff" != verifier.diff_call_id(2)
+    one = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", TASK, 1)]
+    again = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", TASK, 1)]
+    two = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", TASK, 2)]
+    assert one == again == [f"{TASK}-verify1-tests", f"{TASK}-verify1-check1"]
+    assert two == [f"{TASK}-verify2-tests", f"{TASK}-verify2-check1"]
+    assert verifier.diff_call_id(TASK, 1) == f"{TASK}-verify1-diff"
+    assert verifier.diff_call_id(TASK, 1) == verifier.diff_call_id(TASK, 1)
+    assert verifier.diff_call_id(TASK, 1) != verifier.diff_call_id(TASK, 2)
+
+
+def test_call_ids_differ_between_tasks() -> None:
+    """The tool_calls table keys its rows by the call id, so two tasks must never share one.
+
+    A task that reviews its round 1 after another must not take over the rows of the other.
+    """
+    plan = make_plan("$ ruff check .", "`mypy src`")
+    here = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", TASK, 1)]
+    there = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", OTHER_TASK, 1)]
+    assert len(here) == len(there) == 3
+    assert not set(here) & set(there)
+    assert verifier.diff_call_id(TASK, 1) != verifier.diff_call_id(OTHER_TASK, 1)
+    # One task never uses an id twice: not in a round, and not across rounds.
+    later = [c.call_id for c in verifier.precheck_commands(plan, "pytest -q", TASK, 2)]
+    ids = [*here, verifier.diff_call_id(TASK, 1), *later, verifier.diff_call_id(TASK, 2)]
+    assert len(set(ids)) == len(ids)
 
 
 def test_a_very_long_command_is_cut_in_its_label_and_not_in_the_call() -> None:
     long_command = "echo " + "x" * 1000
-    (cmd,) = verifier.precheck_commands(make_plan(f"$ {long_command}"), None, 1)
+    (cmd,) = verifier.precheck_commands(make_plan(f"$ {long_command}"), None, TASK, 1)
     assert cmd.arguments["command"] == long_command
     assert len(cmd.label) <= verifier.MAX_LABEL_CHARS
     assert cmd.label.endswith("...")
@@ -597,7 +618,7 @@ def test_three_failed_rounds_end_the_task_as_stuck_with_the_reason_and_the_evide
     outcome = verifier.stuck_outcome(3, review)
     assert outcome.kind is OutcomeKind.STUCK
     assert outcome.pr_url is None
-    assert outcome.summary.startswith("the verifier sent the work back 3 times")
+    assert outcome.summary.startswith("the work failed review 3 times; last review: ")
     assert "negative numbers are not handled" in outcome.summary
     assert len(outcome.summary) <= verifier.MAX_SUMMARY_CHARS
     assert outcome.summary.isascii()

@@ -21,6 +21,7 @@ removes what it made.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -77,6 +78,7 @@ from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github.inputs import CommentInput, LabelInput
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
@@ -343,6 +345,60 @@ class Light:
     blobs: MemoryBlobStore
     boxes: Boxes
     executed: list[acts.ToolExecInput]  # every tool call that ran, in order
+    delivered: list[acts.DeliverInput] = field(default_factory=list)  # pull requests opened
+
+
+class IssueActivities:
+    """Stand-ins for the activities that talk to GitHub, for a task of an issue on a light worker.
+
+    The review does not touch GitHub. What these tests need is the input `deliver` is given, which
+    says whether the pull request is a draft (`verified_tests`).
+    """
+
+    def __init__(self) -> None:
+        self.delivered: list[acts.DeliverInput] = []
+
+    @activity.defn(name=acts.POST_COMMENT.name)
+    async def post_comment(self, inp: CommentInput) -> str:
+        return "comment-1"
+
+    @activity.defn(name=acts.POST_PLAN.name)
+    async def post_plan(self, inp: acts.PostPlanInput) -> str:
+        return "comment-2"
+
+    @activity.defn(name=acts.ADD_LABEL.name)
+    async def add_label(self, inp: LabelInput) -> str:
+        return inp.label
+
+    @activity.defn(name=acts.REMOVE_LABEL.name)
+    async def remove_label(self, inp: LabelInput) -> str:
+        return inp.label
+
+    @activity.defn(name=acts.BUILD_PR_BRANCH.name)
+    async def build_pr_branch(self, inp: acts.BuildPrBranchInput) -> acts.PrBranchOutput:
+        return acts.PrBranchOutput(
+            branch="longhaul-pr/42",
+            head_sha="c" * 40,
+            base_sha=BASE,
+            base_branch="main",
+            title="fix(calc): fix add",
+        )
+
+    @activity.defn(name=acts.DELIVER.name)
+    async def deliver(self, inp: acts.DeliverInput) -> str:
+        self.delivered.append(inp)
+        return "https://github.com/acme/calc/pull/7"
+
+    @property
+    def activities(self) -> list[Callable[..., Any]]:
+        return [
+            self.post_comment,
+            self.post_plan,
+            self.add_label,
+            self.remove_label,
+            self.build_pr_branch,
+            self.deliver,
+        ]
 
 
 @pytest.fixture
@@ -363,6 +419,26 @@ def local_spec(test_command: str | None = None, **fields: Any) -> TaskSpec:
         title="add() subtracts",
         body="`calc.add` subtracts its arguments instead of adding them.",
         settings=RepoSettings(repo=repo, test_command=test_command, budgets=Budgets(**fields)),
+    )
+
+
+REVIEW_ID = re.compile(r"(^|-)verify\d+-(tests|check\d+|diff)$")
+
+
+def review_calls(world: Light) -> list[acts.ToolExecInput]:
+    """The calls of the pre-check and the diff, told apart by their ids."""
+    return [c for c in world.executed if REVIEW_ID.search(c.call.id)]
+
+
+def issue_spec(test_command: str | None = None) -> TaskSpec:
+    """A task of an issue: it is picked up on GitHub and ends in a pull request."""
+    return TaskSpec(
+        task_id=f"lh-acme-calc-{uuid.uuid4().hex[:8]}",
+        repo=REPO,
+        issue_number=42,
+        title="add() subtracts",
+        body="`calc.add` subtracts its arguments instead of adding them.",
+        settings=RepoSettings(repo=REPO, test_command=test_command),
     )
 
 
@@ -400,6 +476,7 @@ async def light(
         executed.append(inp)
         return await tools.tool_exec(inp)
 
+    github = IssueActivities()
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
         async with Worker(
@@ -413,6 +490,7 @@ async def light(
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
                 *StepActivities(recorder).activities,
+                *github.activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,
@@ -420,7 +498,7 @@ async def light(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield Light(queue, provider, recorder, blobs, boxes, executed)
+            yield Light(queue, provider, recorder, blobs, boxes, executed, github.delivered)
     finally:
         await boxes.destroy_all()
 
@@ -712,7 +790,7 @@ async def test_max_rounds_stuck(env: WorkflowEnvironment, tmp_path: Path) -> Non
     assert acts.MAX_VERIFY_ROUNDS == 3
     assert outcome.kind is OutcomeKind.STUCK
     assert outcome.pr_url is None
-    assert outcome.summary.startswith("the verifier sent the work back 3 times")
+    assert outcome.summary.startswith("the work failed review 3 times; last review: ")
     assert EDGE_CASE in outcome.summary
     assert status.phase is Phase.FAILED
     assert status.outcome == outcome
@@ -823,7 +901,7 @@ async def test_every_call_of_the_review_is_read_only(
 
     assert outcome.kind is OutcomeKind.PR_OPENED
     by_id = {call.call.id: call for call in executed}
-    review = [c for c in executed if c.call.id.startswith("verify")]
+    review = [c for c in executed if c.call.id.startswith(f"{c.task_id}-verify")]
     assert [c.call.name for c in review] == ["run_command", "run_command", "git_diff"]
     assert all(c.read_only for c in review)
     asked = [c for c in executed if c.call.name in ("read_file", "run_tests")]
@@ -899,6 +977,110 @@ async def test_the_task_turn_budget_counts_the_turns_of_the_review(
     assert outcome.kind is OutcomeKind.ERROR
     assert outcome.summary == "turn limit"
     assert world.provider.of("verifier") == []
+
+
+async def test_the_budget_ends_the_task_before_the_precheck_runs(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """A coder that submits on the last turn of the budget gets no review, and no command runs.
+
+    The pre-check can take minutes for each command, and its result could not be used.
+    """
+    world, outcome, _ = await run_light(env, tmp_path, clean_run(), local_spec(task_turns=5))
+
+    assert outcome.summary == "turn limit"
+    assert review_calls(world) == []
+    assert world.provider.of("verifier") == []
+
+
+# ---------- the audit rows of a review ----------
+async def test_two_tasks_keep_their_own_rows_for_the_precheck(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The tool_calls table keys a row by the id of the call, so each task needs ids of its own.
+
+    Both tasks review their round 1. When the ids are the same for every task, the second task
+    takes over the rows of the first, and the exit code and the output of its pre-check are gone.
+    """
+    async with light(env, write_script(tmp_path, clean_run())) as world:
+        first, second = local_spec(BUG_GONE), local_spec(BUG_GONE)
+        for spec in (first, second):
+            handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+            assert (await result_of(handle)).kind is OutcomeKind.PR_OPENED
+        rows = list(world.recorder.tool_calls.values())
+
+    for spec in (first, second):
+        mine = [r for r in rows if r.task_id == spec.task_id and "-verify1-" in r.id]
+        assert {r.id: r.name for r in mine} == {
+            f"{spec.task_id}-verify1-tests": "run_command",
+            f"{spec.task_id}-verify1-check1": "run_command",
+            f"{spec.task_id}-verify1-diff": "git_diff",
+        }
+        assert all(r.exit_code in (0, None) and r.output_ref for r in mine)
+
+
+async def test_the_ids_of_each_round_stay_the_same_across_hand_overs(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """A retry or a replay makes the same call ids, so its rows are written over and not added."""
+    async with light(env, write_script(tmp_path, stuck_run())) as world:
+        spec = local_spec(BUG_GONE)
+        handle = await start_task(
+            env.client,
+            spec,
+            task_queue=world.queue,
+            plan=True,
+            tuning=acts.Tuning(continue_as_new_every_turns=2),
+        )
+        await result_of(handle)
+        ids = [c.call.id for c in review_calls(world)]
+
+    assert ids == [
+        f"{spec.task_id}-verify{n}-{part}"
+        for n in (1, 2, 3)
+        for part in ("tests", "check1", "diff")
+    ]
+
+
+# ---------- a review that ran no command ----------
+async def test_a_pull_request_is_ready_when_a_command_backed_the_verdict(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with light(env, write_script(tmp_path, clean_run())) as world:
+        spec = issue_spec(test_command=HAS_ADD)
+        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+        (delivered,) = world.delivered
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert delivered.verified_tests == "2 passed"
+
+
+async def test_a_pull_request_is_a_draft_when_the_review_ran_no_command(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """With no test command and no command in the plan, nothing ran, so the counts are claimed.
+
+    The verdict can still pass the work. The pull request is a draft and does not say "Verified".
+    """
+    plan = {**PLAN_INPUT, "acceptance_checks": ["add(-2, -3) returns -5"]}
+    steps = [turn("planner", 0, tool("submit_plan", **plan)), *clean_run()[1:]]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        spec = issue_spec(test_command=None)
+        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+        status = await planned_status(handle)
+        (delivered,) = world.delivered
+        review = review_calls(world)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert status.phase is Phase.DONE
+    assert [c.call.name for c in review] == ["git_diff"]  # the diff only
+    (event,) = verdict_events(world.recorder)
+    assert event["passed"] is True  # the verdict decided alone
+    assert delivered.verified_tests is None
+    shown = blocks(world.provider.of("verifier")[0].messages[0])[2]
+    assert verifier_role.NO_PRECHECK in shown
 
 
 # ---------- tasks that are not verified ----------

@@ -62,7 +62,8 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-305 | Clone from GitHub and push from the host | 5 | Done | merge | 2026-11-04 |
 | LH-306 | PR creation and label lifecycle | 3 | Done | merge | 2026-11-04 |
 | LH-307 | Poller workflow on a Temporal Schedule | 5 | Done | merge | 2026-11-04 |
-| LH-308 | Comment commands and issue-to-PR e2e | 5 | Todo | | |
+| LH-308 | Comment commands and issue-to-PR e2e | 5 | Done | merge | 2026-11-07 |
+| LH-391 | PR title and base hardening | 2 | Done | merge | 2026-11-07 |
 
 ## Phase 4: Context engineering (tag v0.4.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -73,12 +74,12 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-404 | Eviction and compaction in the workflow | 3 | Done | merge | 2026-11-04 |
 | LH-405 | Prompt layout and cache breakpoints | 3 | Done | merge | 2026-11-04 |
 | LH-406 | Context metrics and ablation flags | 2 | Done | merge | 2026-11-04 |
-| LH-407 | Long-task test | 3 | Todo | | |
+| LH-407 | Long-task test | 3 | Done | merge | 2026-11-07 |
 
 ## Phase 5: Planner, verifier and stuck handling (tag v0.5.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-501 | Planner role and plan schema | 5 | Todo | | |
+| LH-501 | Planner role and plan schema | 5 | Done | merge | 2026-11-07 |
 | LH-502 | Human plan gate | 3 | Todo | | |
 | LH-503 | Coder role with step tracking | 5 | Todo | | |
 | LH-504 | Verifier role and send-back loop | 5 | Todo | | |
@@ -92,7 +93,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-601 | Embedder and memory schema | 3 | Done | merge | 2026-11-04 |
 | LH-602 | Repo map builder | 5 | Done | merge | 2026-11-04 |
 | LH-603 | Memory store API and verified commands | 3 | Done | merge | 2026-11-04 |
-| LH-604 | Retrieval into the prompt | 3 | Todo | | |
+| LH-604 | Retrieval into the prompt | 3 | Done | merge | 2026-11-07 |
 | LH-605 | Lesson extraction | 3 | Todo | | |
 | LH-606 | Promotion on merged PRs and human approval | 3 | Todo | | |
 | LH-607 | Memory poisoning test and ablation flag | 2 | Todo | | |
@@ -122,7 +123,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 9: Evaluation, chaos, hardening and release (tag v1.0.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-901 | Eval task sets and runner | 5 | Todo | | |
+| LH-901 | Eval task sets and runner | 5 | Done | merge | 2026-11-07 |
 | LH-902 | SWE-bench Verified adapter and grading | 8 | Todo | | |
 | LH-903 | Baselines: single-shot and naive loop | 5 | Todo | | |
 | LH-904 | Full chaos suite | 5 | Todo | | |

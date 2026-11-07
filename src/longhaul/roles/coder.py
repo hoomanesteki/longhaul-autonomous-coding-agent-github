@@ -79,6 +79,9 @@ FIRST_USER_MESSAGE = (
     "Start on the task in your instructions and work through the plan below, one step at a time. "
     "Call `submit_for_review` once the tests pass."
 )
+# The nudge after a reply with no call. The coder with a plan is not offered `finish`, so the
+# line of the other coders (rules.NUDGE) would send it to a tool it does not have.
+NUDGE = "Use tools or call submit_for_review."
 
 INTRO = (
     "You are the coder in an automated pipeline. You fix one issue in the repository checked "
@@ -262,6 +265,7 @@ async def run_calls[C: CallLike](
     run: Callable[[C], Awaitable[ToolResult]],
     update: Callable[[StepUpdate], Awaitable[None]],
     plan: Callable[[], Plan],
+    answered: list[ToolResult] | None = None,
 ) -> CoderCalls:
     """Run the calls of a turn in order, and stop where the turn ends the task.
 
@@ -271,8 +275,13 @@ async def run_calls[C: CallLike](
     answered as an error and the turn goes on. A good `submit_for_review` or `ask_human` answers
     the calls after it as not run, so the transcript stays paired. An error from `run` or
     `update` is not caught: it is not the model's doing.
+
+    `answered` is the list that collects the results: the one the caller gives, or a new one. A
+    caller that gives its own still has the answers of the calls that came before when `run`
+    raises. A step update needs that, because it has changed the plan and has no activity result
+    to look up.
     """
-    results: list[ToolResult] = []
+    results: list[ToolResult] = [] if answered is None else answered
     for position, call in enumerate(calls):
         later = calls[position + 1 :]
         if call.name == UPDATE_STEP:

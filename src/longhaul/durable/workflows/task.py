@@ -766,12 +766,10 @@ class TaskWorkflow:
         finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
 
         async def run(call: acts.ToolCallSummary) -> ToolResult:
-            result = await self._run_tool(index, call)
-            finished.append(result)
-            return result
+            return await self._run_tool(index, call)
 
         try:
-            ran = await self._run_calls(index, calls, run)
+            ran = await self._run_calls(index, calls, run, finished)
         except _SandboxLost as lost:
             return await self._end_lost(index, sampled.transcript_ref, calls, finished, lost)
         # The transcript lives in the blob store, so an activity answers the calls. It answers
@@ -799,16 +797,28 @@ class TaskWorkflow:
         index: int,
         calls: list[acts.ToolCallSummary],
         run: Callable[[acts.ToolCallSummary], Awaitable[ToolResult]],
+        finished: list[ToolResult],
     ) -> _Ran:
-        """Run the calls of a coder turn by the rules of its kind: with a plan, or without."""
+        """Run the calls of a coder turn by the rules of its kind: with a plan, or without.
+
+        `finished` collects the answer of every call as it is made, so that a sandbox lost for good
+        in the middle of the turn (`_end_lost`) still has the answers of the calls before it. For a
+        task with a plan that includes a step update, which has already changed the plan.
+        """
         if self.state.plan is None:
-            plain = await rules.run_calls(calls, run)
+
+            async def kept(call: acts.ToolCallSummary) -> ToolResult:
+                result = await run(call)
+                finished.append(result)
+                return result
+
+            plain = await rules.run_calls(calls, kept)
             return _Ran(plain.results, plain.finish)
 
         async def update(change: coder.StepUpdate) -> None:
             await self._update_step(index, change)
 
-        planned = await coder.run_calls(calls, run, update, self._plan_now)
+        planned = await coder.run_calls(calls, run, update, self._plan_now, answered=finished)
         return _Ran(planned.results, planned.submitted, planned.question)
 
     def _plan_now(self) -> Plan:
@@ -1023,7 +1033,8 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=reply.transcript_ref,
                 results=[],
-                user_text=rules.NUDGE,
+                # The coder of a plan is not offered `finish`, so it is sent to its own tool.
+                user_text=rules.NUDGE if state.plan is None else coder.NUDGE,
             ),
         )
         state.turn_index = index + 1

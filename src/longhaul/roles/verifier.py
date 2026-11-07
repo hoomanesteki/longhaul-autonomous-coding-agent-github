@@ -242,8 +242,9 @@ def command_of(check: str) -> str | None:
 class Command:
     """One command of the pre-check: the call that runs it, and the text that names it.
 
-    `call_id` is stable and different in every round, because the `tool_calls` table keys its
-    rows by it. `label` is the command cut for a message, with no backtick in it.
+    `call_id` is stable, and different in every round and in every task, because the `tool_calls`
+    table keys its rows by it and a row of the same id would be taken over by the next task that
+    reviews. `label` is the command cut for a message, with no backtick in it.
     """
 
     call_id: str
@@ -258,19 +259,22 @@ def _command(call_id: str, command: str) -> Command:
     return Command(call_id, RUN_COMMAND, arguments, label)
 
 
-def precheck_commands(plan: Plan, test_command: str | None, round_number: int) -> list[Command]:
+def precheck_commands(
+    plan: Plan, test_command: str | None, task_id: str, round_number: int
+) -> list[Command]:
     """The commands to run before the verifier looks at anything, in the order they run.
 
     First the test command of the repo, which runs as a shell command because `run_tests` has the
     one command of the worker and not the task's. A repo with no test command runs none. Then the
     acceptance checks of the plan that are commands (`command_of`), without repeats and at most
-    MAX_CHECKS of them. `round_number` counts from 1.
+    MAX_CHECKS of them. `round_number` counts from 1. The ids name the task and the round, so a
+    retry or a replay makes the same ones and no other task makes them.
     """
     commands: list[Command] = []
     seen: set[str] = set()
     tests = (test_command or "").strip()
     if tests:
-        commands.append(_command(f"verify{round_number}-tests", tests))
+        commands.append(_command(f"{task_id}-verify{round_number}-tests", tests))
         seen.add(tests)
     count = 0
     for check in plan.acceptance_checks:
@@ -279,15 +283,15 @@ def precheck_commands(plan: Plan, test_command: str | None, round_number: int) -
             continue
         seen.add(command)
         count += 1
-        commands.append(_command(f"verify{round_number}-check{count}", command))
+        commands.append(_command(f"{task_id}-verify{round_number}-check{count}", command))
         if count == MAX_CHECKS:
             break
     return commands
 
 
-def diff_call_id(round_number: int) -> str:
-    """The id of the `git_diff` call that takes the diff of a round."""
-    return f"verify{round_number}-diff"
+def diff_call_id(task_id: str, round_number: int) -> str:
+    """The id of the `git_diff` call that takes the diff of a round of one task."""
+    return f"{task_id}-verify{round_number}-diff"
 
 
 def _how(check: CheckLike) -> str:
@@ -560,10 +564,14 @@ def coder_message(review: Review) -> str:
 
 
 def stuck_outcome(rounds: int, review: Review) -> Outcome:
-    """The end of a task whose work was sent back `rounds` times: the reason and the evidence."""
+    """The end of a task whose work failed `rounds` reviews: the reason and the evidence.
+
+    The last failure ends the task and sends nobody back, so the summary counts reviews and not
+    messages to the coder.
+    """
     times = "1 time" if rounds == 1 else f"{rounds} times"
     evidence = "; ".join(_without_period(issue) for issue in review.issues[:3])
-    summary = f"the verifier sent the work back {times}; last review: {evidence}"
+    summary = f"the work failed review {times}; last review: {evidence}"
     return Outcome(kind=OutcomeKind.STUCK, summary=_cut(summary, MAX_SUMMARY_CHARS))
 
 

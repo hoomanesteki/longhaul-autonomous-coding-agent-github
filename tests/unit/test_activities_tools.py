@@ -49,7 +49,7 @@ from longhaul.contracts import (
 from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.tools import (
-    PLANNING_NOTE,
+    READ_ONLY_NOTE,
     SHELL_TOOLS,
     NoCheckpoints,
     ToolActivities,
@@ -1351,8 +1351,8 @@ async def test_the_planner_is_told_that_its_changes_were_undone(repo: Repo) -> N
 
     assert result.output_ref is not None
     stored = (await rig.blobs.get(result.output_ref)).decode()
-    assert stored.endswith(PLANNING_NOTE)
-    assert PLANNING_NOTE.isascii()
+    assert stored.endswith(READ_ONLY_NOTE)
+    assert READ_ONLY_NOTE.isascii()
 
 
 async def test_the_note_of_an_undone_call_does_not_name_the_planning_phase(repo: Repo) -> None:
@@ -1409,7 +1409,7 @@ async def test_a_call_of_the_planning_phase_that_only_reads_restores_nothing(rep
 
     assert result.ok and result.post_sha is None
     assert spy.restores == [] and spy.commits == []
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output
 
 
 async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(repo: Repo) -> None:
@@ -1420,7 +1420,7 @@ async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(rep
 
     assert result.ok and result.post_sha is None
     assert spy.restores == []
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output
 
 
 async def test_a_reset_of_the_planning_phase_keeps_what_the_setup_built(repo: Repo) -> None:
@@ -1462,4 +1462,4 @@ async def test_a_call_of_the_coding_phase_is_still_saved(repo: Repo) -> None:
         exec_input("run_command", pre_sha=repo.base_sha, command="echo built > out.txt")
     )
     assert result.post_sha is not None
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output

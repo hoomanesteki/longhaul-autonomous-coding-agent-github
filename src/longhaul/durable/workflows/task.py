@@ -104,12 +104,14 @@ say so (roles/verifier.py):
 
 A review that passes ends the coding as `finish` did: a task of an issue goes on to DELIVERING,
 and the pull request is opened ready for review, with "Verified: <tests_summary>" in its body. A
-review that fails adds a round to `state.verify_rounds`, which crosses hand-overs. Below
-acts.MAX_VERIFY_ROUNDS the coder is sent back: a `verdict` event records the round, the coder's
-transcript and notes (set aside while the verifier had the view) are put back, and a user message
-"Review failed: <issues>. Fix step <id>." goes at the end of that transcript. The phase is CODING
-again. At acts.MAX_VERIFY_ROUNDS the task ends as STUCK, in phase FAILED, with the reason and the
-last review's issues in the summary.
+review whose pre-check ran no command (no test command for the repo, none in the plan) can still
+pass on the verdict alone, but then the counts are the model's word, so the pull request is a draft
+and does not say "Verified". A review that fails adds a round to `state.verify_rounds`, which
+crosses hand-overs. Below acts.MAX_VERIFY_ROUNDS the coder is sent back: a `verdict` event records
+the round, the coder's transcript and notes (set aside while the verifier had the view) are put
+back, and a user message "Review failed: <issues>. Fix step <id>." goes at the end of that
+transcript. The phase is CODING again. At acts.MAX_VERIFY_ROUNDS the task ends as STUCK, in phase
+FAILED, with the reason and the last review's issues in the summary.
 
 Replay. The new activity calls are on the paths a plan opens: `record_step` runs only when the
 coder of a planned task calls `update_step`, and the extra input of `build_pr_branch` is the plan.
@@ -131,9 +133,9 @@ A task of an issue (LH-306) is one whose repo is owner/name and whose spec has a
    the task is not over. The `build_pr_branch` activity makes the pull request branch on the base
    the workspace was prepared at (kept in `state.spec.base_sha`, because the `base` tag in the
    checkpoint repo is the agent's to move), and `deliver` pushes it and opens the pull request:
-   ready for review when a verifier passed the work, else a draft. The task then
-   swaps the label (`longhaul:working` out, `longhaul:pr-open` in) and ends with PR_OPENED
-   carrying the URL. `status()` shows no outcome until then.
+   ready for review when a verifier passed the work and a command backed it, else a draft. The
+   task then swaps the label (`longhaul:working` out, `longhaul:pr-open` in) and ends with
+   PR_OPENED carrying the URL. `status()` shows no outcome until then.
 3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
    because GitHub refuses a pull request with no commit.
 
@@ -157,7 +159,7 @@ can tell them apart without reading prose:
 The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
 ERROR "planner submitted no plan in 20 turns". The verifier adds three: ERROR "verifier submitted
 an invalid verdict twice: ...", ERROR "verifier submitted no verdict in 15 turns", and STUCK "the
-verifier sent the work back 3 times; last review: ..." for a task whose rounds ran out.
+work failed review 3 times; last review: ..." for a task whose rounds ran out.
 
 Not here yet, each in its own story: the plan gate (LH-502), the pause for a question (LH-506),
 budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs that end any way
@@ -935,6 +937,10 @@ class TaskWorkflow:
         """
         state = self.state
         plan = self._plan_now()
+        if self._out_of_turns():
+            # The verifier needs a turn, so no command of the pre-check could be used. Each one can
+            # take minutes, and the task ends the same way once the review has started.
+            return self._end(rules.turn_limit_outcome(), Phase.FAILED)
         state.phase = Phase.VERIFYING
         number = state.verify_rounds + 1
         coder_view = (state.transcript_ref, state.notes)
@@ -953,7 +959,9 @@ class TaskWorkflow:
             {**verifier.verdict_event(number, review), "turn_index": state.turn_index},
         )
         if review.passed:
-            self.verified_tests = review.tests_summary
+            # With no command in the pre-check the counts are the model's word only. The work may
+            # pass, but the pull request stays a draft and does not say it was verified.
+            self.verified_tests = review.tests_summary if brief.checks else None
             return self._finish(rules.finished(summary))
         state.verify_rounds += 1
         if state.verify_rounds >= acts.MAX_VERIFY_ROUNDS:
@@ -975,7 +983,7 @@ class TaskWorkflow:
         checks: list[acts.CheckRun] = []
         try:
             for command in verifier.precheck_commands(
-                plan, state.spec.settings.test_command, number
+                plan, state.spec.settings.test_command, state.spec.task_id, number
             ):
                 call = acts.ToolCallSummary(
                     id=command.call_id, name=command.tool, input=command.arguments
@@ -992,7 +1000,7 @@ class TaskWorkflow:
                         output_ref=result.output_ref,
                     )
                 )
-            diff_id = verifier.diff_call_id(number)
+            diff_id = verifier.diff_call_id(state.spec.task_id, number)
             diff_call = acts.ToolCallSummary(id=diff_id, name=verifier.GIT_DIFF, input={})
             diff = await self._run_tool(index, diff_call, read_only=True)
         except _SandboxLost:
@@ -1331,8 +1339,8 @@ class TaskWorkflow:
     async def _deliver(self, finished: Outcome) -> Outcome:
         """Open the pull request and move the label. Ends the task with its URL.
 
-        The pull request is ready for review when a verifier passed the work and a draft when
-        none did (`verified_tests`, set by `_verify`).
+        The pull request is ready for review when a verifier passed the work and a command of the
+        pre-check backed it, and a draft otherwise (`verified_tests`, set by `_verify`).
         """
         state = self.state
         issue = state.spec.issue_number

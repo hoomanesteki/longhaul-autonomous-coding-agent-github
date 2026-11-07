@@ -18,6 +18,8 @@ from eval import results
 from eval.results import TaskResult, Tokens
 from eval.swebench import adapter
 from eval.swebench.adapter import Instance
+from longhaul.durable import acts
+from longhaul.github.intake import MAX_BODY_BYTES
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
 
@@ -222,6 +224,26 @@ def test_a_one_line_problem_statement_is_its_own_title_and_body(tmp_path: Path) 
 
     assert spec.title == "Only a title"
     assert spec.body == "Only a title"
+
+
+def test_a_long_problem_statement_is_cut_to_the_limit_of_every_other_task(tmp_path: Path) -> None:
+    # CONTRIBUTING rule 5: the spec goes inline into many activities, so it stays under 16 KB.
+    # One instance of the subset (pylint-dev__pylint-7080) has a problem statement of 24 KB.
+    text = "Title\n" + "x" * (MAX_BODY_BYTES + 20_000)
+
+    spec = adapter.build_spec(make_instance(problem_statement=text), "lh-eval-r1-a", tmp_path)
+
+    assert spec.title == "Title"
+    assert spec.body == "x" * MAX_BODY_BYTES + adapter.PROBLEM_CUT_NOTE
+    assert len(spec.model_dump_json().encode()) < acts.INLINE_LIMIT_BYTES
+
+
+def test_a_problem_statement_at_the_limit_is_kept_whole(tmp_path: Path) -> None:
+    text = "Title\n" + "x" * MAX_BODY_BYTES
+
+    spec = adapter.build_spec(make_instance(problem_statement=text), "lh-eval-r1-a", tmp_path)
+
+    assert spec.body == "x" * MAX_BODY_BYTES
 
 
 def test_the_settings_follow_the_rules_of_an_eval_run(tmp_path: Path) -> None:

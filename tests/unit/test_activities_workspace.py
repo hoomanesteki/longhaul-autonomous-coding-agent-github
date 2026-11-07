@@ -610,6 +610,46 @@ async def test_the_new_container_is_made_from_the_image_the_folder_names(rig: Ri
     assert [c["image"] for c in rig.host.created] == ["longhaul-swebench:inst-1"] * 2
 
 
+async def test_build_output_in_an_instance_image_survives_a_recreated_sandbox(rig: Rig) -> None:
+    # An instance image comes with its project built and installed, and the task has no setup
+    # command that could build it again. What git ignores in /workspace, such as the compiled
+    # extensions of astropy, is all of the environment there is on the kept volume.
+    (rig.source / IMAGE_FILE).write_text("longhaul-swebench:inst-1\n", encoding="utf-8")
+    spec = rig.spec(setup_command="")
+    out = await rig.prepare(spec)
+    head = await rig.edit_and_save(out.sandbox_id)
+    old = rig.box(out.sandbox_id)
+    await sh(old, "mkdir -p src/calc/__pycache__ && echo built > src/calc/__pycache__/ext.so")
+    await sh(old, "echo drift >> src/calc/__init__.py && echo new > stray.txt")
+    await rig.host.rm_f(out.sandbox_id)
+
+    new_id = await rig.ensure(out.sandbox_id, head, spec)
+
+    box = rig.box(new_id)
+    assert (box.root / "src" / "calc" / "__pycache__" / "ext.so").read_text() == "built\n"
+    # The restore still puts the files git knows about back, and drops the ones it does not.
+    assert (await box.read_file(MODULE)).decode() == FIXED
+    assert not (box.root / "stray.txt").exists()
+    assert await sh(box, "git status --porcelain") == ""
+
+
+async def test_ignored_files_of_a_task_without_an_instance_image_are_rebuilt_not_kept(
+    rig: Rig,
+) -> None:
+    # The setup command runs again after the restore, so the restore may start from a clean tree.
+    out = await rig.prepare()
+    head = await rig.edit_and_save(out.sandbox_id)
+    await sh(
+        rig.box(out.sandbox_id),
+        "mkdir -p src/calc/__pycache__ && echo built > src/calc/__pycache__/ext.so",
+    )
+    await rig.host.rm_f(out.sandbox_id)
+
+    new_id = await rig.ensure(out.sandbox_id, head)
+
+    assert not (rig.box(new_id).root / "src" / "calc" / "__pycache__" / "ext.so").exists()
+
+
 async def test_a_task_whose_folder_is_gone_is_recreated_from_the_image_of_the_worker(
     rig: Rig,
 ) -> None:

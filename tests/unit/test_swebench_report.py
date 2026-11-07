@@ -150,8 +150,20 @@ def test_two_report_files_for_one_run_id_are_an_error(tmp_path: Path) -> None:
 
 
 # ---------- writing the verdicts into the result files ----------
-def make_run(folder: Path, ids: list[str], *, task_set: str = "swebench") -> None:
+def make_run(
+    folder: Path,
+    ids: list[str],
+    *,
+    task_set: str = "swebench",
+    recorded: dict[str, tuple[str, bool | None, str]] | None = None,
+) -> None:
+    """Result files of a run. `recorded` gives (outcome, resolved, grading) for the tasks that the
+    runner did not leave as finished and not yet graded."""
+    recorded = recorded or {}
     for task_id in ids:
+        outcome, resolved, grading = recorded.get(
+            task_id, ("pr_opened", None, "not graded yet: run eval/swebench/grade.sh")
+        )
         results.write_result(
             folder,
             TaskResult(
@@ -164,10 +176,10 @@ def make_run(folder: Path, ids: list[str], *, task_set: str = "swebench") -> Non
                 git_sha="f" * 40,
                 provider=None,
                 scripted=False,
-                outcome="pr_opened",
+                outcome=outcome,
                 outcome_summary="done",
-                resolved=None,
-                grading="not graded yet: run eval/swebench/grade.sh",
+                resolved=resolved,
+                grading=grading,
                 cost_usd=0.25,
                 tokens=Tokens(),
                 cache_ratio=0.0,
@@ -254,6 +266,39 @@ def test_a_run_graded_twice_ends_with_the_second_verdict(tmp_path: Path) -> None
         report.apply(run_dir, path)
 
     assert results.read_results(run_dir)[0].resolved is None
+
+
+def test_a_task_that_delivered_no_patch_keeps_the_verdict_the_runner_wrote(tmp_path: Path) -> None:
+    # The predictions give every task a row, with an empty patch for the ones that delivered
+    # nothing, so the harness lists them all as empty patches. The runner knows better why.
+    run_dir = tmp_path / "r1"
+    failed = "not graded: the runner failed: ImageError: pulling x failed"
+    stuck = "not graded: the task ended as stuck"
+    make_run(
+        run_dir,
+        IDS[:3],
+        recorded={"a__b-2": ("error", None, failed), "a__b-3": ("stuck", False, stuck)},
+    )
+    (tmp_path / "x.r1.json").write_text(
+        json.dumps(
+            harness_report(
+                resolved_ids=["a__b-1"],
+                unresolved_ids=[],
+                empty_patch_ids=["a__b-2", "a__b-3"],
+                error_ids=[],
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    summary = report.apply(run_dir, tmp_path / "x.r1.json")
+
+    by_id = {r.task_id: r for r in results.read_results(run_dir)}
+    assert by_id["a__b-1"].resolved is True
+    assert (by_id["a__b-2"].resolved, by_id["a__b-2"].grading) == (None, failed)
+    assert (by_id["a__b-3"].resolved, by_id["a__b-3"].grading) == (False, stuck)
+    # The runner failure is still counted as not graded, and not as an agent that did nothing.
+    assert (summary.attempted, summary.resolved, summary.ungraded) == (3, 1, 1)
 
 
 def test_results_of_the_custom_set_are_not_touched(tmp_path: Path) -> None:

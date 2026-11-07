@@ -169,6 +169,7 @@ async def test_config_hash_recorded(stack: EvalStack) -> None:
         assert raw["config_hash"] == expected
         assert raw["seed"] == 7
         assert raw["run_set"] == f"set-{stack.run_id}"
+        assert raw["allow_mixed_models"] is False
         on_disk = json.loads((folder / "summary.json").read_text(encoding="utf-8"))
         assert on_disk["config_hash"] == expected
         assert on_disk["seed"] == 7
@@ -205,3 +206,7 @@ async def test_mixed_models_in_a_run_set_are_refused_before_a_task_starts(
     summary = await run.run_eval(allowed, mixed)
     assert summary.model == "claude-haiku-5-5"
     assert summary.resolved == 1
+    # The files say that the mix was meant, so a later comparison does not take it for a mistake.
+    assert summary.allow_mixed_models is True
+    (naive,) = results.read_results(folder_of(stack, "naive"))
+    assert naive.allow_mixed_models is True

@@ -39,6 +39,10 @@ from longhaul.settings import load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
+# Rich styles the usage error when it detects CI (GITHUB_ACTIONS) or FORCE_COLOR, and the escape
+# codes split option names, so read it as plain text.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 ROOT = Path(__file__).resolve().parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
 SCRIPT = ROOT / "tests" / "fixtures" / "scripts" / "calc_fix.yaml"
@@ -383,7 +387,7 @@ def test_a_window_that_cannot_work_stops_the_command_before_anything_starts(
     result = invoke(run_args("--window", window))
 
     assert result.exit_code == 2
-    assert "--window" in result.output
+    assert "--window" in ANSI.sub("", result.output)
     assert stack.temporal.started == [] and stack.blobs.objects == {}
 
 
@@ -434,11 +438,6 @@ def test_the_header_names_the_mode_the_run_asked_for(stack_for: Callable[..., St
     stack_for(happy())
     unnamed = invoke(run_args())
     assert "context mode" not in unnamed.output
-
-
-# Rich styles the usage error when it detects CI (GITHUB_ACTIONS) or FORCE_COLOR, and the escape
-# codes split option names, so read it as plain text.
-ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def test_a_context_mode_that_does_not_exist_is_a_usage_error_and_starts_nothing(

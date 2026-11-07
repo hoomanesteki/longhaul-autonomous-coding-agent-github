@@ -49,6 +49,8 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-207 | Continue-As-New | 3 | Done | merge | 2026-11-04 |
 | LH-208 | Worker process and run CLI | 3 | Done | merge | 2026-11-04 |
 | LH-209 | Chaos test v1 | 5 | Done | merge | 2026-11-04 |
+| LH-291 | Chaos kills by progress, and lint without a cache | 2 | Done | merge | 2026-11-05 |
+| LH-292 | Payload guard in the converter and root-proof tests | 3 | Done | merge | 2026-11-05 |
 
 ## Phase 3: GitHub integration (tag v0.3.0)
 | ID | Title | Pts | Status | PR | Merged |

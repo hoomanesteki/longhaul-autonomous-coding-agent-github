@@ -298,6 +298,30 @@ def test_patch_is_given_only_headers_and_hunks() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        "Index: ../../planted.txt",
+        "*** ../../planted.txt",
+        "==== //depot/../../planted.txt#1 - ../../planted.txt ====",
+        "Prereq: ../../planted.txt",
+    ],
+)
+def test_patch_reads_no_name_from_a_line_that_is_not_a_unified_header(
+    tmp_path: Path, line: str
+) -> None:
+    # The second layer. Were a name source missing from the check of diff_paths, the text that
+    # patch gets still has none. This calls the fallback without the check, from a folder two
+    # levels down, so that a .. in a name would land inside tmp_path.
+    checkout = tmp_path / "scratch" / "copy"
+    checkout.mkdir(parents=True)
+    diff = f"{line}\n--- /dev/null\n+++ /dev/null\n@@ -0,0 +1 @@\n+text\n"
+
+    single_shot._try_patch(checkout, diff)
+
+    assert [p for p in tmp_path.rglob("*") if "planted" in p.name] == []
+
+
 def test_a_diff_with_a_harmless_index_line_still_falls_back(tmp_path: Path) -> None:
     # svn and cvs write Index: lines, so a diff that holds one is not a reason to refuse it.
     repo = make_repo(tmp_path)
@@ -328,10 +352,10 @@ def test_a_git_diff_that_times_out_after_the_apply_is_a_failed_apply(
 ) -> None:
     real = single_shot._git
 
-    def git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+    def git(cwd: Path, *args: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if args[:1] == ("diff",):
             raise subprocess.TimeoutExpired("git diff", 60)
-        return real(cwd, *args, stdin=stdin)
+        return real(cwd, *args, **kwargs)
 
     monkeypatch.setattr(single_shot, "_git", git)
 

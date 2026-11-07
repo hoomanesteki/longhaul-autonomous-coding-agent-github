@@ -80,6 +80,7 @@ from longhaul.contracts import (
 from longhaul.cost.ledger import Ledger, NoLedger
 from longhaul.cost.pricing import PricingError
 from longhaul.durable import acts
+from longhaul.durable.activities.memory import read_memory_block
 from longhaul.durable.activities.support import (
     Meters,
     heartbeating,
@@ -138,7 +139,11 @@ class ContextActivities:
         view = await self._blobs.get_json(inp.transcript_ref, list[Message])
         keep = acts.FORCED_KEEP_RECENT_TURNS if inp.forced else self._context.keep_recent_turns
         cut = find_cut(view, keep)
-        system = build_system_prompt(inp.role, inp.spec)
+        # The model turns send the memory block with every request, so the tokens counted here
+        # include it, or a compaction would report a request smaller than the one that was sent.
+        system = build_system_prompt(
+            inp.role, inp.spec, await read_memory_block(self._blobs, inp.memory_ref)
+        )
         meter = self._meters.for_task(inp.task_id)
         before = meter.projected(system, view, self._tools)
         if cut == 0 or not self._mode(inp.context_mode).compacts:

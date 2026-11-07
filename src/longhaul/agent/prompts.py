@@ -3,7 +3,7 @@
     1. role and rules     static per role           system prompt
     2. tool usage guide   static                    system prompt
     3. task statement     static per task           system prompt
-    4. memory block       static per task           system prompt (empty until Phase 6)
+    4. memory block       static per task           system prompt (from load_memory, LH-604)
     5. plan               changes on step updates   first user message
     6. progress notes     change on compaction      first user message
 
@@ -155,8 +155,10 @@ def first_user_message(role: Role) -> str:
 def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = None) -> str:
     """The system prompt for `role` on the task `spec`.
 
-    `memory_block` is the rendered repo facts (Phase 6). A missing or blank block leaves the
-    section out, so adding one later only appends to the bytes before it.
+    `memory_block` is the text that load_memory wrote for the task (longhaul.memory.retrieve): a
+    header line and the notes in a fenced block. A missing or blank block leaves the section out,
+    so a task with notes and one without share every byte before it. The block is written once per
+    task, and every model turn gets the same text, so the prompt stays the same bytes.
 
     Raises ValueError for a role that has no prompt yet.
     """

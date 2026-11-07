@@ -294,6 +294,27 @@ async def test_the_tokens_before_and_after_are_those_of_the_whole_request() -> N
     assert out.tokens_after < out.tokens_before
 
 
+@pytest.mark.phase6
+async def test_the_tokens_include_the_memory_block_that_the_system_prompt_carries() -> None:
+    # llm_turn sends the block with every request, so the compactor must count it too, or it
+    # would report a request smaller than the one the model turn projected.
+    block = "Notes from past work on this repo.\n\n```text\n" + "- pytest -q\n" * 300 + "```"
+    rig = Rig(notes_reply())
+    messages = rounds(8)
+    ref = await rig.put(messages)
+    memory_ref = await rig.blobs.put(
+        block.encode(), key=blob_key(SPEC.task_id, "memory", 0, "b.txt")
+    )
+
+    out = await rig.run(compact_input(ref, memory_ref=memory_ref))
+
+    system = build_system_prompt(Role.CODER, SPEC, block)
+    view = await rig.view(out.transcript_ref)
+    assert out.tokens_before == math.ceil(count_request_chars(system, messages, TOOLS) / 3.5)
+    assert out.tokens_after == math.ceil(count_request_chars(system, view, TOOLS) / 3.5)
+    assert out.tokens_before > math.ceil(count_request_chars(SYSTEM, messages, TOOLS) / 3.5)
+
+
 # ---------- nothing to cut ----------
 async def test_a_view_with_no_older_turns_is_left_as_it_is() -> None:
     rig = Rig()

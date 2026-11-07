@@ -55,6 +55,16 @@ What it is built from, and why each piece is what it is:
   still registers `poll_once`, so a worker for local runs needs none. A poll on it fails with the
   name of the setting, and the Temporal UI shows that. The Schedule that triggers the polls is
   made by `longhaul poller install` and not by the worker.
+* Memory follows the `memory` section of the config (LH-604, ADR-0010). With it on, the worker
+  builds one PgMemoryStore on its database, with the embedder the config names, and gives it to
+  prepare_workspace, which keeps the repo map and the verified commands in it, and to load_memory,
+  which reads the notes for the prompt from it. `local` is the real embedder and needs the memory
+  extra: a worker without it stops at the start and says `uv sync --extra memory`, and does not
+  wait for the first search of a task to find out. `hash` needs nothing and is for tests and CI.
+  The vectors of two embedders cannot be compared, so `check_memory` embeds a few stored notes
+  again before the worker connects, and refuses a table that another embedder wrote. With it off,
+  the worker builds no store: no map and no commands are kept, and the memory block of the
+  prompt stays empty. load_memory is registered either way, because the workflow names it.
 * The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
@@ -81,6 +91,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -101,6 +112,7 @@ from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.memory import MemoryActivities
 from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
@@ -114,10 +126,19 @@ from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
 from longhaul.github.remote import GitHubRemote, clone_url_under
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
+from longhaul.memory.embedder import make_embedder
+from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
 from longhaul.roles import planner
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
+from longhaul.settings import (
+    AppConfig,
+    EnvSettings,
+    Memory,
+    config_path,
+    load_config,
+    templates_path,
+)
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
@@ -140,6 +161,22 @@ class WorkerParts:
     store: GitCheckpointStore
     engine: AsyncEngine
     github: GitHubClient | None = None
+    memory: PgMemoryStore | None = None
+
+    async def check_memory(self) -> None:
+        """Refuse to start on a memory table that another embedder wrote, or on a model that
+        cannot load. Nothing to check on a worker without a store.
+
+        The table is read, so a database that cannot be reached stops the worker here, with a
+        message, as it would stop its first task.
+        """
+        if self.memory is None:
+            return
+        try:
+            await self.memory.check_embedder()
+        except (SQLAlchemyError, OSError) as exc:
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            raise ValueError(f"could not check the memory table of the database: {reason}") from exc
 
     async def close(self) -> None:
         """Close the database pool and the GitHub client. The others hold no open connection."""
@@ -173,6 +210,25 @@ def _github_remote(settings: EnvSettings, github: GitHubClient, auth: PatAuth) -
     return GitHubRemote(github, auth, clone_url=clone_url_under(settings.github_web_url))
 
 
+def build_memory(cfg: Memory, sessions: async_sessionmaker[AsyncSession]) -> PgMemoryStore | None:
+    """The memory store of the worker, or None when the config turns memory off.
+
+    It opens no connection, and the embedder loads no model: a local model is read on the first
+    text. A local embedder without its extra raises ValueError here, with the command that
+    installs it, so that the worker stops at the start.
+    """
+    if not cfg.enabled:
+        return None
+    try:
+        embedder = make_embedder(cfg.embedder)
+    except ModuleNotFoundError as exc:  # the extra; the command reports a ValueError in one line
+        raise ValueError(
+            f"memory.embedder is {cfg.embedder} and {exc}. Or set memory.embedder to hash, "
+            "or memory.enabled to false"
+        ) from exc
+    return PgMemoryStore(sessions, embedder)
+
+
 def build_parts(
     settings: EnvSettings, cfg: AppConfig, sandboxes: DockerSandboxManager
 ) -> WorkerParts:
@@ -198,6 +254,7 @@ def build_parts(
     store = GitCheckpointStore(blobs, root=settings.ckpt_dir)
     engine = make_engine(settings.database_url.get_secret_value())
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
+    memory = build_memory(cfg.memory, sessions)
     recorder = SqlRecorder(sessions)
     ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
     # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
@@ -254,8 +311,11 @@ def build_parts(
         recorder,
         image=cfg.sandbox.image,
         limits=cfg.sandbox.limits,
+        memory=memory,
         github=remote,
+        blobs=blobs,
     )
+    notes = MemoryActivities(memory, blobs)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
@@ -285,6 +345,7 @@ def build_parts(
             *compactor.activities,
             *tools.activities,
             *workspace.activities,
+            *notes.activities,
             *events.activities,
             *plans.activities,
             *poller.activities,
@@ -294,6 +355,7 @@ def build_parts(
         store=store,
         engine=engine,
         github=github,
+        memory=memory,
     )
 
 
@@ -349,6 +411,7 @@ async def main() -> None:
     install_signal_handlers(stop)  # before the connection, so an early stop is not a crash
     endpoint: metrics.MetricsServer | None = None
     try:
+        await parts.check_memory()  # before the port is taken and the queue is polled
         endpoint = metrics.serve(settings.metrics_port, settings.metrics_host)
         log.info("metrics on http://%s:%d/metrics", settings.metrics_host, endpoint.port)
         client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)

@@ -232,6 +232,21 @@ class Telemetry(StrictModel):
     capture_content: bool
 
 
+class Memory(StrictModel):
+    """What the agent remembers about a repo between tasks (Phase 6, ADR-0010).
+
+    `embedder` says which model makes the vectors that notes are found by. `local` is the real
+    one and needs the `memory` extra (`uv sync --extra memory`). `hash` needs nothing installed
+    and finds notes by shared words only, which is for tests and CI. The vectors of the two
+    cannot be compared, so a database holds the rows of one, and a worker refuses to start on a
+    table that another embedder wrote. With `enabled` off the worker builds no store, keeps no
+    repo map or verified commands, and the memory block of the prompt stays empty.
+    """
+
+    enabled: bool
+    embedder: Literal["local", "hash"]
+
+
 class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
@@ -242,6 +257,7 @@ class AppConfig(StrictModel):
     loop: Loop
     stuck: Stuck
     telemetry: Telemetry
+    memory: Memory
     pricing_file: Path
 
 

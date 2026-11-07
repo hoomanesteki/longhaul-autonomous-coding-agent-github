@@ -21,6 +21,7 @@ number and so is not delivered; `github_spec` has one.
 """
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -121,6 +122,13 @@ class Stubs:
     order of all activities, and not in `log`. `names()` therefore lists the loop's activities
     only, and `github_names()` the others.
 
+    load_memory (LH-604) is logged in `memory_loads` and nowhere else, as the activities of a task
+    on a worker with a memory store: each entry is the names of the activities that had run
+    before it, then its input. It does not wait at a gate and is not in `log` or `every`, so the
+    exact lists of the tests below stay what they were. `prepared_with` adds fields to the output
+    of prepare_workspace, such as `memory_enabled=True`, which is what makes the workflow call
+    it.
+
     The note that a run makes at its end (acts.OUTCOME_EVENT, LH-704) goes in `outcomes`, with
     the run that made it. It does not wait at a gate and is not in `log`, so the order of the
     other calls stays what each test below says. An error in `fails` for record_event is raised
@@ -150,11 +158,15 @@ class Stubs:
         self.overflow: dict[int, int] = {}
         self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
         self.outcomes: list[tuple[str, acts.RecordEventInput]] = []
+        self.memory_loads: list[tuple[list[str], acts.LoadMemoryInput]] = []
+        self.memory_block = ref("memory/memory-block.txt")
+        self.prepared_with: dict[str, Any] = {}
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
         return [
             self.prepare_workspace,
+            self.load_memory,
             self.ensure_sandbox,
             self.llm_turn,
             self.tool_exec,
@@ -217,7 +229,16 @@ class Stubs:
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
         await self._enter(acts.PREPARE_WORKSPACE.name, spec)
-        return acts.PrepareWorkspaceOutput(sandbox_id="sbx-1", base_sha=BASE, head_sha=BASE)
+        return acts.PrepareWorkspaceOutput(
+            sandbox_id="sbx-1", base_sha=BASE, head_sha=BASE, **self.prepared_with
+        )
+
+    @activity.defn(name=acts.LOAD_MEMORY.name)
+    async def load_memory(self, inp: acts.LoadMemoryInput) -> BlobRef:
+        self.memory_loads.append((list(self.every), inp))
+        if acts.LOAD_MEMORY.name in self.fails:
+            raise self.fails[acts.LOAD_MEMORY.name]
+        return self.memory_block
 
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
@@ -2900,3 +2921,234 @@ async def test_a_status_comment_that_is_still_posting_does_not_stop_the_hand_ove
 
     assert outcome == FINISHED
     assert len(stubs.run_ids) == 2, "the task handed over while the status comment was pending"
+
+
+# ---------- LH-604: the memory block is loaded once and rides in every turn ----------
+MAP_REF = ref("memory/repo-map.txt")
+WITH_MEMORY: dict[str, Any] = {"memory_enabled": True, "repo_map_ref": MAP_REF}
+
+
+async def test_load_memory_runs_once_after_prepare_and_the_block_goes_to_every_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.prepared_with = WITH_MEMORY
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    ((before, loaded),) = stubs.memory_loads
+    # After the workspace is ready, and before the model has been asked anything.
+    assert before == ["prepare_workspace"]
+    assert loaded == acts.LoadMemoryInput(spec=spec, repo_map_ref=MAP_REF)
+    assert stubs.every[0] == "prepare_workspace"
+    assert stubs.every[1] == "llm_turn"
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 3
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
+
+
+async def test_a_worker_without_memory_adds_no_activity_to_the_task(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # What prepare_workspace says decides it, and the output of a worker that has no store (or an
+    # output recorded before LH-604) says nothing. So the sequence of an old history is the same.
+    stubs = Stubs(reads_then_finishes(1))
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert stubs.memory_loads == []
+    assert {t.memory_ref for t in stubs.payloads(acts.LLM_TURN.name)} == {None}
+
+
+async def test_the_block_survives_continue_as_new_and_is_not_loaded_again(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # Runs of turns 0-2 and 3-5 and 6. A new run would find other lessons if it asked again, and
+    # the prompt must be the same bytes for the whole task.
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.prepared_with = WITH_MEMORY
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert len(stubs.run_ids) == 3
+    assert len(stubs.memory_loads) == 1
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 7
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
+
+
+async def test_the_compaction_gets_the_block_as_well(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.prepared_with = WITH_MEMORY
+    stubs.decisions[0] = "compact"
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    (compaction,) = compactions(stubs)
+    assert compaction.memory_ref == stubs.memory_block
+
+
+async def test_a_memory_that_cannot_be_loaded_does_not_fail_the_task(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The notes are hints. After its retries the activity gives up, and the task goes on without.
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.prepared_with = WITH_MEMORY
+    stubs.fails[acts.LOAD_MEMORY.name] = ApplicationError(
+        "the store is down", type="OperationalError", non_retryable=True
+    )
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert final.phase is Phase.DONE
+    assert len(stubs.memory_loads) == 1
+    assert {t.memory_ref for t in stubs.payloads(acts.LLM_TURN.name)} == {None}
+
+
+async def test_the_verified_test_command_fills_in_a_repo_that_names_none(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    assert spec.settings.test_command is None
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    # Every model turn, in every run, builds its prompt from a spec that names the command, and
+    # the spec of the task is otherwise what it was.
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 5
+    assert {t.spec.settings.test_command for t in turns} == {"pytest -q"}
+    assert all(t.spec.model_copy(update={"settings": spec.settings}) == spec for t in turns)
+
+
+async def test_a_test_command_in_the_settings_is_never_replaced(
+    env: WorkflowEnvironment,
+) -> None:
+    named = make_spec().model_copy(
+        update={"settings": RepoSettings(repo="acme/calc", test_command="make check")}
+    )
+    stubs = Stubs()
+    stubs.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    await play(env, stubs, named)
+
+    assert {t.spec.settings.test_command for t in stubs.payloads(acts.LLM_TURN.name)} == {
+        "make check"
+    }
+
+
+async def test_histories_with_and_without_the_memory_call_replay(env: WorkflowEnvironment) -> None:
+    """An old history has no load_memory and a new one has it, and the same code replays both.
+
+    The first task is what the workflow did before LH-604: its prepare_workspace output has no
+    memory flag, so it never calls the activity. The second is a task on a worker with a store,
+    which calls it once, and hands over to a new run after three turns.
+    """
+    old, new = Stubs(reads_then_finishes(3)), Stubs(edits_then_finishes(4))
+    new.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    async with running(env, old) as queue:
+        before = await start_task(env.client, make_spec("lh-acme-calc-61"), task_queue=queue)
+        await result_of(before)
+    async with running(env, new) as queue:
+        first = await start_task(
+            env.client, make_spec("lh-acme-calc-62"), task_queue=queue, tuning=EVERY_3
+        )
+        await result_of(first)
+        histories = [
+            await before.fetch_history(),
+            await env.client.get_workflow_handle(
+                "lh-acme-calc-62", run_id=first.first_execution_run_id
+            ).fetch_history(),
+            await env.client.get_workflow_handle("lh-acme-calc-62").fetch_history(),
+        ]
+
+    assert old.memory_loads == [] and len(new.memory_loads) == 1
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    for history in histories:
+        await replayer.replay_workflow(history)
+
+
+def _with_prepare_result(history: WorkflowHistory, **fields: Any) -> WorkflowHistory:
+    """The history with `fields` added to the recorded result of prepare_workspace."""
+    scheduled = next(
+        event.event_id
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+        and event.activity_task_scheduled_event_attributes.activity_type.name
+        == acts.PREPARE_WORKSPACE.name
+    )
+    completed = next(
+        event.activity_task_completed_event_attributes
+        for event in history.events
+        if event.HasField("activity_task_completed_event_attributes")
+        and event.activity_task_completed_event_attributes.scheduled_event_id == scheduled
+    )
+    payload = completed.result.payloads[0]
+    payload.data = json.dumps({**json.loads(payload.data), **fields}).encode()
+    return history
+
+
+async def test_a_history_in_which_old_code_saw_the_memory_flag_replays(
+    env: WorkflowEnvironment,
+) -> None:
+    """A rolling upgrade can hand the prepare result of a new worker to old workflow code.
+
+    The new worker returns memory_enabled=true. The old workflow code ignores the field and goes
+    on to llm_turn, so that is the command the history holds. A worker that runs the new code
+    must replay it without a load_memory call, which `workflow.patched` decides: the history has
+    no marker for it. The history is recorded with the flag off and its recorded result is then
+    edited to carry the flag, which gives the history that the old code would have written.
+    """
+    stubs = Stubs(reads_then_finishes(1))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, make_spec("lh-acme-calc-63"), task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert stubs.memory_loads == []
+    seen = _with_prepare_result(history, memory_enabled=True, repo_map_ref=MAP_REF.model_dump())
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(seen)
+
+
+def _patch_markers(history: WorkflowHistory) -> list[str]:
+    return [
+        event.marker_recorded_event_attributes.marker_name
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+        and event.marker_recorded_event_attributes.marker_name == "core_patch"
+    ]
+
+
+async def test_a_task_with_memory_records_the_patch_marker_and_one_without_does_not(
+    env: WorkflowEnvironment,
+) -> None:
+    # The marker is what lets a worker tell a history of this code from a history of old code.
+    # A task that never asks about memory has no use for it, which keeps the history of every
+    # task on a worker with no store as it was.
+    with_memory, without = Stubs(reads_then_finishes(1)), Stubs(reads_then_finishes(1))
+    with_memory.prepared_with = WITH_MEMORY
+    async with running(env, with_memory) as queue:
+        first = await start_task(env.client, make_spec("lh-acme-calc-64"), task_queue=queue)
+        await result_of(first)
+        marked = await first.fetch_history()
+    async with running(env, without) as queue:
+        second = await start_task(env.client, make_spec("lh-acme-calc-65"), task_queue=queue)
+        await result_of(second)
+        plain = await second.fetch_history()
+
+    assert len(_patch_markers(marked)) == 1
+    assert _patch_markers(plain) == []

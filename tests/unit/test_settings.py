@@ -154,6 +154,9 @@ def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: A
         pytest.param(("loop",), "planner_max_turns", id="loop.planner_max_turns"),
         pytest.param((), "telemetry", id="telemetry section"),
         pytest.param(("telemetry",), "capture_content", id="telemetry.capture_content"),
+        pytest.param((), "memory", id="memory section"),
+        pytest.param(("memory",), "enabled", id="memory.enabled"),
+        pytest.param(("memory",), "embedder", id="memory.embedder"),
     ],
 )
 def test_new_settings_have_no_silent_default(
@@ -231,6 +234,7 @@ UNKNOWN_KEY_CASES = [
     pytest.param(("loop",), "max_verify_round", id="loop"),
     pytest.param(("stuck",), "no_progress_turn", id="stuck"),
     pytest.param(("telemetry",), "capture_contnt", id="telemetry"),
+    pytest.param(("memory",), "embeder", id="memory"),
 ]
 
 
@@ -822,3 +826,41 @@ def test_the_policy_is_not_changed_by_asking_for_a_window() -> None:
     policy.for_window(8_000)
 
     assert policy == before
+
+
+# ---------- the memory section (LH-604) ----------
+@pytest.mark.phase6
+def test_the_example_config_turns_memory_on_with_the_local_embedder() -> None:
+    memory = load_config(EXAMPLE).memory
+    assert (memory.enabled, memory.embedder) == (True, "local")
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("embedder", ["local", "hash"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_memory_section_takes_both_embedders_on_or_off(
+    tmp_path: Path, embedder: str, enabled: bool
+) -> None:
+    data = _example_data()
+    data["memory"] = {"enabled": enabled, "embedder": embedder}
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    memory = load_config(path).memory
+
+    assert (memory.enabled, memory.embedder) == (enabled, embedder)
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("embedder", ["openai", "Local", "", "fastembed", 3])
+def test_an_embedder_that_does_not_exist_is_refused_and_the_error_names_the_setting(
+    tmp_path: Path, embedder: object
+) -> None:
+    data = _example_data()
+    data["memory"]["embedder"] = embedder
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("memory", "embedder")]
+    assert "hash" in str(excinfo.value)

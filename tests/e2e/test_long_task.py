@@ -103,6 +103,9 @@ class LonglogStack(Stack):
         config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
         config["context"]["compact_at"] = COMPACT_AT
         config["context"]["keep_recent_turns"] = KEEP_RECENT_TURNS
+        # The local embedder needs the memory extra and a model download (LH-604). The hash one
+        # needs neither, and the worker still keeps its memory.
+        config["memory"]["embedder"] = "hash"
         path = self.root / "longhaul.yaml"
         path.write_text(yaml.safe_dump(config), encoding="utf-8")
         return path

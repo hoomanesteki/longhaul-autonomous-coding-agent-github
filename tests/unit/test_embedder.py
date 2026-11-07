@@ -19,7 +19,13 @@ from typing import Any
 import pytest
 
 from longhaul.db.models import MemoryItemRow
-from longhaul.memory.embedder import EMBEDDING_DIM, LOCAL_MODEL, HashEmbedder, LocalEmbedder
+from longhaul.memory.embedder import (
+    EMBEDDING_DIM,
+    LOCAL_MODEL,
+    HashEmbedder,
+    LocalEmbedder,
+    make_embedder,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 
@@ -284,6 +290,40 @@ def test_a_missing_dependency_of_fastembed_is_not_reported_as_a_missing_fastembe
     with pytest.raises(ModuleNotFoundError, match="onnxruntime") as raised:
         LocalEmbedder().embed(["one"])
     assert raised.value.name == "onnxruntime"
+
+
+# ---------- the embedder a config names (LH-604) ----------
+@pytest.mark.phase6
+def test_the_hash_embedder_needs_nothing_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "fastembed", None)
+
+    assert isinstance(make_embedder("hash"), HashEmbedder)
+
+
+@pytest.mark.phase6
+def test_the_local_embedder_loads_no_model_when_it_is_made(fastembed: FakeFastembed) -> None:
+    embedder = make_embedder("local")
+
+    assert isinstance(embedder, LocalEmbedder)
+    assert fastembed.loaded == []  # the model loads on the first text, not at the start
+
+
+@pytest.mark.phase6
+def test_a_worker_without_the_extra_hears_it_when_the_embedder_is_made_and_not_at_the_first_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "fastembed", None)
+
+    with pytest.raises(ModuleNotFoundError, match=r"uv sync --extra memory") as raised:
+        make_embedder("local")
+    assert raised.value.name == "fastembed"
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("name", ["openai", "", "Local"])
+def test_an_embedder_that_does_not_exist_is_refused(name: str) -> None:
+    with pytest.raises(ValueError, match="embedder"):
+        make_embedder(name)
 
 
 def test_importing_the_module_does_not_import_fastembed() -> None:

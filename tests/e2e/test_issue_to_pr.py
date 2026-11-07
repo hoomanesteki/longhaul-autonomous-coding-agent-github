@@ -181,6 +181,9 @@ class Stack:
         """The example config with the one repo of this test in the allowlist."""
         config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
         config["repos"] = [{**config["repos"][0], "repo": self.repo}]
+        # The local embedder needs the memory extra and a model download (LH-604). The hash one
+        # needs neither, and the worker still keeps its memory.
+        config["memory"]["embedder"] = "hash"
         self.config_file.write_text(yaml.safe_dump(config), encoding="utf-8")
 
     def environment(self) -> dict[str, str]:

@@ -178,6 +178,41 @@ async def test_the_first_turn_builds_the_request_from_the_spec() -> None:
     assert call["tools"] == TOOLS
 
 
+# ---------- the memory block (LH-604) ----------
+BLOCK = "Notes from past work on this repo.\n\n```text\n- pytest -q\n```"
+
+
+@pytest.mark.phase6
+async def test_the_memory_block_of_the_task_ends_the_system_prompt_of_every_turn() -> None:
+    rig = Rig(reply("end_turn"), reply("end_turn"))
+    block = await rig.blobs.put(
+        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "memory-block.txt")
+    )
+    ref = await rig.put("transcript-1.json", answered(), turn=1)
+
+    await rig.run(turn_input(memory_ref=block))
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, memory_ref=block))
+
+    first, later = rig.provider.calls
+    assert first["system"] == later["system"] == build_system_prompt(Role.CODER, SPEC, BLOCK)
+    assert first["system"].endswith(BLOCK)
+
+
+@pytest.mark.phase6
+async def test_a_turn_without_a_memory_ref_sends_the_prompt_it_always_did() -> None:
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(memory_ref=None))
+    assert rig.provider.calls[0]["system"] == build_system_prompt(Role.CODER, SPEC)
+
+
+@pytest.mark.phase6
+async def test_an_empty_block_adds_no_section() -> None:
+    rig = Rig(reply("end_turn"))
+    empty = await rig.blobs.put(b"", key=blob_key(SPEC.task_id, "memory", 0, "block.txt"))
+    await rig.run(turn_input(memory_ref=empty))
+    assert rig.provider.calls[0]["system"] == build_system_prompt(Role.CODER, SPEC)
+
+
 async def test_no_effort_in_the_config_sends_no_options() -> None:
     config = CFG.model_copy(update={"effort": None})
     rig = Rig(reply("end_turn"), config=lambda role: config)

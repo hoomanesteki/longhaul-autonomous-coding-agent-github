@@ -8,9 +8,10 @@ import it. The workflow reads the types and the policies. An activity registers 
 
 The policies are the ones in plan section 3.7. Two activities are not in that table and got
 their numbers here: `append_results`, which reads and writes one blob, and `cleanup`. Both are
-sized like `load_memory`. `ensure_sandbox` is in the table with 10 minutes and 5 attempts, and
-has a heartbeat timeout like `prepare_workspace`: it builds a container and runs the setup
-command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
+sized like `load_memory`, which has the table's 2 minutes and 3 attempts and no heartbeat: it is
+one search of the store and one blob write. `ensure_sandbox` is in the table with 10 minutes and
+5 attempts, and has a heartbeat timeout like `prepare_workspace`: it builds a container and runs
+the setup command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
 `bundle_checkpoint` has the table's 5 minutes and 3 attempts and the same kind of heartbeat
 timeout, because it uploads the whole history of a repository. `record_event` is a local
 activity: it is one row insert, and it runs inside the worker that holds the workflow. `compact`
@@ -77,6 +78,7 @@ from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
+    CarryState,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
@@ -208,17 +210,54 @@ FORBIDDEN_BRANCH = "ForbiddenBranchError"
 
 
 # ---------- payloads ----------
+class RunState(CarryState):
+    """CarryState plus what only the workflow carries from run to run (LH-604).
+
+    CarryState is a shared contract (contracts.py) with no field for the memory block, and this
+    story does not change it. The workflow takes and hands over this subclass instead, so the
+    extra field rides through Continue-As-New with the rest of the state. The JSON of a CarryState
+    is a valid RunState with no block, which is how a workflow that an older worker started
+    decodes, and the JSON of a RunState is a valid CarryState to a reader that does not know the
+    field.
+
+    `memory_ref` is the memory block that load_memory wrote for the task, or None when the task
+    has none. It is set once, by the run that prepared the workspace, and never changes.
+    """
+
+    memory_ref: BlobRef | None = None
+
+
 class PrepareWorkspaceOutput(BaseModel):
     """What the workflow keeps of a prepared workspace.
 
     `repo_map_ref` is the repo map for the task's issue (LH-602): text in the blob store, for
     the memory block of the prompt (LH-604). It is None when the worker has no memory store, or
     the map could not be built, and the task goes on without it.
+
+    `memory_enabled` says that this worker keeps memory, and so that the workflow should call
+    load_memory next. The workflow reads it from the recorded result and not from any setting,
+    so the history of a task that began before LH-604 has no such call to replay, and a worker
+    without a store adds no activity to its tasks. `test_command` is the first approved test
+    command of the repo (retrieve.first_test_command), and is set only when the repo settings
+    name none: the workflow puts it into the spec, so every prompt of the task names it.
     """
 
     sandbox_id: str
     base_sha: str
     head_sha: str
+    repo_map_ref: BlobRef | None = None
+    memory_enabled: bool = False
+    test_command: str | None = None
+
+
+class LoadMemoryInput(BaseModel):
+    """What load_memory needs to write the memory block of a task.
+
+    The spec gives the repo and the issue text that the lessons are searched by. `repo_map_ref`
+    is the map that prepare_workspace wrote for this issue, if it wrote one.
+    """
+
+    spec: TaskSpec
     repo_map_ref: BlobRef | None = None
 
 
@@ -264,10 +303,13 @@ class LlmTurnInput(BaseModel):
     transcript_ref: BlobRef | None  # None before the first turn
     # The notes reach the model in the first message of the view, where compaction put them
     # (context/compact.py apply), so the system prompt does not change with them (D7). This field
-    # is the workflow's copy, which it hands back to the compact activity. The plan and the memory
-    # block reach the model in Phases 5 and 6.
+    # is the workflow's copy, which it hands back to the compact activity. The plan reaches the
+    # model in Phase 5.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
+    # The memory block that load_memory wrote for the task (LH-604): text in the blob store that
+    # ends the system prompt. It is the same ref on every turn of the task, in every run, so the
+    # prompt is the same bytes. None means the task has no block.
     memory_ref: BlobRef | None = None
     # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
     # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
@@ -389,6 +431,9 @@ class CompactInput(BaseModel):
     script_ref: BlobRef | None = None
     # The context mode of the run, as in LlmTurnInput. Only `full` compacts.
     context_mode: ContextMode | None = None
+    # The memory block of the task, as in LlmTurnInput. The system prompt that the token counts
+    # are made from has it, as the one that the model turn sends does.
+    memory_ref: BlobRef | None = None
 
 
 class CompactOutput(BaseModel):
@@ -647,6 +692,14 @@ POLL_ONCE = Act(
     ),
 )
 
+LOAD_MEMORY = Act(
+    "load_memory",
+    LoadMemoryInput,
+    BlobRef,  # the rendered memory block, as text
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 COMPACT = Act(
     "compact",
     CompactInput,
@@ -755,6 +808,7 @@ STORE_PLAN = Act(
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
+    LOAD_MEMORY,
     LLM_TURN,
     TOOL_EXEC,
     APPEND_RESULTS,

@@ -862,12 +862,41 @@ class Notes:
     def __init__(self) -> None:
         self.added: list[tuple[MemoryItem, str]] = []
         self.failure: Exception | None = None
+        self.listing_failure: Exception | None = None
+        # The notes that a person turned down. The real store keeps a rejected note rejected when
+        # a task finds it again, so it is never among the approved ones.
+        self.turned_down: set[str] = set()
 
     async def add_verified(self, item: MemoryItem, *, source_ref: str) -> str:
         if self.failure is not None:
             raise self.failure
         self.added.append((item, source_ref))
         return f"item-{len(self.added)}"
+
+    async def list_items(
+        self, repo: str, *, status: str | None = None, kind: str | None = None
+    ) -> list[Any]:
+        if self.listing_failure is not None:
+            raise self.listing_failure
+        found = [
+            item
+            for item, _ in self.added
+            if item.repo == repo and (kind is None or item.kind == kind)
+        ]
+        wanted = "approved" if status is None else status
+        return [
+            type(
+                "Row",
+                (),
+                {
+                    "content": item.content,
+                    "kind": item.kind,
+                    "status": "rejected" if item.content in self.turned_down else "approved",
+                },
+            )()
+            for item in found
+            if (item.content in self.turned_down) == (wanted == "rejected")
+        ]
 
     @property
     def commands(self) -> list[str]:
@@ -1499,3 +1528,77 @@ async def test_a_sandbox_that_could_not_be_rebuilt_is_not_counted(
     with pytest.raises(SetupCommandError):
         await rig.ensure(out.sandbox_id, out.head_sha, rig.spec(setup_command="exit 3"))
     assert counters.registry.get_sample_value("longhaul_sandbox_recreated_total") == 0
+
+
+# ---------- the memory flag and the test command (LH-604) ----------
+@pytest.mark.phase6
+async def test_a_worker_without_a_memory_store_tells_the_workflow_there_is_no_memory(
+    rig: Rig,
+) -> None:
+    out = await rig.prepare()
+
+    assert (out.memory_enabled, out.test_command) == (False, None)
+
+
+@pytest.mark.phase6
+async def test_a_worker_with_a_memory_store_tells_the_workflow_to_load_it(rig: Rig) -> None:
+    out = await prepare_with(rig, Notes())
+
+    assert out.memory_enabled is True
+
+
+@pytest.mark.phase6
+async def test_the_test_command_falls_back_to_the_first_approved_one(rig: Rig) -> None:
+    (rig.source / "Makefile").write_text("test:\n\t@echo '4 passed in 0.01s'\n")
+    notes = Notes()
+
+    out = await prepare_with(rig, notes, rig.spec())  # the settings name no test command
+
+    assert notes.commands == [PYTEST, "make test"]
+    assert out.test_command == PYTEST
+
+
+@pytest.mark.phase6
+async def test_a_test_command_in_the_repo_settings_is_not_replaced(rig: Rig) -> None:
+    out = await prepare_with(rig, Notes(), rig.spec(test_command="make check"))
+
+    assert out.test_command is None  # None says: leave the settings as they are
+
+
+@pytest.mark.phase6
+async def test_a_linter_is_not_a_test_command(rig: Rig) -> None:
+    (rig.source / "pyproject.toml").write_text('[project]\nname = "calc"\nversion = "0.1.0"\n')
+    (rig.source / "Makefile").write_text("lint:\n\t@echo 'All checks passed!'\n")
+    notes = Notes()
+
+    out = await prepare_with(rig, notes)
+
+    assert notes.commands == ["make lint"]
+    assert out.test_command is None
+
+
+@pytest.mark.phase6
+async def test_a_command_that_a_person_rejected_is_not_the_test_command(rig: Rig) -> None:
+    # The command works at this commit and is verified again, but the store keeps it rejected.
+    notes = Notes()
+    notes.turned_down = {PYTEST}
+
+    out = await prepare_with(rig, notes)
+
+    assert notes.commands == [PYTEST]
+    assert out.test_command is None
+
+
+@pytest.mark.phase6
+async def test_a_store_that_cannot_be_read_leaves_the_test_command_alone(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    notes = Notes()
+    notes.listing_failure = ConnectionError("the database is gone")
+
+    with caplog.at_level(logging.WARNING, logger="longhaul.durable.activities.workspace"):
+        out = await prepare_with(rig, notes)
+
+    assert out.test_command is None
+    assert out.memory_enabled is True
+    assert "the database is gone" in caplog.text

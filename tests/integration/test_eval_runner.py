@@ -29,6 +29,7 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
+from tests.fakes.worker_config import hash_embedder_config
 
 from eval import custom_tasks, grade_custom, results, run
 from longhaul.agent.workspace import prepare_local_workspace
@@ -133,7 +134,9 @@ async def stack(tmp_path: Path, database: str) -> AsyncIterator[EvalStack]:
     require_image()
     queue = f"lh-eval-{uuid.uuid4().hex[:8]}"
     settings = service_settings(database_url=database, task_queue=queue, ckpt_dir=tmp_path / "ckpt")
-    parts = worker.build_parts(settings, load_config(CONFIG), DockerSandboxManager())
+    # The example config names the local embedder, which needs the memory extra (LH-604).
+    config = load_config(hash_embedder_config(tmp_path))
+    parts = worker.build_parts(settings, config, DockerSandboxManager())
     client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)
     stop = asyncio.Event()
     serving = asyncio.create_task(worker.serve(client, queue, parts.activities, stop))

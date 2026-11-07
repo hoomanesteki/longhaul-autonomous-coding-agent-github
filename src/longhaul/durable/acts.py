@@ -94,6 +94,7 @@ from longhaul.contracts import (
 )
 from longhaul.durable.payload_guard import PayloadTooLargeError
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
+from longhaul.roles.stuck import CallSignal
 
 # The `finish` control tool ends a task. The workflow runs nothing for it: rules.run_calls reads
 # its summary. A unit test keeps the name equal to longhaul.tools.control.FINISH.
@@ -326,6 +327,18 @@ class ToolExecInput(BaseModel):
     # A call of the planning phase (LH-501). The activity runs it, and then puts the tree back on
     # `pre_sha` if it changed anything, and saves no checkpoint. The default is the coder's call.
     read_only: bool = False
+
+
+class ToolExecResult(ToolResult):
+    """What tool_exec returns: the ToolResult, and the facts the stuck detector reads (LH-505).
+
+    `signal` is None for a call that has none to give, such as a read, and for every call of the
+    planning phase, which the detector does not watch. The facts are small by design (see
+    roles/stuck.py), so they add a few hundred bytes to the history at most. A result stored
+    before this field existed reads back as one without facts.
+    """
+
+    signal: CallSignal | None = None
 
 
 class ToolResultSummary(BaseModel):
@@ -614,7 +627,7 @@ LLM_TURN = Act(
 TOOL_EXEC = Act(
     "tool_exec",
     ToolExecInput,
-    ToolResult,
+    ToolExecResult,
     start_to_close=timedelta(seconds=TOOL_TIMEOUT_S + 60),
     heartbeat=timedelta(seconds=15),
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),

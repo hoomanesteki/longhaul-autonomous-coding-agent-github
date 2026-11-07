@@ -45,7 +45,8 @@ What it is built from, and why each piece is what it is:
   `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
   Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
-  another number stops before it takes a task.
+  another number stops before it takes a task. The stuck detector (LH-505) is the same: the
+  workflow keeps a copy of the four limits in `stuck`, and `tool_exec` returns the facts it reads.
 * The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
@@ -74,6 +75,7 @@ the wait is short and bounded.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import signal
 from collections.abc import Callable, Sequence
@@ -119,7 +121,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, stuck
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.telemetry import metrics
@@ -170,6 +172,23 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
     return get_provider(settings)
 
 
+def _check_stuck_limits(cfg: AppConfig) -> None:
+    """Refuse a config whose `stuck` limits the workflow's detector does not use.
+
+    The detector runs in the workflow, which cannot read the config file and keeps its own copy
+    of the numbers (stuck.DEFAULT_LIMITS). Like the planner's turn limit, a different number
+    would be accepted and then ignored on every task.
+    """
+    have = stuck.limits_of(cfg.stuck)
+    for field in dataclasses.fields(stuck.Limits):
+        got, want = getattr(have, field.name), getattr(stuck.DEFAULT_LIMITS, field.name)
+        if got != want:
+            raise ValueError(
+                f"stuck.{field.name} is {got}, but the stuck detector of the workflow uses "
+                f"{want} and cannot be told otherwise. Set it to {want}"
+            )
+
+
 def build_parts(
     settings: EnvSettings, cfg: AppConfig, sandboxes: DockerSandboxManager
 ) -> WorkerParts:
@@ -186,6 +205,7 @@ def build_parts(
             f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
             f"Set it to {acts.PLANNER_MAX_TURNS}"
         )
+    _check_stuck_limits(cfg)
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
     try:

@@ -20,6 +20,8 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 
 ROOT = Path(__file__).resolve().parents[2]
 LIMITS = stuck.DEFAULT_LIMITS
+# Limits that no test reaches, for the tests of the window and of its size.
+NEVER = stuck.Limits(10**9, 10**9, 10**9, 10**9)
 HASH_A = "a" * 40
 HASH_B = "b" * 40
 FILE = "src/inv.py"
@@ -86,7 +88,7 @@ def test_a_finished_step_is_progress() -> None:
 def test_a_fall_in_passing_tests_is_not_progress() -> None:
     # 5 passed, then 3, then back to 5: the second 5 is not above the best, so it is no gain.
     turns = [sig(0, tests_passed=5), sig(1, tests_passed=3)]
-    turns += [sig(i, tests_passed=5) for i in range(2, 17)]
+    turns += [sig(i, tests_passed=5) for i in range(2, 16)]
     assert only_last(feed(turns)).reason is StuckReason.NO_PROGRESS
 
 
@@ -289,7 +291,7 @@ def test_the_more_specific_rule_wins_when_two_fire_on_one_turn() -> None:
 
 
 def test_the_window_keeps_the_last_30_turns() -> None:
-    detector = StuckDetector(stuck.Limits(1000, 1000, 1000, 1000))
+    detector = StuckDetector(NEVER)
     for i in range(50):
         detector.observe(sig(i))
     assert [s.turn_index for s in detector.window] == list(range(20, 50))
@@ -344,7 +346,7 @@ def worst_turn(turn: int) -> TurnSignal:
 def test_state_size_bound() -> None:
     # The window sits in CarryState, which crosses Continue-As-New, so it has to stay small
     # however long the task runs and however large each field is.
-    detector = StuckDetector(stuck.Limits(1000, 1000, 1000, 1000))
+    detector = StuckDetector(NEVER)
     for turn in range(200):
         detector.observe(worst_turn(turn))
     window = detector.window
@@ -354,7 +356,7 @@ def test_state_size_bound() -> None:
 
 
 def test_a_typical_full_window_is_far_below_the_bound() -> None:
-    detector = StuckDetector(stuck.Limits(1000, 1000, 1000, 1000))
+    detector = StuckDetector(NEVER)
     for turn in range(40):
         detector.observe(
             sig(
@@ -368,7 +370,7 @@ def test_a_typical_full_window_is_far_below_the_bound() -> None:
 
 
 def test_old_edit_regions_are_dropped_because_no_rule_reads_them() -> None:
-    detector = StuckDetector(stuck.Limits(1000, 1000, 1000, 1000))
+    detector = StuckDetector(NEVER)
     for turn in range(30):
         detector.observe(edit(turn, 1, 5))
     kept = [bool(s.edited_regions) for s in detector.window]

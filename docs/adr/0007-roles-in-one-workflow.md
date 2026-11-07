@@ -37,6 +37,10 @@ LH-503 adds the coder's side of the plan. A coder with a plan is the same role i
 - **`status()` carries the plan** as `PlannedStatus`, a `TaskStatus` with one more field, because `TaskStatus` is a contract.
 - **A question ends the task for now.** `ask_human` records a `paused` event with the question and ends the task as `stuck` in the phase `paused`. LH-506 replaces `_ask_human` in the workflow with the wait for an answer.
 
+LH-505 adds a watcher for the coder:
+
+- **The stuck detector is a pure module the workflow calls.** `roles/stuck.py` keeps a window of the last 30 coder turns in `CarryState.stuck_window` and has four rules. `tool_exec` returns the small facts the rules read, with each result, because the workflow sees only a preview of the text. A rule that fires records a `stuck` event and the task goes on. LH-506 replaces that with the pause and the hint. The planner is not watched, since reading the same file three times is its job.
+
 ## Consequences
 
 Easier:

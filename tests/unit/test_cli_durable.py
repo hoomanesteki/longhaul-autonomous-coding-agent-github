@@ -11,6 +11,7 @@ asyncio.run, which cannot happen inside a running one.
 
 import asyncio
 import os
+import re
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -365,6 +366,11 @@ def test_the_header_names_the_mode_the_run_asked_for(stack_for: Callable[..., St
     assert "context mode" not in unnamed.output
 
 
+# Rich styles the usage error when it detects CI (GITHUB_ACTIONS) or FORCE_COLOR, and the escape
+# codes split option names, so read it as plain text.
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
 def test_a_context_mode_that_does_not_exist_is_a_usage_error_and_starts_nothing(
     stack_for: Callable[..., Stack],
 ) -> None:
@@ -372,7 +378,7 @@ def test_a_context_mode_that_does_not_exist_is_a_usage_error_and_starts_nothing(
     result = invoke(run_args("--context-mode", "partial"))
 
     assert result.exit_code == 2
-    assert "--context-mode" in result.output
+    assert "--context-mode" in ANSI.sub("", result.output)
     assert stack.temporal.started == []
 
 

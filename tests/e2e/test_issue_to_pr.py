@@ -5,13 +5,14 @@ uses the same one) and on a free port otherwise, which the test says in its outp
 `longhaul worker`, started the way an operator starts it, against the compose Temporal, Postgres
 and MinIO and the local Docker daemon. It reaches the fake through LONGHAUL_GITHUB_API_URL, and
 clones from and pushes to a bare repo on disk through LONGHAUL_GITHUB_WEB_URL. The model is the
-scripted provider with the script that fixes `calc`. Run `make up` and `make sandbox-image` first.
+scripted provider with a script that plans and then fixes `calc`, since every task the poller
+starts plans first (LH-501). Run `make up` and `make sandbox-image` first.
 The workspace setup builds a venv and installs pytest and calc from PyPI, so the machine needs
 outbound network.
 
 The poller runs once, as the Schedule would start it. The test then follows the task to its end
-and checks what the issue shows: one "Picked up" comment, one draft pull request, and the label
-`longhaul:pr-open` where `longhaul:working` was.
+and checks what the issue shows: one "Picked up" comment, one comment with the plan, one draft
+pull request, and the label `longhaul:pr-open` where `longhaul:working` was.
 
 Nothing here touches what other work on the machine uses. The test has its own task queue, its
 own scratch database (migrated to head, then dropped), its own checkpoint folder, and a repo with
@@ -56,7 +57,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.phase3]
 
 ROOT = Path(__file__).resolve().parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
-SCRIPT = ROOT / "tests" / "fixtures" / "scripts" / "calc_fix.yaml"
+SCRIPT = ROOT / "tests" / "fixtures" / "scripts" / "calc_fix_planned.yaml"
 CONFIG = ROOT / "config" / "longhaul.example.yaml"
 IMAGE = "longhaul-sandbox:py312"
 # `uv run` and `uv sync` put the script next to the interpreter.
@@ -68,9 +69,9 @@ LABEL = "longhaul"
 TOKEN = "ghp_e2e_issue_to_pr_0123456789abcdef"
 # The whole path from the labeled issue to the pull request has to fit in three minutes (LH-308).
 # One deadline covers the start of the worker, both polls and the wait for the task, so slow
-# stages cannot add up to more. The task itself is five turns of a script and a workspace setup,
-# so what is left over is slack for a slow machine. The worker also has its own limit, because
-# its start is a loop in a thread.
+# stages cannot add up to more. The task itself is eight turns of a script (three of the planner,
+# five of the coder) and a workspace setup, so what is left over is slack for a slow machine. The
+# worker also has its own limit, because its start is a loop in a thread.
 TOTAL_S = 180
 WORKER_START_S = 60
 
@@ -355,11 +356,13 @@ async def label_to_pr(stack: Stack) -> None:
     assert "3 passed" in pull["body"], pull["body"]
     assert set(fake.branches(repo)) == {"main", f"longhaul-pr/{issue}"}, "main was not pushed to"
 
-    # The issue shows one "Picked up" comment and nothing else from us.
+    # The issue shows one "Picked up" comment, then the plan once, and nothing else from us.
     comments = fake.comment_bodies(repo, issue)
-    assert len(comments) == 1, comments
+    assert len(comments) == 2, comments
     assert comments[0].startswith("Picked up"), comments[0]
     assert task_id in comments[0]
+    assert "## Plan, version 1" in comments[1], comments[1]
+    assert f"<!-- longhaul:key={task_id}:plan_comment:1 -->" in comments[1], comments[1]
 
     # `longhaul:working` came and went, and the pull request label stayed.
     assert sorted(fake.label_names(repo, issue)) == [LABEL, "longhaul:pr-open"]
@@ -377,7 +380,7 @@ async def label_to_pr(stack: Stack) -> None:
     )
     assert again == acts.PollResult(repos=1, issues=1, started=0, known=1), shown
     assert fake.count_pulls(repo) == 1
-    assert fake.count_comments(repo, issue) == 1
+    assert fake.count_comments(repo, issue) == 2
 
     with psycopg.connect(stack.database) as conn:
         rows = conn.execute("SELECT id, repo, issue_number FROM tasks").fetchall()

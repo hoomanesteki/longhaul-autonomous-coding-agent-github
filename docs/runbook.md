@@ -403,7 +403,7 @@ Rules that keep a command from doing something nobody meant:
 
 Each poll now reads the new comments of every open labeled issue that has a task, which is one more GitHub call for each such issue, and one more for each author of a command that the poll has not asked about yet.
 
-The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one draft pull request and the label `longhaul:pr-open`. It needs `make up` and `make sandbox-image`, and takes about two minutes.
+The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one draft pull request and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner and for the coder. It needs `make up` and `make sandbox-image`, and takes about two minutes.
 
 ## Kill the worker on purpose
 

@@ -4,10 +4,14 @@ The plan puts these in durable/activities/github.py. That module holds the polle
 the delivery has a file of its own.
 
 `build_pr_branch` runs on the host, from the task's bare repo. It reads the default branch from
-the API, titles one commit with the summary the agent gave to `finish`, and makes the branch
-`longhaul-pr/<n>` with one commit on top of the base (checkpoints/squash.py). The base is the sha
-that the workflow handed over, not the `base` tag of the repo, which the sandbox can move. It
-pushes nothing.
+the API, titles the commits, and makes the branch `longhaul-pr/<n>` on top of the base
+(checkpoints/squash.py). A task without a plan gets one commit, titled with the summary the agent
+gave to `finish`. A task with a plan (LH-503) gets one commit for each step that is done, titled
+from the step's description, and one for the work after the last step, titled from the summary.
+The workflow hands over the plan with the status of each step, and the checkpoints that the steps
+left are read from the `checkpoints` table, because the sha of a checkpoint is not in the state.
+The pull request keeps the title of the summary either way. The base is the sha that the workflow
+handed over, not the `base` tag of the repo, which the sandbox can move. It pushes nothing.
 The branch is the same commit on every attempt, so a retry changes nothing.
 
 `deliver` takes that branch to GitHub in two steps, both through the idempotency ledger of
@@ -52,14 +56,16 @@ from longhaul.checkpoints.push import ForbiddenBranchError, push_branch
 from longhaul.checkpoints.squash import (
     Group,
     NothingToDeliverError,
+    StepEnd,
     build_pr_branch,
     commit_subject,
     file_stats,
+    group_by_step,
     parse_author,
     pr_branch_name,
     repo_scope,
 )
-from longhaul.db.records import ToolCallRecord
+from longhaul.db.records import CheckpointRecord, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import github_failure, heartbeating, not_retried, small
 from longhaul.github.client import GitHubClient, GitHubError
@@ -87,11 +93,13 @@ TESTS_TOOL = "run_tests"
 
 
 class DeliveryRecords(Protocol):
-    """The part of the recorder that these activities use: one event written, one row read."""
+    """The part of the recorder that these activities use: one event written, rows read."""
 
     async def record_event(self, task_id: str, type: str, payload: dict[str, Any]) -> None: ...
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None: ...
+
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]: ...
 
 
 class DeliveryActivities:
@@ -145,7 +153,7 @@ class DeliveryActivities:
             )
             built = await build_pr_branch(
                 inp.task_id,
-                [Group(title, inp.head_sha)],
+                await self._groups(inp, title),
                 base_sha=inp.base_sha,
                 store=self._store,
                 default_branch=default_branch,
@@ -168,6 +176,23 @@ class DeliveryActivities:
                 base_branch=default_branch,
                 title=title,
             )
+        )
+
+    async def _groups(self, inp: acts.BuildPrBranchInput, title: str) -> list[Group]:
+        """The commits of the branch: one for the whole task, or one for each done step.
+
+        A task without a plan never reads the table.
+        """
+        if inp.plan is None:
+            return [Group(title, inp.head_sha)]
+        rows = await self._records.step_checkpoints(inp.task_id)
+        return group_by_step(
+            inp.plan,
+            [StepEnd(row.step_id, row.sha) for row in rows if row.step_id is not None],
+            summary=inp.summary,
+            head_sha=inp.head_sha,
+            scope=repo_scope(inp.repo),
+            fallback=FALLBACK_DESCRIPTION,
         )
 
     # ---------- deliver ----------

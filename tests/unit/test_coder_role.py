@@ -26,6 +26,7 @@ from longhaul.agent.prompts import (
 )
 from longhaul.context.compact import NOTES_HEADING
 from longhaul.contracts import (
+    BlobRef,
     Message,
     OutcomeKind,
     Plan,
@@ -78,7 +79,13 @@ def spec() -> TaskSpec:
     )
 
 
+BY_REF = BlobRef(key="tasks/lh-x/turns/0001/args-t1.json", sha256="0" * 64, size=20_000)
+
+
 def call(name: str, call_id: str, arguments: dict[str, Any] | None) -> acts.ToolCallSummary:
+    """A call of the workflow's kind. `None` is a call whose arguments were over 16 KB."""
+    if arguments is None:
+        return acts.ToolCallSummary(id=call_id, name=name, args_ref=BY_REF)
     return acts.ToolCallSummary(id=call_id, name=name, input=arguments)
 
 

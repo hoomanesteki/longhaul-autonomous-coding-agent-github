@@ -18,7 +18,14 @@ roles/planner.py, which owns what the planner may do, and its tool guide is here
 coder's, because the two share most lines. A role also has its own first user message
 (`first_user_message`), and its own transcript, so each role has its own cached prefix (ADR-0007).
 
-The function is pure. The same arguments give the same bytes: it reads no clock, no
+A coder with a plan (LH-503) has a text of its own too: `build_planned_system_prompt`, with the
+intro and rules of roles/coder.py. It works the steps, marks them with `update_step` and ends
+with `submit_for_review`, so it is told about those and not about `finish`. Whether a task has a
+plan is settled before the coder's transcript starts and does not change in it, so the prompt is
+still the same bytes in every request. `build_system_prompt` is the prompt of a coder without a
+plan and is as it was.
+
+The functions are pure. The same arguments give the same bytes: it reads no clock, no
 environment and no random source, and it leaves the task id out, because two tasks on one
 issue should not differ in their first bytes. The first line is the role line from
 `providers.base`, which the scripted provider reads to pick its steps.
@@ -43,24 +50,25 @@ compaction. The first message wins on the rest:
 
 A step update edits the plan block in place instead of adding a message at the tail. That keeps
 one plan in the conversation, where the model reads it, in the order above. A task has a handful of
-steps, so the rewrite is paid a handful of times.
+steps, so the rewrite is paid a handful of times. `render_plan` writes the block and `with_plan`
+puts it into the first message, replacing the block that is there, so llm_turn can bring the plan
+up to date before each call from the plan the workflow holds.
 
 The tool list is the other half of the prefix. It is the same list in the same order for the life
 of a transcript, because a change to a tool drops every cache (ADR-0003, appendix).
 """
 
-from longhaul.contracts import Role, TaskSpec
+from longhaul.contracts import Message, Plan, Role, TaskSpec, TextBlock
 from longhaul.providers.base import format_role_line
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 
 RULES_HEADING = "## Rules"
 TOOLS_HEADING = "## Tools"
 TASK_HEADING = "## Task"
 FACTS_HEADING = "## Repo facts"
 SECTION_HEADINGS = (RULES_HEADING, TOOLS_HEADING, TASK_HEADING, FACTS_HEADING)
-# The heading of block 5. The plan is rendered into the first user message by the coder story
-# (LH-503), not into the system prompt. The constant is here so that the layout test and that story
-# agree on the line the plan block starts with.
+# The heading of block 5. The plan is rendered into the first user message (`render_plan`), not
+# into the system prompt. A block that starts with it is the plan block (`is_plan_block`).
 PLAN_HEADING = "## Plan"
 
 # The first user message. The task itself is in the system prompt (block 3), so this only
@@ -124,6 +132,29 @@ _ERRORS = "- When a tool reports an error, read it and change your next call."
 
 _TOOL_GUIDE = (_FIND, _EDIT, _RUN, _DIFF, _OUTPUT, _PARALLEL, _ERRORS)
 
+_PLANNED_DIFF = (
+    "- Look at `git_diff` before you submit for review, to check that the change is what you meant."
+)
+_STEPS = (
+    "- Mark a step of the plan with `update_step`: give its `step_id`, the `status` (`todo`, "
+    "`doing`, `done` or `skipped`) and a short `note`. A step that is `done` is saved, and the "
+    "pull request gets one commit for it."
+)
+_PLANNED_PARALLEL = (
+    f"- Independent tool calls can go in one reply. Send `{coder.SUBMIT_FOR_REVIEW}` and "
+    f"`{coder.ASK_HUMAN}` on their own."
+)
+_PLANNED_TOOL_GUIDE = (
+    _FIND,
+    _EDIT,
+    _RUN,
+    _PLANNED_DIFF,
+    _STEPS,
+    _OUTPUT,
+    _PLANNED_PARALLEL,
+    _ERRORS,
+)
+
 _PLANNER_RUN = (
     "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. Use "
     "`run_command` for any other shell command, such as git log or a short script that "
@@ -141,14 +172,21 @@ _ROLE_TEXT: dict[Role, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     Role.CODER: (_CODER_INTRO, _CODER_RULES, _TOOL_GUIDE),
     Role.PLANNER: (planner.INTRO, planner.RULES, _PLANNER_TOOL_GUIDE),
 }
+# The coder of a task that has a plan (LH-503).
+_PLANNED_CODER_TEXT = (coder.INTRO, coder.RULES, _PLANNED_TOOL_GUIDE)
 
 # The first user message of each role that has one of its own. Every other role starts as the
 # coder does.
 _FIRST_MESSAGE: dict[Role, str] = {Role.PLANNER: planner.FIRST_USER_MESSAGE}
 
 
-def first_user_message(role: Role) -> str:
-    """The user message that opens the transcript of `role`."""
+def first_user_message(role: Role, *, planned: bool = False) -> str:
+    """The user message that opens the transcript of `role`.
+
+    `planned` is for the coder of a task that has a plan, whose message points at the plan.
+    """
+    if planned and role is Role.CODER:
+        return coder.FIRST_USER_MESSAGE
     return _FIRST_MESSAGE.get(role, FIRST_USER_MESSAGE)
 
 
@@ -161,15 +199,35 @@ def build_system_prompt(role: Role, spec: TaskSpec, memory_block: str | None = N
     Raises ValueError for a role that has no prompt yet.
     """
     try:
-        intro, rules, guide = _ROLE_TEXT[role]
+        text = _ROLE_TEXT[role]
     except KeyError:
         raise ValueError(f"no system prompt is written for the {role!s} role yet") from None
+    return _assemble(role, text, spec, memory_block)
+
+
+def build_planned_system_prompt(spec: TaskSpec, memory_block: str | None = None) -> str:
+    """The system prompt of the coder of a task that has a plan (LH-503).
+
+    It takes the plan's existence from the caller and not the plan itself: the plan changes on
+    every step update and lives in the first message (block 5), so the prompt cannot hold it. The
+    task block and the memory block are the same bytes as for a coder without a plan.
+    """
+    return _assemble(Role.CODER, _PLANNED_CODER_TEXT, spec, memory_block)
+
+
+def _assemble(
+    role: Role,
+    text: tuple[str, tuple[str, ...], tuple[str, ...]],
+    spec: TaskSpec,
+    memory: str | None,
+) -> str:
+    intro, rules, guide = text
     sections = [
         "\n".join([format_role_line(role), "", intro, "", RULES_HEADING, *rules]),
         "\n".join([TOOLS_HEADING, *guide]),
         task_statement(spec),
     ]
-    facts = _clean(memory_block or "")
+    facts = _clean(memory or "")
     if facts:
         sections.append(f"{FACTS_HEADING}\n{facts}")
     return "\n\n".join(sections)
@@ -195,6 +253,57 @@ def task_statement(spec: TaskSpec) -> str:
         numbered = [f"{n}. {_clean(text)}" for n, text in enumerate(spec.comments, start=1)]
         lines += ["", "Comments on the issue:", *numbered]
     return "\n".join(lines)
+
+
+# ---------- block 5: the plan ----------
+def _line(text: str) -> str:
+    """Text from the model on one line, so that it cannot start a block of its own."""
+    return " ".join(text.split())
+
+
+def render_plan(plan: Plan) -> str:
+    """The plan block of the first user message: the steps with their statuses, then the checks.
+
+    The same plan gives the same text, and a status change changes only the status in its step
+    line, so a step update rewrites one block and nothing else. Model text is put on one line.
+    """
+    lines = [PLAN_HEADING, f"Summary: {_line(plan.summary)}", "", "Steps:"]
+    for step in plan.steps:
+        lines.append(f"{_line(step.id)}. [{step.status}] {_line(step.description)}")
+        if step.files:
+            lines.append(f"    Files: {', '.join(_line(path) for path in step.files)}")
+        lines.append(f"    Done when: {_line(step.done_when)}")
+    lines += ["", "Acceptance checks:", *(f"- {_line(check)}" for check in plan.acceptance_checks)]
+    if plan.risks:
+        lines += ["", "Risks:", *(f"- {_line(risk)}" for risk in plan.risks)]
+    return "\n".join(lines)
+
+
+def is_plan_block(block: object) -> bool:
+    """True for the text block that `render_plan` wrote."""
+    return isinstance(block, TextBlock) and block.text.lstrip().startswith(PLAN_HEADING)
+
+
+def with_plan(transcript: list[Message], plan: Plan) -> list[Message]:
+    """The transcript with the plan block of its first message brought up to date.
+
+    The block replaces the one that is there, in the same place, so a hint or the notes of a
+    compaction that follow it stay where they were. A first message with no plan block gets one
+    after its first block, the line that starts the work. The transcript it is given is not
+    changed. Raises ValueError when the transcript does not start with a user message.
+    """
+    if not transcript or transcript[0].role != "user":
+        raise ValueError("the first message of the transcript has to be the user message")
+    block = TextBlock(text=render_plan(plan))
+    blocks = list(transcript[0].content)
+    at = next((i for i, existing in enumerate(blocks) if is_plan_block(existing)), None)
+    if at is None:
+        blocks.insert(1, block)
+    elif blocks[at] == block:
+        return list(transcript)
+    else:
+        blocks[at] = block
+    return [Message(role="user", content=blocks), *transcript[1:]]
 
 
 def _repo_label(repo: str) -> str:

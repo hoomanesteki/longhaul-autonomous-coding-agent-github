@@ -63,7 +63,11 @@ from longhaul.durable import acts
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
@@ -310,6 +314,7 @@ async def light(
                 *tools.activities,
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
+                *StepActivities(recorder).activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,
@@ -335,7 +340,8 @@ async def result_of(handle: WorkflowHandle[Any, Outcome], wait_s: float = WAIT_S
 
 
 async def planned_status(handle: WorkflowHandle[Any, Outcome]) -> acts.PlannedStatus:
-    return await handle.query(TaskWorkflow.status, result_type=acts.PlannedStatus)
+    # The result type can be set only for a query asked for by name.
+    return await handle.query("status", result_type=acts.PlannedStatus)
 
 
 def statuses(plan: Plan | None) -> list[str]:
@@ -666,6 +672,7 @@ async def real(env: WorkflowEnvironment, tmp_path: Path, script: Path) -> AsyncI
                 *workspace.activities,
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
+                *StepActivities(recorder).activities,
                 *PlanCommentActivities(github.client, ledger, templates=TEMPLATES).activities,
                 *SideEffectActivities(github.client, ledger).activities,
                 *delivery.activities,

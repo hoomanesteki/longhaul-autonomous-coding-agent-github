@@ -46,6 +46,10 @@ What it is built from, and why each piece is what it is:
   Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
   another number stops before it takes a task.
+* The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
+  `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
+  without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
+  the step updates, and every worker registers it.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. Without a token the worker still starts and still registers `poll_once`, so a
   worker for local runs needs none. A poll on it fails with the name of the setting, and the
@@ -97,7 +101,11 @@ from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -111,7 +119,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.telemetry import metrics
@@ -211,6 +219,7 @@ def build_parts(
         context=cfg.context,
         meters=meters,
         role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        planned_tools=coder.tool_specs(registry.specs()),
     )
     compactor = ContextActivities(
         provider,
@@ -245,6 +254,7 @@ def build_parts(
     )
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
+    steps = StepActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
@@ -274,6 +284,7 @@ def build_parts(
             *workspace.activities,
             *events.activities,
             *plans.activities,
+            *steps.activities,
             *poller.activities,
             *delivery,
         ],

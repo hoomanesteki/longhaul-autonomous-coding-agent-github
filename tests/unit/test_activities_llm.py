@@ -51,7 +51,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
 from longhaul.durable.scripts import script_key, upload_script
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -637,12 +637,13 @@ async def test_a_transcript_the_api_would_reject_fails_without_a_retry_and_witho
 
 
 async def test_a_role_without_a_prompt_fails_without_a_retry() -> None:
-    # The verifier gets its prompt in LH-504. The planner got its own in LH-501.
+    # The planner got its prompt in LH-501 and the verifier in LH-504. The compactor builds its
+    # own request, so a model turn in its name is a mistake.
     rig = Rig()
     with pytest.raises(ApplicationError) as caught:
-        await rig.run(turn_input(role=Role.VERIFIER))
+        await rig.run(turn_input(role=Role.COMPACTOR))
     assert caught.value.non_retryable
-    assert "verifier" in str(caught.value)
+    assert "compactor" in str(caught.value)
     assert rig.provider.calls == []
 
 
@@ -944,3 +945,161 @@ async def test_a_step_tool_call_is_returned_like_any_call() -> None:
     out = await rig.run(turn_input(plan=make_plan()))
     assert [c.name for c in out.tool_call_summaries] == ["update_step"]
     assert out.tool_call_summaries[0].input == {"step_id": "s1", "status": "done"}
+
+
+# ---------- the verifier (LH-504) ----------
+VERIFIER_TOOLS = verifier.tool_specs(TOOLS)
+DIFF = "diff --git a/calc.py b/calc.py\n-    return a - b\n+    return a + b"
+
+
+def verifier_rig(*steps: Step) -> Rig:
+    rig = Rig(*steps)
+    rig.activities = LlmActivities(
+        rig.provider,
+        rig.blobs,
+        rig.recorder,
+        TOOLS,
+        lambda role: CFG,
+        role_tools={Role.VERIFIER: VERIFIER_TOOLS},
+    )
+    return rig
+
+
+async def output_of(rig: Rig, call_id: str, text: str) -> BlobRef:
+    """The full text of a tool call, as tool_exec stores it."""
+    return await rig.blobs.put(
+        text.encode(), key=blob_key(SPEC.task_id, "turns", 0, f"tool-{call_id}-output.txt")
+    )
+
+
+async def brief_of(
+    rig: Rig, tests_output: str = "3 passed in 0.01s", diff: str = DIFF
+) -> acts.ReviewBrief:
+    return acts.ReviewBrief(
+        checks=[
+            acts.CheckRun(
+                command="pytest -q",
+                call_id="verify1-tests",
+                passed=True,
+                exit_code=0,
+                output_ref=await output_of(rig, "verify1-tests", tests_output),
+            )
+        ],
+        diff=acts.CheckRun(
+            command="git_diff",
+            call_id="verify1-diff",
+            passed=True,
+            exit_code=None,
+            output_ref=await output_of(rig, "verify1-diff", diff),
+        ),
+    )
+
+
+async def test_the_verifier_is_asked_with_its_own_prompt_tools_and_first_message() -> None:
+    rig = verifier_rig(reply("tool_use", use("toolu_1", "read_file", path="calc.py")))
+    plan = make_plan("done", "done")
+    brief = await brief_of(rig)
+
+    out = await rig.run(turn_input(role=Role.VERIFIER, plan=plan, review=brief))
+
+    (call,) = rig.provider.calls
+    assert call["system"] == build_system_prompt(Role.VERIFIER, SPEC)
+    assert call["tools"] == VERIFIER_TOOLS
+    (first,) = call["messages"]
+    assert first.role == "user"
+    assert [b.text for b in first.content] == [
+        verifier.FIRST_USER_MESSAGE,
+        render_plan(plan),
+        verifier.render_precheck([(brief.checks[0], "3 passed in 0.01s")]),
+        verifier.render_diff(DIFF),
+    ]
+    # The first message is the one the verifier was asked with, so the stored transcript has it.
+    assert (await rig.transcript(out.transcript_ref))[0] == first
+
+
+async def test_a_long_diff_reaches_the_verifier_as_a_head_a_tail_and_a_handle() -> None:
+    rig = verifier_rig(reply("end_turn"))
+    lines = [f"+line {n}" for n in range(3000)]
+    brief = await brief_of(rig, diff="\n".join(lines))
+
+    await rig.run(turn_input(role=Role.VERIFIER, plan=make_plan(), review=brief))
+
+    diff_block = [b.text for b in rig.provider.calls[0]["messages"][0].content][-1]
+    assert diff_block.startswith(verifier.DIFF_HEADING)
+    assert "+line 0" in diff_block and "+line 2999" in diff_block
+    assert "+line 1500" not in diff_block
+    assert "handle out_verify1-diff" in diff_block
+
+
+async def test_a_long_test_output_is_cut_to_its_start_and_its_summary_line() -> None:
+    rig = verifier_rig(reply("end_turn"))
+    log = "\n".join([*(f"test {n} ok" for n in range(2000)), "2000 passed in 9s"])
+    brief = await brief_of(rig, tests_output=log)
+
+    await rig.run(turn_input(role=Role.VERIFIER, plan=make_plan(), review=brief))
+
+    block = [b.text for b in rig.provider.calls[0]["messages"][0].content][2]
+    assert "2000 passed in 9s" in block
+    assert "handle out_verify1-tests" in block
+    assert "test 1000 ok" not in block
+
+
+async def test_the_brief_is_read_on_the_first_turn_only() -> None:
+    rig = verifier_rig(reply("end_turn"), reply("end_turn"))
+    first = await rig.run(
+        turn_input(role=Role.VERIFIER, plan=make_plan(), review=await brief_of(rig))
+    )
+    gone = BlobRef(key="tasks/lh-x/gone.txt", sha256="0" * 64, size=1)
+    later = acts.ReviewBrief(
+        checks=[], diff=acts.CheckRun(command="git_diff", call_id="d", passed=True, output_ref=gone)
+    )
+
+    # The transcript holds the first message, so a brief whose blobs are gone is never read.
+    await rig.run(
+        turn_input(
+            role=Role.VERIFIER,
+            turn_index=1,
+            transcript_ref=first.transcript_ref,
+            plan=make_plan(),
+            review=later,
+        )
+    )
+
+    one, two = rig.provider.calls
+    assert one["messages"][0] == two["messages"][0]
+    assert one["system"] == two["system"] and one["tools"] == two["tools"]
+
+
+async def test_a_verifier_without_a_brief_gets_the_plan_and_no_checks() -> None:
+    rig = verifier_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.VERIFIER, plan=make_plan()))
+
+    (first,) = rig.provider.calls[0]["messages"]
+    assert [b.text for b in first.content] == [
+        verifier.FIRST_USER_MESSAGE,
+        render_plan(make_plan()),
+    ]
+
+
+async def test_the_other_roles_ignore_a_brief() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.PLANNER, review=await brief_of(rig)))
+
+    assert rig.provider.calls[0]["messages"] == [
+        Message(role="user", content=[TextBlock(text=planner.FIRST_USER_MESSAGE)])
+    ]
+
+
+async def test_a_worker_without_verifier_tools_offers_the_verifier_the_default_list() -> None:
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.VERIFIER, plan=make_plan()))
+    assert rig.provider.calls[0]["tools"] == TOOLS
+
+
+async def test_a_submit_verdict_call_is_returned_like_any_call() -> None:
+    verdict = {"passed": True, "tests_run": "pytest -q", "tests_summary": "3 passed", "issues": []}
+    rig = verifier_rig(reply("tool_use", use("toolu_1", "submit_verdict", **verdict)))
+    out = await rig.run(turn_input(role=Role.VERIFIER, plan=make_plan()))
+
+    assert [c.name for c in out.tool_call_summaries] == ["submit_verdict"]
+    assert out.tool_call_summaries[0].input == verdict

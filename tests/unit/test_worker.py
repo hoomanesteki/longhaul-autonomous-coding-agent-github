@@ -28,7 +28,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.settings import EnvSettings, load_config
 from longhaul.telemetry import metrics
 
@@ -560,3 +560,24 @@ def test_a_worker_records_steps_with_the_recorder_of_the_rest(tmp_path: Path) ->
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     recording = activity_object(parts, "record_step")
     assert recording._records is activity_object(parts, "llm_turn")._recorder
+
+
+# ---------- the verifier (LH-504) ----------
+def test_the_verifier_gets_its_own_tools_on_every_worker(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+
+    offered = [tool.name for tool in llm.tools_for(Role.VERIFIER)]
+    assert offered == [*verifier.TOOLS, "submit_verdict"]
+    assert not {"edit_file", "write_file", "run_command", "finish"} & set(offered)
+    # The flag is for the coder only: the verifier has one list.
+    assert llm.tools_for(Role.VERIFIER, planned=True) == llm.tools_for(Role.VERIFIER)
+
+
+def test_a_verify_round_limit_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The workflow keeps its own copy of the limit, so a different number in the file would be
+    # read, accepted and ignored. Stopping at the start says so while the operator is looking.
+    loop = CONFIG.loop.model_copy(update={"max_verify_rounds": 5})
+    config = CONFIG.model_copy(update={"loop": loop})
+    with pytest.raises(ValueError, match=r"loop\.max_verify_rounds.*5.*3"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]

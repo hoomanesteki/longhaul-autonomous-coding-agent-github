@@ -344,6 +344,50 @@ async def test_the_pull_request_is_a_draft_into_the_default_branch_under_a_stabl
     assert "Closes #42" in request.body
 
 
+async def test_a_pull_request_whose_work_was_verified_is_ready_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"verified_tests": "41 passed"})
+
+    await run(make().deliver, inp)
+
+    (request,) = seen
+    assert request.draft is False
+    assert "Verified: 41 passed" in request.body
+    assert request.body.rstrip().endswith("Closes #42")
+    assert request.idempotency_key == f"{TASK}:pr:1"
+
+
+async def test_the_body_of_a_verified_pull_request_is_the_same_on_a_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # create_pr refuses a reused key with other text, and a retried deliver builds the body again.
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"verified_tests": "41 passed"})
+    activities = make()
+
+    await run(activities.deliver, inp)
+    await run(activities.deliver, inp)
+
+    assert seen[0] == seen[1]
+    assert seen[0].body.encode() == seen[1].body.encode()
+
+
 async def test_a_push_to_a_protected_name_is_recorded_and_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

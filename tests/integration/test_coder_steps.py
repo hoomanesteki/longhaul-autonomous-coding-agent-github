@@ -77,7 +77,7 @@ from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
@@ -155,6 +155,9 @@ FIX = tool("edit_file", path=MODULE, old_str="    return a - b", new_str="    re
 ADD_TEST = tool("write_file", path=NEW_TEST_FILE, content=NEW_TEST)
 ADD_NOTE = tool("write_file", path=CHANGELOG, content="- add() adds again\n")
 SUBMIT = tool("submit_for_review", summary=SUMMARY)
+# A submission is reviewed (LH-504). These scripts are about the coder, so the review passes.
+VERDICT = tool("submit_verdict", passed=True, tests_run=PYTEST, tests_summary="3 passed", issues=[])
+REVIEW = turn("verifier", 0, VERDICT)
 
 
 def three_step_run() -> list[dict[str, Any]]:
@@ -166,6 +169,7 @@ def three_step_run() -> list[dict[str, Any]]:
         coder_turn(2, ADD_TEST, step("s2", "done")),
         coder_turn(3, ADD_NOTE, step("s3", "done")),
         coder_turn(4, SUBMIT),
+        REVIEW,
     ]
 
 
@@ -298,7 +302,10 @@ async def light(
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     boxes = Boxes()
@@ -373,6 +380,7 @@ async def test_plan_statuses_show_in_the_first_message_and_in_status(
         coder_turn(1, FIX, step("s1", "done", "add() adds")),
         coder_turn(2, step("s2", "doing")),
         coder_turn(3, SUBMIT),
+        REVIEW,
     ]
     async with light(env, write_script(tmp_path, steps), hold_coder_call=3) as world:
         handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
@@ -413,7 +421,7 @@ async def test_plan_statuses_show_in_the_first_message_and_in_status(
 async def test_the_coder_is_offered_the_step_tools_and_not_finish(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    steps = [turn("planner", 0, tool("submit_plan", **PLAN_INPUT)), coder_turn(0, SUBMIT)]
+    steps = [turn("planner", 0, tool("submit_plan", **PLAN_INPUT)), coder_turn(0, SUBMIT), REVIEW]
     async with light(env, write_script(tmp_path, steps)) as world:
         handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
         await result_of(handle)
@@ -452,6 +460,7 @@ async def test_a_step_that_is_not_in_the_plan_is_answered_and_the_task_goes_on(
         coder_turn(0, step("s9", "done")),
         coder_turn(1, step("s1", "sleeping")),
         coder_turn(2, SUBMIT),
+        REVIEW,
     ]
     async with light(env, write_script(tmp_path, steps)) as world:
         handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
@@ -616,7 +625,8 @@ class Real:
             issue_number=self.number,
             title="add() subtracts",
             body="`calc.add` subtracts its arguments instead of adding them.",
-            settings=RepoSettings(repo=REPO, test_command=PYTEST, setup_command=""),
+            # No test command: the review runs it, and the image has no pytest to run it with.
+            settings=RepoSettings(repo=REPO, setup_command=""),
         )
 
     def bare(self, *args: str) -> str:
@@ -642,7 +652,10 @@ async def real(env: WorkflowEnvironment, tmp_path: Path, script: Path) -> AsyncI
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     tools = ToolActivities(registry, manager, blobs, recorder, checkpoints=store)
@@ -769,4 +782,6 @@ async def test_pr_commits_per_step(env: WorkflowEnvironment, tmp_path: Path) -> 
 
         (pull,) = world.fake.pulls(REPO)
         assert pull["title"] == "fix(calc): fix add() so it returns the sum of its arguments"
-        assert pull["draft"] is True
+        # The review passed, so the pull request is ready and says what was verified.
+        assert pull["draft"] is False
+        assert "Verified: 3 passed" in pull["body"]

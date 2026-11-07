@@ -637,6 +637,7 @@ def identity(ctx: RunContext, task: custom_tasks.CustomTask) -> dict[str, Any]:
         "config_hash": config_files.load(options.config).sha256,
         "seed": options.seed,
         "run_set": options.run_set,
+        "allow_mixed_models": options.allow_mixed_models,
         "model": ctx.model,
         "git_sha": ctx.commit,
         "provider": options.provider,
@@ -783,11 +784,15 @@ async def ask_once(
     """The one model call of a single-shot task, asked again after an error that may pass.
 
     Every call that was billed is on the cost ledger (invariant I6), with the number of the try
-    as its attempt: the calls that failed after they were billed, and the one that answered.
+    as its attempt: the calls that failed after they were billed, and the one that answered. The
+    answer is booked before its diff is applied, so a failure of git or patch cannot lose the row.
+    The number of files in the prompt is `top_files` of the config file, which the hash covers.
     """
     assert ctx.cfg is not None
     assert ctx.provider_for is not None
     assert ctx.ledger is not None
+    top_files = config_files.load(ctx.options.config).config.top_files
+    assert top_files is not None  # the config of a single-shot run has to name it
     loop = LoopConfig.from_config(ctx.cfg, Role.CODER)
     call = CallOptions(effort=loop.effort) if loop.effort is not None else None
     provider = ctx.provider_for(script_for(ctx.options, task))
@@ -795,7 +800,7 @@ async def ask_once(
     repo = f"local:{folder}"
     for attempt in range(1, CALL_ATTEMPTS + 1):
         try:
-            answer = await single_shot.solve(
+            asked = await single_shot.ask(
                 provider,
                 model=ctx.model,
                 repo=folder,
@@ -805,6 +810,7 @@ async def ask_once(
                 # turn that was cut off.
                 max_tokens=loop.max_tokens_retry,
                 options=call,
+                top=top_files,
             )
         except ProviderError as exc:
             if exc.usage is not None:
@@ -814,8 +820,8 @@ async def ask_once(
             wait = exc.retry_after_s or RETRY_BASE_S * 2 ** (attempt - 1)
             await asyncio.sleep(min(wait, RETRY_MAX_S))
             continue
-        await ctx.ledger.record(workflow_id, repo, ctx.model, 0, attempt, answer.usage)
-        return answer
+        await ctx.ledger.record(workflow_id, repo, ctx.model, 0, attempt, asked.usage)
+        return await single_shot.apply_reply(folder, asked)
     raise AssertionError("the loop returns or raises on its last try")
 
 

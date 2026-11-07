@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import statistics
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, get_args
@@ -69,6 +70,9 @@ class TaskResult(BaseModel):
     seed: int
     # The name the operator gave to the runs that are compared with each other, if any.
     run_set: str | None = None
+    # The run was started with --allow-mixed-models. The runner compares models only inside a
+    # run set, so this is what tells a later comparison that a pair on two models was meant.
+    allow_mixed_models: bool = False
     model: str
     git_sha: str
     # Where the answers came from. `scripted` is true when a script played them: such a run is
@@ -114,6 +118,7 @@ class Summary(BaseModel):
     config_hash: str = Field(pattern=CONFIG_HASH)
     seed: int
     run_set: str | None = None
+    allow_mixed_models: bool = False
     model: str
     provider: str | None
     scripted: bool
@@ -184,8 +189,33 @@ def models_in_run_set(results_dir: Path, run_set: str) -> dict[str, str]:
     return found
 
 
+def check_comparable(runs: Sequence[Summary]) -> None:
+    """Refuse to put runs on more than one model side by side, unless a run allowed it.
+
+    The runner checks the models of a run set when a run starts, and only for runs that name a
+    set. A report that pairs two runs calls this, so a pair that nobody put in a set is held to
+    the same rule (plan section 8.4). `--allow-mixed-models` on any of the runs says that the
+    operator meant it.
+    """
+    models = {run.run_id: run.model for run in runs}
+    if len(set(models.values())) > 1 and not any(run.allow_mixed_models for run in runs):
+        named = ", ".join(f"{run_id} used {model}" for run_id, model in sorted(models.items()))
+        raise ValueError(
+            f"these runs are on more than one model ({named}), and none of them was started "
+            "with --allow-mixed-models. A comparison needs one model (plan section 8.4)"
+        )
+
+
 def _check_one_run(results: list[TaskResult]) -> None:
-    fields = ("run_id", "task_set", "config", "config_hash", "seed", "run_set")
+    fields = (
+        "run_id",
+        "task_set",
+        "config",
+        "config_hash",
+        "seed",
+        "run_set",
+        "allow_mixed_models",
+    )
     for field in (*fields, "model", "provider", "scripted"):
         values = {str(getattr(r, field)) for r in results}
         if len(values) != 1:
@@ -214,6 +244,7 @@ def summarize(results: list[TaskResult], *, started_at: datetime, ended_at: date
         config_hash=first.config_hash,
         seed=first.seed,
         run_set=first.run_set,
+        allow_mixed_models=first.allow_mixed_models,
         model=first.model,
         provider=first.provider,
         scripted=first.scripted,

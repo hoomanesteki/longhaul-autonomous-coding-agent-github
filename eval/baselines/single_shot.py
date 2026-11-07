@@ -19,8 +19,14 @@ sandbox (the repo's code never runs on the host). The runner builds it and calls
 scripted provider the reply is read from the script, so a dry run needs no key and costs nothing.
 
 A diff is untrusted text. Before anything runs, every path in it is checked: no absolute path, no
-`..` and nothing in `.git`. The copy it is applied to is deleted afterwards, and the repo that
-`solve` is given is only read.
+`..` and nothing in `.git`. The paths are checked wherever a patch tool reads one, which is more
+than the `---` and `+++` lines: `Index:` lines and context diff headers name files too, and the
+patch of macOS follows a `..` in them. `patch` is then given only the headers and hunks of the
+unified diff, so a name in a line that the check does not know about never reaches it. The copy
+the diff is applied to is deleted afterwards, and the repo that `solve` is given is only read.
+
+`solve` is `ask` followed by `apply_reply`. The runner calls the two apart: the call is paid for
+when the provider answers, and the cost ledger has to hold it whatever the apply step does next.
 """
 
 from __future__ import annotations
@@ -191,23 +197,53 @@ def extract_diff(reply: str) -> str:
 _PATH_LINE = re.compile(r"^(?:---|\+\+\+) (?P<path>[^\t\n]+)", re.MULTILINE)
 _MOVE_LINE = re.compile(r"^(?:rename|copy) (?:from|to) (?P<path>[^\n]+)", re.MULTILINE)
 _GIT_LINE = re.compile(r"^diff --git (?P<a>\S+) (?P<b>\S+)", re.MULTILINE)
+# Names that patch reads and git does not: svn and cvs write `Index:`, and the old header of a
+# context diff is a `*** ` line. They are checked, but never staged, so they are not in diff_paths.
+_OTHER_NAME_LINE = re.compile(r"^(?:Index:|\*\*\*) (?P<path>[^\t\n]+)", re.MULTILINE)
+# The escapes that git and GNU patch decode inside a quoted name: \056 is a dot.
+_ESCAPE = re.compile(r'\\(?:(?P<octal>[0-7]{1,3})|(?P<letter>[abfnrtv\\"]))')
+_LETTERS = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11, "\\": 92, '"': 34}
+
+
+def _decoded(quoted: str) -> str:
+    """The text of a quoted name with its escapes resolved. Octal escapes are bytes of UTF-8."""
+    out = bytearray()
+    last = 0
+    for match in _ESCAPE.finditer(quoted):
+        out += quoted[last : match.start()].encode("utf-8", errors="replace")
+        octal = match.group("octal")
+        out.append(int(octal, 8) & 0xFF if octal is not None else _LETTERS[match.group("letter")])
+        last = match.end()
+    out += quoted[last:].encode("utf-8", errors="replace")
+    return out.decode("utf-8", errors="replace")
 
 
 def _unquoted(path: str) -> str:
     path = path.strip()
-    return path[1:-1] if len(path) > 1 and path[0] == path[-1] == '"' else path
+    if len(path) > 1 and path[0] == path[-1] == '"':
+        return _decoded(path[1:-1])
+    return path
+
+
+def _screened(raw: str) -> str:
+    """The name without its quotes, or PatchError when it is a path the diff must not touch."""
+    name = _unquoted(raw)
+    if name == "/dev/null":
+        return name
+    parts = [part for part in name.split("/") if part]
+    if name.startswith("/") or ".." in parts:
+        raise PatchError(f"the diff names {name!r}, a path outside the repo")
+    if any(part.lower() == ".git" for part in parts):
+        raise PatchError(f"the diff names {name!r}, which is inside .git and not allowed")
+    return name
 
 
 def _checked(raw: str) -> str | None:
     """The path as the repo knows it (the first component dropped, as -p1 does), or None."""
-    raw = _unquoted(raw)
-    if raw == "/dev/null":
+    name = _screened(raw)
+    if name == "/dev/null":
         return None
-    parts = [part for part in raw.split("/") if part]
-    if raw.startswith("/") or ".." in parts:
-        raise PatchError(f"the diff names {raw!r}, a path outside the repo")
-    if any(part.lower() == ".git" for part in parts):
-        raise PatchError(f"the diff names {raw!r}, which is inside .git and not allowed")
+    parts = [part for part in name.split("/") if part]
     return "/".join(parts[1:]) or None
 
 
@@ -222,6 +258,8 @@ def diff_paths(diff: str) -> list[str]:
         path = _checked(item)
         if path is not None:
             seen[path] = None
+    for m in _OTHER_NAME_LINE.finditer(diff):
+        _screened(m.group("path"))
     return list(seen)
 
 
@@ -261,15 +299,18 @@ def _git_env() -> dict[str, str]:
 
 
 def _run(
-    command: list[str], cwd: Path, stdin: str | None = None
+    command: list[str], cwd: Path, stdin: str | None = None, *, errors: str = "replace"
 ) -> subprocess.CompletedProcess[str]:
     # A new session has no controlling terminal, so patch cannot stop to ask a question.
+    # What a tool prints is read for messages, where a mangled character does no harm. The
+    # patch is the one output that has to come back exactly, and asks for errors="strict".
     return subprocess.run(
         command,
         cwd=cwd,
         input=stdin,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors=errors,
         timeout=TOOL_TIMEOUT_S,
         env=_git_env(),
         start_new_session=True,
@@ -277,8 +318,10 @@ def _run(
     )
 
 
-def _git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
-    return _run(["git", *_GIT_SETTINGS, *args], cwd, stdin)
+def _git(
+    cwd: Path, *args: str, stdin: str | None = None, errors: str = "replace"
+) -> subprocess.CompletedProcess[str]:
+    return _run(["git", *_GIT_SETTINGS, *args], cwd, stdin, errors=errors)
 
 
 def _checkout(source: Path, dest: Path) -> None:
@@ -338,15 +381,68 @@ def _try_git(checkout: Path, diff: str) -> str | None:
     return None
 
 
+_HUNK_LINE = ("@@", " ", "+", "-", "\\")
+
+
+def patch_input(diff: str) -> str:
+    """The text that `patch` reads: the `---` and `+++` headers of each file and its hunks.
+
+    Everything else is left out: prose, `Index:` lines, `diff --git` and `index` lines, context
+    diff headers, `Prereq:` and the `====` lines of Perforce, and ed commands. Each of those is
+    a place where some patch tool reads a file name or runs a command, and the check of
+    `diff_paths` cannot know all of them. What remains names its files in the two header
+    lines, which the check has read. A diff in the context format has no unified header, so it
+    comes back empty, which the system prompt makes unlikely.
+    """
+    lines = re.findall(r"[^\n]*\n|[^\n]+", diff)  # not splitlines: U+2028 is not a line end
+    kept: list[str] = []
+    in_file = False
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        following = lines[index + 1] if index + 1 < len(lines) else ""
+        if line.startswith("--- ") and following.startswith("+++ "):
+            kept += [line, following]
+            in_file = True
+            index += 2
+            continue
+        # An empty line is a context line whose space the model left out.
+        if in_file and (line.startswith(_HUNK_LINE) or line.strip("\r\n") == ""):
+            kept.append(line)
+        index += 1
+    return "".join(kept)
+
+
 def _try_patch(checkout: Path, diff: str) -> str | None:
+    # -u reads a unified diff and nothing else, which leaves out the ed and normal formats.
     # -t answers every question with its default, -N skips a hunk that is applied already, and
     # -E removes a file that the diff empties, as GNU patch does and BSD patch does not.
-    command = ["patch", "-p1", "--fuzz=2", "-t", "-N", "-E"]
+    command = ["patch", "-p1", "--fuzz=2", "-u", "-t", "-N", "-E"]
+    text = patch_input(diff)
+    if not text:
+        return "patch -p1 --fuzz=2 found no unified diff in the reply"
     try:
-        done = _run(command, checkout, stdin=diff)
+        done = _run(command, checkout, stdin=text)
     except FileNotFoundError:
         return "patch -p1 --fuzz=2 is not installed"
     return None if done.returncode == 0 else _problem("patch -p1 --fuzz=2", done)
+
+
+def _staged_diff(checkout: Path, paths: list[str]) -> str:
+    # Only the files the diff names are staged, so a .orig file that patch leaves next to a
+    # fuzzy hunk is not in the result.
+    _git(checkout, "add", "-A", "--", *paths)
+    try:
+        done = _git(checkout, "diff", "--cached", "--no-color", "--no-ext-diff", errors="strict")
+    except UnicodeDecodeError:
+        # git prints the lines around a change as they are in the file. The grader takes the
+        # patch as text, so a file in another encoding cannot go through it unchanged.
+        raise PatchError(
+            "the diff changes a file that is not UTF-8 text, so its patch cannot be kept as text"
+        ) from None
+    if not done.stdout.strip():
+        raise PatchError("the diff applies but changes nothing")
+    return done.stdout
 
 
 def apply_diff(repo: Path, diff: str) -> AppliedPatch:
@@ -354,7 +450,8 @@ def apply_diff(repo: Path, diff: str) -> AppliedPatch:
 
     git apply goes first. When it refuses, patch gets a fresh copy, so nothing that the first
     attempt wrote can show up in the second. Raises PatchError when both refuse, when the diff
-    names a path it must not touch, and when it applies but changes nothing.
+    names a path it must not touch, and when it applies but changes nothing. A git command that
+    does not finish in time counts as a refusal, so the caller gets a PatchError for it too.
     """
     if not diff.strip():
         raise PatchError("the reply holds no diff")
@@ -365,27 +462,98 @@ def apply_diff(repo: Path, diff: str) -> AppliedPatch:
     with tempfile.TemporaryDirectory(prefix="lh-single-shot-") as scratch:
         for method, attempt in (("git", _try_git), ("patch", _try_patch)):
             checkout = Path(scratch) / method
-            _checkout(repo, checkout)
             try:
+                _checkout(repo, checkout)
                 problem = attempt(checkout, diff)
+                if problem is None:
+                    patch = _staged_diff(checkout, paths)
+                    return AppliedPatch(patch, "git" if method == "git" else "patch")
             except subprocess.TimeoutExpired:
                 problem = f"{method} did not finish in {TOOL_TIMEOUT_S} s"
-            if problem is not None:
-                problems.append(problem)
-                continue
-            # Only the files the diff names are staged, so a .orig file that patch leaves next
-            # to a fuzzy hunk is not in the result.
-            _git(checkout, "add", "-A", "--", *paths)
-            patch = _git(checkout, "diff", "--cached", "--no-color", "--no-ext-diff").stdout
-            if not patch.strip():
-                raise PatchError("the diff applies but changes nothing")
-            return AppliedPatch(patch, "git" if method == "git" else "patch")
+            problems.append(problem)
     raise PatchError("the diff did not apply. " + "; ".join(problems))
 
 
 # ---------- the one call ----------
 def _text_of(content: list[object]) -> str:
     return "".join(block.text for block in content if isinstance(block, TextBlock))
+
+
+@dataclass(frozen=True)
+class Asked:
+    """The one call, answered: what is in the prompt, and what the model said and cost."""
+
+    files: list[str]  # the files in the prompt, best first
+    reply: str  # the text of the reply
+    usage: Usage
+    stop_reason: str
+
+
+async def ask(
+    provider: LLMProvider,
+    *,
+    model: str,
+    repo: Path,
+    problem: str,
+    repo_map: str,
+    max_tokens: int,
+    options: CallOptions | None = None,
+    top: int = TOP_FILES,
+) -> Asked:
+    """Retrieve the files and ask once. A failed provider call raises ProviderError.
+
+    This is the half of the baseline that costs money. Nothing here touches git or patch, so a
+    caller can book `usage` before the reply is applied.
+    """
+    files = await asyncio.to_thread(read_files, repo)
+    names = rank(files, problem, top)
+    prompt = build_prompt(problem, repo_map, {name: files[name] for name in names})
+    reply = await provider.complete(
+        model=model,
+        system=SYSTEM_PROMPT,
+        messages=[Message(role="user", content=[TextBlock(text=prompt)])],
+        tools=[],
+        max_tokens=max_tokens,
+        options=options,
+    )
+    return Asked(
+        files=names,
+        reply=_text_of(list(reply.content)),
+        usage=reply.usage,
+        stop_reason=reply.stop_reason,
+    )
+
+
+async def apply_reply(repo: Path, asked: Asked) -> SingleShotResult:
+    """Take the diff out of the reply and apply it to a copy of `repo`.
+
+    A reply with no diff, a diff that does not apply and a reply that was cut off are results
+    with `error` set and the usage of the call, which was paid for all the same.
+    """
+
+    def result(
+        *, patch: str = "", method: Method | None = None, error: str | None = None
+    ) -> SingleShotResult:
+        return SingleShotResult(
+            files=asked.files,
+            reply=asked.reply,
+            usage=asked.usage,
+            stop_reason=asked.stop_reason,
+            patch=patch,
+            method=method,
+            error=error,
+        )
+
+    if asked.stop_reason == "max_tokens":
+        # A diff that stops in the middle of a hunk can still apply with a fuzz, and would
+        # then be a different change than the model meant.
+        return result(error="the reply was cut off at max_tokens, so its diff is not complete")
+    diff = extract_diff(asked.reply)
+    try:
+        applied = await asyncio.to_thread(apply_diff, repo, diff)
+    except PatchError as exc:
+        return result(error=str(exc))
+    return result(patch=applied.patch, method=applied.method)
 
 
 async def solve(
@@ -404,39 +572,14 @@ async def solve(
     Any other failure, such as a reply with no diff or one that does not apply, is a result with
     `error` set and the usage of the call, which was paid for all the same.
     """
-    files = await asyncio.to_thread(read_files, repo)
-    names = rank(files, problem, top)
-    prompt = build_prompt(problem, repo_map, {name: files[name] for name in names})
-    reply = await provider.complete(
+    asked = await ask(
+        provider,
         model=model,
-        system=SYSTEM_PROMPT,
-        messages=[Message(role="user", content=[TextBlock(text=prompt)])],
-        tools=[],
+        repo=repo,
+        problem=problem,
+        repo_map=repo_map,
         max_tokens=max_tokens,
         options=options,
+        top=top,
     )
-    text = _text_of(list(reply.content))
-
-    def result(
-        *, patch: str = "", method: Method | None = None, error: str | None = None
-    ) -> SingleShotResult:
-        return SingleShotResult(
-            files=names,
-            reply=text,
-            usage=reply.usage,
-            stop_reason=reply.stop_reason,
-            patch=patch,
-            method=method,
-            error=error,
-        )
-
-    if reply.stop_reason == "max_tokens":
-        # A diff that stops in the middle of a hunk can still apply with a fuzz, and would
-        # then be a different change than the model meant.
-        return result(error="the reply was cut off at max_tokens, so its diff is not complete")
-    diff = extract_diff(text)
-    try:
-        applied = await asyncio.to_thread(apply_diff, repo, diff)
-    except PatchError as exc:
-        return result(error=str(exc))
-    return result(patch=applied.patch, method=applied.method)
+    return await apply_reply(repo, asked)

@@ -1,0 +1,60 @@
+{
+  "run": 12,
+  "task_id": "inventory-01",
+  "workflow_id": "lh-chaos-inventory-01-2f6d1852",
+  "seed": 7012,
+  "kills_planned": [
+    "worker",
+    "temporal",
+    "temporal"
+  ],
+  "kills": [
+    {
+      "type": "worker",
+      "landed": true,
+      "place": "ensure_sandbox",
+      "struck_at": "2026-11-07T19:39:02.441268Z",
+      "resume_latency_s": 20.890074
+    },
+    {
+      "type": "temporal",
+      "landed": true,
+      "place": "between activities",
+      "struck_at": "2026-11-07T19:39:26.191284Z",
+      "resume_latency_s": 1.485202
+    },
+    {
+      "type": "temporal",
+      "landed": true,
+      "place": "append_results",
+      "struck_at": "2026-11-07T19:39:31.367268Z",
+      "resume_latency_s": 1.472252
+    }
+  ],
+  "completed": true,
+  "outcome": "pr_opened",
+  "diff_equals_reference": true,
+  "problems": [],
+  "ledger_rows": 13,
+  "extra_ledger_rows": 0,
+  "cost_usd": 0.068066,
+  "extra_cost_usd": 0.0,
+  "resume_latency_s": [
+    20.890074,
+    1.485202,
+    1.472252
+  ],
+  "side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "expected_side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "duplicate_side_effects": 0,
+  "missing_side_effects": 0,
+  "wall_time_s": 70.5
+}

@@ -21,13 +21,28 @@ _module = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_module)
 make_fixture_git = _module.make_fixture_git
 
-FIXTURE_NAMES = ["calc", "textkit", "inventory"]
+FIXTURE_NAMES = ["calc", "textkit", "inventory", "longlog"]
 
 # The failing tests each fixture must have at base, and that ISSUE.md names.
 EXPECTED_FAILURES = {
     "calc": {"tests/test_calc.py::test_add_positive_numbers"},
     "textkit": {"tests/test_slug.py::test_slugify_accented_latin"},
     "inventory": {"tests/test_store.py::test_remove_more_than_stock_is_rejected"},
+    # One bug and one test in each of twelve modules, in the order the task fixes them.
+    "longlog": {
+        "tests/test_chunks.py::test_chunk_keeps_the_last_partial_chunk",
+        "tests/test_clamp.py::test_clamp_allows_the_upper_bound",
+        "tests/test_dedupe.py::test_dedupe_keeps_the_first_copy",
+        "tests/test_initials.py::test_initials_uses_every_word",
+        "tests/test_leap.py::test_a_century_divisible_by_400_is_a_leap_year",
+        "tests/test_ordinal.py::test_the_teens_end_in_th",
+        "tests/test_pages.py::test_page_count_rounds_up",
+        "tests/test_percent.py::test_percent_of_a_whole",
+        "tests/test_ranges.py::test_inclusive_range_includes_the_stop",
+        "tests/test_slug.py::test_slugify_lowercases",
+        "tests/test_stats.py::test_mean_keeps_the_fraction",
+        "tests/test_words.py::test_word_count_ignores_extra_spaces",
+    },
 }
 
 

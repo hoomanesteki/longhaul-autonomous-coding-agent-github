@@ -124,6 +124,11 @@ tokens before and after. Doing it at the end of the turn means a hand-over that 
 the compacted view and its notes. A compaction that fails for good fails the workflow, like any
 other activity, and one that finds nothing to fold changes nothing and records nothing.
 
+A run can ask for a window of its own (`longhaul run --window`, acts.Tuning.window_tokens). The
+workflow cannot read the config, so it hands the number to each activity that counts tokens:
+`llm_turn`, `tool_exec` and `append_results`. They work out what it changes (settings.Context
+.for_window), and a run without one gets the config's window.
+
 F6, a prompt over the window. `llm_turn` refuses a request that its projection puts over the hard
 limit, and the provider can reject one too. Both arrive as a provider error of kind
 context_too_long. The workflow then compacts with `forced=True`, which keeps the last two turns
@@ -605,6 +610,7 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=reply.transcript_ref,
                 results=[acts.summarize_result(r) for r in ran.results],
+                window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
@@ -626,6 +632,7 @@ class TaskWorkflow:
                 transcript_ref=reply.transcript_ref,
                 results=[],
                 user_text=planner.NUDGE,
+                window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
@@ -802,6 +809,7 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=sampled.transcript_ref,
                 results=[acts.summarize_result(r) for r in ran.results],
+                window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
@@ -842,6 +850,7 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=transcript_ref,
                 results=answers,
+                window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
@@ -874,6 +883,7 @@ class TaskWorkflow:
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
                         script_ref=self._script(),
+                        window_tokens=self._window(),
                         context_mode=self._context_mode(),
                     ),
                 )
@@ -974,6 +984,7 @@ class TaskWorkflow:
                 transcript_ref=reply.transcript_ref,
                 results=[],
                 user_text=rules.NUDGE,
+                window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
@@ -999,6 +1010,7 @@ class TaskWorkflow:
                         pre_sha=state.head_sha,
                         sandbox_id=self._sandbox_id(),
                         read_only=read_only,
+                        window_tokens=self._window(),
                     ),
                 )
                 break
@@ -1175,6 +1187,11 @@ class TaskWorkflow:
 
     def _script(self) -> BlobRef | None:
         return workflow.memo_value(acts.SCRIPT_MEMO_KEY, None, type_hint=BlobRef)
+
+    def _window(self) -> int | None:
+        """The context window the run asked for, or None when the config of the worker decides."""
+        tuning = self._tuning()
+        return tuning.window_tokens if tuning is not None else None
 
     def _context_mode(self) -> ContextMode | None:
         """The context mode the run asked for, or None when the worker's config decides."""

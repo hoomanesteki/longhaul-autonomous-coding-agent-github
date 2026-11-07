@@ -93,6 +93,7 @@ __all__ = [
     "count_request_chars",
     "estimate_tokens",
     "prompt_tokens",
+    "result_cap",
 ]
 
 # The rule before anything has been measured: ceil(len / 3.5).
@@ -107,6 +108,12 @@ MAX_CHARS_PER_TOKEN = 10.0
 # its error may flip the decision. It is about 8 percent of the default compact_at of 0.60,
 # in line with the 10 percent the calibration is asked to reach.
 PRECISION_MARGIN = 0.05
+
+# A run in a window of its own (`longhaul run --window`) lets one tool result take this fraction
+# of it at most. The shipped config allows 4,000 tokens in a window of 200,000, which is 1/50. The
+# fraction is a little more generous, because a small window has little room for anything else,
+# and it is a power of two so that the numbers in a test come out whole: 250 in a window of 8,000.
+RESULT_SHARE_OF_WINDOW = 32
 
 Decision = Literal["ok", "compact", "force"]
 
@@ -127,6 +134,20 @@ def estimate_tokens(text: str) -> int:
     It counts characters, not bytes, so non-ASCII text is not over-counted.
     """
     return _tokens_for(len(text), DEFAULT_CHARS_PER_TOKEN)
+
+
+def result_cap(configured: int, window: int | None) -> int:
+    """The most tokens one tool result may take: `configured`, or less in a small window.
+
+    `window` is the window of a run that asked for its own, or None for a run that uses the
+    config's. The cap is the configured one unless a result of that size would be more than
+    1/32 of the window, and it is at least 1. Two places have to agree on this number: the
+    activity that cuts the results to it, and the one that keeps room for them when it decides
+    whether the next request fits (llm_turn). Both call this.
+    """
+    if window is None:
+        return configured
+    return min(configured, max(1, window // RESULT_SHARE_OF_WINDOW))
 
 
 def prompt_tokens(usage: Usage) -> int:

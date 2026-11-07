@@ -281,6 +281,8 @@ class LlmTurnInput(BaseModel):
     # The script that answers this task instead of the provider of the worker. It comes from the
     # memo (SCRIPT_MEMO_KEY) and is the same on every turn of a task.
     script_ref: BlobRef | None = None
+    # The context window this run asked for (Tuning.window_tokens), in place of the config's.
+    window_tokens: int | None = Field(default=None, ge=1)
     # The context mode this run asked for, from the memo (CONTEXT_MODE_MEMO_KEY). None means the
     # run did not ask, and the config of the worker decides.
     context_mode: ContextMode | None = None
@@ -326,6 +328,9 @@ class ToolExecInput(BaseModel):
     # A call of the planning phase (LH-501). The activity runs it, and then puts the tree back on
     # `pre_sha` if it changed anything, and saves no checkpoint. The default is the coder's call.
     read_only: bool = False
+    # The context window of the run (Tuning.window_tokens). A tool pages its output to the cap for
+    # one result, and that cap shrinks with a small window (context.tokens.result_cap).
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 class ToolResultSummary(BaseModel):
@@ -355,6 +360,8 @@ class AppendResultsInput(BaseModel):
     results: list[ToolResultSummary]
     # Text from the harness, such as the nudge. It goes after the results, as the API requires.
     user_text: str | None = None
+    # The context window of the run, as in ToolExecInput: the results are cut to the cap that fits.
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 # What a compaction came to. The first three are context.compact.CompactStatus, and a test keeps
@@ -773,16 +780,19 @@ GITHUB: tuple[Act[Any, Any], ...] = (
 
 # ---------- per-run tuning ----------
 class Tuning(BaseModel):
-    """Per-run changes to the section 3.7 timeouts, for tests and chaos runs.
+    """Per-run changes to the section 3.7 timeouts and to the context window.
 
-    After a hard kill the server notices a dead activity only when its heartbeat timeout
-    passes: up to 60 s for `prepare_workspace` and `ensure_sandbox`, 30 s for `llm_turn`, 15 s
-    for `tool_exec` (ADR-0004 section 3). A chaos run that kills the worker five times cannot
-    wait that long, so it starts its tasks with a shorter heartbeat timeout.
+    The timeouts are for tests and chaos runs. After a hard kill the server notices a dead
+    activity only when its heartbeat timeout passes: up to 60 s for `prepare_workspace` and
+    `ensure_sandbox`, 30 s for `llm_turn`, 15 s for `tool_exec` (ADR-0004 section 3). A chaos run
+    that kills the worker five times cannot wait that long, so it starts its tasks with a shorter
+    heartbeat timeout.
+
+    The window is for a run that has to fill it: `longhaul run --window` (LH-407).
 
     The value travels in the workflow memo, not in a global, so it works for a worker in
-    another process, survives a replay and carries over Continue-As-New. A production run
-    has no tuning.
+    another process, survives a replay and carries over Continue-As-New. A run that changes
+    nothing has no tuning.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -797,6 +807,11 @@ class Tuning(BaseModel):
     # The wait of a hand-over for a status comment that cannot be posted. The test server does
     # not skip time while an activity runs, so a test of the drop would wait 30 s without this.
     status_grace_s: float | None = Field(default=None, gt=0)
+    # The context window of this run, in tokens, in place of context.window_tokens of the config of
+    # the worker. The activities that count tokens read it from their inputs (llm_turn, tool_exec
+    # and append_results), and settings.Context.for_window says what it changes. The long-task
+    # test needs a window that 62 turns fill, and the config's holds a task of hundreds of them.
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "longlog"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The package is in src/. The fake sandbox has no setup step that installs it.
+pythonpath = ["src"]
+# No tracebacks, so the output is the trace and the summary and nothing else.
+addopts = "--tb=no"

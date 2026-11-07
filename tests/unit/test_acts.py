@@ -7,7 +7,7 @@ these tests pin what each side may rely on.
 from datetime import timedelta
 from pathlib import Path
 from types import NoneType
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -291,6 +291,50 @@ def test_a_hand_over_waits_for_a_status_comment_as_long_as_the_tuning_says() -> 
     assert acts.status_grace(acts.Tuning(status_grace_s=1.5)) == timedelta(seconds=1.5)
 
 
+@pytest.mark.parametrize("window", [0, -8_000])
+def test_tuning_rejects_a_window_that_cannot_hold_a_request(window: int) -> None:
+    with pytest.raises(ValidationError):
+        acts.Tuning(window_tokens=window)
+
+
+def test_a_window_in_the_tuning_changes_no_timeout() -> None:
+    for act in acts.ALL:
+        assert acts.options(act, acts.Tuning(window_tokens=8_000)) == acts.options(act, None)
+
+
+def test_the_activities_that_count_tokens_take_the_window_of_a_run() -> None:
+    inputs: list[Any] = [
+        acts.LlmTurnInput(
+            task_id="lh-x",
+            turn_index=0,
+            role=Role.CODER,
+            spec=SPEC,
+            transcript_ref=None,
+            window_tokens=8_000,
+        ),
+        acts.ToolExecInput(
+            task_id="lh-x",
+            turn_index=0,
+            call=acts.ToolCallSummary(id="t1", name="list_dir", input={}),
+            pre_sha=SHA,
+            sandbox_id="sbx-1",
+            window_tokens=8_000,
+        ),
+        acts.AppendResultsInput(
+            task_id="lh-x", turn_index=0, transcript_ref=REF, results=[], window_tokens=8_000
+        ),
+    ]
+    assert [i.window_tokens for i in inputs] == [8_000] * 3
+
+
+def test_a_run_without_a_window_of_its_own_sends_none() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    append = acts.AppendResultsInput(task_id="lh-x", turn_index=0, transcript_ref=REF, results=[])
+    assert (turn.window_tokens, append.window_tokens) == (None, None)
+
+
 def test_tuning_rejects_unknown_fields() -> None:
     # A misspelled knob would otherwise be dropped and the run would use the long timeouts.
     with pytest.raises(ValidationError):
@@ -402,6 +446,7 @@ SAMPLES: list[BaseModel] = [
     acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="cancelled by alice"),
     acts.Tuning(heartbeat_timeout_s=2.5),
     acts.Tuning(continue_as_new_every_turns=3),
+    acts.Tuning(window_tokens=8_000),
     acts.BundleCheckpointInput(task_id="lh-x", turn_index=40),
     acts.RecordEventInput(
         task_id="lh-x", type="continue_as_new", payload={"turn_index": 40, "bundle": None}

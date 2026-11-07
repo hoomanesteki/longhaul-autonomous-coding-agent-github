@@ -47,6 +47,11 @@ on the branch. That commit can still be restored by its sha, and the `tool_calls
 result name the commit that counts. The row means "this commit was saved", not "this commit is
 on the branch".
 
+A run that asked for a window of its own (`longhaul run --window`) has a smaller cap. Both
+activities get the window in their input and use result_cap(), the cap of the worker cut to a share
+of that window (context/tokens.py). `llm_turn` keeps room for the results of a turn by the same
+number, so the three have to agree.
+
 Each run that reached its tool is timed into longhaul_tool_duration_seconds (LH-704), the failing
 ones too. A call that found its sandbox gone never ran, and is not timed.
 
@@ -87,6 +92,7 @@ from longhaul.agent.turns import (
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key, call_slug
 from longhaul.context.log import added_messages, append_to_log
+from longhaul.context.tokens import result_cap
 from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
@@ -224,7 +230,7 @@ class ToolActivities:
             task_id=inp.task_id,
             turn_index=inp.turn_index,
             blob_prefix=f"tasks/{inp.task_id}",
-            output_max_tokens=self._output_max_tokens,
+            output_max_tokens=result_cap(self._output_max_tokens, inp.window_tokens),
         )
         try:
             async with heartbeating():
@@ -365,7 +371,8 @@ class ToolActivities:
     async def append_results(self, inp: acts.AppendResultsInput) -> BlobRef:
         inp = small(inp)
         transcript = await self._blobs.get_json(inp.transcript_ref, list[Message])
-        results = await asyncio.gather(*(self._result(r) for r in inp.results))
+        cap = result_cap(self._output_max_tokens, inp.window_tokens)
+        results = await asyncio.gather(*(self._result(r, cap) for r in inp.results))
         try:
             grown = self._answer(transcript, list(results), inp.user_text)
         except (
@@ -381,10 +388,10 @@ class ToolActivities:
         )
         return ref
 
-    async def _result(self, summary: acts.ToolResultSummary) -> ToolResult:
+    async def _result(self, summary: acts.ToolResultSummary, cap: int) -> ToolResult:
         if summary.output_ref is not None:
             full = (await self._blobs.get(summary.output_ref)).decode("utf-8", errors="replace")
-            text = shape_output(full, self._output_max_tokens, output_handle(summary.call_id))
+            text = shape_output(full, cap, output_handle(summary.call_id))
         else:
             text = summary.output or ""  # a short text that no tool made, such as a bad finish
         return ToolResult(call_id=summary.call_id, ok=summary.ok, output=text)

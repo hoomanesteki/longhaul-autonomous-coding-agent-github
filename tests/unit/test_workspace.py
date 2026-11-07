@@ -270,7 +270,7 @@ async def test_the_built_in_skips_cannot_be_turned_off_by_a_negation(tmp_path: P
     assert await copy_to_fake(source) == ["keep.txt"]
 
 
-@pytest.mark.parametrize("name", ["calc", "textkit", "inventory"])
+@pytest.mark.parametrize("name", ["calc", "textkit", "inventory", "longlog"])
 async def test_the_fixture_repos_hide_their_reference_fix(name: str) -> None:
     # A real model must not see the fix that the repo's own tests are checked against.
     files = await copy_to_fake(FIXTURES / name)

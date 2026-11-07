@@ -92,6 +92,15 @@ workflow hands it to each call in `LlmTurnInput.window_tokens`. The call then us
 the config with that window and with the cap for one result cut to fit it
 (settings.Context.for_window), for the guard, for the room kept for results and for the decision.
 The other thresholds are shares of the window, so they follow it.
+
+The coder of a task with a plan (LH-503) is the one role with two forms. A plan in the input
+(`LlmTurnInput.plan`) makes the coder's prompt `build_planned_system_prompt`, its first message the
+one that points at the plan, and its tool list `planned_tools`, which has `update_step`,
+`submit_for_review` and `ask_human` in place of `finish`. A task has a plan from before the coder's
+transcript starts or not at all, so each of the three is the same for the life of the transcript.
+The plan is the fifth block of the first message (agent/prompts.py), and the activity brings that
+block up to date before every call from the plan the workflow holds, which is how a step update
+reaches the model. A worker with no `planned_tools` offers such a coder `tools`, as it did before.
 """
 
 from __future__ import annotations
@@ -109,7 +118,12 @@ from temporalio import activity
 
 from longhaul.agent import rules
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import build_system_prompt, first_user_message
+from longhaul.agent.prompts import (
+    build_planned_system_prompt,
+    build_system_prompt,
+    first_user_message,
+    with_plan,
+)
 from longhaul.agent.turns import (
     TranscriptError,
     append_assistant,
@@ -154,6 +168,7 @@ from longhaul.durable.activities.support import (
 )
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
+from longhaul.roles import coder
 from longhaul.settings import Context
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import chat_span
@@ -185,6 +200,11 @@ def _budget(context: Context | None) -> ContextBudget | None:
     return ContextBudget(context.window_tokens, context.compact_at, context.hard_limit)
 
 
+def _answered_by_the_workflow(tool: str) -> bool:
+    """True for a call whose answer is a line from the workflow, so no output to reserve for."""
+    return is_control_tool(tool) or tool in coder.CONTROL_TOOLS
+
+
 def _options(cfg: LoopConfig) -> CallOptions | None:
     return CallOptions(effort=cfg.effort) if cfg.effort is not None else None
 
@@ -208,7 +228,8 @@ class LlmActivities:
     shares it, so both count with the ratio the replies taught.
 
     `role_tools` gives a role the tools it is offered when they are not `tools`. The planner has
-    its own (roles/planner.py).
+    its own (roles/planner.py). `planned_tools` is the list of the coder of a task with a plan
+    (roles/coder.py `tool_specs`).
     """
 
     def __init__(
@@ -223,6 +244,7 @@ class LlmActivities:
         context: Context | None = None,
         meters: Meters | None = None,
         role_tools: Mapping[Role, Sequence[ToolSpec]] | None = None,
+        planned_tools: Sequence[ToolSpec] | None = None,
     ) -> None:
         self._provider = provider
         self._scripts = TaskProviders(blobs)
@@ -230,6 +252,7 @@ class LlmActivities:
         self._recorder = recorder
         self._tools = list(tools)
         self._role_tools = {role: list(specs) for role, specs in (role_tools or {}).items()}
+        self._planned_tools = None if planned_tools is None else list(planned_tools)
         self._config_for = config_for
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
         self._context = context
@@ -241,8 +264,13 @@ class LlmActivities:
         """What to register on a worker."""
         return [self.llm_turn]
 
-    def tools_for(self, role: Role) -> list[ToolSpec]:
-        """The tools that `role` is offered with every call."""
+    def tools_for(self, role: Role, *, planned: bool = False) -> list[ToolSpec]:
+        """The tools that `role` is offered with every call.
+
+        `planned` is for the coder of a task that has a plan. No other role has a second list.
+        """
+        if planned and role is Role.CODER and self._planned_tools is not None:
+            return self._planned_tools
         return self._role_tools.get(role, self._tools)
 
     @activity.defn(name=acts.LLM_TURN.name)
@@ -269,14 +297,20 @@ class LlmActivities:
         inp = small(inp)
         cfg = self._config_for(inp.role)
         mode = self._mode(inp.context_mode)
-        tools = self.tools_for(inp.role)
+        planned = inp.role is Role.CODER and inp.plan is not None
+        tools = self.tools_for(inp.role, planned=planned)
         try:
             # The block is blob text that was written once for the task, so the system prompt is
             # the same bytes on every turn (D7). A task without one gets the prompt it always had.
-            system = build_system_prompt(
-                inp.role, inp.spec, await read_memory_block(self._blobs, inp.memory_ref)
+            memory_block = await read_memory_block(self._blobs, inp.memory_ref)
+            system = (
+                build_planned_system_prompt(inp.spec, memory_block)
+                if planned
+                else build_system_prompt(inp.role, inp.spec, memory_block)
             )
-            stored = await self._transcript(inp)
+            stored = await self._transcript(inp, planned=planned)
+            if planned and inp.plan is not None:
+                stored = with_plan(stored, inp.plan)  # a step update reaches the model here
             shown = show_hints(stored, inp.hints)
             transcript = self._evict(shown, mode)  # tier 1
             validate_pairs(transcript)  # a transcript the API would reject is not sent
@@ -324,9 +358,9 @@ class LlmActivities:
         return small(out)
 
     # ----- the request -----
-    async def _transcript(self, inp: acts.LlmTurnInput) -> list[Message]:
+    async def _transcript(self, inp: acts.LlmTurnInput, *, planned: bool) -> list[Message]:
         if inp.transcript_ref is None:
-            return append_user_text([], first_user_message(inp.role))
+            return append_user_text([], first_user_message(inp.role, planned=planned))
         return await self._blobs.get_json(inp.transcript_ref, list[Message])
 
     async def _paused(self, ref: BlobRef | None) -> list[Block]:
@@ -436,7 +470,7 @@ class LlmActivities:
         if policy is None or budget is None or not mode.compacts:
             return "ok"
         upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
-        pending = sum(1 for call in calls if not is_control_tool(call.name))
+        pending = sum(1 for call in calls if not _answered_by_the_workflow(call.name))
         tokens = meter.projected(system, upcoming, tools)
         return budget.decide(tokens + pending * policy.tool_output_max_tokens)
 

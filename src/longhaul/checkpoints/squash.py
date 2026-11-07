@@ -4,15 +4,24 @@ The scratch branch `longhaul/<n>` holds one commit for every tool call that chan
 is a log of the agent's moves, with titles such as `lh: edit_file turn 3 call c1`, and nobody
 should have to read it. The branch of the pull request, `longhaul-pr/<n>`, is built from it on
 the host: one commit for each group of work, written in the style guide
-(`fix(calc): add returns the sum`) and made by the configured author. In Phase 3 there is one
-group, titled from the summary the agent gave to `finish`. Phase 5 will pass one group for each
-plan step.
+(`fix(calc): add returns the sum`) and made by the configured author. A task without a plan has
+one group, titled from the summary the agent gave to `finish`. A task with a plan has one group
+for each step that is done, titled from the step's description, and a last one for the work after
+the last step, titled from the summary (`group_by_step`, LH-503).
 
 How a commit is made. A group is `(title, last_sha)`, where `last_sha` is the checkpoint at the
 end of the group. The commit for it is a new commit with the tree of `last_sha`, on top of the
 commit for the group before (the base for the first). That is the diff of the group, applied,
 and it needs no working tree and no patch to apply: it cannot conflict, and the last commit has
 the tree of the last checkpoint to the byte. A group that changes nothing makes no commit.
+
+A step's group ends at the checkpoint that was saved when the coder marked the step done, so the
+groups follow the order the steps were finished in. A coder that works the plan in order, as it
+is told to, gets step order. A step finished out of order is committed where it was finished,
+because a branch can only grow forward: each group has to descend from the one before it. A step
+with no change of its own makes no commit, like any group. The last group ends at the head of the
+work, and it makes no commit when the last step already ended there, so the commits together are
+the change from the base to the head, to the byte, whatever the steps were.
 
 The commits are the same every time. The `build_pr_branch` activity builds the branch from
 scratch, and it can run again for a task whose branch is already on the remote, for example after
@@ -53,6 +62,7 @@ from longhaul.checkpoints.git_store import (
     git_value,
 )
 from longhaul.checkpoints.push import assert_not_default, check_branch_name
+from longhaul.contracts import Plan
 from longhaul.github.marks import ZERO_WIDTH_SPACE, defuse_marks
 from longhaul.settings import DEFAULT_GIT_AUTHOR
 
@@ -65,9 +75,11 @@ __all__ = [
     "Group",
     "NothingToDeliverError",
     "PrBranch",
+    "StepEnd",
     "build_pr_branch",
     "commit_subject",
     "file_stats",
+    "group_by_step",
     "parse_author",
     "pr_branch_name",
     "repo_scope",
@@ -93,6 +105,13 @@ class Group(NamedTuple):
 
     title: str
     last_sha: str
+
+
+class StepEnd(NamedTuple):
+    """Where the work of a step ended: the checkpoint saved when the coder marked it done."""
+
+    step_id: str
+    sha: str
 
 
 @dataclass(frozen=True)
@@ -271,6 +290,44 @@ def _fit(text: str, room: int) -> str:
     if text[room] != " " and " " in cut:
         cut = cut.rsplit(" ", 1)[0]
     return cut.rstrip(f" ,;:-/({ZERO_WIDTH_SPACE}")
+
+
+# ---------- one group for each step ----------
+def group_by_step(
+    plan: Plan,
+    ends: Sequence[StepEnd],
+    *,
+    summary: str,
+    head_sha: str,
+    scope: str,
+    fallback: str,
+) -> list[Group]:
+    """The groups of a task with a plan: one for each done step, then one for the rest.
+
+    `ends` are the step checkpoints in the order they were saved. A step makes a group when the
+    plan says it is done and a checkpoint was saved for it. A step that was finished more than
+    once counts where it was finished last. A checkpoint of a step the plan does not have is left
+    out. The title of a step's group is its description, written as a commit subject with the
+    rules of `commit_subject` (the scope of the caller, the closing keywords and mentions
+    defused, the length cut), and `fallback` stands in for a description with no words.
+
+    The last group ends at `head_sha` and is titled from the summary. It holds the work after
+    the last step, and it makes no commit when there is none (build_pr_branch skips a group
+    that adds nothing). A plan with no done step therefore gives the single group of a task
+    without one.
+    """
+    steps = {step.id: step for step in plan.steps if step.status == "done"}
+    latest: dict[str, str] = {}
+    for end in ends:
+        if end.step_id in steps:
+            latest.pop(end.step_id, None)  # a repeat moves to where it was finished last
+            latest[end.step_id] = end.sha
+    groups = [
+        Group(commit_subject(steps[step_id].description, scope=scope, fallback=fallback), sha)
+        for step_id, sha in latest.items()
+    ]
+    groups.append(Group(commit_subject(summary, scope=scope, fallback=fallback), head_sha))
+    return groups
 
 
 # ---------- reading the repo ----------

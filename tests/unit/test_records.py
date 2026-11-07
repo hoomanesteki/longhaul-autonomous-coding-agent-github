@@ -160,6 +160,31 @@ async def test_a_sha_can_be_a_checkpoint_of_two_kinds() -> None:
     ]
 
 
+@pytest.mark.phase5
+async def test_two_steps_done_at_the_same_sha_are_two_checkpoints() -> None:
+    # A step marked done with no new work since the one before has the same sha. Each step still
+    # has its own row (LH-503), and a row written again is one row.
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint(kind="step", step_id="s1"))
+    await recorder.record_checkpoint(checkpoint(kind="step", step_id="s2"))
+    await recorder.record_checkpoint(checkpoint(kind="step", step_id="s2"))
+    assert [(c.kind, c.step_id) for c in recorder.checkpoints] == [("step", "s1"), ("step", "s2")]
+
+
+@pytest.mark.phase5
+async def test_the_step_checkpoints_of_a_task_come_back_in_the_order_they_were_saved() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint("a" * 40, kind="tool"))
+    await recorder.record_checkpoint(checkpoint("b" * 40, kind="step", step_id="s2"))
+    await recorder.record_checkpoint(checkpoint("c" * 40, kind="step", step_id="s1"))
+    await recorder.record_checkpoint(checkpoint("d" * 40, kind="step", step_id="s1", task_id="y"))
+
+    found = await recorder.step_checkpoints("lh-x")
+
+    assert [(c.step_id, c.sha[0]) for c in found] == [("s2", "b"), ("s1", "c")]
+    assert await recorder.step_checkpoints("lh-none") == []
+
+
 async def test_a_bundle_checkpoint_keeps_its_ref() -> None:
     ref = BlobRef(key=f"tasks/lh-x/ckpt/{SHA}.bundle", sha256="b" * 64, size=9)
     recorder = MemoryRecorder()

@@ -3,14 +3,18 @@
 `Recorder` is the small interface the activities use, so a unit test can run them without
 Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints`, `events` and `plans`
 tables and `MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a
-tool (`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in
-the `Recorder` protocol: only the delivery activities read rows, and they name what they need.
+tool (`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306), and the step
+checkpoints of a task (`step_checkpoints`), which `build_pr_branch` turns into one commit for each
+step (LH-503). Neither is in the `Recorder` protocol: only the delivery activities read rows, and
+they name what they need.
 tests/integration/test_records.py runs the cases of tests/unit/test_records.py against both.
 
 Temporal runs an activity again after a crash or a timeout, and the second run writes what the
 first run may already have written. A turn, a tool call and a checkpoint are therefore written
 once, however often they are recorded: the first two as upserts on their key, the checkpoint by
-looking for the same sha first, because its table has no natural key. An event is a log line.
+looking for the same sha, kind and step first, because its table has no natural key. The step is
+part of it because a step that is done with no new work has the sha of the step before it
+(LH-503), and each of the two still has its own row. An event is a log line.
 The same event twice means that the thing happened twice, so it is written every time. A plan is
 an upsert on its task and version, and it only ever rewrites the plan itself: the status and the
 decision of a row that someone has already decided on are left as they are.
@@ -45,6 +49,9 @@ from longhaul.db.models import Checkpoint, Event, PlanRow, Task, ToolCallRow, Tu
 # The workflow cannot import this module, so each side has the name, and a unit test keeps the two
 # equal.
 COMPACTION_EVENT = "compaction"
+
+# The kind of the checkpoint that a step leaves when it is done (plan section 3.5).
+STEP_KIND = "step"
 
 
 @dataclass(frozen=True)
@@ -97,7 +104,8 @@ class CheckpointRecord:
     """One saved workspace state: a commit in the task's bare repo (ADR-0006).
 
     `kind` is one of tool, step, compaction and bundle. tool_exec writes `tool` after each
-    commit. `bundle_ref` is set for a bundle only.
+    commit, and record_step writes `step` for a step that is done (LH-503), with its `step_id`.
+    `bundle_ref` is set for a bundle only.
     """
 
     task_id: str
@@ -201,6 +209,9 @@ class MemoryRecorder:
         # A row that has a status already keeps it, as the SQL upsert does.
         self.plans[key] = record if kept is None else replace(kept, plan=record.plan)
 
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+        return [c for c in self.checkpoints if c.task_id == task_id and c.kind == STEP_KIND]
+
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
         # The position breaks a tie between two calls of one turn in favour of the one recorded
@@ -213,7 +224,7 @@ class MemoryRecorder:
 
 
 def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
-    return (a.task_id, a.sha, a.kind) == (b.task_id, b.sha, b.kind)
+    return (a.task_id, a.sha, a.kind, a.step_id) == (b.task_id, b.sha, b.kind, b.step_id)
 
 
 _TURN_KEY = ("task_id", "turn_index", "attempt")
@@ -257,6 +268,8 @@ class SqlRecorder:
             Checkpoint.task_id == record.task_id,
             Checkpoint.sha == record.sha,
             Checkpoint.kind == record.kind,
+            # IS NOT DISTINCT FROM: a tool checkpoint has no step, and NULL = NULL is not true.
+            Checkpoint.step_id.is_not_distinct_from(record.step_id),
         )
         async with self._sessions.begin() as session:
             # No unique key to upsert on, so look first. Two attempts of one activity do not
@@ -306,6 +319,26 @@ class SqlRecorder:
         )
         async with self._sessions.begin() as session:
             await session.execute(stmt)
+
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+        """The checkpoints of the done steps of a task, in the order they were saved."""
+        stmt = (
+            select(Checkpoint)
+            .where(Checkpoint.task_id == task_id, Checkpoint.kind == STEP_KIND)
+            .order_by(Checkpoint.id)
+        )
+        async with self._sessions() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [
+            CheckpointRecord(
+                task_id=row.task_id,
+                sha=row.sha,
+                kind=row.kind,
+                turn_index=row.turn_index,
+                step_id=row.step_id,
+            )
+            for row in rows
+        ]
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         """The call of this tool in the latest turn, or None if the task never used it.

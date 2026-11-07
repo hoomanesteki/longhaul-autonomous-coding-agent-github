@@ -64,6 +64,35 @@ coding.
 A run that starts with a plan, because an earlier run made it and handed over, does not plan
 again.
 
+The coder with a plan (LH-503). A task that has a plan codes differently, and a task that has none
+codes as it always did. The coder of a planned task is offered `update_step`, `submit_for_review`
+and `ask_human` in place of `finish`, and reads the plan in the first message of its transcript
+(roles/coder.py, agent/prompts.py). The workflow handles those three calls itself, as it does
+`finish`:
+
+1. `update_step` goes to the `record_step` activity, which writes the event and, for a step that is
+   done, a `step` checkpoint at `state.head_sha`. Only then does the new status go into
+   `state.plan`, so `status()` never shows a step as done before its checkpoint is saved. The
+   next `llm_turn` gets the plan in its input and brings the first message up to date. A call
+   that names a step the plan does not have, or a status it does not know, is answered as an
+   error and changes nothing.
+2. `submit_for_review` ends the coding the way `finish` does, and a task of an issue goes on to
+   DELIVERING. Until the verifier exists (LH-504) nothing stands between the two. A call to
+   `finish` still ends such a task, for a worker or a history from before this story. The
+   `build_pr_branch` activity gets the plan, and makes one commit for each done step.
+3. `ask_human` is where the pause of LH-506 will go. Until it exists, the workflow records a
+   `paused` event with the question and ends the task with outcome STUCK, in phase PAUSED, and a
+   summary that names the question. `_ask_human` is the one place to replace.
+
+`status()` of a task with a plan answers with `acts.PlannedStatus`: the TaskStatus and the plan
+with the status of each step. TaskStatus is a contract and has no field for the plan. A client
+that wants the plan asks by name: `handle.query("status", result_type=acts.PlannedStatus)`.
+
+Replay. The new activity calls are on the paths a plan opens: `record_step` runs only when the
+coder of a planned task calls `update_step`, and the extra input of `build_pr_branch` is the plan.
+A task without a plan makes the commands it made before, in the same order, so its histories
+replay as they were.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -108,11 +137,11 @@ can tell them apart without reading prose:
 The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
 ERROR "planner submitted no plan in 20 turns".
 
-Not here yet, each in its own story: the plan gate, the coder's use of the plan and the verifier
-phase (Phase 5), budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs
-that end any way but a cancel (LH-507). An activity that fails for good, after its retries, fails
-the workflow with that error. A prompt over the context window is the exception, and it is
-handled as described next.
+Not here yet, each in its own story: the plan gate and the verifier phase (Phase 5), the pause
+for a question (LH-506), budget enforcement and pauses (Phase 7), clean-up and a final outcome
+for runs that end any way but a cancel (LH-507). An activity that fails for good, after its
+retries, fails the workflow with that error. A prompt over the context window is the exception,
+and it is handled as described next.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -236,6 +265,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -262,7 +292,7 @@ with workflow.unsafe.imports_passed_through():
     )
     from longhaul.durable import acts
     from longhaul.github import lifecycle
-    from longhaul.roles import planner
+    from longhaul.roles import coder, planner
 
 
 @dataclass(frozen=True)
@@ -294,10 +324,28 @@ LOAD_MEMORY_PATCH = "lh-604-load-memory"
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
 
+# The event a question to a person records (plan section 3.5). LH-506 writes the same event when it
+# builds the pause.
+PAUSED_EVENT = "paused"
+ASKED_REASON = "agent_asked"
+
 # The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
 CONTINUE_AS_NEW_EVENT = "continue_as_new"
 HAND_OVER_TURNS = "turns"  # the turn count reached the interval
 HAND_OVER_HISTORY = "history"  # the server suggested it, because the history grew
+
+
+@dataclass(frozen=True)
+class _Ran:
+    """What the calls of a coder turn came to, for a task with a plan or without.
+
+    `finish` is the summary of a good `finish` or `submit_for_review`, and `question` the text of
+    a good `ask_human`. Either ends the task.
+    """
+
+    results: list[ToolResult]
+    finish: str | None
+    question: str | None = None
 
 
 class _CancelRequested(Exception):
@@ -441,7 +489,7 @@ class TaskWorkflow:
 
     def _snapshot(self) -> TaskStatus:
         state = self.state
-        return TaskStatus(
+        status = TaskStatus(
             task_id=state.spec.task_id,
             phase=state.phase,
             turn_index=state.turn_index,
@@ -451,6 +499,9 @@ class TaskWorkflow:
             plan_version=state.plan_version or None,
             outcome=self.outcome,
         )
+        if state.plan is None:
+            return status
+        return acts.PlannedStatus(**status.model_dump(), plan=state.plan)
 
     # ---------- the run ----------
     @workflow.run
@@ -852,12 +903,10 @@ class TaskWorkflow:
         finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
 
         async def run(call: acts.ToolCallSummary) -> ToolResult:
-            result = await self._run_tool(index, call)
-            finished.append(result)
-            return result
+            return await self._run_tool(index, call)
 
         try:
-            ran = await rules.run_calls(calls, run)
+            ran = await self._run_calls(index, calls, run, finished)
         except _SandboxLost as lost:
             return await self._end_lost(index, sampled.transcript_ref, calls, finished, lost)
         # The transcript lives in the blob store, so an activity answers the calls. It answers
@@ -876,8 +925,88 @@ class TaskWorkflow:
         state.turn_index = index + 1
         if ran.finish is not None:
             return self._finish(rules.finished(ran.finish))
+        if ran.question is not None:
+            return await self._ask_human(ran.question)
         await self._relieve(index, sampled.context_decision)
         return None
+
+    async def _run_calls(
+        self,
+        index: int,
+        calls: list[acts.ToolCallSummary],
+        run: Callable[[acts.ToolCallSummary], Awaitable[ToolResult]],
+        finished: list[ToolResult],
+    ) -> _Ran:
+        """Run the calls of a coder turn by the rules of its kind: with a plan, or without.
+
+        `finished` collects the answer of every call as it is made, so that a sandbox lost for good
+        in the middle of the turn (`_end_lost`) still has the answers of the calls before it. For a
+        task with a plan that includes a step update, which has already changed the plan.
+        """
+        if self.state.plan is None:
+
+            async def kept(call: acts.ToolCallSummary) -> ToolResult:
+                result = await run(call)
+                finished.append(result)
+                return result
+
+            plain = await rules.run_calls(calls, kept)
+            return _Ran(plain.results, plain.finish)
+
+        async def update(change: coder.StepUpdate) -> None:
+            await self._update_step(index, change)
+
+        planned = await coder.run_calls(calls, run, update, self._plan_now, answered=finished)
+        return _Ran(planned.results, planned.submitted, planned.question)
+
+    def _plan_now(self) -> Plan:
+        plan = self.state.plan
+        if plan is None:
+            raise ApplicationError("the task has no plan to update", non_retryable=True)
+        return plan
+
+    async def _update_step(self, index: int, change: coder.StepUpdate) -> None:
+        """Record one step update, and then put the new status in the plan.
+
+        The record comes first, so that `status()` and the next prompt never show a step as done
+        before the checkpoint of its work is saved. A retry of the activity writes the same rows.
+        """
+        state = self.state
+        plan = self._plan_now()
+        if state.head_sha is None:
+            # prepare_workspace sets it before the first turn. Asking again changes nothing.
+            raise ApplicationError(
+                "a step cannot be recorded: the run has no checkpoint", non_retryable=True
+            )
+        await self._call(
+            acts.RECORD_STEP,
+            acts.RecordStepInput(
+                task_id=state.spec.task_id,
+                step_id=change.step_id,
+                status=change.status,
+                note=change.note,
+                head_sha=state.head_sha,
+                turn_index=index,
+            ),
+        )
+        state.plan = coder.with_status(plan, change)
+
+    async def _ask_human(self, question: str) -> Outcome:
+        """The coder asked a person. LH-506 replaces this with the pause and the wait.
+
+        It records the question and the phase it would pause in, PAUSED, and ends the task as
+        stuck with the question in the summary. The labels and the comment on the issue are the
+        pause flow's work, so a task of an issue keeps its working label here.
+        """
+        await self._note(
+            PAUSED_EVENT,
+            {
+                "reason": ASKED_REASON,
+                "question": question,
+                "turn_index": self.state.turn_index,
+            },
+        )
+        return self._end(coder.asked_outcome(question), Phase.PAUSED)
 
     async def _end_lost(
         self,
@@ -1046,7 +1175,8 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=reply.transcript_ref,
                 results=[],
-                user_text=rules.NUDGE,
+                # The coder of a plan is not offered `finish`, so it is sent to its own tool.
+                user_text=rules.NUDGE if state.plan is None else coder.NUDGE,
                 window_tokens=self._window(),
             ),
         )
@@ -1123,6 +1253,7 @@ class TaskWorkflow:
                     summary=finished.summary,
                     base_sha=base_sha,
                     head_sha=state.head_sha,
+                    plan=state.plan,
                 ),
             )
         except ActivityError as err:

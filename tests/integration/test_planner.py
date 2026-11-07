@@ -36,7 +36,12 @@ from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 from tests.fakes.memory import FakeMemory, row
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FACTS_HEADING, FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import (
+    FACTS_HEADING,
+    build_planned_system_prompt,
+    build_system_prompt,
+    render_plan,
+)
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.contracts import (
@@ -73,7 +78,7 @@ from longhaul.github.side_effects import MemoryLedger, SideEffectActivities, eff
 from longhaul.memory.retrieve import render_memory_block
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.sandbox.docker_manager import TASK_LABEL, DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
@@ -446,8 +451,13 @@ async def test_plan_stored_and_posted(
         planned = world.provider.of("planner")
         assert len(planned) == 3
         assert set(planned[0].tool_names) == {*planner.TOOLS, "submit_plan"}
-        assert [m.role for m in world.provider.of("coder")[0].messages] == ["user"]
-        assert last_text(world.provider.of("coder")[0].messages) == FIRST_USER_MESSAGE
+        first = world.provider.of("coder")[0].messages
+        assert [m.role for m in first] == ["user"]
+        # The line that starts the work, then the plan with every step still to do (LH-503).
+        assert [b.text for b in first[0].content if isinstance(b, TextBlock)] == [
+            coder.FIRST_USER_MESSAGE,
+            render_plan(PLAN),
+        ]
 
         # Every turn has a role, and the numbering goes on from the planner's turns to the coder's.
         assert world.llm.asked == [
@@ -553,7 +563,8 @@ async def test_the_planner_and_the_coder_end_their_prompts_with_the_same_memory_
     planned, coded = world.provider.of("planner"), world.provider.of("coder")
     assert (len(planned), len(coded)) == (3, 1)
     assert {r.system for r in planned} == {build_system_prompt(Role.PLANNER, spec, block)}
-    assert {r.system for r in coded} == {build_system_prompt(Role.CODER, spec, block)}
+    # The coder of a task with a plan has the prompt of its own form (LH-503), with the same block.
+    assert {r.system for r in coded} == {build_planned_system_prompt(spec, block)}
     for request in (*planned, *coded):
         assert request.system.endswith(f"{FACTS_HEADING}\n{block}")
 

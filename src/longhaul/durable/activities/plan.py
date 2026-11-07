@@ -1,7 +1,8 @@
-"""The store_plan and post_plan activities: what happens to a plan once the planner submits it.
+"""The store_plan, post_plan and record_step activities: what happens to a plan (LH-501, LH-503).
 
 The workflow cannot write to Postgres and cannot read a template, so it hands the plan to two
-activities (LH-501).
+activities when the planner submits it (LH-501), and each step update of the coder to a third
+(LH-503).
 
 `store_plan` writes version `n` of the plan to the `plans` table as `proposed`. The rows are the
 history of the plan: the workflow's CarryState holds only the plan in force, and a reviewer, the
@@ -13,6 +14,14 @@ and posts it with the idempotent comment write of github/side_effects.py, under 
 run again: a retry after a 502 that landed, or a run after a Continue-As-New, finds the comment
 and posts nothing new (failure modes F10 and F11). The body is the same bytes on every attempt,
 because `post_comment` refuses a key that is used again with other text.
+
+`record_step` records one `update_step` call of the coder. Every update is a `step_updated` event
+with the step, its status, the note and the head of the work, so the log of a task shows how the
+plan went. An update to `done` also writes a `step` checkpoint at that head, which names where the
+work of the step ended. The pull request has one commit for each of them (checkpoints/squash.py).
+The checkpoint is written first. A retry writes the same row again, and the table keeps one for a
+step and sha (db/records.py). The event is the second write, so a retry after the first has landed
+adds the event once.
 
 Failures. A GitHub error is retryable or not as the client classified it (support.github_failure).
 A request that no retry can fix, such as a template that is missing or a key that was used for
@@ -28,7 +37,7 @@ from typing import Any, Protocol
 from jinja2 import TemplateError
 from temporalio import activity
 
-from longhaul.db.records import PlanRecord
+from longhaul.db.records import STEP_KIND, CheckpointRecord, PlanRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import github_failure, not_retried, small
 from longhaul.github.client import GitHubClient, GitHubError
@@ -38,12 +47,22 @@ from longhaul.github.side_effects import Ledger, SideEffectError, effect_key, po
 
 # The purpose part of the idempotency key of a plan comment (plan section 3.7).
 PLAN_COMMENT = "plan_comment"
+# The type of the event that a step update records.
+STEP_EVENT = "step_updated"
 
 
 class PlanRecords(Protocol):
     """The part of the recorder that store_plan uses."""
 
     async def record_plan(self, record: PlanRecord) -> None: ...
+
+
+class StepRecords(Protocol):
+    """The part of the recorder that record_step uses."""
+
+    async def record_checkpoint(self, record: CheckpointRecord) -> None: ...
+
+    async def record_event(self, task_id: str, type: str, payload: dict[str, Any]) -> None: ...
 
 
 class PlanActivities:
@@ -61,6 +80,39 @@ class PlanActivities:
     async def store_plan(self, inp: acts.StorePlanInput) -> None:
         inp = small(inp)
         await self._records.record_plan(PlanRecord(inp.task_id, inp.version, inp.plan))
+
+
+class StepActivities:
+    """record_step, with the recorder it writes through. Every worker registers it (LH-503)."""
+
+    def __init__(self, records: StepRecords) -> None:
+        self._records = records
+
+    @property
+    def activities(self) -> list[Callable[..., Any]]:
+        """What to register on a worker."""
+        return [self.record_step]
+
+    @activity.defn(name=acts.RECORD_STEP.name)
+    async def record_step(self, inp: acts.RecordStepInput) -> None:
+        inp = small(inp)
+        if inp.status == "done":
+            await self._records.record_checkpoint(
+                CheckpointRecord(
+                    inp.task_id, inp.head_sha, STEP_KIND, inp.turn_index, step_id=inp.step_id
+                )
+            )
+        await self._records.record_event(
+            inp.task_id,
+            STEP_EVENT,
+            {
+                "step_id": inp.step_id,
+                "status": inp.status,
+                "note": inp.note,
+                "head_sha": inp.head_sha,
+                "turn_index": inp.turn_index,
+            },
+        )
 
 
 class PlanCommentActivities:

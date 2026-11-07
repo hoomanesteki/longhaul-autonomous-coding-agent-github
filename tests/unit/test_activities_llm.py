@@ -17,7 +17,14 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FACTS_HEADING, FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import (
+    FACTS_HEADING,
+    FIRST_USER_MESSAGE,
+    PLAN_HEADING,
+    build_planned_system_prompt,
+    build_system_prompt,
+    render_plan,
+)
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import (
@@ -25,6 +32,8 @@ from longhaul.contracts import (
     CallOptions,
     LLMResponse,
     Message,
+    Plan,
+    PlanStep,
     ProviderError,
     ProviderErrorKind,
     RepoSettings,
@@ -43,7 +52,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
 from longhaul.durable.scripts import script_key, upload_script
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -869,3 +878,134 @@ async def test_a_submit_plan_call_is_returned_like_any_call() -> None:
 
     assert [c.name for c in out.tool_call_summaries] == ["submit_plan"]
     assert out.tool_call_summaries[0].input == plan
+
+
+# ---------- the coder of a task with a plan (LH-503) ----------
+def make_plan(*statuses: str) -> Plan:
+    steps = [
+        PlanStep(
+            id=f"s{n}",
+            description=f"Change module {n}",
+            done_when="the tests pass",
+            status=status,  # type: ignore[arg-type]
+        )
+        for n, status in enumerate(statuses or ("todo", "todo"), start=1)
+    ]
+    return Plan(summary="add() subtracts", steps=steps, acceptance_checks=["pytest -q"])
+
+
+STEP_TOOLS = coder.tool_specs(TOOLS)
+
+
+def planned_rig(*steps: Step) -> Rig:
+    rig = Rig(*steps)
+    rig.activities = LlmActivities(
+        rig.provider,
+        rig.blobs,
+        rig.recorder,
+        TOOLS,
+        lambda role: CFG,
+        planned_tools=STEP_TOOLS,
+    )
+    return rig
+
+
+@pytest.mark.phase5
+async def test_a_coder_with_a_plan_is_asked_with_its_own_prompt_tools_and_first_message() -> None:
+    plan = make_plan()
+    rig = planned_rig(reply("tool_use", use("toolu_1", path="a.py")))
+    out = await rig.run(turn_input(plan=plan))
+
+    (call,) = rig.provider.calls
+    assert call["system"] == build_planned_system_prompt(SPEC)
+    assert call["tools"] == STEP_TOOLS
+    (first,) = call["messages"]
+    assert [b.text for b in first.content] == [coder.FIRST_USER_MESSAGE, render_plan(plan)]
+    # The plan is in the stored transcript too, so the next turn starts from it.
+    assert (await rig.transcript(out.transcript_ref))[0] == first
+
+
+@pytest.mark.phase5
+async def test_a_coder_without_a_plan_is_asked_as_it_always_was() -> None:
+    rig = planned_rig(reply("end_turn"))
+    await rig.run(turn_input())
+
+    (call,) = rig.provider.calls
+    assert call["system"] == build_system_prompt(Role.CODER, SPEC)
+    assert call["tools"] == TOOLS
+    assert call["messages"] == [FIRST]
+
+
+@pytest.mark.phase5
+async def test_the_system_prompt_and_tools_do_not_change_when_a_step_does() -> None:
+    rig = planned_rig(reply("end_turn"), reply("end_turn"))
+    first = await rig.run(turn_input(plan=make_plan("doing", "todo")))
+    await rig.run(
+        turn_input(
+            turn_index=1, transcript_ref=first.transcript_ref, plan=make_plan("done", "doing")
+        )
+    )
+
+    one, two = rig.provider.calls
+    assert one["system"] == two["system"]
+    assert one["tools"] == two["tools"]
+
+
+@pytest.mark.phase5
+async def test_a_step_update_rewrites_the_plan_block_of_the_first_message_in_place() -> None:
+    rig = planned_rig(
+        reply("tool_use", use("toolu_1", path="a.py")),
+        reply("tool_use", use("toolu_2", path="b.py")),
+    )
+    first = await rig.run(turn_input(plan=make_plan("doing", "todo")))
+    stored = await rig.transcript(first.transcript_ref)
+    answered_ = [
+        *stored,
+        Message(role="user", content=[ToolResultBlock(tool_use_id="toolu_1", content="x = 1")]),
+    ]
+    ref = await rig.put("answered.json", answered_)
+
+    second = await rig.run(
+        turn_input(turn_index=1, transcript_ref=ref, plan=make_plan("done", "doing"))
+    )
+
+    sent = rig.provider.calls[1]["messages"]
+    assert [b.text for b in sent[0].content] == [
+        coder.FIRST_USER_MESSAGE,
+        render_plan(make_plan("done", "doing")),
+    ]
+    # Only the first message moved. The turns after it are as the model last saw them.
+    assert sent[1:3] == answered_[1:]
+    after = await rig.transcript(second.transcript_ref)
+    assert after[0] == sent[0]
+    assert (
+        sum(PLAN_HEADING in b.text for m in after for b in m.content if isinstance(b, TextBlock))
+        == 1
+    )
+
+
+@pytest.mark.phase5
+async def test_the_planner_gets_no_plan_block_whatever_the_input_holds() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.PLANNER, plan=make_plan()))
+
+    (call,) = rig.provider.calls
+    assert call["messages"] == [
+        Message(role="user", content=[TextBlock(text=planner.FIRST_USER_MESSAGE)])
+    ]
+
+
+@pytest.mark.phase5
+async def test_a_worker_without_step_tools_offers_a_coder_with_a_plan_the_default_list() -> None:
+    # A worker built before the story passes none, and its coder keeps the tools it had.
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(plan=make_plan()))
+    assert rig.provider.calls[0]["tools"] == TOOLS
+
+
+@pytest.mark.phase5
+async def test_a_step_tool_call_is_returned_like_any_call() -> None:
+    rig = planned_rig(reply("tool_use", use("toolu_1", "update_step", step_id="s1", status="done")))
+    out = await rig.run(turn_input(plan=make_plan()))
+    assert [c.name for c in out.tool_call_summaries] == ["update_step"]
+    assert out.tool_call_summaries[0].input == {"step_id": "s1", "status": "done"}

@@ -375,6 +375,31 @@ async def test_a_finish_call_leaves_no_room_for_a_result() -> None:
     assert out.context_decision == "ok"
 
 
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("update_step", {"step_id": "s1", "status": "done"}),
+        ("submit_for_review", {"summary": "Done."}),
+        ("ask_human", {"question": "Which one?"}),
+    ],
+)
+@pytest.mark.phase5
+async def test_a_step_tool_call_leaves_no_room_for_a_result(
+    name: str, args: dict[str, str]
+) -> None:
+    # LH-503: the workflow answers these three itself, with a line of text, as it does finish.
+    messages = rounds(1, lines=3)
+    window = window_for(messages, 0.5)
+    rig = Rig(
+        reply("tool_use", use("c1", name, **args)),
+        policy=context(window, tool_output_max_tokens=window),
+    )
+
+    out = await rig.run(turn_input(turn_index=1, transcript_ref=await rig.put(messages)))
+
+    assert out.context_decision == "ok"
+
+
 async def test_the_next_request_is_projected_with_one_more_turn_elided() -> None:
     # Three big results are in the view and two are kept. The request that is sent has the first
     # one as a stub and takes 0.70 of the window, which would call for a compaction. The next

@@ -386,6 +386,42 @@ async def test_checkpoints_of_other_shas_kinds_and_tasks_are_all_kept(
     assert scratch.query("SELECT count(*) FROM checkpoints") == [(4,)]
 
 
+@pytest.mark.phase5
+async def test_two_steps_done_at_the_same_sha_are_two_rows_and_a_repeat_is_not_a_third(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    # LH-503: a step marked done with no new work has the sha of the step before it.
+    for step_id in ("s1", "s2", "s2"):
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id="lh-a-1", sha=SHA, kind="step", turn_index=4, step_id=step_id)
+        )
+    assert scratch.query("SELECT step_id FROM checkpoints ORDER BY id") == [("s1",), ("s2",)]
+
+
+@pytest.mark.phase5
+async def test_the_step_checkpoints_of_a_task_come_back_in_the_order_they_were_saved(
+    recorder: SqlRecorder,
+) -> None:
+    saved = [
+        ("lh-a-1", "a" * 40, "tool", None),
+        ("lh-a-1", "b" * 40, "step", "s2"),
+        ("lh-a-1", "c" * 40, "step", "s1"),
+        ("lh-b-2", "d" * 40, "step", "s1"),
+    ]
+    for task, sha, kind, step_id in saved:
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id=task, sha=sha, kind=kind, turn_index=2, step_id=step_id)
+        )
+
+    found = await recorder.step_checkpoints("lh-a-1")
+
+    assert [(c.step_id, c.sha[0], c.kind, c.turn_index) for c in found] == [
+        ("s2", "b", "step", 2),
+        ("s1", "c", "step", 2),
+    ]
+    assert await recorder.step_checkpoints("lh-none") == []
+
+
 async def test_a_kind_outside_the_plan_is_refused(recorder: SqlRecorder) -> None:
     with pytest.raises(IntegrityError, match="ck_checkpoints_kind"):
         await recorder.record_checkpoint(

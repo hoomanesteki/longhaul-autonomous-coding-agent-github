@@ -19,7 +19,8 @@ from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import CheckpointError, RepoNotFoundError
 from longhaul.checkpoints.push import ForbiddenBranchError
 from longhaul.checkpoints.squash import FileStat, NothingToDeliverError, PrBranch
-from longhaul.db.records import MemoryRecorder, ToolCallRecord
+from longhaul.contracts import Plan, PlanStep
+from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities import delivery
 from longhaul.durable.activities.delivery import DeliveryActivities
@@ -151,6 +152,93 @@ async def test_the_branch_is_built_from_the_title_the_summary_gives(
     assert [tuple(g) for g in seen["groups"]] == [("fix(calc): fix add()", SHA)]
     assert (seen["default_branch"], seen["author"]) == ("main", AUTHOR)
     assert seen["base_sha"] == BASE, "the base is the one the workflow handed over"
+
+
+def three_steps(*statuses: str) -> Plan:
+    steps = [
+        PlanStep(
+            id=f"s{n}",
+            description=f"Change file {n}",
+            done_when="the tests pass",
+            status=status,  # type: ignore[arg-type]
+        )
+        for n, status in enumerate(statuses, start=1)
+    ]
+    return Plan(summary="plan", steps=steps, acceptance_checks=["pytest -q"])
+
+
+async def groups_built_for(
+    recorder: MemoryRecorder, plan: Plan | None, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[str, str]]:
+    seen: dict[str, Any] = {}
+
+    async def build(task_id: str, groups: Any, **kwargs: Any) -> PrBranch:
+        seen["groups"] = groups
+        return PrBranch("longhaul-pr/42", SHA, BASE)
+
+    monkeypatch.setattr(delivery, "build_pr_branch", build)
+    inp = build_input().model_copy(update={"plan": plan})
+    await run(make(recorder=recorder).build_pr_branch, inp)
+    return [tuple(g) for g in seen["groups"]]
+
+
+@pytest.mark.phase5
+async def test_a_task_with_a_plan_gets_one_group_for_each_done_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = MemoryRecorder()
+    for n, sha in enumerate(["1" * 40, "2" * 40], start=1):
+        await recorder.record_checkpoint(
+            CheckpointRecord(TASK, sha, "step", turn_index=n, step_id=f"s{n}")
+        )
+
+    groups = await groups_built_for(recorder, three_steps("done", "done", "todo"), monkeypatch)
+
+    assert groups == [
+        ("fix(calc): change file 1", "1" * 40),
+        ("fix(calc): change file 2", "2" * 40),
+        ("fix(calc): fix add()", SHA),
+    ]
+
+
+@pytest.mark.phase5
+async def test_the_tool_checkpoints_of_a_task_are_not_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(CheckpointRecord(TASK, "1" * 40, "tool", turn_index=1))
+
+    groups = await groups_built_for(recorder, three_steps("done", "todo"), monkeypatch)
+
+    assert groups == [("fix(calc): fix add()", SHA)]
+
+
+@pytest.mark.phase5
+async def test_a_task_without_a_plan_never_reads_the_step_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoSteps(MemoryRecorder):
+        async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+            raise AssertionError("a task without a plan has no steps to read")
+
+    groups = await groups_built_for(NoSteps(), None, monkeypatch)
+
+    assert groups == [("fix(calc): fix add()", SHA)]
+
+
+@pytest.mark.phase5
+async def test_the_title_of_the_pull_request_is_still_the_summary_with_a_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def build(task_id: str, groups: Any, **kwargs: Any) -> PrBranch:
+        return PrBranch("longhaul-pr/42", SHA, BASE)
+
+    monkeypatch.setattr(delivery, "build_pr_branch", build)
+    inp = build_input().model_copy(update={"plan": three_steps("done", "done")})
+
+    out = await run(make().build_pr_branch, inp)
+
+    assert out.title == "fix(calc): fix add()"
 
 
 async def test_a_task_that_changed_nothing_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:

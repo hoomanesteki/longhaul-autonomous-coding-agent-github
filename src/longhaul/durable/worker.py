@@ -48,6 +48,10 @@ What it is built from, and why each piece is what it is:
   Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
   another number stops before it takes a task.
+* The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
+  `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
+  without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
+  the step updates, and every worker registers it.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. It also carries out the slash commands in the comments of the task issues (LH-308),
   and posts the one reply to a command from someone who may not steer, through the same
@@ -113,7 +117,11 @@ from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.memory import MemoryActivities
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -129,7 +137,7 @@ from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.memory.embedder import make_embedder
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import (
     AppConfig,
@@ -279,6 +287,7 @@ def build_parts(
         context=cfg.context,
         meters=meters,
         role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        planned_tools=coder.tool_specs(registry.specs()),
     )
     compactor = ContextActivities(
         provider,
@@ -318,6 +327,7 @@ def build_parts(
     notes = MemoryActivities(memory, blobs)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
+    steps = StepActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
@@ -348,6 +358,7 @@ def build_parts(
             *notes.activities,
             *events.activities,
             *plans.activities,
+            *steps.activities,
             *poller.activities,
             *delivery,
         ],

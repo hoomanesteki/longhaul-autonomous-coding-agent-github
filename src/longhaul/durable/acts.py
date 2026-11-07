@@ -44,6 +44,10 @@ of the `plans` table, so it is sized like `append_results` and every worker regi
 GitHub write with the policy of `post_comment`, and it sits in `GITHUB` with them. The template is
 read inside the activity, so the workflow, which may not read files, passes the plan itself.
 
+The coder with a plan (LH-503) adds one more, `record_step`. It writes the event of a step update
+and, for a step that is done, the `step` checkpoint at the head of the work. Like `store_plan` it
+is a database write of a row or two, sized like `append_results`, and every worker registers it.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -86,6 +90,7 @@ from longhaul.contracts import (
     StopDetails,
     StopReason,
     TaskSpec,
+    TaskStatus,
     ToolResult,
     Usage,
 )
@@ -303,9 +308,12 @@ class LlmTurnInput(BaseModel):
     transcript_ref: BlobRef | None  # None before the first turn
     # The notes reach the model in the first message of the view, where compaction put them
     # (context/compact.py apply), so the system prompt does not change with them (D7). This field
-    # is the workflow's copy, which it hands back to the compact activity. The plan reaches the
-    # model in Phase 5.
+    # is the workflow's copy, which it hands back to the compact activity.
     notes: ProgressNotes | None = None
+    # The plan with the status of each step, as the workflow holds it. A coder with a plan reads it
+    # in the first message of its transcript, which llm_turn brings up to date before each call
+    # (LH-503). It also decides the coder's prompt and tool list, so it is set for the whole
+    # transcript or for none of it. The other roles ignore it.
     plan: Plan | None = None
     # The memory block that load_memory wrote for the task (LH-604): text in the blob store that
     # ends the system prompt. It is the same ref on every turn of the task, in every run, so the
@@ -504,6 +512,10 @@ class BuildPrBranchInput(BaseModel):
     which the workflow keeps. The activity does not read it from the checkpoint repo, where the
     sandbox could move the `base` tag. `head_sha` is the latest checkpoint the workflow knows.
     The work of the whole task is the change from the base to the head.
+
+    `plan` is the plan with the status of each step, for a task that has one (LH-503). The
+    activity makes one commit for each done step from it and from the step checkpoints, and a task
+    without a plan gets the single commit it always did.
     """
 
     task_id: str
@@ -511,6 +523,7 @@ class BuildPrBranchInput(BaseModel):
     summary: str
     base_sha: str
     head_sha: str
+    plan: Plan | None = None
 
 
 class PrBranchOutput(BaseModel):
@@ -548,6 +561,34 @@ class PostPlanInput(BaseModel):
     number: int  # the issue
     version: int = Field(ge=1)
     plan: Plan
+
+
+class RecordStepInput(BaseModel):
+    """What record_step needs: one step update, and the head of the work it was made at.
+
+    A step that is `done` gets a `step` checkpoint at `head_sha`. Every update, the others
+    included, is an event with its note.
+    """
+
+    task_id: str
+    step_id: str
+    status: Literal["todo", "doing", "done", "skipped"]
+    note: str = ""
+    head_sha: str
+    turn_index: int = Field(ge=0)
+
+
+class PlannedStatus(TaskStatus):
+    """What status() returns for a task that has a plan: the status, and the plan with its steps.
+
+    TaskStatus is a contract and has no field for the plan, so this is the same model with one
+    more. A client that wants the plan asks for the query by name with the type:
+    `handle.query("status", result_type=PlannedStatus)`. The SDK takes the result type from the
+    method only when the query is asked for by method, so that form reads a TaskStatus, because
+    the extra field is ignored. A task without a plan answers with a plain TaskStatus.
+    """
+
+    plan: Plan | None = None
 
 
 class DeliverInput(BaseModel):
@@ -805,6 +846,14 @@ STORE_PLAN = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+RECORD_STEP = Act(
+    "record_step",
+    RecordStepInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -818,6 +867,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     POLL_ONCE,
     COMPACT,
     STORE_PLAN,
+    RECORD_STEP,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).

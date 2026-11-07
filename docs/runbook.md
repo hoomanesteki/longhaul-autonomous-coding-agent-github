@@ -525,7 +525,7 @@ A failed setup raises an error and does not mark the patch as wrong, because the
 
 * Each task runs in an image made from the instance's own image, with its repo and conda environment, and the dollar cap is 4 (plan section 8.4). The runner builds the image and copies the repo to a temporary folder. The folder names the image in a file `.longhaulimage`, which the worker reads when it prepares the sandbox (`agent/workspace.py`, `read_image_file`) and when it makes a new one after a crash.
 * The result files say `not graded yet`. The runner also writes `predictions.jsonl`, with the test files of each instance cut out of the agent's diff.
-* `eval/swebench/grade.sh eval/results/<run id>` runs `python -m swebench.harness.run_evaluation` and puts `resolved` into each result file and the summary.
+* `eval/swebench/grade.sh eval/results/<run id>` runs `python -m swebench.harness.run_evaluation` and puts `resolved` into the result file of each task that finished and into the summary. A task that ended any other way keeps the verdict the runner gave it.
 
 ```bash
 uv sync --extra eval                    # swebench and datasets, which CI does not install

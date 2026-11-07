@@ -89,7 +89,7 @@ called `swebench` hides the real package.
    reads the file when it prepares the sandbox, and again when it has to make a new one after a
    crash. Files that git ignores, the compiled extensions among them, stay in the image.
 4. The task starts with the problem statement as the issue (the hints of the dataset are not
-   shown), the plan gate off, no setup command, the network cut, and the caps of plan section 8.4:
+   shown, and a statement over 8,000 bytes is cut, see "Known limits"), the plan gate off, no setup command, the network cut, and the caps of plan section 8.4:
    4 dollars, 150 turns and 120 minutes. The test command of the benchmark, without the test files,
    is the task's test command, which the prompt shows as a hint. The `run_tests` tool keeps the
    command of the worker (`python -m pytest -q`), so the agent runs the hinted command with
@@ -123,6 +123,12 @@ the repo. `report.py` then sets `resolved` and `grading` in each `<task id>.json
 | empty patch | false | the agent delivered no change |
 | error, and the log says the patch did not apply | false | the patch does not apply |
 | error, any other | null | the harness did not grade it |
+
+Only a task that ended as `pr_opened` gets a verdict. The predictions have a row, with an empty
+patch, for every task, so the harness lists a task that was stuck, ran out of budget, was cancelled
+or failed in the runner as an empty patch too. `report.py` leaves those result files as the runner
+wrote them: `resolved` false with `not graded: the task ended as ...`, or null with
+`not graded: the runner failed: ...` for a failure of the runner, such as a failed image pull.
 
 A null counts as `ungraded` in the summary, not as a failure. Look at the `run_instance.log` of
 the instance under `harness/logs/run_evaluation/`, fix the cause (a missing image, a full disk) and
@@ -192,7 +198,17 @@ request.
   and that removes compiled extensions and other build output that git ignores. The tree starts
   clean, so a normal run never restores. After a crash in the middle of a call on an instance with
   built extensions (astropy, matplotlib, scikit-learn), the retry can find the environment broken.
-  Re-run that task.
+  Re-run that task. A sandbox that is made again (its container died or was removed) is not
+  affected: its restore keeps the ignored files, because the instance has no setup command that
+  could build them again.
+* **Long problem statements are cut.** The task spec goes inline into several activities of every
+  turn, so the problem statement is cut to 8,000 bytes (`MAX_BODY_BYTES`, the limit of a GitHub
+  issue and of `longhaul run --issue-file`) and ends with a note that text is missing. Two
+  instances of the subset are cut: `pylint-dev__pylint-7080` (24,770 bytes) and
+  `django__django-11087` (9,262 bytes). The other 38 are whole. Every configuration sees the same
+  text, so a comparison between configurations is fair, but the absolute rate on those two is
+  lower than with the full text. Passing the statement by reference on the spec (a `BlobRef`)
+  would lift the cut; that change is not made yet.
 * **Links are not copied.** The sandbox's file API cannot make links, so a symlink that git tracks
   is missing from the copy of the repo, as it is for any `local:` task. The files that the
   built-in patterns of `agent/workspace.py` skip (`.env`, caches) are missing too.

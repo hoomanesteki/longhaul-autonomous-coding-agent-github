@@ -71,7 +71,10 @@ own mode, which travels in `LlmTurnInput.context_mode` and wins over the config
 (longhaul.context.modes). Tier 1 runs in `full` and `no_compaction`. The decision is always "ok"
 unless the mode is `full`, so a workflow that acts on the decision never compacts in the others.
 The guard in front of the call stays on in every mode: it is how a task in `none` ends, at the hard
-limit, with the outcome "context limit" and not with a provider error.
+limit, with the outcome "context limit" and not with a provider error. The mode `sliding` (LH-903,
+the naive baseline) answers the guard another way: before the request is measured against the limit,
+the oldest whole turns are dropped until it fits (context/sliding.py), and the cut view is what is
+sent and stored. The guard then refuses only a request that no cut can bring under the limit.
 
 The share of the window. A request that passes the guard is going out, and the activity notes what
 share of the window it takes (`Recorder.record_request_fraction`), so that `tasks.max_fraction`
@@ -133,6 +136,7 @@ from longhaul.agent.turns import (
     validate_pairs,
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key
+from longhaul.context import sliding
 from longhaul.context.evict import elide_old_outputs
 from longhaul.context.log import added_messages, append_to_log
 from longhaul.context.modes import ContextMode
@@ -318,10 +322,14 @@ class LlmActivities:
             raise not_retried(exc) from exc
         paused = await self._paused(inp.paused_ref)
         provider = await self._provider_for(inp)
-        # The text of a paused reply goes back as the last message, which the API continues.
-        request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         meter = self._meters.for_task(inp.task_id)
-        projected = await self._preflight(provider, cfg, system, request, tools, meter)
+        measured: int | None = None
+        if mode.slides:
+            transcript, measured = await self._slide(
+                provider, cfg, system, transcript, paused, tools, meter
+            )
+        request = self._with_paused(transcript, paused)
+        projected = await self._preflight(provider, cfg, system, request, tools, meter, measured)
         await self._note_share(inp.task_id, projected)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
@@ -389,8 +397,16 @@ class LlmActivities:
         if self._budget is not None:
             await self._recorder.record_request_fraction(task_id, projected / self._budget.window)
 
+    @staticmethod
+    def _with_paused(transcript: list[Message], paused: list[Block]) -> list[Message]:
+        """The request: the view, then the text of a paused reply as the last message.
+
+        The API continues that message, so it goes at the end and is not part of the view.
+        """
+        return [*transcript, Message(role="assistant", content=paused)] if paused else transcript
+
     # ----- tier 2: the size of the request -----
-    async def _preflight(
+    async def _measure(
         self,
         provider: LLMProvider,
         cfg: LoopConfig,
@@ -399,11 +415,10 @@ class LlmActivities:
         tools: list[ToolSpec],
         meter: TokenMeter,
     ) -> int:
-        """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
+        """The projected tokens of the request, or 0 when there is no context policy.
 
-        A request at or over `hard_limit` of the window is not sent. The workflow handles this
-        as it does the provider's own answer (F6), by compacting and asking once more. Close to
-        the thresholds the estimate is replaced by the provider's exact count, if it gives one.
+        Close to the thresholds the estimate is replaced by the provider's exact count, if it
+        gives one.
         """
         budget = self._budget
         if budget is None:
@@ -411,6 +426,62 @@ class LlmActivities:
         tokens = meter.projected(system, request, tools)
         if budget.needs_exact_count(tokens):
             tokens = await self._exact_count(provider, cfg, system, request, tools) or tokens
+        return tokens
+
+    async def _slide(
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        transcript: list[Message],
+        paused: list[Block],
+        tools: list[ToolSpec],
+        meter: TokenMeter,
+    ) -> tuple[list[Message], int | None]:
+        """The sliding window (mode `sliding`): the newest turns that fit under the hard limit.
+
+        The request is measured as it will be sent, with the system prompt, the tools of the role
+        and the text of a paused reply, so what comes back passes the guard in `_preflight` unless
+        no cut can make it fit. A request that is under the limit is returned as it is. The
+        measure of the view that is returned goes with it, so that the guard does not ask the
+        provider for the same count a second time.
+        """
+        budget = self._budget
+        if budget is None:
+            return transcript, None
+
+        async def measure(view: list[Message]) -> int:
+            request = self._with_paused(view, paused)
+            return await self._measure(provider, cfg, system, request, tools, meter)
+
+        def over(tokens: int) -> bool:
+            return budget.decide(tokens) == "force"
+
+        return await sliding.fit(transcript, measure, over)
+
+    async def _preflight(
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        request: list[Message],
+        tools: list[ToolSpec],
+        meter: TokenMeter,
+        measured: int | None = None,
+    ) -> int:
+        """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
+
+        A request at or over `hard_limit` of the window is not sent. The workflow handles this
+        as it does the provider's own answer (F6), by compacting and asking once more. `measured`
+        is the size of this very request when the caller has it already.
+        """
+        budget = self._budget
+        if budget is None:
+            return 0
+        if measured is not None:
+            tokens = measured
+        else:
+            tokens = await self._measure(provider, cfg, system, request, tools, meter)
         if budget.decide(tokens) == "force":
             limit = int(budget.window * budget.hard_limit)
             raise provider_failure(

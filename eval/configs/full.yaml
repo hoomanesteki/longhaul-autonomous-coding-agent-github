@@ -1,0 +1,13 @@
+# The product (plan section 8.3): the planner, the verifier, memory and the stuck detector on,
+# and both context tiers (elide old tool outputs, then compact into notes).
+#
+# The runner stores the sha256 of this file in every result it writes, so a change here, a
+# comment included, gives later runs another hash. Change it in a commit of its own.
+name: full
+description: The product, with every part on and both context tiers.
+runner: durable
+planner: true
+verifier: true
+memory: true
+stuck_detector: true
+context_mode: full

@@ -1,0 +1,16 @@
+# The naive baseline (plan section 8.3): the same durable stack, tools, model, turn limit and cost
+# limit as `full`, with the parts that make the product different switched off.
+#
+# The context mode is applied by the runner and travels with the task. `sliding` drops the oldest
+# whole turns when a request would pass the hard limit, which is what a loop with no context
+# engineering usually does. The other four switches are recorded here. The worker reads them from
+# its own config, and a part that the stack does not have is not there, which is the same as off.
+# Each story that adds a switch makes the runner pass it on.
+name: naive
+description: The same stack with the planner, verifier, memory and stuck detector off, and a sliding window for context.
+runner: durable
+planner: false
+verifier: false
+memory: false
+stuck_detector: false
+context_mode: sliding

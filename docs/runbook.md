@@ -232,7 +232,7 @@ A task that runs for many turns keeps two records of its transcript (ADR-0013). 
 | `compact_at` | 0.60 | At this share of the window the older turns are folded into progress notes by the compactor model. |
 | `hard_limit` | 0.85 | A request projected above this share is not sent. The view is compacted down to the last two turns and the turn is asked once more. |
 | `keep_recent_turns` | 6 | The turns a compaction leaves as they are. |
-| `mode` | full | Which tiers run: `full`, `no_compaction` or `none`. See the next section. |
+| `mode` | full | Which tiers run: `full`, `no_compaction`, `none` or `sliding`. See the next section. |
 
 Each compaction writes a `compaction` event with the tokens before and after, and each call of the compactor model has its own row in `cost_ledger`:
 
@@ -290,8 +290,11 @@ The evaluation compares runs with the tiers on and off (plan section 8), so `con
 | `full` | on | on | one forced compaction, then the turn is asked again |
 | `no_compaction` | on | off | the run ends with `error` and the summary `context limit` |
 | `none` | off | off | the run ends with `error` and the summary `context limit` |
+| `sliding` | off | off | the oldest whole turns are dropped until the request fits |
 
-The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In the two modes without compaction nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In `no_compaction` and `none` nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+
+`sliding` is the window of the naive baseline (see "The baselines" below). Before `llm_turn` measures a request it cuts the oldest turns from the view until the request is under `hard_limit`. A turn is an assistant message with the user message that answers its tool calls, and a cut never separates a call from its result. The first message stays, and a line `[longhaul:turn_offset=N]` in it keeps the turn count, as it does after a compaction. Nothing is summarized, so what leaves the window is gone from the view; the log keeps it. The run ends with `context limit` only when no cut helps, for example when one tool result is larger than the window. Each turn that slides changes the start of the request, so the prompt cache is read only as far as the first message.
 
 `context.mode` in the config is the default of a worker. A single run can ask for its own, and that wins:
 
@@ -597,13 +600,16 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 | Flag | Meaning |
 |---|---|
 | `--set custom\|swebench` | `custom` is the 15 custom tasks. `swebench` is the 40 instances of `eval/swebench/subset.txt`, and `--limit` takes the first N of them (see "The SWE-bench set"). |
-| `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
+| `--config full\|naive\|single_shot` | A file in `eval/configs`. `full` is the product, and `naive` and `single_shot` are the baselines (see "The baselines"). The sha256 of the file is stored in every result. Every config runs on both sets. |
 | `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
 | `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
 | `--concurrency K` | How many tasks run at once. The default is 1. |
 | `--model ID` | Checked against the coder model in the worker's config, and recorded. |
-| `--memory on\|off`, `--context-mode full\|no_compaction\|none` | Recorded in each result file. The worker reads memory and context settings from its own config, so start it with the settings you mean to measure. |
-| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. Every other `--provider` is only recorded: the worker answers with its own provider. |
+| `--context-mode full\|no_compaction\|none\|sliding` | Only with `--config full`, for an ablation. It takes the place of the context mode in the config file, travels with each task and is recorded. |
+| `--memory on\|off` | Only with `--config full`. Recorded in each result file. The worker reads its memory settings from its own config, so start it with the settings you mean to measure. |
+| `--run-set NAME`, `--allow-mixed-models` | Runs that share a run set are compared with each other, so they must use one model. The runner stops a run whose model differs from the earlier runs of its set, unless `--allow-mixed-models` is passed. A run with no run set is compared with nothing at start time, so every result file records `allow_mixed_models`, and a report that pairs two runs calls `results.check_comparable`, which refuses two models unless a run allowed it. |
+| `--seed N` | Recorded in each result file. The default is 42, the seed of the SWE-bench subset. Nothing in the custom runner draws random numbers yet. |
+| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. For the durable configs every other `--provider` is only recorded, because the worker answers with its own provider. For `single_shot` the runner makes the call itself, so `--provider` chooses who answers. |
 | `--results-dir`, `--pause-timeout-s` | Where results go (default `eval/results`), and how long a pause lasts before the runner ends the task (default 60). |
 
 ### What a run does
@@ -614,9 +620,39 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 4. Reads the patch from the checkpoint repo and grades it. A task counts as resolved when the agent finished (outcome `pr_opened`) and the grader passed the patch. A task that ended any other way is not graded and is not resolved.
 5. Writes `<task id>.json` and `<task id>.patch`, removes the sandbox and the checkpoint repo of the task, and at the end writes `summary.json`.
 
+A `single_shot` task takes a different path through steps 2 to 4. There is no workflow: the runner builds the repo map in a sandbox, makes the one call, books it on the cost ledger under the id `lh-eval-<run id>-<task id>` and applies the diff in a throwaway copy of the repo. The patch it hands to the grader is `git diff` of that copy. Outcome `pr_opened` means that a patch was applied. A reply with no diff, a diff that neither tool applies and a reply that was cut off at max tokens end as `error` and are not graded.
+
 When the runner itself fails on a task, for example a lost connection or a database error, that task gets a result with outcome `error` and `resolved` null, and the other tasks go on. The summary counts it as attempted and not graded. Ctrl-C ends the whole run: the tasks that are running are terminated, no summary is written, and the run id cannot be used again.
 
-A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout, the hash of the config file, the seed, the run set and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+
+### The baselines
+
+The headline numbers compare `full` with two simpler setups on the same model and tasks (plan section 8.3). Each is defined by a file in `eval/configs`, and the runner stores the sha256 of that file in every result. A comment in the file changes the hash, so change a config in a commit of its own.
+
+| Config | What it is |
+|---|---|
+| `full` | The product: planner, verifier, memory and stuck detector on, and both context tiers. |
+| `naive` | The same durable stack, tools, model, turn limit and cost limit. Planner, verifier, memory and stuck detector are off. The context mode is `sliding`: when a request would pass the hard limit, the oldest whole turns are dropped. |
+| `single_shot` | No loop and no tools. The five files closest to the issue by BM25, plus the repo map, in one prompt; one call asks for a unified diff. |
+
+For the naive config the runner can apply the context mode only: it travels with each task in the workflow memo. The planner, the verifier, memory and the stuck detector are not per-run switches yet. The file records them as off, the worker's own config decides what runs, and a part that the stack does not have yet is not there. When a story adds one of those switches, it makes the runner pass the config's value on.
+
+The single-shot baseline works in three steps (`eval/baselines/single_shot.py`):
+
+1. Retrieve. BM25 (`rank_bm25`) between the issue and the text of each file the agent would see, with camelCase and snake_case names split into words. Files with equal scores come in path order. The top five go into the prompt whole (a file over 30,000 characters is cut and says so), after the repo map.
+2. Ask. One call through the provider protocol with no tools and the larger output cap of the loop (`max_tokens_retry`), because the reply is a whole diff. A provider error that asking again can fix is retried up to three times, and each billed call is a ledger row.
+3. Apply. The reply is searched for the diff, which may sit in a code fence between prose. Every path in it is checked first: no absolute path, no `..`, nothing in `.git`. The check reads the `---` and `+++` lines, the `diff --git` and rename lines, and also the `Index:` lines and context diff headers, because `patch` takes file names from those too and the `patch` of macOS follows a `..` in them. Then `git apply --recount` runs on a throwaway copy of the repo, one file at a time, and when git refuses, `patch -p1 -u --fuzz=2` runs on a fresh copy. It is given only the `---` and `+++` headers and the hunks of the diff, so a line it would read a name from, and any ed command, never reaches it. A reply cut off at max tokens is not applied. The number of files in step 1 is `top_files` in `eval/configs/single_shot.yaml`.
+
+Compare the three on one model by giving the runs a run set. The model comes from the config of the worker, so the runs of a set share it unless the worker was started with another config:
+
+```bash
+uv run python eval/run.py --set custom --config full --run-set headline --run-id headline-full
+uv run python eval/run.py --set custom --config naive --run-set headline --run-id headline-naive
+uv run python eval/run.py --set custom --config single_shot --run-set headline --run-id headline-single-shot
+```
+
+A dry run of the single-shot config plays `tests/fixtures/scripts/eval_single_shot` (one script per task, each with the one answer) in place of `tests/fixtures/scripts/eval`.
 
 ### The custom task set
 

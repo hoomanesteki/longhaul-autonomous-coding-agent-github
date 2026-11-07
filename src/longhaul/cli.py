@@ -362,8 +362,9 @@ def run(
         typer.Option(
             "--context-mode",
             help="Which context tiers this run uses: `full` (elide old tool outputs and compact), "
-            "`no_compaction` (elide only) or `none` (neither; the run ends with `context limit` "
-            "when the window is full). Default: context.mode of the worker's config.",
+            "`no_compaction` (elide only), `none` (neither; the run ends with `context limit` "
+            "when the window is full) or `sliding` (neither; the oldest turns are dropped when "
+            "the window is full). Default: context.mode of the worker's config.",
         ),
     ] = None,
     plan: Annotated[

@@ -15,15 +15,23 @@ the runner ends it when the pause lasts a minute.
 
 The worker is started separately (`uv run longhaul worker`) and must see the same
 LONGHAUL_CKPT_DIR as this command, because the patch is read from the checkpoint repo. Its
-config decides the model, the context settings and the memory. `--model`, `--memory` and
-`--context-mode` are recorded in the result files and `--model` is checked against the config,
-but none of them changes the worker. Start it with the config that you mean to measure.
+config decides the model and the memory. `--model` is checked against it and `--memory` is
+recorded in the result files, but neither changes the worker, so start it with the config that
+you mean to measure.
+
+The configs (LH-903). `--config` names a file in eval/configs, and the sha256 of the file is
+stored in every result. `full` and `naive` run on the durable stack, and the runner sends the
+context mode of the config (or of `--context-mode`, for an ablation of `full`) with each task, so
+the worker applies it. `single_shot` has no workflow: the runner builds the repo map in a sandbox,
+makes the one model call itself (eval/baselines/single_shot.py), books it on the cost ledger and
+grades the patch like any other. Runs that are compared share a `--run-set`, and the runner refuses
+to put two models in one unless `--allow-mixed-models` is passed (plan section 8.4).
 
 The SWE-bench set (LH-902) runs the same way, with three differences. The repo of a task is the
 copy of an instance image (eval/swebench/adapter.py), the task runs in the sandbox image of the
 instance, and the official harness grades the whole run afterwards: the files say `not graded yet`
-until `eval/swebench/grade.sh` has filled in `resolved`. The naive and single-shot configs (LH-903)
-are accepted as flags and refused with a message until their story lands.
+until `eval/swebench/grade.sh` has filled in `resolved`. Every config runs on it. A single-shot
+task reads the same copy and builds its repo map in the image of the instance.
 """
 
 from __future__ import annotations
@@ -50,10 +58,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker  # noqa: E40
 from temporalio.client import Client, WorkflowFailureError, WorkflowHandle  # noqa: E402
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
-from eval import custom_tasks, grade_custom, results  # noqa: E402
+from eval import config_files, custom_tasks, grade_custom, results  # noqa: E402
+from eval.baselines import single_shot  # noqa: E402
 from eval.swebench import adapter as swebench_adapter  # noqa: E402
 from eval.swebench import images as swebench_images  # noqa: E402
-from longhaul.agent.workspace import DEFAULT_TEST_COMMAND  # noqa: E402
+from longhaul.agent.loop import LoopConfig  # noqa: E402
+from longhaul.agent.workspace import (  # noqa: E402
+    DEFAULT_TEST_COMMAND,
+    prepare_local_workspace,
+    read_image_file,
+)
 from longhaul.blobs.base import BlobStoreBase  # noqa: E402
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore  # noqa: E402
 from longhaul.cli import (  # noqa: E402
@@ -65,19 +79,29 @@ from longhaul.cli import (  # noqa: E402
     open_client,
     try_status,
 )
+from longhaul.context.modes import ContextMode  # noqa: E402
 from longhaul.contracts import (  # noqa: E402
     Budgets,
+    CallOptions,
+    LLMProvider,
     Outcome,
     OutcomeKind,
     Phase,
+    ProviderError,
     RepoSettings,
+    Role,
     TaskSpec,
     TaskStatus,
 )
+from longhaul.cost.ledger import Ledger, SqlLedger  # noqa: E402
+from longhaul.cost.pricing import load_pricing  # noqa: E402
 from longhaul.db.models import CostLedgerRow  # noqa: E402
 from longhaul.db.session import make_engine  # noqa: E402
 from longhaul.durable.client import cancel_task, get_task, start_task  # noqa: E402
 from longhaul.durable.scripts import upload_script  # noqa: E402
+from longhaul.github.intake import LOCAL_PREFIX  # noqa: E402
+from longhaul.memory.repo_map import build_repo_map  # noqa: E402
+from longhaul.providers.base import get_provider  # noqa: E402
 from longhaul.sandbox.docker_manager import DockerSandboxManager  # noqa: E402
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config  # noqa: E402
 
@@ -104,10 +128,17 @@ WORKFLOW_PREFIX = "lh-eval-"
 SCRIPT_SUFFIX = ".yaml"
 
 SETS = ("custom", "swebench")
-CONFIGS = ("full", "naive", "single_shot")
+CONFIGS = results.CONFIG_NAMES
 SWITCHES = ("on", "off")
-CONTEXT_MODES = ("full", "no_compaction", "none")
+CONTEXT_MODES = tuple(mode.value for mode in ContextMode)
 PROVIDERS = ("anthropic", "openai", "scripted", "replay")
+# Plan section 8.2 draws the SWE-bench subset with this seed. A result records the seed of its run.
+DEFAULT_SEED = 42
+# The single-shot call is asked again after a provider error that asking again can fix, with the
+# wait that the provider named, or else this many seconds doubled for each failure.
+CALL_ATTEMPTS = 3
+RETRY_BASE_S = 2.0
+RETRY_MAX_S = 30.0
 
 
 # ---------- options ----------
@@ -119,13 +150,18 @@ class RunOptions:
     model: str | None = None
     limit: int | None = None
     concurrency: int = 1
-    memory: results.Switch = "on"
+    # What the operator asked for. None leaves it to the config file (eval/configs).
+    memory: results.Switch | None = None
     context_mode: results.ContextMode | None = None
     provider: str | None = None
     # A script file serves every task. A folder holds one script per task, named <task id>.yaml.
     script: Path | None = None
     results_dir: Path = DEFAULT_RESULTS_DIR
     pause_timeout_s: float = PAUSE_TIMEOUT_S
+    seed: int = DEFAULT_SEED
+    # Runs that are compared with each other share a name, and share one model.
+    run_set: str | None = None
+    allow_mixed_models: bool = False
 
     @property
     def scripted(self) -> bool:
@@ -164,8 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="the coder model; it must match the worker's config")
     parser.add_argument("--limit", type=positive_int, help="run only the first N tasks")
     parser.add_argument("--concurrency", type=positive_int, default=1, metavar="K")
-    parser.add_argument("--memory", choices=SWITCHES, default="on", help="recorded in the results")
-    parser.add_argument("--context-mode", choices=CONTEXT_MODES, help="recorded in the results")
+    parser.add_argument("--memory", choices=SWITCHES, help="recorded in the results")
+    parser.add_argument(
+        "--context-mode",
+        choices=CONTEXT_MODES,
+        help="in place of the config's, for an ablation of --config full; sent with each task",
+    )
     parser.add_argument("--provider", choices=PROVIDERS)
     parser.add_argument(
         "--script",
@@ -174,6 +214,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--pause-timeout-s", type=positive_float, default=PAUSE_TIMEOUT_S)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="recorded in the results")
+    parser.add_argument(
+        "--run-set",
+        help="names the runs that are compared with each other; they must share one model",
+    )
+    parser.add_argument(
+        "--allow-mixed-models",
+        action="store_true",
+        help="let this run use another model than the earlier runs of its --run-set",
+    )
     return parser
 
 
@@ -181,13 +231,24 @@ def parse_args(argv: Sequence[str] | None = None) -> RunOptions:
     """Read the command line. Every mistake ends with a usage error (exit code 2)."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not RUN_ID.fullmatch(args.run_id):
-        parser.error(
-            "--run-id must be 1 to 40 letters, digits, '.', '_' or '-', starting with a letter "
-            f"or a digit, not {args.run_id!r}"
-        )
+    for flag, value in (("--run-id", args.run_id), ("--run-set", args.run_set)):
+        if value is not None and not RUN_ID.fullmatch(value):
+            parser.error(
+                f"{flag} must be 1 to 40 letters, digits, '.', '_' or '-', starting with a "
+                f"letter or a digit, not {value!r}"
+            )
+    try:
+        config_files.load(args.config)
+    except ValueError as exc:
+        parser.error(f"--config {args.config}: {exc}")
     if args.config != "full":
-        parser.error(f"--config {args.config} is not available yet: the baselines come with LH-903")
+        for flag, value in (("--context-mode", args.context_mode), ("--memory", args.memory)):
+            if value is not None:
+                parser.error(
+                    f"{flag} only goes with --config full. The {args.config} config sets it in "
+                    f"its file, and the hash of that file is stored with each result. Use "
+                    f"--config full for an ablation"
+                )
     provider = args.provider
     if args.script is not None:
         if provider not in (None, "scripted"):
@@ -210,7 +271,24 @@ def parse_args(argv: Sequence[str] | None = None) -> RunOptions:
         script=args.script,
         results_dir=args.results_dir,
         pause_timeout_s=args.pause_timeout_s,
+        seed=args.seed,
+        run_set=args.run_set,
+        allow_mixed_models=args.allow_mixed_models,
     )
+
+
+def effective_context_mode(options: RunOptions) -> ContextMode | None:
+    """The context mode of the run: `--context-mode`, else the one in the config file."""
+    if options.context_mode is not None:
+        return ContextMode(options.context_mode)
+    return config_files.load(options.config).config.context_mode
+
+
+def effective_memory(options: RunOptions) -> results.Switch:
+    """Memory as the result files record it: `--memory`, else the config file's switch."""
+    if options.memory is not None:
+        return options.memory
+    return config_files.switch(config_files.load(options.config).config.memory)
 
 
 # ---------- tasks ----------
@@ -304,6 +382,26 @@ def resolve_model(options: RunOptions, cfg: AppConfig) -> str:
             f"that names {options.model} as the coder"
         )
     return coder
+
+
+def check_run_set(options: RunOptions, model: str) -> None:
+    """Refuse a run whose model differs from the earlier runs of its run set.
+
+    The runs of a set are the configs that a comparison puts side by side, and a comparison needs
+    one model (plan section 8.4). The earlier runs are read from the results folder. A run with no
+    run set is compared with nothing, and `--allow-mixed-models` turns the check off.
+    """
+    if options.run_set is None or options.allow_mixed_models:
+        return
+    earlier = results.models_in_run_set(options.results_dir, options.run_set)
+    others = {run: used for run, used in earlier.items() if used != model}
+    if others:
+        named = ", ".join(f"{run} used {used}" for run, used in sorted(others.items()))
+        raise ValueError(
+            f"the run set {options.run_set} has runs on other models ({named}) and this run "
+            f"would use {model}. The runs of a comparison have to use one model (plan section "
+            f"8.4). Pass --allow-mixed-models to run it anyway"
+        )
 
 
 def claim_run_dir(results_dir: Path, run_id: str) -> Path:
@@ -476,6 +574,11 @@ class RunContext:
     # None for the custom set. The SWE-bench set brings a driver of its own.
     driver: TaskDriver | None = None
     wall_limit_s: float = (CUSTOM_BUDGETS.task_wall_minutes * 60) + WALL_MARGIN_S
+    # The single-shot config only: the worker's config for the image and the output caps, who
+    # answers the one call (by script, for a scripted run), and the ledger that books it.
+    cfg: AppConfig | None = None
+    provider_for: Callable[[Path | None], LLMProvider] | None = None
+    ledger: Ledger | None = None
 
 
 async def ledger_totals(
@@ -555,18 +658,23 @@ async def clean_up(ctx: RunContext, workflow_id: str) -> None:
 def identity(ctx: RunContext, task: Task) -> dict[str, Any]:
     """The fields that every result of this run shares, whether the task finished or not."""
     options = ctx.options
+    mode = effective_context_mode(options)
     return {
         "run_id": options.run_id,
         "task_id": task.id,
         "workflow_id": workflow_id_for(options.run_id, task),
         "task_set": options.task_set,
         "config": options.config,
+        "config_hash": config_files.load(options.config).sha256,
+        "seed": options.seed,
+        "run_set": options.run_set,
+        "allow_mixed_models": options.allow_mixed_models,
         "model": ctx.model,
         "git_sha": ctx.commit,
         "provider": options.provider,
         "scripted": options.scripted,
-        "memory": options.memory,
-        "context_mode": options.context_mode,
+        "memory": effective_memory(options),
+        "context_mode": mode.value if mode is not None else None,
     }
 
 
@@ -639,6 +747,13 @@ async def grade_task(
 
 
 async def execute_task(ctx: RunContext, task: Task, started_at: datetime) -> results.TaskResult:
+    """Run one task the way its config says: as a workflow, or as one call."""
+    if config_files.load(ctx.options.config).config.runner == "single_shot":
+        return await execute_single_shot(ctx, task, started_at)
+    return await execute_durable(ctx, task, started_at)
+
+
+async def execute_durable(ctx: RunContext, task: Task, started_at: datetime) -> results.TaskResult:
     options = ctx.options
     workflow_id = workflow_id_for(options.run_id, task)
     script = script_for(options, task)
@@ -648,7 +763,11 @@ async def execute_task(ctx: RunContext, task: Task, started_at: datetime) -> res
     async with prepared_spec(ctx, task, workflow_id) as spec:
         try:
             await start_task(
-                ctx.client, spec, task_queue=ctx.settings.task_queue, script=script_ref
+                ctx.client,
+                spec,
+                task_queue=ctx.settings.task_queue,
+                script=script_ref,
+                context_mode=effective_context_mode(options),
             )
             live = TemporalTask(ctx.client, workflow_id)
             watched = await watch(
@@ -690,6 +809,160 @@ async def execute_task(ctx: RunContext, task: Task, started_at: datetime) -> res
     return result
 
 
+# ---------- the single-shot config ----------
+def problem_of(spec: TaskSpec) -> str:
+    """The issue as the baseline reads it: the title, then the body, as the agent gets them."""
+    return f"{spec.title}\n\n{spec.body}"
+
+
+def folder_of(spec: TaskSpec) -> Path:
+    """The folder of a task's repo. Every task of the runner is on a local folder."""
+    if not spec.repo.startswith(LOCAL_PREFIX):
+        raise ValueError(f"the task {spec.task_id} is not on a local folder: {spec.repo}")
+    return Path(spec.repo[len(LOCAL_PREFIX) :])
+
+
+async def repo_map_for(ctx: RunContext, folder: Path, workflow_id: str, problem: str) -> str:
+    """The repo map of a task's repo. The script that builds it runs in a sandbox, never here.
+
+    The sandbox is named after the task, so `clean_up` removes it. It runs in the image that the
+    folder asks for (the image of a SWE-bench instance), else in the worker's. A repo map that
+    cannot be built fails the task: the config says the prompt has one, and a quiet fallback
+    would measure something else. An empty map is not a failure; it means that no module fits or
+    none is Python.
+    """
+    assert ctx.cfg is not None  # a single-shot run always has the worker config
+    image = await asyncio.to_thread(read_image_file, folder)
+    workspace = await prepare_local_workspace(
+        ctx.sandboxes,
+        folder,
+        task_id=workflow_id,
+        image=image or ctx.cfg.sandbox.image,
+        limits=ctx.cfg.sandbox.limits,
+        setup_command="",
+    )
+    return await build_repo_map(workspace.sandbox, problem)
+
+
+async def ask_once(
+    ctx: RunContext, task: Task, spec: TaskSpec, repo_map: str
+) -> single_shot.SingleShotResult:
+    """The one model call of a single-shot task, asked again after an error that may pass.
+
+    Every call that was billed is on the cost ledger (invariant I6), with the number of the try
+    as its attempt: the calls that failed after they were billed, and the one that answered. The
+    answer is booked before its diff is applied, so a failure of git or patch cannot lose the row.
+    The number of files in the prompt is `top_files` of the config file, which the hash covers.
+    """
+    assert ctx.cfg is not None
+    assert ctx.provider_for is not None
+    assert ctx.ledger is not None
+    top_files = config_files.load(ctx.options.config).config.top_files
+    assert top_files is not None  # the config of a single-shot run has to name it
+    loop = LoopConfig.from_config(ctx.cfg, Role.CODER)
+    call = CallOptions(effort=loop.effort) if loop.effort is not None else None
+    provider = ctx.provider_for(script_for(ctx.options, task))
+    folder = folder_of(spec)
+    workflow_id = spec.task_id
+    for attempt in range(1, CALL_ATTEMPTS + 1):
+        try:
+            asked = await single_shot.ask(
+                provider,
+                model=ctx.model,
+                repo=folder,
+                problem=problem_of(spec),
+                repo_map=repo_map,
+                # The reply is a whole diff, so it gets the larger cap that the loop allows a
+                # turn that was cut off.
+                max_tokens=loop.max_tokens_retry,
+                options=call,
+                top=top_files,
+            )
+        except ProviderError as exc:
+            if exc.usage is not None:
+                await ctx.ledger.record(workflow_id, spec.repo, ctx.model, 0, attempt, exc.usage)
+            if not exc.retryable or attempt == CALL_ATTEMPTS:
+                raise
+            wait = exc.retry_after_s or RETRY_BASE_S * 2 ** (attempt - 1)
+            await asyncio.sleep(min(wait, RETRY_MAX_S))
+            continue
+        await ctx.ledger.record(workflow_id, spec.repo, ctx.model, 0, attempt, asked.usage)
+        return await single_shot.apply_reply(folder, asked)
+    raise AssertionError("the loop returns or raises on its last try")
+
+
+def single_shot_outcome(
+    answer: single_shot.SingleShotResult | None, failure: str | None
+) -> Outcome:
+    """`pr_opened` when a patch was applied, which is what the grader needs. Else an error."""
+    if answer is not None and answer.error is None:
+        files = ", ".join(answer.files)
+        return Outcome(
+            kind=OutcomeKind.PR_OPENED,
+            summary=f"Applied a diff with {answer.method} (files in the prompt: {files}).",
+        )
+    reason = failure or (answer.error if answer is not None else None) or "no answer"
+    return Outcome(kind=OutcomeKind.ERROR, summary=reason)
+
+
+async def execute_single_shot(
+    ctx: RunContext, task: Task, started_at: datetime
+) -> results.TaskResult:
+    """Run one task as one model call, grade the patch and write the result file.
+
+    The call is on the ledger under the id that a workflow would have, so the cost of every
+    config comes from the same table. A provider that keeps failing, a reply with no diff and a
+    diff that does not apply are the model's failures: the task ends with an error result and is
+    not graded. Anything else is the runner's, and `run_one` records it. The task reads the repo
+    that its set prepares (prepared_spec), and the patch is cut and graded the way its set does
+    it, so a SWE-bench task leaves the patch the harness grades later.
+    """
+    options = ctx.options
+    workflow_id = workflow_id_for(options.run_id, task)
+    answer: single_shot.SingleShotResult | None = None
+    failure: str | None = None
+    async with prepared_spec(ctx, task, workflow_id) as spec:
+        try:
+            try:
+                async with asyncio.timeout(ctx.wall_limit_s):
+                    folder = folder_of(spec)
+                    repo_map = await repo_map_for(ctx, folder, workflow_id, problem_of(spec))
+                    answer = await ask_once(ctx, task, spec, repo_map)
+            except ProviderError as exc:
+                failure = f"the provider failed: {exc.kind.value}: {exc.message}"
+            except TimeoutError:
+                failure = f"the time limit of {ctx.wall_limit_s:.0f} s passed"
+            ended_at = datetime.now(UTC)
+            outcome = single_shot_outcome(answer, failure)
+            patch = answer.patch if answer is not None else ""
+            if ctx.driver is not None:
+                patch = ctx.driver.patch(task, patch)
+            resolved, grading = await grade_task(ctx, task, outcome, patch, workflow_id)
+            cost_usd, tokens = await ledger_totals(ctx.sessions, workflow_id)
+        except BaseException:
+            await abandon(ctx, workflow_id)
+            raise
+    await clean_up(ctx, workflow_id)
+    (ctx.folder / f"{results.check_task_id(task.id)}.patch").write_text(patch, encoding="utf-8")
+    result = results.TaskResult(
+        **identity(ctx, task),
+        outcome=outcome.kind.value,
+        outcome_summary=outcome.summary,
+        resolved=resolved,
+        grading=grading,
+        cost_usd=cost_usd,
+        tokens=tokens,
+        cache_ratio=results.cache_ratio(tokens),
+        started_at=started_at,
+        ended_at=ended_at,
+        wall_time_s=(ended_at - started_at).total_seconds(),
+        turns=1 if answer is not None else 0,
+    )
+    results.write_result(ctx.folder, result)
+    print(describe(result), flush=True)
+    return result
+
+
 def describe(result: results.TaskResult) -> str:
     verdict = {True: "resolved", False: "not resolved", None: "not graded"}[result.resolved]
     return (
@@ -716,21 +989,49 @@ async def run_tasks(ctx: RunContext, tasks: Sequence[Task]) -> list[results.Task
     return [job.result() for job in running]
 
 
+def make_provider_factory(
+    options: RunOptions, settings: EnvSettings
+) -> Callable[[Path | None], LLMProvider]:
+    """Who answers the single-shot call: the provider asked for, else the one of the settings.
+
+    A scripted run gets a provider for the script of the task. Each script is read once, because
+    tasks that share a script share the provider and a provider keeps no state between calls.
+    """
+    chosen = settings.model_copy(update={"provider": options.provider or settings.provider})
+    made: dict[Path | None, LLMProvider] = {}
+
+    def provider_for(script: Path | None) -> LLMProvider:
+        if script not in made:
+            made[script] = get_provider(chosen, script_path=script)
+        return made[script]
+
+    return provider_for
+
+
 async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summary:
     """Run the tasks, write the result files and the summary, and return the summary.
 
     Everything that can be checked without starting a task is checked first, so a mistake costs
-    nothing: the model, the repos, the scripts, the settings of the stack and the run id. The
-    results folder is made last, so a run that stops before its first task leaves no trace.
+    nothing: the model and the run set, the repos, the scripts, the provider of a single-shot
+    run, the settings of the stack and the run id. The results folder is made last, so a run that
+    stops before its first task leaves no trace.
     """
     cfg = load_config(config_path(settings))
     model = resolve_model(options, cfg)
+    check_run_set(options, model)
     tasks = select_tasks(options)
     await asyncio.to_thread(
         check_tasks, [t for t in tasks if isinstance(t, custom_tasks.CustomTask)]
     )
     for task in tasks:
         script_for(options, task)
+    provider_for: Callable[[Path | None], LLMProvider] | None = None
+    pricing = None
+    if config_files.load(options.config).config.runner == "single_shot":
+        provider_for = make_provider_factory(options, settings)
+        for task in tasks:
+            provider_for(script_for(options, task))  # a script that does not load stops the run
+        pricing = load_pricing(options.provider or settings.provider, cfg)
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set: the cost comes from the cost ledger")
 
@@ -740,6 +1041,7 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
     folder = claim_run_dir(options.results_dir, options.run_id)
 
     engine = make_engine(settings.database_url.get_secret_value())
+    sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
     sandboxes = DockerSandboxManager()
     driver = swebench_adapter.SwebenchDriver() if options.task_set == "swebench" else None
     started_at = datetime.now(UTC)
@@ -750,7 +1052,7 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
             client=client,
             blobs=blobs,
             store=make_store(blobs, settings),
-            sessions=async_sessionmaker[AsyncSession](engine, expire_on_commit=False),
+            sessions=sessions,
             sandboxes=sandboxes,
             grader=grade_custom.Grader(
                 sandboxes, image=cfg.sandbox.image, limits=cfg.sandbox.limits
@@ -759,6 +1061,9 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
             commit=git_sha(),
             folder=folder,
             driver=driver,
+            cfg=cfg,
+            provider_for=provider_for,
+            ledger=SqlLedger(sessions, pricing) if pricing is not None else None,
         )
         finished = await run_tasks(ctx, tasks)
     finally:
@@ -774,12 +1079,12 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
 
 def main(argv: Sequence[str] | None = None) -> int:
     options = parse_args(argv)
-    unapplied_provider = options.provider not in (None, "scripted")
-    if options.memory != "on" or options.context_mode is not None or unapplied_provider:
+    durable = config_files.load(options.config).config.runner == "durable"
+    unapplied_provider = durable and options.provider not in (None, "scripted")
+    if options.memory is not None or unapplied_provider:
         print(
-            "note: --memory, --context-mode and --provider are recorded in the results. The "
-            "worker takes them from its own config, so start it with the settings you mean to "
-            "measure.",
+            "note: --memory and --provider are recorded in the results. The worker takes them "
+            "from its own config, so start it with the settings you mean to measure.",
             file=sys.stderr,
         )
     try:

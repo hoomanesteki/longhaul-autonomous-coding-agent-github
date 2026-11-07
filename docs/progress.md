@@ -45,10 +45,10 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-203 | Task workflow skeleton | 5 | Done | merge | 2026-10-31 |
 | LH-204 | LLM and tool activities | 5 | Done | merge | 2026-10-31 |
 | LH-205 | Git checkpoint store | 5 | Done | merge | 2026-10-31 |
-| LH-206 | Sandbox recovery and retry-safe tool execution | 5 | Todo | | |
-| LH-207 | Continue-As-New | 3 | Todo | | |
-| LH-208 | Worker process and run CLI | 3 | Todo | | |
-| LH-209 | Chaos test v1 | 5 | Todo | | |
+| LH-206 | Sandbox recovery and retry-safe tool execution | 5 | Done | merge | 2026-11-03 |
+| LH-207 | Continue-As-New | 3 | Done | merge | 2026-11-04 |
+| LH-208 | Worker process and run CLI | 3 | Done | merge | 2026-11-04 |
+| LH-209 | Chaos test v1 | 5 | Done | merge | 2026-11-04 |
 
 ## Phase 3: GitHub integration (tag v0.3.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -57,20 +57,20 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-302 | GitHub client and auth | 5 | Done | merge | 2026-10-31 |
 | LH-303 | Repo allowlist and issue intake | 3 | Done | merge | 2026-10-31 |
 | LH-304 | Idempotent side-effect activities | 5 | Done | merge | 2026-10-31 |
-| LH-305 | Clone from GitHub and push from the host | 5 | Todo | | |
-| LH-306 | PR creation and label lifecycle | 3 | Todo | | |
-| LH-307 | Poller workflow on a Temporal Schedule | 5 | Todo | | |
+| LH-305 | Clone from GitHub and push from the host | 5 | Done | merge | 2026-11-04 |
+| LH-306 | PR creation and label lifecycle | 3 | Done | merge | 2026-11-04 |
+| LH-307 | Poller workflow on a Temporal Schedule | 5 | Done | merge | 2026-11-04 |
 | LH-308 | Comment commands and issue-to-PR e2e | 5 | Todo | | |
 
 ## Phase 4: Context engineering (tag v0.4.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-401 | Token meter and context budget | 3 | Done | merge | 2026-10-31 |
-| LH-402 | Output handles and read_output | 3 | Todo | | |
-| LH-403 | Structured compaction | 5 | Todo | | |
-| LH-404 | Eviction and compaction in the workflow | 3 | Todo | | |
-| LH-405 | Prompt layout and cache breakpoints | 3 | Todo | | |
-| LH-406 | Context metrics and ablation flags | 2 | Todo | | |
+| LH-402 | Output handles and read_output | 3 | Done | merge | 2026-11-04 |
+| LH-403 | Structured compaction | 5 | Done | merge | 2026-11-03 |
+| LH-404 | Eviction and compaction in the workflow | 3 | Done | merge | 2026-11-04 |
+| LH-405 | Prompt layout and cache breakpoints | 3 | Done | merge | 2026-11-04 |
+| LH-406 | Context metrics and ablation flags | 2 | Done | merge | 2026-11-04 |
 | LH-407 | Long-task test | 3 | Todo | | |
 
 ## Phase 5: Planner, verifier and stuck handling (tag v0.5.0)
@@ -87,9 +87,9 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 6: Memory (tag v0.6.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-601 | Embedder and memory schema | 3 | Todo | | |
-| LH-602 | Repo map builder | 5 | Todo | | |
-| LH-603 | Memory store API and verified commands | 3 | Todo | | |
+| LH-601 | Embedder and memory schema | 3 | Done | merge | 2026-11-04 |
+| LH-602 | Repo map builder | 5 | Done | merge | 2026-11-04 |
+| LH-603 | Memory store API and verified commands | 3 | Done | merge | 2026-11-04 |
 | LH-604 | Retrieval into the prompt | 3 | Todo | | |
 | LH-605 | Lesson extraction | 3 | Todo | | |
 | LH-606 | Promotion on merged PRs and human approval | 3 | Todo | | |
@@ -98,12 +98,12 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 7: Budgets, cost and observability (tag v0.7.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-701 | Pricing table and cost ledger | 3 | Todo | | |
+| LH-701 | Pricing table and cost ledger | 3 | Done | merge | 2026-11-03 |
 | LH-702 | Budget enforcement and top-ups | 5 | Todo | | |
-| LH-703 | OpenTelemetry traces | 5 | Todo | | |
-| LH-704 | Prometheus metrics and Grafana dashboard | 3 | Todo | | |
+| LH-703 | OpenTelemetry traces | 5 | Done | merge | 2026-11-04 |
+| LH-704 | Prometheus metrics and Grafana dashboard | 3 | Done | merge | 2026-11-04 |
 | LH-705 | Run report | 3 | Todo | | |
-| LH-706 | Structured logs and redaction | 2 | Todo | | |
+| LH-706 | Structured logs and redaction | 2 | Done | merge | 2026-11-04 |
 
 ## Phase 8: Console (tag v0.8.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -127,5 +127,5 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-905 | Results report | 3 | Todo | | |
 | LH-906 | Security hardening pass | 3 | Todo | | |
 | LH-907 | Docs, README and demo | 3 | Todo | | |
-| LH-908 | Terraform for AWS (Could) | 5 | Todo | | |
+| LH-908 | Terraform for AWS (Could) | 5 | Done | merge | 2026-11-04 |
 | LH-909 | Route tool calls through Keystone (Could) | 3 | Todo | | |

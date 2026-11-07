@@ -11,12 +11,15 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from longhaul.contracts import EffortLevel, Role, SandboxLimits
 from longhaul.settings import (
+    DEFAULT_GIT_AUTHOR,
     AppConfig,
     EffortLevels,
     EnvSettings,
     ModelIds,
+    config_path,
     get_settings,
     load_config,
+    templates_path,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase0]
@@ -115,6 +118,11 @@ def test_every_role_has_an_entry_in_models_and_effort(section: type[BaseModel]) 
     assert set(section.model_fields) == set(ROLES)
 
 
+def test_example_config_keeps_prompts_and_tool_text_out_of_traces() -> None:
+    # Content capture is opt in (plan LH-703): prompts hold code and may hold secrets.
+    assert load_config(EXAMPLE).telemetry.capture_content is False
+
+
 @pytest.mark.parametrize("level", get_args(EffortLevel))
 def test_every_effort_level_loads(tmp_path: Path, level: str) -> None:
     data = _example_data()
@@ -143,6 +151,8 @@ def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: A
         pytest.param((), "effort", id="effort section"),
         pytest.param(("effort",), "compactor", id="effort.compactor"),
         pytest.param(("loop",), "max_tokens_retry", id="loop.max_tokens_retry"),
+        pytest.param((), "telemetry", id="telemetry section"),
+        pytest.param(("telemetry",), "capture_content", id="telemetry.capture_content"),
     ],
 )
 def test_new_settings_have_no_silent_default(
@@ -199,6 +209,7 @@ UNKNOWN_KEY_CASES = [
     pytest.param(("context",), "compact_att", id="context"),
     pytest.param(("loop",), "max_verify_round", id="loop"),
     pytest.param(("stuck",), "no_progress_turn", id="stuck"),
+    pytest.param(("telemetry",), "capture_contnt", id="telemetry"),
 ]
 
 
@@ -431,6 +442,7 @@ def test_environment_wins_over_dotenv(isolated_cwd: Path, monkeypatch: pytest.Mo
         ("LONGHAUL_GITHUB_APP_KEY_PATH", "github_app_key_path"),
         ("LONGHAUL_ADMIN_TOKEN", "admin_token"),
         ("LONGHAUL_SCRIPT", "script"),
+        ("LONGHAUL_RECORDINGS_DIR", "recordings_dir"),
         ("ANTHROPIC_API_KEY", "anthropic_api_key"),
         ("OPENAI_API_KEY", "openai_api_key"),
         ("OPENAI_BASE_URL", "openai_base_url"),
@@ -451,6 +463,28 @@ def test_env_example_config_path_exists_and_matches_default() -> None:
 
     assert (ROOT / configured).is_file()
     assert configured == EnvSettings.model_fields["config"].default
+
+
+def test_recording_settings_are_off_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_RECORDINGS_DIR", raising=False)
+    monkeypatch.delenv("LONGHAUL_RECORD", raising=False)
+    settings = EnvSettings()
+    assert settings.recordings_dir is None
+    assert settings.record is False
+
+
+def test_recording_settings_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_RECORDINGS_DIR", "eval/chaos/recordings/inventory")
+    monkeypatch.setenv("LONGHAUL_RECORD", "true")
+    settings = EnvSettings()
+    assert settings.recordings_dir == Path("eval/chaos/recordings/inventory")
+    assert settings.record is True
+
+
+def test_a_blank_record_variable_means_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A copied .env.example has the variable blank, and a blank must not turn recording on.
+    monkeypatch.setenv("LONGHAUL_RECORD", "")
+    assert EnvSettings().record is False
 
 
 def test_script_setting_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -532,7 +566,7 @@ def test_every_configured_model_has_all_four_prices() -> None:
 
 
 def test_prices_match_the_decided_rates() -> None:
-    # Per million tokens, from the provider's model table as cached on 2026-10-06.
+    # Per million tokens, from the provider's model table as checked on 2026-11-03.
     prices = _prices()
 
     assert _rates(prices["claude-sonnet-5-5"]) == {
@@ -585,3 +619,105 @@ def test_cache_prices_sit_around_the_input_price() -> None:
         assert block["cache_read_per_mtok"] < block["input_per_mtok"]
         assert block["input_per_mtok"] < block["cache_write_per_mtok"]
         assert block["cache_write_per_mtok"] < block["output_per_mtok"]
+
+
+# ---------- LH-208: finding the config from any working directory ----------
+def test_the_config_is_found_from_any_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LONGHAUL_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    assert not Path("config").exists()
+    assert config_path(EnvSettings(_env_file=None)).resolve() == EXAMPLE.resolve()
+
+
+def test_a_config_in_the_working_directory_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LONGHAUL_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "longhaul.example.yaml").write_text("{}", encoding="utf-8")
+    assert config_path(EnvSettings(_env_file=None)) == Path("config/longhaul.example.yaml")
+
+
+def test_an_absolute_config_path_is_used_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    named = tmp_path / "mine.yaml"
+    monkeypatch.setenv("LONGHAUL_CONFIG", str(named))
+    assert config_path(EnvSettings(_env_file=None)) == named
+
+
+# ---------- LH-306: the commit author and the templates ----------
+def test_the_commit_author_defaults_to_longhaul(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_GIT_AUTHOR", raising=False)
+    assert EnvSettings(_env_file=None).git_author == (  # type: ignore[call-arg]
+        "longhaul <longhaul@users.noreply.github.com>"
+    )
+
+
+def test_the_commit_author_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GIT_AUTHOR", "Ada <ada@example.com>")
+    assert EnvSettings(_env_file=None).git_author == "Ada <ada@example.com>"  # type: ignore[call-arg]
+
+
+def test_a_blank_commit_author_counts_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GIT_AUTHOR", "")
+    assert EnvSettings(_env_file=None).git_author == DEFAULT_GIT_AUTHOR  # type: ignore[call-arg]
+
+
+def test_the_templates_are_found_from_any_folder(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_TEMPLATES_DIR", raising=False)
+    found = templates_path(EnvSettings(_env_file=None))  # type: ignore[call-arg]
+    assert (found / "pr_body.md.j2").is_file()
+
+
+def test_the_templates_folder_can_be_set(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("LONGHAUL_TEMPLATES_DIR", str(tmp_path))
+    assert templates_path(EnvSettings(_env_file=None)) == tmp_path  # type: ignore[call-arg]
+
+
+def test_env_example_lists_the_commit_author() -> None:
+    assert _env_example()["LONGHAUL_GIT_AUTHOR"] == ""
+
+
+# ---------- the metrics endpoint of the worker (LH-704) ----------
+PROMETHEUS_CONFIG = ROOT / "docker" / "prometheus" / "prometheus.yml"
+
+
+def test_the_metrics_endpoint_defaults_to_the_port_prometheus_scrapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LONGHAUL_METRICS_PORT", raising=False)
+    monkeypatch.delenv("LONGHAUL_METRICS_HOST", raising=False)
+    settings = EnvSettings()
+
+    scraped = yaml.safe_load(PROMETHEUS_CONFIG.read_text(encoding="utf-8"))["scrape_configs"]
+    (worker,) = [job for job in scraped if job["job_name"] == "worker"]
+    (target,) = worker["static_configs"][0]["targets"]
+    assert target.rpartition(":")[2] == str(settings.metrics_port) == "9464"
+    # Only this machine can read it, unless an operator opens it (docs/runbook.md says how).
+    assert settings.metrics_host == "127.0.0.1"
+
+
+def test_the_metrics_endpoint_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", "9500")
+    monkeypatch.setenv("LONGHAUL_METRICS_HOST", "0.0.0.0")
+    settings = EnvSettings()
+    assert (settings.metrics_host, settings.metrics_port) == ("0.0.0.0", 9500)
+
+
+@pytest.mark.parametrize("port", ["-1", "65536", "nine"])
+def test_a_metrics_port_that_cannot_be_a_port_is_refused(
+    monkeypatch: pytest.MonkeyPatch, port: str
+) -> None:
+    monkeypatch.setenv("LONGHAUL_METRICS_PORT", port)
+    with pytest.raises(ValidationError):
+        EnvSettings()
+
+
+def test_the_example_env_file_names_the_metrics_settings() -> None:
+    example = _env_example()
+    assert example["LONGHAUL_METRICS_PORT"] == "9464"
+    assert example["LONGHAUL_METRICS_HOST"] == "127.0.0.1"

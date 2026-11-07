@@ -9,8 +9,18 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase0]
 
 def test_baseline_tables_registered() -> None:
     # Each story that adds a table adds it here: LH-205 checkpoints, LH-204 turns and
-    # tool_calls, LH-304 side_effects.
-    tables = {"repo_settings", "tasks", "checkpoints", "turns", "tool_calls", "side_effects"}
+    # tool_calls, LH-304 side_effects, LH-206 events, LH-701 cost_ledger, LH-601 memory_items.
+    tables = {
+        "repo_settings",
+        "tasks",
+        "checkpoints",
+        "turns",
+        "tool_calls",
+        "side_effects",
+        "events",
+        "cost_ledger",
+        "memory_items",
+    }
     assert set(Base.metadata.tables) == tables
 
 
@@ -19,10 +29,23 @@ def test_task_columns_match_data_model() -> None:
     assert set(columns) == {
         "id", "repo", "issue_number", "title", "status", "phase", "outcome", "pr_url",
         "model_coder", "cost_usd", "turns", "started_at", "ended_at", "settings", "created_at",
+        # The context totals of LH-406 (plan section 3.5 names them in that story).
+        "input_tokens_total", "output_tokens_total", "cache_read_total", "compactions",
+        "max_fraction",
     }  # fmt: skip
     assert columns["id"].primary_key
     assert columns["issue_number"].nullable
     assert not columns["repo"].nullable
+
+
+def test_task_context_totals_start_at_zero_and_are_never_null() -> None:
+    # A task row is made by the poller before any activity writes a total, and a report reads the
+    # columns of every row, so none of them may be NULL.
+    ddl = str(CreateTable(Task.__table__).compile(dialect=postgresql.dialect()))
+    for name in ("input_tokens_total", "output_tokens_total", "cache_read_total"):
+        assert f"{name} BIGINT DEFAULT 0 NOT NULL" in ddl
+    assert "compactions INTEGER DEFAULT 0 NOT NULL" in ddl
+    assert "max_fraction FLOAT DEFAULT 0 NOT NULL" in ddl
 
 
 def test_task_indexes_and_pk_name() -> None:
@@ -45,6 +68,7 @@ def test_turn_columns_match_data_model() -> None:
         "task_id", "turn_index", "attempt", "role", "request_ref", "response_ref",
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "cost_usd", "stop_reason", "latency_ms", "started_at", "ended_at", "created_at",
+        "cache_ratio",
     }  # fmt: skip
     keys = [c.name for c in Turn.__table__.primary_key.columns]
     assert keys == ["task_id", "turn_index", "attempt"]
@@ -66,6 +90,7 @@ def test_turn_ddl() -> None:
     assert "input_tokens INTEGER DEFAULT 0 NOT NULL" in ddl
     assert "cache_write_tokens INTEGER DEFAULT 0 NOT NULL" in ddl
     assert "cost_usd NUMERIC(10, 6) DEFAULT 0 NOT NULL" in ddl
+    assert "cache_ratio FLOAT DEFAULT 0 NOT NULL" in ddl
     assert "started_at TIMESTAMP WITH TIME ZONE NOT NULL" in ddl
     assert "created_at TIMESTAMP WITH TIME ZONE DEFAULT now() NOT NULL" in ddl
 

@@ -28,6 +28,7 @@ from longhaul.checkpoints.git_store import (
     GitCheckpointStore,
     RepoNotFoundError,
     _script,
+    _scrub,
     branch_name,
     bundle_key,
     check_clone_url,
@@ -46,6 +47,10 @@ TASK = "lh-acme-calc-42"
 BRANCH = "longhaul/42"
 MODULE = "src/calc/__init__.py"
 FIXED = "def add(a: int, b: int) -> int:\n    return a + b\n"
+# The third line after the changed one is empty, so the hunk of the patch ends on a context
+# line that holds a single space. Text that is stripped loses it.
+BLANK_TAIL_BEFORE = "def f():\n    x = 1\n    y = 2\n    return x + y\n\ndef g():\n    return 0\n"
+BLANK_TAIL_AFTER = BLANK_TAIL_BEFORE.replace("x = 1", "x = 10")
 
 _spec = importlib.util.spec_from_file_location(
     "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
@@ -56,11 +61,15 @@ _spec.loader.exec_module(_module)
 make_fixture_git = _module.make_fixture_git
 
 
+def host_env() -> dict[str, str]:
+    """The environment without GIT_* variables, which a running hook exports."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
 def git(*args: str) -> str:
     """Git on the host with no GIT_* variables from a running hook."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     result = subprocess.run(
-        ["git", *args], check=True, capture_output=True, text=True, env=env, timeout=60
+        ["git", *args], check=True, capture_output=True, text=True, env=host_env(), timeout=60
     )
     return result.stdout.strip()
 
@@ -658,6 +667,106 @@ async def test_a_push_that_is_refused_takes_the_local_commit_back(
     assert env.bare("rev-parse", f"{second}^") == env.base_sha
 
 
+# A shell command can make commits of its own. The tree is then clean against the new HEAD, so a
+# commit that is given its parent compares with the parent instead.
+AGENT_GIT = "git -c user.name=agent -c user.email=agent@example.com"
+
+
+async def test_commit_with_a_parent_builds_on_it_after_the_agent_moved_head(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, f"echo mine > mine.txt && git add mine.txt && {AGENT_GIT} commit -qm own")
+    assert (await sh(box, "git rev-parse HEAD")).strip() != env.base_sha
+    assert (await sh(box, "git status --porcelain")).strip() == ""
+
+    assert (
+        await env.store.commit(box, "lh: run_command turn 1 call c1") is None
+    )  # the old blind spot
+    sha = await env.store.commit(box, "lh: run_command turn 1 call c1", parent=env.base_sha)
+
+    assert sha is not None and env.head() == sha
+    assert env.bare("rev-parse", f"{sha}^") == env.base_sha
+    assert env.bare("show", f"{sha}:mine.txt") == "mine"
+    assert env.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "2"
+    assert (await sh(box, "git rev-parse HEAD")).strip() == sha
+
+
+async def test_commit_with_a_parent_on_a_tree_equal_to_it_moves_head_back_and_adds_nothing(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, f"{AGENT_GIT} commit -q --allow-empty -m nothing")
+
+    assert (
+        await env.store.commit(box, "lh: run_command turn 1 call c1", parent=env.base_sha) is None
+    )
+
+    assert (await sh(box, "git rev-parse HEAD")).strip() == env.base_sha
+    assert env.head() == env.base_sha
+    assert env.bare("rev-list", "--count", f"refs/heads/{BRANCH}") == "1"
+
+
+async def test_commit_with_a_parent_keeps_the_chain_when_the_agent_resets_past_it(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    first = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert first is not None
+    await sh(box, "git reset -q --hard HEAD~1")
+
+    sha = await env.store.commit(box, "lh: run_command turn 2 call c2", parent=first)
+
+    assert sha is not None and env.bare("rev-parse", f"{sha}^") == first
+    assert env.bare("rev-parse", f"{sha}^{{tree}}") == env.bare(
+        "rev-parse", f"{env.base_sha}^{{tree}}"
+    )
+
+
+async def test_commit_with_a_parent_that_only_the_checkpoint_repo_has_fetches_it(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    replaced = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert replaced is not None
+    await env.store.restore(box, env.base_sha)
+    await box.write_file("other.txt", b"other\n")
+    assert await env.store.commit(box, "lh: write_file turn 1 call c1")
+    # A new container clones the branch and so has the second commit only.
+    fresh_box = FakeSandbox()
+    try:
+        await env.store.attach(fresh_box, TASK)
+        assert await sh(fresh_box, f"git cat-file -t {replaced} 2>/dev/null || echo missing") == (
+            "missing\n"
+        )
+        await fresh_box.write_file("third.txt", b"third\n")
+
+        sha = await env.store.commit(fresh_box, "lh: write_file turn 2 call c2", parent=replaced)
+    finally:
+        await fresh_box.destroy()
+
+    assert sha is not None and env.bare("rev-parse", f"{sha}^") == replaced
+
+
+async def test_commit_with_a_parent_that_does_not_exist_fails_and_changes_nothing(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file("a.txt", b"a\n")
+
+    with pytest.raises(CheckpointError, match="not in the checkpoint repository"):
+        await env.store.commit(box, "lh: write_file turn 1 call c1", parent="c" * 40)
+
+    assert env.head() == env.base_sha
+    assert "a.txt" in await sh(box, "git status --porcelain")
+
+
+@pytest.mark.parametrize("parent", ["", "main", "HEAD~1", "$(touch pwned)", "A" * 40])
+async def test_commit_refuses_a_parent_that_is_not_a_full_sha(
+    plain_store: GitCheckpointStore, empty_box: FakeSandbox, parent: str
+) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await plain_store.commit(empty_box, "lh: write_file turn 1 call c1", parent=parent)
+    assert list(empty_box.root.iterdir()) == [], "nothing ran in the sandbox"
+
+
 # ---------- restore ----------
 
 
@@ -800,6 +909,29 @@ async def test_restore_keeps_the_directories_named_in_keep(env: Env, tmp_path: P
         await sandbox.destroy()
 
 
+async def test_restore_can_keep_the_files_that_git_ignores(env: Env, box: FakeSandbox) -> None:
+    await sh(box, "echo build/ >> .gitignore")
+    ignore = await env.store.commit(box, "lh: write_file turn 1 call c1")
+    assert ignore is not None
+    await sh(
+        box,
+        "mkdir -p build .venv && echo so > build/ext.so && echo keep > .venv/marker"
+        " && echo drift >> src/calc/__init__.py && echo x > report.xml && mkdir -p out/deep"
+        " && echo y > out/deep/y.txt && rm tests/test_calc.py",
+    )
+
+    await env.store.restore(box, ignore, keep_ignored=True)
+
+    # Only the changes are undone: tracked files, and new files that are not ignored.
+    assert (await sh(box, "git status --porcelain")).strip() == ""
+    assert (await sh(box, "git rev-parse HEAD")).strip() == ignore
+    assert (box.root / "tests" / "test_calc.py").exists()
+    assert not (box.root / "report.xml").exists()
+    assert not (box.root / "out").exists()
+    assert (box.root / "build" / "ext.so").read_text() == "so\n"
+    assert (box.root / ".venv" / "marker").read_text() == "keep\n"
+
+
 async def test_restore_of_an_unknown_commit_names_it(env: Env, box: FakeSandbox) -> None:
     await sh(box, "echo keep >> pyproject.toml")
     with pytest.raises(CheckpointError, match="1" * 40):
@@ -830,6 +962,214 @@ async def test_a_timeout_in_the_sandbox_is_a_checkpoint_error(
             await plain_store.commit(sandbox, "lh: edit_file turn 1 call c1")
     finally:
         await sandbox.destroy()
+
+
+# ---------- is_at ----------
+#
+# tool_exec asks before every call whether the workspace already is where the call has to start.
+# A yes skips the restore, which also deletes ignored files, so a build that the agent made
+# survives a run of calls that change nothing.
+
+
+async def test_a_fresh_workspace_is_at_its_commit(env: Env, box: FakeSandbox) -> None:
+    assert await env.store.is_at(box, env.base_sha)
+
+
+async def test_the_workspace_is_at_the_commit_it_saved(env: Env, box: FakeSandbox) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    sha = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert sha is not None
+
+    assert await env.store.is_at(box, sha)
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        "echo drift >> pyproject.toml",  # a tracked file changed
+        "rm tests/test_calc.py",  # a tracked file deleted
+        "echo new > notes.txt",  # an untracked file
+        "mkdir -p deep/dir && echo x > deep/dir/f",  # an untracked folder
+        "chmod +x pyproject.toml",  # a mode change
+        "echo staged > s.txt && git add s.txt",  # staged only
+        "git checkout -q -b feature",  # another branch at the same commit
+        "git checkout -q --detach",  # no branch at all
+        "rm -rf .git",  # no repository
+        "git init -q nested && echo n > nested/n.txt",  # a nested repository
+    ],
+)
+async def test_a_workspace_that_differs_is_not_at_the_commit(
+    env: Env, box: FakeSandbox, script: str
+) -> None:
+    await sh(box, script)
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+async def test_files_that_git_ignores_are_not_a_difference(env: Env, box: FakeSandbox) -> None:
+    # The venv and the caches are not part of a checkpoint, and a restore would delete the caches.
+    await sh(
+        box,
+        "mkdir -p .venv/bin src/calc/__pycache__ build.egg-info"
+        " && echo x > .venv/bin/python && echo y > src/calc/__pycache__/m.pyc"
+        " && echo z > build.egg-info/PKG-INFO",
+    )
+    assert await env.store.is_at(box, env.base_sha)
+
+
+async def test_a_config_the_agent_changed_cannot_hide_a_new_file(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, "git config status.showUntrackedFiles no && echo new > notes.txt")
+    assert not await env.store.is_at(box, env.base_sha)
+
+
+async def test_the_question_changes_nothing(env: Env, box: FakeSandbox) -> None:
+    await sh(box, "echo drift >> pyproject.toml && echo new > notes.txt")
+    before = snapshot(box.root)
+    head = env.head()
+
+    assert not await env.store.is_at(box, env.base_sha)
+
+    assert snapshot(box.root) == before
+    assert env.head() == head
+    assert (await sh(box, "git rev-parse HEAD")).strip() == env.base_sha
+
+
+async def test_a_stale_lock_does_not_stop_the_question_or_get_removed(
+    env: Env, box: FakeSandbox
+) -> None:
+    await sh(box, "touch .git/index.lock")
+    assert await env.store.is_at(box, env.base_sha)
+    assert (box.root / ".git" / "index.lock").exists()
+
+
+async def test_a_commit_the_workspace_never_had_is_not_the_commit_it_is_at(
+    env: Env, box: FakeSandbox
+) -> None:
+    assert not await env.store.is_at(box, "1" * 40)
+
+
+@pytest.mark.parametrize("sha", ["main", "HEAD", "abc", "a" * 40 + "; touch pwned", "$(id)"])
+async def test_is_at_only_takes_full_shas(
+    plain_store: GitCheckpointStore, empty_box: FakeSandbox, sha: str
+) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await plain_store.is_at(empty_box, sha)
+    assert list(empty_box.root.iterdir()) == [], "nothing ran in the sandbox"
+
+
+async def test_is_at_without_a_checkpoint_repo_says_so(env: Env) -> None:
+    sandbox = FakeSandbox()
+    env.store.mount_point = str(env.tmp_path / "nothing-here")
+    try:
+        with pytest.raises(CheckpointError, match="checkpoint repository"):
+            await env.store.is_at(sandbox, env.base_sha)
+    finally:
+        await sandbox.destroy()
+
+
+# ---------- diff (LH-208) ----------
+
+
+async def test_diff_is_the_patch_from_the_base_tag_to_a_checkpoint(
+    env: Env, box: FakeSandbox
+) -> None:
+    await box.write_file(MODULE, FIXED.encode())
+    head = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    assert head is not None
+
+    patch = await env.store.diff(TASK, head)
+
+    assert patch.splitlines()[0] == f"diff --git a/{MODULE} b/{MODULE}"
+    assert "-    return a - b" in patch and "+    return a + b" in patch
+    assert patch.endswith("\n")
+    assert patch.rstrip("\n") == env.bare("diff", "--no-color", env.base_sha, head)
+
+
+async def test_diff_keeps_the_blank_context_line_a_hunk_ends_on(tmp_path: Path) -> None:
+    folder = tmp_path / "blank-tail"
+    folder.mkdir()
+    (folder / "m.py").write_text(BLANK_TAIL_BEFORE, encoding="utf-8")
+    source = make_fixture_git(folder, tmp_path / "blank-tail-repo")
+    base_sha = git("-C", str(source), "rev-parse", "HEAD")
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "blank-root")
+    await store.init_task(TASK, str(source), base_sha)
+    store.mount_point = str(store.repo_path(TASK))
+    box = FakeSandbox()
+    try:
+        await store.attach(box, TASK)
+        await box.write_file("m.py", BLANK_TAIL_AFTER.encode())
+        head = await store.commit(box, "lh: edit_file turn 1 call c1")
+    finally:
+        await box.destroy()
+    assert head is not None
+
+    patch = await store.diff(TASK, head)
+
+    raw = subprocess.run(
+        ["git", f"--git-dir={store.repo_path(TASK)}", "diff", "--no-color", base_sha, head],
+        check=True, capture_output=True, text=True, timeout=60, env=host_env(),
+    ).stdout  # fmt: skip
+    assert raw.endswith("     return x + y\n \n"), "the probe must end on a blank context line"
+    assert patch == raw
+    # The patch has to apply to the base it was made against.
+    target = shutil.copytree(source, tmp_path / "target", ignore=shutil.ignore_patterns(".git"))
+    git("-C", str(target), "init", "-q", "--template=")
+    (target / "p.patch").write_text(patch, encoding="utf-8")
+    git("-C", str(target), "apply", "--check", "p.patch")
+
+
+async def test_diff_of_the_base_commit_is_empty(env: Env) -> None:
+    assert await env.store.diff(TASK, env.base_sha) == ""
+
+
+async def test_diff_reads_the_checkpoint_it_is_given_and_not_the_branch(
+    env: Env, box: FakeSandbox
+) -> None:
+    # An attempt that died can leave a commit on the branch that the workflow never learned of.
+    await box.write_file(MODULE, FIXED.encode())
+    first = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+    await box.write_file("NOTES.md", b"stray\n")
+    assert await env.store.commit(box, "lh: write_file turn 2 call c2")
+
+    patch = await env.store.diff(TASK, first or "")
+
+    assert "NOTES.md" not in patch
+
+
+async def test_diff_does_not_run_an_external_diff_program_the_agent_configured(
+    env: Env, box: FakeSandbox
+) -> None:
+    # The agent can write to the bare repo, so its config is untrusted (see the module docstring).
+    marker = env.tmp_path / "ran"
+    program = env.tmp_path / "spy.sh"
+    program.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    program.chmod(0o755)
+    env.bare("config", "diff.external", str(program))
+    await box.write_file(MODULE, FIXED.encode())
+    head = await env.store.commit(box, "lh: edit_file turn 1 call c1")
+
+    patch = await env.store.diff(TASK, head or "")
+
+    assert "+    return a + b" in patch
+    assert not marker.exists()
+
+
+async def test_diff_of_a_task_without_a_repo_says_so(plain_store: GitCheckpointStore) -> None:
+    with pytest.raises(RepoNotFoundError):
+        await plain_store.diff(TASK, "a" * 40)
+
+
+@pytest.mark.parametrize("sha", ["HEAD", "main", "abc", "a" * 40 + " --output=x"])
+async def test_diff_only_takes_full_shas(env: Env, sha: str) -> None:
+    with pytest.raises(ValueError, match="sha"):
+        await env.store.diff(TASK, sha)
+
+
+async def test_diff_of_a_commit_the_repo_does_not_have_is_a_checkpoint_error(env: Env) -> None:
+    with pytest.raises(CheckpointError, match="diff"):
+        await env.store.diff(TASK, "1" * 40)
 
 
 # ---------- bundles ----------
@@ -1178,3 +1518,88 @@ async def test_cleanup_removes_the_repo_even_when_its_files_are_read_only(
 
     assert not env.repo.exists()
     assert not env.store.has_repo(TASK)
+
+
+# ---------- git config for a clone that needs a credential (LH-305) ----------
+
+SECRET = "c2VjcmV0LXRva2Vu"
+GIT_CONFIG = ["-c", f"http.https://github.com/.extraheader=AUTHORIZATION: basic {SECRET}"]
+
+
+def record_commands(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """The words of every command that the store starts, as git sees them."""
+    seen: list[list[str]] = []
+    real = asyncio.create_subprocess_exec
+
+    async def record(*args: str, **kwargs: object) -> asyncio.subprocess.Process:
+        seen.append([str(word) for word in args])
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr("longhaul.checkpoints.git_store.asyncio.create_subprocess_exec", record)
+    return seen
+
+
+async def test_init_task_gives_git_the_config_before_the_clone_and_keeps_none_of_it(
+    tmp_path: Path, template: Template, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen = record_commands(monkeypatch)
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    await store.init_task(TASK, str(template.source), template.base_sha, git_config=GIT_CONFIG)
+
+    (clone,) = [words for words in seen if "clone" in words]
+    at = clone.index("clone")
+    assert clone[at - 2 : at] == GIT_CONFIG, "the pair sits right before the subcommand"
+    # Not in a file of the repo (the sandbox reads them), and not in any other command's words.
+    for path in store.repo_path(TASK).rglob("*"):
+        if path.is_file():
+            assert SECRET.encode() not in path.read_bytes(), path
+    assert [words for words in seen if SECRET in " ".join(words) and "clone" not in words] == []
+
+
+async def test_a_failed_clone_with_config_is_still_reported_as_a_clone(
+    tmp_path: Path,
+) -> None:
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    with pytest.raises(CheckpointError, match="git clone failed") as caught:
+        await store.init_task(TASK, str(tmp_path / "missing"), "a" * 40, git_config=GIT_CONFIG)
+
+    assert SECRET not in str(caught.value)
+    assert list((tmp_path / "ckpt").iterdir()) == [], "nothing half built is left"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        ["--exec-path=/tmp/x"],
+        ["-c"],
+        ["-c", "core.sshCommand"],
+        ["-c", "=value"],
+        ["-C", "/", "-c", "a=b"],
+        ["-c", "a=b", "--upload-pack=x"],
+        ["-c", "a=b\n-c"],
+    ],
+)
+async def test_init_task_takes_only_pairs_of_dash_c_and_a_setting(
+    tmp_path: Path, template: Template, config: list[str]
+) -> None:
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+
+    with pytest.raises(ValueError, match="git_config"):
+        await store.init_task(TASK, str(template.source), template.base_sha, git_config=config)
+
+    assert not (tmp_path / "ckpt").exists()
+
+
+def test_scrub_hides_the_value_of_the_config_and_the_secret_inside_it() -> None:
+    text = f"fatal: AUTHORIZATION: basic {SECRET} was refused ({SECRET})"
+
+    scrubbed = _scrub(text, GIT_CONFIG)
+
+    assert SECRET not in scrubbed
+    assert scrubbed == "fatal: *** was refused (***)"
+
+
+def test_scrub_leaves_text_alone_when_there_is_no_config() -> None:
+    assert _scrub("fatal: nothing secret", ()) == "fatal: nothing secret"

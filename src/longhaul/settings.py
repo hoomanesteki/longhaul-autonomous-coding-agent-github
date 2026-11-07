@@ -13,7 +13,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from longhaul.context.modes import ContextMode
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
+
+# The identity of the commits on a pull request branch, written the way git writes an author.
+# squash.parse_author checks it when the worker starts.
+DEFAULT_GIT_AUTHOR = "longhaul <longhaul@users.noreply.github.com>"
 
 # A key is secret-looking when its name contains one of these after it is lower-cased and
 # stripped of separators. Matching inside the flattened name catches camelCase (githubToken),
@@ -61,8 +66,50 @@ class EnvSettings(BaseSettings):
     script: Path | None = None
     # Where the worker keeps one bare repo per task. Unset means ~/.longhaul/ckpt (ADR-0006).
     ckpt_dir: Path | None = None
+    # Recorded model calls (LH-209). With provider "replay" the provider plays this folder. With
+    # `record` on, the provider of the run is wrapped and saves every call into it.
+    recordings_dir: Path | None = None
+    record: bool = False
+    # Author and committer of the commits on a pull request branch (LH-306).
+    git_author: str = DEFAULT_GIT_AUTHOR
+    # Where the Jinja templates are, such as pr_body.md.j2. Unset means templates/ in the checkout.
+    templates_dir: Path | None = None
     otel_exporter_otlp_endpoint: str | None = Field(
         default=None, validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT"
+    )
+    # Where the worker serves its Prometheus metrics (telemetry/metrics.py). The port is the one
+    # docker/prometheus/prometheus.yml scrapes. The host keeps the endpoint on this machine; a
+    # Prometheus in Docker on Linux reaches the host through the docker bridge and needs
+    # 0.0.0.0 (docs/runbook.md). Port 0 lets the system choose a free port.
+    metrics_port: int = Field(default=9464, ge=0, le=65535)
+    metrics_host: str = "127.0.0.1"
+
+
+# longhaul/settings.py -> longhaul -> src -> the checkout.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def config_path(settings: EnvSettings) -> Path:
+    """The config file: the one named by LONGHAUL_CONFIG, found from any working directory.
+
+    The default is a path relative to the repo root. Run from another folder it would be
+    missing, so the checkout this package lives in is tried next.
+    """
+    path = settings.config
+    if path.is_absolute() or path.exists():
+        return path
+    bundled = PROJECT_ROOT / path
+    return bundled if bundled.exists() else path
+
+
+def templates_path(settings: EnvSettings) -> Path:
+    """The folder of the Jinja templates: LONGHAUL_TEMPLATES_DIR, else templates/ of the checkout.
+
+    The worker image copies the folder next to the code and sets the variable, because an
+    installed package does not sit inside the checkout.
+    """
+    return (
+        settings.templates_dir if settings.templates_dir is not None else PROJECT_ROOT / "templates"
     )
 
 
@@ -119,6 +166,10 @@ class Context(StrictModel):
     keep_recent_turns: int
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
+    # Which of the two tiers run (LH-406). `full` is what the product does, and the default keeps
+    # every config written before the mode existed on that behavior. A run can name its own mode
+    # (`longhaul run --context-mode`), and that wins over this one.
+    mode: ContextMode = ContextMode.FULL
 
 
 class Loop(StrictModel):
@@ -147,6 +198,12 @@ class Stuck(StrictModel):
     hint_wait_hours: int
 
 
+class Telemetry(StrictModel):
+    # Prompts, tool arguments and tool output can hold code and secrets. Spans carry names,
+    # sizes and timings only, unless this is on (plan LH-703).
+    capture_content: bool
+
+
 class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
@@ -156,6 +213,7 @@ class AppConfig(StrictModel):
     context: Context
     loop: Loop
     stuck: Stuck
+    telemetry: Telemetry
     pricing_file: Path
 
 

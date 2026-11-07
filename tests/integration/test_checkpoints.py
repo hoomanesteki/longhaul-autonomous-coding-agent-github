@@ -1,27 +1,43 @@
-"""Git checkpoint store against real containers (LH-205).
+"""Git checkpoint store against real containers (LH-205), and what tool_exec saves with it (LH-206).
 
 The bare repo of each task lives under pytest's tmp_path on the host and is mounted at /ckpt in
 a sandbox that DockerSandboxManager starts. Every test builds its own task, so the tests can run
 in any order. Sandboxes go through cleanup_task and the bare repos are removed in a finally
-block.
+block. The last test runs tool_exec on such a sandbox and reads the rows it wrote from a
+throwaway Postgres database (migrated to head, then dropped).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import subprocess
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, LiteralString
 
+import psycopg
 import pytest
+from alembic import command
+from alembic.config import Config
+from psycopg import sql
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from temporalio.testing import ActivityEnvironment
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore, bundle_key
 from longhaul.contracts import Sandbox, SandboxLimits
+from longhaul.db.records import MemoryRecorder, SqlRecorder
+from longhaul.db.session import make_engine
+from longhaul.durable import acts
+from longhaul.durable.activities.tools import ToolActivities
 from longhaul.sandbox.docker_manager import DockerSandboxManager
+from longhaul.settings import EnvSettings, get_settings
+from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
@@ -30,6 +46,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
 MODULE = "src/calc/__init__.py"
 FIXED = "def add(a: int, b: int) -> int:\n    return a + b\n"
+LOCAL_DSN = "postgresql://longhaul:longhaul@localhost:5432/longhaul"
+SCRATCH_PREFIX = "longhaul_ckpttest_"
+UNREACHABLE_DSN = "postgresql://nobody:nopass@127.0.0.1:1/never"
 
 _spec = importlib.util.spec_from_file_location(
     "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
@@ -315,3 +334,184 @@ async def test_agent_user_can_write_to_the_bind_mount(task: Task) -> None:
         timeout_s=30,
     )
     assert result.stdout.split() == ["10001", "writable"], result.stderr
+
+
+# ---------- what tool_exec saves (LH-206) ----------
+@dataclass(frozen=True)
+class Scratch:
+    name: str
+    url: str
+
+    def rows(self, statement: LiteralString) -> list[tuple[Any, ...]]:
+        with psycopg.connect(self.url) as conn:
+            return conn.execute(statement).fetchall()
+
+
+@pytest.fixture
+def database(monkeypatch: pytest.MonkeyPatch) -> Iterator[Scratch]:
+    """A fresh database at the head revision. Alembic must not reach the application database."""
+    secret = EnvSettings().database_url
+    server = make_url(secret.get_secret_value() if secret else LOCAL_DSN)
+    admin_dsn = str(server.set(database="postgres").render_as_string(hide_password=False))
+    name = SCRATCH_PREFIX + uuid.uuid4().hex[:12]
+    url = str(server.set(database=name).render_as_string(hide_password=False))
+    monkeypatch.setenv("LONGHAUL_DATABASE_URL", UNREACHABLE_DSN)
+    get_settings.cache_clear()
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+    try:
+        cfg = Config(str(ROOT / "alembic.ini"))
+        cfg.set_main_option("script_location", str(ROOT / "src/longhaul/db/migrations"))
+        cfg.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+        command.upgrade(cfg, "head")
+        yield Scratch(name, url)
+    finally:
+        get_settings.cache_clear()
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            conn.execute(
+                sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+
+
+@pytest.fixture
+async def recorder(database: Scratch) -> AsyncIterator[SqlRecorder]:
+    engine = make_engine(database.url)
+    try:
+        yield SqlRecorder(async_sessionmaker[AsyncSession](engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
+
+
+async def test_a_command_that_commits_by_itself_is_checkpointed_and_kept(task: Task) -> None:
+    """The image sets a git identity, so `git commit` works inside run_command.
+
+    The commit moves HEAD and leaves the tree clean against it. The work must still reach a
+    checkpoint on top of pre_sha, or the next call would restore pre_sha and undo it. A revert
+    and a reset are saved the same way.
+    """
+    tools = ToolActivities(
+        default_registry(test_command="true", blobs=task.blobs),
+        task.manager,
+        task.blobs,
+        MemoryRecorder(),
+        checkpoints=task.store,
+    )
+    steps = [
+        ("perl -pi -e 's/return a - b/return a + b/' src/calc/__init__.py && git commit -qam fix"),
+        "git revert --no-edit HEAD",
+        "git reset -q --hard HEAD~1",
+    ]
+    head = task.base_sha
+    shas = [head]
+    for turn, step in enumerate(steps):
+        inp = acts.ToolExecInput(
+            task_id=task.task_id,
+            turn_index=turn,
+            call=acts.ToolCallSummary(
+                id=f"toolu_{turn}", name="run_command", input={"command": step}
+            ),
+            pre_sha=head,
+            sandbox_id=task.sandbox.id,
+        )
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(env.info, attempt=1)
+        result = await env.run(tools.tool_exec, inp)
+        assert result.ok and result.post_sha is not None, f"{step}: {result.output}"
+        assert task.bare("rev-parse", f"{result.post_sha}^") == head
+        head = result.post_sha
+        shas.append(head)
+        # The next call restores pre_sha first when the workspace is not on it. It is on it.
+        assert (await task.sh("git rev-parse HEAD")).strip() == head
+        assert await task.store.is_at(task.sandbox, head)
+
+    fixed, reverted, reset = shas[1:]
+    assert "return a + b" in task.bare("show", f"{fixed}:{MODULE}")
+    assert "return a - b" in task.bare("show", f"{reverted}:{MODULE}")
+    # The reset goes back to the first checkpoint, which had the fix.
+    assert "return a + b" in task.bare("show", f"{reset}:{MODULE}")
+    assert task.branch_head() == head
+    assert task.bare("rev-list", "--count", f"refs/heads/{task.branch}") == "4"
+
+
+async def test_every_mutation_checkpointed(
+    task: Task, database: Scratch, recorder: SqlRecorder
+) -> None:
+    """Every call that changed the workspace has a post_sha, a checkpoints row and a commit.
+
+    The calls run through tool_exec in a real container, each one from the sha the one before
+    left, as the workflow passes them. A call that changes nothing, because it only reads or
+    because it failed, has none of the three.
+    """
+    tools = ToolActivities(
+        default_registry(test_command="true", blobs=task.blobs),
+        task.manager,
+        task.blobs,
+        recorder,
+        checkpoints=task.store,
+    )
+    calls: list[tuple[str, dict[str, Any], bool]] = [
+        ("read_file", {"path": MODULE}, False),
+        ("edit_file", {"path": MODULE, "old_str": "return a - b", "new_str": "return a + b"}, True),
+        ("edit_file", {"path": MODULE, "old_str": "no such text", "new_str": "x"}, False),
+        ("write_file", {"path": "NOTES.md", "content": "notes\n"}, True),
+        ("run_command", {"command": "echo built > out.txt"}, True),
+        ("run_command", {"command": "cat out.txt"}, False),
+        ("run_tests", {}, False),  # the test command is `true`, which leaves the tree clean
+        ("git_diff", {}, False),
+        ("list_dir", {"path": "."}, False),
+        ("run_command", {"command": "echo more >> out.txt"}, True),
+    ]
+    head = task.base_sha
+    saved: list[tuple[str, int, str]] = []  # (sha, turn, name) of each checkpoint
+    results = []
+    for turn, (name, arguments, mutates) in enumerate(calls):
+        call = acts.ToolCallSummary(id=f"toolu_{turn}", name=name, input=arguments)
+        inp = acts.ToolExecInput(
+            task_id=task.task_id,
+            turn_index=turn,
+            call=call,
+            pre_sha=head,
+            sandbox_id=task.sandbox.id,
+        )
+        env = ActivityEnvironment()
+        env.info = dataclasses.replace(env.info, attempt=1)
+        result = await env.run(tools.tool_exec, inp)
+        results.append(result)
+        assert (result.post_sha is not None) == mutates, f"turn {turn}: {name}: {result.output}"
+        assert result.pre_sha == head
+        if result.post_sha is not None:
+            head = result.post_sha
+            saved.append((head, turn, name))
+    assert len(saved) == 4
+
+    # One row of kind tool for each checkpoint, in order, with the turn that made it.
+    rows = database.rows("SELECT sha, kind, turn_index FROM checkpoints ORDER BY id")
+    assert rows == [(sha, "tool", turn) for sha, turn, _ in saved]
+    # The rows of the calls name the same shas, and only the calls that changed something do.
+    posted = database.rows(
+        "SELECT turn_index, pre_sha, post_sha FROM tool_calls "
+        "WHERE post_sha IS NOT NULL ORDER BY turn_index"
+    )
+    assert [(turn, post) for turn, _, post in posted] == [(turn, sha) for sha, turn, _ in saved]
+    assert database.rows("SELECT count(*) FROM tool_calls") == [(len(calls),)]
+    assert database.rows("SELECT count(*) FROM tool_calls WHERE post_sha IS NULL") == [
+        (len(calls) - len(saved),)
+    ]
+
+    # The commits are the line of the checkpoint branch, each one a child of the one before,
+    # and each carries the message that names its call.
+    parent = task.base_sha
+    for sha, turn, name in saved:
+        assert task.bare("rev-parse", f"{sha}^") == parent
+        assert (
+            task.bare("log", "-1", "--format=%s", sha)
+            == f"lh: {name} turn {turn} call toolu_{turn}"
+        )
+        parent = sha
+    assert task.branch_head() == head
+    assert task.bare("rev-list", "--count", f"refs/heads/{task.branch}") == str(len(saved) + 1)
+    assert task.bare("rev-list", "--merges", f"refs/heads/{task.branch}") == ""
+    # And the last one holds all of the work.
+    assert task.bare("show", f"{head}:out.txt") == "built\nmore"
+    assert task.bare("show", f"{head}:NOTES.md") == "notes"
+    assert "return a + b" in task.bare("show", f"{head}:{MODULE}")

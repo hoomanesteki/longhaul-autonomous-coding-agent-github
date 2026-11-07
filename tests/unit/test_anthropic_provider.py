@@ -378,6 +378,8 @@ async def test_tool_use_parsed() -> None:
                     "id": "toolu_01B",
                     "name": "read_file",
                     "input": {"path": "b.py"},
+                    # The conversation breakpoint: the last block of the assistant turn (LH-405).
+                    "cache_control": EPHEMERAL,
                 },
             ],
         },
@@ -715,9 +717,82 @@ async def test_cache_control_placed() -> None:
     assert [t["name"] for t in body["tools"]] == ["read_file", "run_tests", "finish"]
     assert ["cache_control" in t for t in body["tools"]] == [False, False, True]
     assert body["tools"][-1]["cache_control"] == EPHEMERAL
-    # Two breakpoints in all: the system prompt and the last tool. The messages carry none.
-    assert json.dumps(body).count("cache_control") == 2
-    assert "cache_control" not in json.dumps(body["messages"])
+    # Three breakpoints in all: the last tool, the system prompt, and the last block of the
+    # assistant turn (LH-405), which is the tool call in the second message.
+    assert json.dumps(body).count("cache_control") == 3
+    assert body["messages"][1]["content"][-1] == {
+        **to_anthropic(TRANSCRIPT)[1]["content"][-1],
+        "cache_control": EPHEMERAL,
+    }
+    assert "cache_control" not in json.dumps([body["messages"][0], body["messages"][2]])
+
+
+async def test_the_conversation_breakpoint_is_the_last_assistant_turn_with_a_message_after_it() -> (
+    None
+):
+    seen = Recorder(_ok)
+    long = [
+        *TRANSCRIPT,
+        Message(
+            role="assistant",
+            content=[
+                TextBlock(text="Fixed."),
+                ToolUseBlock(id="toolu_01C", name="run_tests", input={}),
+            ],
+        ),
+        Message(
+            role="user", content=[ToolResultBlock(tool_use_id="toolu_01C", content="1 passed")]
+        ),
+    ]
+
+    await _ask(_provider(seen), messages=long)
+
+    messages = seen.bodies[0]["messages"]
+    assert ["cache_control" in m["content"][-1] for m in messages] == [
+        False,
+        False,
+        False,
+        True,
+        False,
+    ]
+    assert messages[3]["content"][-1]["type"] == "tool_use"
+    assert json.dumps(seen.bodies[0]).count("cache_control") == 2  # that one, and the system
+
+
+async def test_a_request_with_no_assistant_turn_has_no_conversation_breakpoint() -> None:
+    seen = Recorder(_ok)
+
+    await _ask(_provider(seen), messages=HI, tools=[READ_FILE])
+
+    assert "cache_control" not in json.dumps(seen.bodies[0]["messages"])
+
+
+async def test_a_paused_reply_at_the_end_gets_no_breakpoint() -> None:
+    # The text of a paused turn goes back as the last message and is continued, so it is
+    # different on the next request. The turn before it is the one worth caching.
+    seen = Recorder(_ok)
+    paused = [*TRANSCRIPT, Message(role="assistant", content=[TextBlock(text="Half a sentence")])]
+
+    await _ask(_provider(seen), messages=paused)
+
+    marked = ["cache_control" in m["content"][-1] for m in seen.bodies[0]["messages"]]
+    assert marked == [False, True, False, False]
+
+
+async def test_the_breakpoint_skips_an_assistant_turn_the_renderer_dropped() -> None:
+    # A message with no text is not sent, so the marker goes where the message really is.
+    seen = Recorder(_ok)
+    odd = [
+        *TRANSCRIPT,
+        Message(role="assistant", content=[TextBlock(text="  ")]),
+        Message(role="user", content=[TextBlock(text="go on")]),
+    ]
+
+    await _ask(_provider(seen), messages=odd)
+
+    marked = ["cache_control" in m["content"][-1] for m in seen.bodies[0]["messages"]]
+    assert marked.count(True) == 1
+    assert len(marked) == len(to_anthropic(odd))
 
 
 async def test_cache_control_is_left_off_when_cache_system_is_false() -> None:
@@ -1480,6 +1555,18 @@ async def test_count_tokens_returns_input_tokens() -> None:
     assert "cache_control" not in json.dumps(body)
 
 
+def _without_markers(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            **message,
+            "content": [
+                {k: v for k, v in b.items() if k != "cache_control"} for b in message["content"]
+            ],
+        }
+        for message in messages
+    ]
+
+
 async def test_count_tokens_sends_what_complete_sends() -> None:
     seen = Recorder(_by_path(_message([TEXT])))
     provider = _provider(seen)
@@ -1500,8 +1587,11 @@ async def test_count_tokens_sends_what_complete_sends() -> None:
     def plain(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [{k: v for k, v in t.items() if k != "cache_control"} for t in tools]
 
-    for key in ("model", "messages", "output_config"):
+    for key in ("model", "output_config"):
         assert counted[key] == sent[key]
+    # The count has no markers, and the sent messages have the one of the conversation.
+    assert counted["messages"] == _without_markers(sent["messages"])
+    assert "cache_control" not in json.dumps(counted)
     assert counted["system"][0]["text"] == sent["system"][0]["text"]
     assert plain(counted["tools"]) == plain(sent["tools"])
 

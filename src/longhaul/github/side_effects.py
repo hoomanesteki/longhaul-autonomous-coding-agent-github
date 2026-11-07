@@ -71,6 +71,7 @@ from temporalio.exceptions import ApplicationError
 from longhaul.db.models import SideEffect
 from longhaul.durable.payload_guard import PayloadTooLargeError, assert_small
 from longhaul.github.client import GitHubClient, GitHubFatal, GitHubRetryable, repo_path
+from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput, key_of
 
 __all__ = [
     "MARKER_PREFIX",
@@ -157,7 +158,7 @@ def effect_key(workflow_id: str, purpose: str, seq: int) -> str:
                 f"the {name} of a key has letters, digits, dot, underscore or hyphen, "
                 f"not {_shown(part)}"
             )
-    key = f"{workflow_id}:{purpose}:{seq}"
+    key = key_of(workflow_id, purpose, seq)
     _check_key(key)
     return key
 
@@ -359,33 +360,8 @@ async def run_once(
 
 
 # ---------- the four writes ----------
-class CommentInput(BaseModel):
-    task_id: str
-    repo: str
-    number: int  # an issue or a pull request
-    body: str
-    idempotency_key: str
-
-
-class LabelInput(BaseModel):
-    task_id: str
-    repo: str
-    number: int
-    label: str
-    idempotency_key: str
-
-
-class PullRequestInput(BaseModel):
-    task_id: str
-    repo: str
-    head: str  # a branch of the repo, or owner:branch
-    base: str
-    title: str
-    body: str
-    draft: bool = True  # until a verifier has passed the work (Phase 5)
-    idempotency_key: str
-
-
+# The inputs are in github/inputs.py, so that the workflow can build them without importing this
+# module. They are exported from here as well.
 def _need(value: str, message: str) -> None:
     if not value.strip():
         raise SideEffectError(message)

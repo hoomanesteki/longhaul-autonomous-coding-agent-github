@@ -135,9 +135,9 @@ async def test_run_tests_passes_after_the_fix(reg: ToolRegistry, box: Sandbox) -
     assert "summary: 3 passed" in r.output
 
 
-async def test_output_cap_marker(reg: ToolRegistry, box: Sandbox) -> None:
-    # 50,000 characters out, 25,000 on stderr. Letters that appear nowhere else in
-    # the result make the head, the cut and the tail easy to tell apart.
+async def test_a_long_output_comes_back_whole(reg: ToolRegistry, box: Sandbox) -> None:
+    # 50,000 characters out, 25,000 on stderr. The tool does not cut them: the activity and the
+    # loop shape the result afterwards (LH-402), and read_output pages the whole text.
     script = (
         "import sys; "
         "sys.stdout.write('H' * 8000 + 'M' * 30000 + 'T' * 12000); "
@@ -146,13 +146,10 @@ async def test_output_cap_marker(reg: ToolRegistry, box: Sandbox) -> None:
     r = await call(reg, box, "run_command", command=f'python -c "{script}"')
     assert r.ok, r.output
     assert r.exit_code == 0
-    assert "[output truncated: 30000 characters cut]" in r.output
-    assert "[output truncated: 5000 characters cut]" in r.output
-    assert "H" * 8000 in r.output and "H" * 8001 not in r.output
-    assert "T" * 12000 in r.output and "T" * 12001 not in r.output
-    assert "M" not in r.output
-    assert "E" * 8000 in r.output and "E" * 12001 not in r.output
-    assert len(r.output) < 2 * 20_000 + 500
+    assert "truncated" not in r.output
+    assert r.output == (
+        f"exit code: 0\nstdout:\n{'H' * 8000}{'M' * 30000}{'T' * 12000}\nstderr:\n{'E' * 25000}"
+    )
 
 
 async def test_short_output_is_left_alone(reg: ToolRegistry, box: Sandbox) -> None:

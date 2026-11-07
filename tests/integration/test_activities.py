@@ -5,15 +5,18 @@ The recorder writes to a throwaway Postgres database (migrated to head, then dro
 blobs go to MemoryBlobStore, or to MinIO when LONGHAUL_BLOB_ENDPOINT is set. A time skipping
 Temporal test server runs the workflow, so a retry's backoff costs no real time.
 
-prepare_workspace and cleanup are test stand-ins here: the real ones belong to LH-206 and
-LH-208. The worker runs under the same sandbox settings as a production worker.
+prepare_workspace and cleanup are test stand-ins here. The test makes its own sandbox, which is
+not a clone of a bare repo, so the tool activities run with NoCheckpoints. The real
+prepare_workspace, ensure_sandbox and checkpoints are run by test_sandbox_recovery.py (LH-206),
+and the real cleanup arrives with the worker (LH-208). The worker runs under the same sandbox
+settings as a production worker.
 """
 
 import asyncio
 import shlex
 import sys
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,16 +27,15 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
-from google.protobuf.message import Message as ProtoMessage
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
-from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.exceptions import ActivityError, ApplicationError, RetryState
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
+from tests.fakes.history import payload_sizes
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.agent.turns import validate_pairs
@@ -52,16 +54,19 @@ from longhaul.contracts import (
     Sandbox,
     SandboxLimits,
     TaskSpec,
+    TextBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.support import heartbeating
-from longhaul.durable.activities.tools import SandboxLookup, ToolActivities
+from longhaul.durable.activities.tools import NoCheckpoints, SandboxLookup, ToolActivities
 from longhaul.durable.client import start_task
+from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
@@ -96,8 +101,10 @@ SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=3)
 # ---------- the Temporal server, the database and the blobs ----------
 @pytest.fixture
 async def env() -> AsyncIterator[WorkflowEnvironment]:
+    # The converter of durable.client.connect, so the guard of I2 is in place as it is in a
+    # worker.
     async with await WorkflowEnvironment.start_time_skipping(
-        data_converter=pydantic_data_converter
+        data_converter=guarded_data_converter
     ) as environment:
         yield environment
 
@@ -159,7 +166,7 @@ def blobs() -> BlobStoreBase:
     return MemoryBlobStore()
 
 
-# ---------- the workspace, which belongs to LH-206 and LH-208 ----------
+# ---------- the workspace stand-ins ----------
 class Workspace:
     """prepare_workspace and cleanup for the tests. `prepare` makes the sandbox."""
 
@@ -249,7 +256,9 @@ def make_spec(test_command: str | None = None) -> TaskSpec:
     return TaskSpec(
         task_id=task_id,
         repo="acme/calc",
-        issue_number=42,
+        # No issue number: the task of an issue on an owner/name repo is delivered as a pull
+        # request (LH-306), and this test runs the loop on a faked workspace with no GitHub.
+        issue_number=None,
         title="add() subtracts",
         body="`calc.add` subtracts its arguments instead of adding them.",
         settings=RepoSettings(
@@ -293,11 +302,17 @@ async def running(
     sandboxes: SandboxLookup,
     workspace: Workspace,
     registry: ToolRegistry | None = None,
+    extra: Sequence[Callable[..., Any]] = (),
+    test_command: str | None = None,
 ) -> AsyncIterator[Run]:
-    """A worker with the real activities. Yields the task queue it polls."""
-    toolbox = registry or default_registry()
+    """A worker with the real activities. Yields the task queue it polls.
+
+    `extra` are more activities to register, such as the ones a hand-over calls.
+    """
+    # The tools read their output handles from the store the activities write to.
+    toolbox = registry or default_registry(test_command=test_command, blobs=blobs)
     llm = LlmActivities(provider, blobs, recorder, toolbox.specs(), lambda role: CFG)
-    tools = SpyTools(toolbox, sandboxes, blobs, recorder)
+    tools = SpyTools(toolbox, sandboxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     async with Worker(
         env.client,
@@ -308,6 +323,9 @@ async def running(
             *tools.activities,
             workspace.prepare_workspace,
             workspace.cleanup,
+            # The workflow notes the end of every run with record_event (LH-704).
+            *EventActivities(recorder).activities,
+            *extra,
         ],
         workflow_runner=workflow_runner(),
     ):
@@ -325,32 +343,6 @@ def scheduled(history: WorkflowHistory) -> list[str]:
         for event in history.events
         if event.HasField("activity_task_scheduled_event_attributes")
     ]
-
-
-def payload_sizes(history: WorkflowHistory) -> list[int]:
-    """The size of every payload in the history: inputs, results, failure details and so on."""
-    sizes: list[int] = []
-
-    def walk(message: ProtoMessage) -> None:
-        if message.DESCRIPTOR.full_name == "temporal.api.common.v1.Payload":
-            sizes.append(len(message.data))  # type: ignore[attr-defined]
-            return
-        for field_, value in message.ListFields():
-            if field_.message_type is None:
-                continue  # a number, a string or an enum
-            if isinstance(value, ProtoMessage):
-                walk(value)
-            elif field_.message_type.GetOptions().map_entry:
-                items = [v for v in value.values() if isinstance(v, ProtoMessage)]
-                for item in items:
-                    walk(item)
-            else:
-                for item in value:  # a repeated field
-                    walk(item)
-
-    for event in history.events:
-        walk(event)
-    return sizes
 
 
 def started_attempts(history: WorkflowHistory, activity_name: str) -> list[int]:
@@ -385,7 +377,7 @@ async def test_workflow_fixes_calc_via_activities(
             recorder=recorder,
             sandboxes=manager,
             workspace=workspace,
-            registry=default_registry(test_command=PYTEST),
+            test_command=PYTEST,
         ) as run:
             handle = await start_task(
                 env.client, spec, task_queue=run.queue, tuning=SHORT_HEARTBEAT
@@ -644,3 +636,138 @@ async def test_a_prompt_over_the_window_ends_the_run_with_context_limit(
     assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="context limit")
     assert (final.phase, final.turn_index) == (Phase.FAILED, 1)
     assert len(provider.options_seen) == 1
+
+
+# ---------- LH-207: a task that hands over to a new run ----------
+class PromptSpy(ScriptedProvider):
+    """A scripted provider that keeps the messages of every request it gets."""
+
+    def __init__(self, script: Path) -> None:
+        super().__init__(script)
+        self.prompts: list[list[Message]] = []
+
+    async def complete(self, **kwargs: Any) -> LLMResponse:
+        self.prompts.append([m.model_copy(deep=True) for m in kwargs["messages"]])
+        return await super().complete(**kwargs)
+
+
+class HandOverStubs:
+    """ensure_sandbox and bundle_checkpoint for a task that hands over.
+
+    The sandbox is the fake one the test seeded, so ensure_sandbox only says that it is still
+    there. bundle_checkpoint waits for the test, which keeps the first run inside its hand-over
+    while the test signals a hint.
+    """
+
+    def __init__(self, boxes: FakeBoxes) -> None:
+        self.boxes = boxes
+        self.go = asyncio.Event()
+        self.bundled: list[acts.BundleCheckpointInput] = []
+        self.ensured: list[acts.EnsureSandboxInput] = []
+
+    @activity.defn(name=acts.ENSURE_SANDBOX.name)
+    async def ensure_sandbox(self, inp: acts.EnsureSandboxInput) -> str:
+        self.ensured.append(inp)
+        assert inp.sandbox_id in self.boxes.boxes
+        return inp.sandbox_id
+
+    @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
+    async def bundle_checkpoint(self, inp: acts.BundleCheckpointInput) -> BlobRef:
+        self.bundled.append(inp)
+        await self.go.wait()
+        key = f"tasks/{inp.task_id}/ckpt/{BASE}.bundle"
+        return BlobRef(key=key, sha256="0" * 64, size=1)
+
+
+def texts_of(messages: list[Message]) -> list[str]:
+    return [b.text for m in messages for b in m.content if isinstance(b, TextBlock)]
+
+
+async def test_a_task_hands_over_and_the_hint_reaches_the_next_run(
+    env: WorkflowEnvironment,
+    database: Scratch,
+    recorder: SqlRecorder,
+    blobs: BlobStoreBase,
+    tmp_path: Path,
+) -> None:
+    """Five turns with a hand-over every two: three runs, one transcript, one fix.
+
+    The hint comes while the first run is handing over. The model reads it in the first request
+    of the next run, and never twice. The real record_event writes the events.
+    """
+    read = {"name": "read_file", "input": {"path": "src/calc/__init__.py"}}
+    edit = {
+        "name": "edit_file",
+        "input": {
+            "path": "src/calc/__init__.py",
+            "old_str": "    return a - b",
+            "new_str": "    return a + b",
+        },
+    }
+    steps = [
+        {"respond": {"tool_calls": [{"name": "list_dir", "input": {"path": "."}}]}},
+        {"respond": {"tool_calls": [read]}},
+        {"respond": {"tool_calls": [edit]}},
+        {"respond": {"tool_calls": [read]}},
+        {"respond": {"tool_calls": [{"name": "finish", "input": {"summary": "Fixed add()."}}]}},
+    ]
+    script = tmp_path / "five_turns.yaml"
+    script.write_text(yaml.safe_dump({"steps": steps}))
+
+    provider = PromptSpy(script)
+    boxes = FakeBoxes()
+    hand_over = HandOverStubs(boxes)
+    spec = make_spec()
+    hint_text = "Hint from alice: use pytest -x"
+    async with running(
+        env,
+        provider=provider,
+        blobs=blobs,
+        recorder=recorder,
+        sandboxes=boxes,
+        workspace=boxes.workspace(),
+        extra=[
+            hand_over.ensure_sandbox,
+            hand_over.bundle_checkpoint,
+        ],
+    ) as run:
+        handle = await start_task(
+            env.client,
+            spec,
+            task_queue=run.queue,
+            tuning=acts.Tuning(continue_as_new_every_turns=2),
+        )
+        async with asyncio.timeout(WAIT_S):
+            while not hand_over.bundled:
+                await asyncio.sleep(0.02)
+        await handle.signal("hint", args=["alice", "use pytest -x"])
+        hand_over.go.set()
+        outcome = await result_of(handle)
+        box = boxes.boxes[f"sbx-{spec.task_id}"]
+        fixed = (await box.read_file("src/calc/__init__.py")).decode()
+        transcript = await run.final_transcript()
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Fixed add().")
+    assert "return a + b" in fixed
+
+    # Hand-overs after turns 2 and 4, and the new run found the sandbox where it was left.
+    assert [b.turn_index for b in hand_over.bundled] == [2, 4]
+    assert [e.sandbox_id for e in hand_over.ensured] == [f"sbx-{spec.task_id}"] * 2
+    events = database.rows(
+        "SELECT type, payload->>'turn_index', payload->>'reason' FROM events ORDER BY id"
+    )
+    # The two hand-overs, and the note at the end of the run that the metrics count the task
+    # from (LH-704). A note has no turn_index and no reason.
+    assert events == [
+        ("continue_as_new", "2", "turns"),
+        ("continue_as_new", "4", "turns"),
+        (acts.OUTCOME_EVENT, None, None),
+    ]
+
+    # The first two requests are from before the hint. The third is the next run's first.
+    assert [hint_text in texts_of(p) for p in provider.prompts] == [False, False, True, True, True]
+    assert all(texts_of(p).count(hint_text) <= 1 for p in provider.prompts)
+    # The stored transcript is whole, and the hint is in it once.
+    validate_pairs(transcript)
+    assert texts_of(transcript).count(hint_text) == 1
+    assert sum(1 for m in transcript if m.role == "assistant") == 5

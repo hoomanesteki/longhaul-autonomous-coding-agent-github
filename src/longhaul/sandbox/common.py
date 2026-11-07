@@ -37,8 +37,9 @@ def mount_for(path: str) -> str:
 
 
 # Each stream keeps at most this much (the 1 MB cap from LH-107): the first half
-# and the last half. Tools that trim further (LH-109 keeps 8,000 plus 12,000
-# characters) need the real tail, so the middle goes, not the end.
+# and the last half. The tools pass the text on whole, and what the model reads is cut later
+# from it, to the first and last lines (context/truncate.py, LH-402). That cut needs the real
+# tail, so the middle goes, not the end.
 OUTPUT_CAP = 1_000_000
 OUTPUT_HEAD = OUTPUT_CAP // 2
 OUTPUT_TAIL = OUTPUT_CAP - OUTPUT_HEAD

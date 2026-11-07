@@ -15,6 +15,7 @@ from longhaul.agent.prompts import (
     FIRST_USER_MESSAGE,
     SECTION_HEADINGS,
     build_system_prompt,
+    task_statement,
 )
 from longhaul.contracts import RepoSettings, Role, TaskSpec
 from longhaul.providers.base import format_role_line, parse_role_line
@@ -132,6 +133,31 @@ def test_task_statement_has_the_facts_a_coder_needs() -> None:
     assert "2. Only add() is wrong." in task
 
 
+def test_the_task_statement_is_the_third_block_of_the_prompt() -> None:
+    # The compactor reads it on the first round (LH-404), so it is the same text the coder gets.
+    spec = make_spec()
+    prompt = build_system_prompt(Role.CODER, spec)
+
+    assert task_statement(spec).startswith(TASK)
+    assert task_statement(spec) in prompt
+    assert prompt.index(task_statement(spec)) > prompt.index(TOOLS)
+
+
+def test_a_local_repo_shows_its_folder_name_and_not_its_path() -> None:
+    # The path holds the user name and the directory layout, and the prompt goes to the provider.
+    spec = make_spec(repo="local:/home/alice/work/calc", issue_number=None)
+    task = build_system_prompt(Role.CODER, spec)
+    assert "Repository: local:calc\n" in task
+    assert "alice" not in task
+
+
+def test_the_local_prefix_is_the_one_the_intake_uses() -> None:
+    from longhaul.agent.prompts import LOCAL_PREFIX
+    from longhaul.github.intake import LOCAL_PREFIX as INTAKE_PREFIX
+
+    assert LOCAL_PREFIX == INTAKE_PREFIX
+
+
 def test_a_task_without_an_issue_number_or_test_command_or_body() -> None:
     spec = make_spec(
         issue_number=None,
@@ -183,6 +209,23 @@ def test_tool_guide_names_only_tools_that_exist() -> None:
     # Every tool the coder uses day to day is in the guide.
     for tool in ("list_dir", "read_file", "search", "edit_file", "run_tests", "git_diff", "finish"):
         assert tool in named
+
+
+def test_the_guide_tells_the_model_how_to_read_a_cut_output() -> None:
+    prompt = build_system_prompt(Role.CODER, make_spec(), MEMORY)
+    static = prompt[: prompt.index(TASK)]
+    assert "`read_output`" in static
+    assert "`handle`" in static and "`pattern`" in static
+
+
+def test_the_guide_explains_the_stub_that_replaces_an_old_result() -> None:
+    # Tier 1 of the context strategy (LH-404) leaves a stub where an old result was. The model
+    # has to know what it is, and that its handle still works.
+    from longhaul.context.evict import ELIDED_PREFIX
+
+    prompt = build_system_prompt(Role.CODER, make_spec())
+    static = prompt[: prompt.index(TASK)]
+    assert f"starts with {ELIDED_PREFIX.strip()}" in static
 
 
 def test_first_user_message_points_at_the_system_prompt() -> None:

@@ -1,0 +1,11 @@
+apiVersion: 1
+providers:
+  - name: longhaul
+    type: file
+    # The file in docker/grafana/dashboards is the only copy. A change made in the Grafana UI
+    # could not be saved, and the dashboard cannot be deleted from there either.
+    allowUiUpdates: false
+    disableDeletion: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

@@ -20,7 +20,9 @@ from longhaul.blobs.base import (
     BlobIntegrityError,
     BlobNotFoundError,
     blob_key,
+    call_slug,
     check_key,
+    handle_key,
 )
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.blobs.s3 import S3BlobStore
@@ -210,6 +212,54 @@ async def test_memory_store_keeps_its_own_copy_of_the_data() -> None:
     assert await store.get(ref) == b"abc"
 
 
+# --- reading by key, for handles --------------------------------------------------------------
+
+
+async def test_memory_store_reads_an_object_by_its_key_alone() -> None:
+    # An output handle names a call and not a ref, so a small index blob is read by key.
+    store = MemoryBlobStore()
+    await store.put(b"index bytes", key="tasks/lh-x/outputs/toolu_1.json")
+    assert await store.get_by_key("tasks/lh-x/outputs/toolu_1.json") == b"index bytes"
+
+
+async def test_reading_a_missing_key_raises_not_found() -> None:
+    with pytest.raises(BlobNotFoundError, match="nowhere"):
+        await MemoryBlobStore().get_by_key("nowhere")
+
+
+@pytest.mark.parametrize("key", UNSAFE_KEYS)
+async def test_reading_by_key_refuses_unsafe_keys(key: str) -> None:
+    with pytest.raises(ValueError, match="blob key"):
+        await MemoryBlobStore().get_by_key(key)
+
+
+def test_handle_key_needs_only_the_task_and_the_call() -> None:
+    assert handle_key("lh-x", "toolu_01AbC") == "tasks/lh-x/outputs/toolu_01AbC.json"
+
+
+def test_handle_key_gives_two_odd_call_ids_two_keys_inside_the_task() -> None:
+    first = handle_key("lh-x", "functions.get:0")
+    second = handle_key("lh-x", "functions.get:1")
+    assert first != second
+    for key in (first, second, handle_key("lh-x", "../../other/outputs/a")):
+        assert key.startswith("tasks/lh-x/outputs/")
+        assert key.count("/") == 3
+        assert check_key(key) == key
+
+
+def test_call_slug_keeps_a_plain_id_and_cleans_an_odd_one() -> None:
+    assert call_slug("toolu_01AbC") == "toolu_01AbC"
+    cleaned = call_slug("functions.get:0")
+    assert cleaned.startswith("functions.get_0-")
+    assert call_slug("functions.get:0") == cleaned
+
+
+@pytest.mark.parametrize("bad", ["", "bad task", "../x", "a/b"])
+def test_handle_key_rejects_an_unsafe_task_id(bad: str) -> None:
+    with pytest.raises(ValueError, match="blob key"):
+        handle_key(bad, "toolu_1")
+
+
 # --- JSON helpers ---------------------------------------------------------------------------
 
 
@@ -346,6 +396,34 @@ async def test_s3_store_refuses_unsafe_keys_before_any_request() -> None:
             await store.put(b"x", key="../escape")
         with pytest.raises(ValueError, match="blob key"):
             await store.get(BlobRef(key="/abs", sha256=_sha(b"x"), size=1))
+        stub.assert_no_pending_responses()
+
+
+async def test_s3_get_by_key_returns_the_bytes_without_a_ref() -> None:
+    store = _s3()
+    data = b"small index"
+    with Stubber(store._client) as stub:
+        stub.add_response(
+            "get_object",
+            {"Body": _body(data), "ContentLength": len(data)},
+            {"Bucket": "bucket", "Key": "k/index.json"},
+        )
+        assert await store.get_by_key("k/index.json") == data
+
+
+async def test_s3_get_by_key_maps_a_missing_key_to_not_found() -> None:
+    store = _s3()
+    with Stubber(store._client) as stub:
+        stub.add_client_error("get_object", service_error_code="NoSuchKey", http_status_code=404)
+        with pytest.raises(BlobNotFoundError, match="k/missing.json"):
+            await store.get_by_key("k/missing.json")
+
+
+async def test_s3_get_by_key_refuses_an_unsafe_key_before_any_request() -> None:
+    store = _s3()
+    with Stubber(store._client) as stub:
+        with pytest.raises(ValueError, match="blob key"):
+            await store.get_by_key("../escape")
         stub.assert_no_pending_responses()
 
 

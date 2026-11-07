@@ -4,12 +4,15 @@ The design and the reasons are in ADR-0006. In short:
 
 * `init_task` clones the repo into <root>/<task_id>.git on the host and puts the branch
   longhaul/<issue> at the base commit. No token, URL or host path is written into the repo.
+  A GitHub repo is cloned with the token as a setting of that one git process (`git_config`).
 * The sandbox gets that folder read-write at /ckpt (DockerSandboxManager.create(mounts=...)).
   `attach` clones it into /workspace, so every later step needs nothing but the sandbox.
-* `commit` snapshots the workspace as a commit and pushes it to /ckpt. `restore` puts the
-  workspace back on any commit, byte for byte, so a retried tool call never runs on a half
-  changed tree.
+* `commit` snapshots the workspace as a commit and pushes it to /ckpt. Given a parent, it saves
+  what differs from that commit, so commits the agent made itself do not hide its work.
+  `restore` puts the workspace back on any commit, byte for byte, so a retried tool call never
+  runs on a half changed tree.
 * `bundle` and `restore_from_bundle` move a task to another host through the blob store.
+* `diff` reads the work of a task on the host, for the command that reports a finished run.
 
 The agent can write to /ckpt, so the host treats everything in that repo as untrusted: it runs
 git with hooks switched off, and only for a few read-only or ref-only commands.
@@ -26,7 +29,7 @@ import shutil
 import stat
 import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -58,16 +61,21 @@ MAX_BUNDLE_BYTES = 256 * 1024 * 1024
 MAX_MESSAGE_CHARS = 4000
 
 CLONE_TIMEOUT_S = 900
+PUSH_TIMEOUT_S = 600
 HOST_GIT_TIMEOUT_S = 120
+# A config value shorter than this is not scrubbed from git's output (see _scrub).
+MIN_SECRET_CHARS = 8
 ATTACH_TIMEOUT_S = 900
 RESTORE_TIMEOUT_S = 300
 COMMIT_TIMEOUT_S = 180
+IS_AT_TIMEOUT_S = 60
 
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _ISSUE = re.compile(r"-(\d+)$")
 _HELPER_URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*::")
 _OUTPUT = re.compile(r"LH-(?:CLEAN|SHA (?P<sha>[0-9a-f]{40,64}))")
+_AT, _MOVED = "LH-AT", "LH-MOVED"
 _MARKER = re.compile(r"@([A-Z]+)@")
 
 # The git that runs on the host. The sandbox can rewrite the config and hooks of the repo it
@@ -177,17 +185,69 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
     await proc.wait()
 
 
+def check_git_config(config: Sequence[str]) -> tuple[str, ...]:
+    """Return config if it is pairs of `-c` and `name=value`, else raise ValueError.
+
+    These are settings for one git process, such as the output of git_auth_header. Anything
+    else in that place, such as `-C` or `--exec-path`, would let a caller change what git runs.
+    """
+    words = tuple(config)
+    pairs = zip(words[0::2], words[1::2], strict=False)
+    if len(words) % 2 or not all(flag == "-c" and _is_setting(item) for flag, item in pairs):
+        raise ValueError("git_config takes pairs of '-c' and 'name=value', and nothing else")
+    return words
+
+
+def _is_setting(item: str) -> bool:
+    name, equals, _ = item.partition("=")
+    return bool(equals and name) and not any(ord(c) < 32 or c == "\x7f" for c in item)
+
+
+def _scrub(text: str, config: Sequence[str]) -> str:
+    """Hide the values of `config` in git's own words.
+
+    A verbose git can print the header it sends. The value and its last word, which is the
+    credential in an `AUTHORIZATION: basic <secret>` header, are replaced. A short value is
+    left alone: it is not a credential, and replacing it would garble the message.
+    """
+    secrets: set[str] = set()
+    for item in config:
+        if item != "-c":
+            value = item.partition("=")[2]
+            secrets.update((value, value.rsplit(" ", 1)[-1]))
+    for secret in sorted(secrets, key=len, reverse=True):
+        if len(secret) >= MIN_SECRET_CHARS:
+            text = text.replace(secret, "***")
+    return text
+
+
 async def _run_git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    strip: bool = True,
+    config: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
 ) -> tuple[int, str, str]:
-    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit."""
+    """Run git on the host and return its exit code, stdout and stderr. Never raises on exit.
+
+    stdout is stripped unless `strip` is False. A patch needs it as git wrote it: a hunk can end
+    on a context line that holds one space, and stripping drops that line.
+
+    `config` goes before the subcommand and lives for this process only. Its values are
+    removed from the text that comes back, because that text ends up in exceptions.
+
+    `env` adds variables to the environment of this process, such as the author and the dates of
+    a commit that has to come out the same every time (checkpoints/squash.py).
+    """
     where = ("--git-dir", str(git_dir)) if git_dir is not None else ()
     proc = await asyncio.create_subprocess_exec(
         "git",
         *_HOST_FLAGS,
+        *config,
         *where,
         *args,
-        env=_host_env(),
+        env={**_host_env(), **(env or {})},
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -200,14 +260,26 @@ async def _run_git(
     except BaseException:
         await _kill(proc)  # a cancelled activity must not leave git running
         raise
-    return proc.returncode or 0, out.decode(errors="replace").strip(), err.decode(errors="replace")
+    text = out.decode(errors="replace")
+    return (
+        proc.returncode or 0,
+        _scrub(text.strip() if strip else text, config),
+        _scrub(err.decode(errors="replace"), config),
+    )
 
 
 async def git(
-    *args: str, git_dir: Path | None = None, timeout_s: float = HOST_GIT_TIMEOUT_S
+    *args: str,
+    git_dir: Path | None = None,
+    timeout_s: float = HOST_GIT_TIMEOUT_S,
+    strip: bool = True,
+    config: Sequence[str] = (),
+    env: Mapping[str, str] | None = None,
 ) -> str:
     """Like _run_git, but a failure raises CheckpointError and the result is stdout."""
-    code, out, err = await _run_git(*args, git_dir=git_dir, timeout_s=timeout_s)
+    code, out, err = await _run_git(
+        *args, git_dir=git_dir, timeout_s=timeout_s, strip=strip, config=config, env=env
+    )
     if code != 0:
         raise CheckpointError(f"git {args[0]} failed (exit {code}): {_tail(err or out)}")
     return out
@@ -346,14 +418,36 @@ g cat-file -e "${SHA}^{commit}" 2>/dev/null || {
   exit 6
 }
 g reset -q --hard "$SHA"
-g clean -q -ffdx @KEEP@
+g clean -q @CLEAN@ @KEEP@
+"""
+
+# Read only, and it takes no lock: it runs before every tool call, so a stale index.lock from a
+# killed command must not stop it, and it must not clear a lock that a live command holds. Any
+# doubt answers "moved" and the caller restores. -unormal is on the command line because the
+# agent can set status.showUntrackedFiles=no in the config of its own repository.
+_IS_AT = r"""
+SHA=@SHA@
+[ -d .git ] || { echo LH-MOVED; exit 0; }
+AT=1
+[ "$(g rev-parse -q --verify HEAD 2>/dev/null || true)" = "$SHA" ] || AT=0
+[ "$(g symbolic-ref -q HEAD 2>/dev/null || true)" = "refs/heads/$BRANCH" ] || AT=0
+CHANGES=$(g --no-optional-locks status --porcelain -unormal 2>/dev/null) || AT=0
+[ -z "$CHANGES" ] || AT=0
+if [ "$AT" = 1 ]; then echo LH-AT; else echo LH-MOVED; fi
 """
 
 # HEAD goes back to the task branch first: the agent may have switched branches, and the
 # snapshot has to be a child of the branch the checkpoints live on. A failed push takes the
 # commit back, so the changes are still pending and the next call tries again.
+#
+# PARENT is the commit the caller expects the snapshot to build on, or empty. A shell command can
+# make commits of its own (git commit, revert, reset), which move HEAD and leave the tree clean
+# against the new HEAD. With a parent, the branch is first moved back to it with a soft reset,
+# which keeps the files, so "clean" means "equal to the parent" and the work becomes one commit
+# on top of the parent. Without a parent, the tree is compared with wherever HEAD is.
 _COMMIT = r"""
 MSG=@MSG@
+EXPECT=@PARENT@
 [ -d .git ] || {
   echo "the workspace is not a git repository; restore it first" >&2
   exit 4
@@ -364,6 +458,15 @@ g rev-parse -q --verify HEAD >/dev/null || {
   echo "the workspace has no commit to build on; restore it first" >&2
   exit 4
 }
+if [ -n "$EXPECT" ]; then
+  g cat-file -e "${EXPECT}^{commit}" 2>/dev/null ||
+    g fetch -q --no-tags "$CKPT" "$EXPECT" 2>/dev/null || true
+  g cat-file -e "${EXPECT}^{commit}" 2>/dev/null || {
+    echo "commit $EXPECT is not in the checkpoint repository" >&2
+    exit 6
+  }
+  g reset -q --soft "$EXPECT"
+fi
 g add -A
 if g diff --cached --quiet; then
   echo LH-CLEAN
@@ -464,16 +567,23 @@ class GitCheckpointStore(CheckpointStore):
 
     # -- the host side --
 
-    async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
+    async def init_task(
+        self, task_id: str, clone_url: str, base_sha: str, *, git_config: Sequence[str] = ()
+    ) -> str:
         """Create the bare repo of a task and return its path, which is what to mount.
 
         It clones `clone_url`, puts the branch longhaul/<issue> and the tag `base` on
         `base_sha`, and keeps nothing of the URL. Called again for a task that has its repo,
         it checks that the base is the same and changes nothing, so a retry is safe.
+
+        A repo that needs a credential gets it in `git_config`: `-c name=value` pairs for the
+        clone process only, such as github/client.py's git_auth_header. They are not written
+        to the repo, and git's own words are scrubbed of them before they reach an error.
         """
         check_task_id(task_id)
         check_sha(base_sha)
         check_clone_url(clone_url)
+        config = check_git_config(git_config)
         final = self.repo_path(task_id)
         if final.exists():
             await self._check_existing(task_id, base_sha)
@@ -483,7 +593,8 @@ class GitCheckpointStore(CheckpointStore):
         try:
             await git(
                 "clone", "--bare", "--no-hardlinks", "--quiet", "--template=", "--",
-                _local_source(clone_url), str(scratch), timeout_s=CLONE_TIMEOUT_S,
+                _local_source(clone_url), str(scratch),
+                timeout_s=CLONE_TIMEOUT_S, config=config,
             )  # fmt: skip
             await self._place_branch(scratch, task_id, base_sha)
             await self._seal(scratch, task_id, base_sha)
@@ -543,6 +654,21 @@ class GitCheckpointStore(CheckpointStore):
             await git("config", key, value, git_dir=repo)
         await asyncio.to_thread(_open_to_sandbox, repo)
 
+    @contextlib.asynccontextmanager
+    async def scratch(self, task_id: str, purpose: str) -> AsyncIterator[Path]:
+        """A path for a short-lived repo of a task, removed afterwards. The path is new.
+
+        It sits in the private root and is named like a half-built clone, so `cleanup_task`
+        also removes one that a killed worker left behind.
+        """
+        check_task_id(task_id)
+        await asyncio.to_thread(self._make_root)
+        path = self.root / f".{task_id}.{purpose}-{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            yield path
+        finally:
+            await asyncio.to_thread(_remove_tree, path)
+
     async def cleanup_task(self, task_id: str) -> None:
         """Remove the bare repo, and any half-built clone, of a task. Safe to call twice."""
         repo = self.repo_path(task_id)
@@ -573,14 +699,22 @@ class GitCheckpointStore(CheckpointStore):
             task=shlex.quote(task_id),
         )  # fmt: skip
 
-    async def commit(self, sandbox: Sandbox, message: str) -> str | None:
+    async def commit(
+        self, sandbox: Sandbox, message: str, *, parent: str | None = None
+    ) -> str | None:
         """Save the workspace as a commit on the task branch and return its sha.
 
         Returns None, and creates nothing, when the tree matches the last commit.
+
+        `parent` names the commit the new one has to build on. Give it when the commands that ran
+        may have made commits of their own: the tree is then compared with `parent`, not with
+        HEAD, and the new commit holds the net change since `parent` whatever happened to HEAD.
+        When nothing differs from `parent`, HEAD is put back on it and the answer is None.
         """
         out = await self._in_sandbox(
             sandbox, _COMMIT, "commit the workspace", COMMIT_TIMEOUT_S,
             msg=shlex.quote(_commit_message(message)),
+            parent=shlex.quote(check_sha(parent) if parent is not None else ""),
         )  # fmt: skip
         lines = out.strip().splitlines()
         found = _OUTPUT.fullmatch(lines[-1]) if lines else None
@@ -588,17 +722,61 @@ class GitCheckpointStore(CheckpointStore):
             raise CheckpointError(f"commit gave unexpected output: {_tail(out)}")
         return found.group("sha")  # None for LH-CLEAN
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
+    async def is_at(self, sandbox: Sandbox, sha: str) -> bool:
+        """True when the workspace is on the task branch at `sha` and has nothing to save.
+
+        Nothing to save means the tree matches the commit: no file is changed, deleted, staged
+        or new, and files that git ignores do not count. tool_exec asks before each call and
+        restores only when the answer is no. A restore also deletes the ignored files that the
+        agent made on purpose, such as the output of a build, so it is kept for the calls that
+        need it.
+        """
+        out = await self._in_sandbox(
+            sandbox, _IS_AT, "check the workspace", IS_AT_TIMEOUT_S,
+            sha=shlex.quote(check_sha(sha)),
+        )  # fmt: skip
+        lines = out.strip().splitlines()
+        answer = lines[-1] if lines else ""
+        if answer not in (_AT, _MOVED):
+            raise CheckpointError(f"checking the workspace gave unexpected output: {_tail(out)}")
+        return answer == _AT
+
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
         """Put the workspace on `sha`, byte for byte: tracked files, no extras, no leftovers.
 
         Everything not in the commit is deleted, ignored files included, except the folders in
         `keep`. The checkpoint branch in /ckpt is not changed.
+
+        With `keep_ignored`, the files that git ignores stay as well. That undoes what a command
+        changed, and not what the setup built: use it where the setup has run and cannot run
+        again, such as after prepare_workspace has cut the network.
         """
-        keep = " ".join(f"-e {shlex.quote(name)}" for name in self._keep)
+        keep = "" if keep_ignored else " ".join(f"-e {shlex.quote(name)}" for name in self._keep)
         await self._in_sandbox(
             sandbox, _ENSURE_REPO + _RESTORE, "restore the workspace", RESTORE_TIMEOUT_S,
-            sha=shlex.quote(check_sha(sha)), keep=keep,
+            sha=shlex.quote(check_sha(sha)), keep=keep, clean="-ffd" if keep_ignored else "-ffdx",
         )  # fmt: skip
+
+    # -- reading the work --
+
+    async def diff(self, task_id: str, head_sha: str) -> str:
+        """The patch from the `base` tag to a checkpoint, read on the host. "" when nothing changed.
+
+        The text is git's own, not stripped, so that `git apply` accepts it.
+
+        The checkpoint is named by the caller and not read from the branch, because an attempt
+        that died can leave a commit on the branch that the workflow never learned about. The
+        agent can write the config of this repo, so an external diff program or a text
+        conversion that it names must not run here.
+        """
+        repo = self._require_repo(task_id)
+        patch = await git(
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+            f"refs/tags/{BASE_TAG}", check_sha(head_sha), "--",
+            git_dir=repo, strip=False,
+        )  # fmt: skip
+        # Git ends every line with a newline. The check is for a git that does not.
+        return patch if not patch or patch.endswith("\n") else f"{patch}\n"
 
     # -- bundles --
 

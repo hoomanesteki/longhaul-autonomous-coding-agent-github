@@ -1162,3 +1162,78 @@ async def test_list_open_pulls_by_head_errors_use_the_same_mapping(
     fake.fail_next(r"/pulls$", 502)
     with pytest.raises(GitHubRetryable):
         await gh.list_open_pulls_by_head(REPO, "longhaul-pr/1")
+
+
+# --- the repo and its branches: where a clone starts (LH-305) ---------------------------------
+
+
+def seed_remote(fake: FakeGitHub, tmp_path: Path, default_branch: str = "main") -> str:
+    """A repo with a bare remote that holds one commit on `default_branch`. Returns its sha."""
+    work = tmp_path / "work"
+    work.mkdir()
+    git("init", "-q", "-b", default_branch, cwd=work)
+    (work / "a.txt").write_text("one\n")
+    git("add", "-A", cwd=work)
+    git("commit", "-q", "-m", "initial", cwd=work)
+    fake.seed_repo(
+        "acme/widgets", default_branch=default_branch, remote=tmp_path / "r.git", source=work
+    )
+    return git("rev-parse", "HEAD", cwd=work)
+
+
+async def test_get_repo_and_get_branch_give_the_default_branch_and_its_commit(
+    fake: FakeGitHub, gh: GitHubClient, tmp_path: Path
+) -> None:
+    sha = seed_remote(fake, tmp_path, default_branch="trunk")
+
+    repo = await gh.get_repo("acme/widgets")
+    branch = await gh.get_branch("acme/widgets", repo["default_branch"])
+
+    assert repo["default_branch"] == "trunk"
+    assert branch["commit"]["sha"] == sha
+
+
+async def test_get_branch_takes_a_name_with_slashes(
+    fake: FakeGitHub, gh: GitHubClient, tmp_path: Path
+) -> None:
+    sha = seed_remote(fake, tmp_path)
+    work = tmp_path / "work"
+    git("push", "-q", fake.clone_url("acme/widgets"), f"{sha}:refs/heads/longhaul/42", cwd=work)
+
+    branch = await gh.get_branch("acme/widgets", "longhaul/42")
+
+    assert branch["commit"]["sha"] == sha
+
+
+@pytest.mark.parametrize("branch", ["", "../issues/1", "a/./b", "a//b", "/main", "main/"])
+async def test_get_branch_refuses_a_name_that_would_change_the_path(
+    branch: str, fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    with pytest.raises(GitHubFatal, match="branch"):
+        await gh.get_branch(REPO, branch)
+    assert fake.requests == []
+
+
+async def test_get_branch_escapes_what_could_start_a_query(
+    fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    with pytest.raises(GitHubFatal):
+        await gh.get_branch(REPO, "main?x=1#top")
+    assert not any("x=1" in request.query for request in fake.requests)
+
+
+async def test_get_repo_and_get_branch_errors_use_the_same_mapping(
+    fake: FakeGitHub, gh: GitHubClient
+) -> None:
+    with pytest.raises(GitHubFatal):
+        await gh.get_repo("acme/missing")
+    with pytest.raises(GitHubFatal, match="owner/name"):
+        await gh.get_repo("not-a-repo")
+    with pytest.raises(GitHubFatal):
+        await gh.get_branch(REPO, "main")  # the repo has no remote, so no branches
+    fake.fail_next(r"/repos/acme/calc$", 502)
+    with pytest.raises(GitHubRetryable):
+        await gh.get_repo(REPO)
+    fake.fail_next(r"/branches/main$", 503)
+    with pytest.raises(GitHubRetryable):
+        await gh.get_branch(REPO, "main")

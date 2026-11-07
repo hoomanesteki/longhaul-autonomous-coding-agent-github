@@ -21,13 +21,13 @@ Spike LH-201 checked the SDK patterns that Phase 2 depends on. The results are i
 
 ## Decision
 
-Use Temporal, with the Python SDK `temporalio`, locked at 1.34.0 in `uv.lock`.
+Use Temporal, with the Python SDK `temporalio`, locked at 1.35.0 in `uv.lock`. The appendix facts were checked on 1.34.0, and the integration tests that rely on them pass on 1.35.0.
 
 - One task is one workflow, `TaskWorkflow`. The workflow id is the task id.
 - Workflow code is deterministic. It schedules activities and does no I/O (invariant I1). All I/O lives in activities.
 - Each model turn and each tool call is its own activity with its own timeout, heartbeat and retry policy (plan section 3.7).
 - Payloads are Pydantic models, encoded by `temporalio.contrib.pydantic.pydantic_data_converter`. Anything over 16 KB crosses an activity boundary as a `BlobRef` (ADR-0005).
-- Long runs hand off with Continue-As-New and carry `CarryState`.
+- Long runs hand off with Continue-As-New and carry `CarryState`. A run hands over after every 40 turns, or when the server suggests it. Before it does, it uploads a git bundle and records a `continue_as_new` event, and it treats a failure of either as a warning. A cancel that has arrived is acted on in the old run instead of being carried, because `CarryState` has no field for it and the check and the hand-over are one step with no await between them. The hints stay in `CarryState`, and the transcript tells `llm_turn` which of them the model has read, so nothing about delivery crosses the hand-over. The tuning rides in the memo, which `continue_as_new` carries over.
 - The GitHub poller is a Temporal Schedule with overlap policy SKIP (ADR-0008).
 - Tests use `temporalio.testing.WorkflowEnvironment`. `start_time_skipping()` covers long timers. `start_local()` covers anything that needs schedules.
 - The local stack runs the Temporal dev server from `docker-compose.yml` (`temporalio/temporal:1.5.1`, which ships Server 1.29.1).

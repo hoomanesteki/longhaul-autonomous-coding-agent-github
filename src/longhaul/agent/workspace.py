@@ -41,6 +41,9 @@ GIT_TIMEOUT_S = 120
 CHMOD_BATCH = 50  # paths per command, so a big tree stays under the argument size limit
 # Long enough for a cold pip install of a real project over a slow link.
 DEFAULT_SETUP_TIMEOUT_S = 900
+# How the agent runs the repo's tests when the repo names no command. The setup command puts the
+# project and pytest in .venv, and the sandbox puts .venv/bin first on the PATH.
+DEFAULT_TEST_COMMAND = "python -m pytest -q"
 
 OUTPUT_TAIL_LINES = 40
 OUTPUT_TAIL_CHARS = 4_000
@@ -410,10 +413,10 @@ async def _commit_base(sandbox: Sandbox) -> str:
 # --- setup -----------------------------------------------------------------------------------
 
 
-def _has_dev_extra(pyproject: Path) -> bool:
+def _has_dev_extra(pyproject_text: str) -> bool:
     try:
-        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(pyproject_text)
+    except tomllib.TOMLDecodeError:
         return False
     project = data.get("project")
     extras = project.get("optional-dependencies") if isinstance(project, dict) else None
@@ -423,20 +426,34 @@ def _has_dev_extra(pyproject: Path) -> bool:
     )
 
 
+def pip_install_command(pyproject_text: str) -> str:
+    """The default setup for a project whose pyproject.toml reads `pyproject_text`.
+
+    The sandbox's root filesystem is read-only, so packages go into /workspace/.venv, whose
+    bin directory leads PATH. A project with no `dev` extra gets pytest installed next to it.
+    It takes the text, not a path, so a recovery can read the file from the workspace it is
+    setting up, and not from a folder that may have changed since the task began.
+    """
+    target = "-e '.[dev]'" if _has_dev_extra(pyproject_text) else "-e . pytest"
+    # No pip cache: HOME is a 64 MB tmpfs, which a few large wheels would fill.
+    pip = ".venv/bin/pip install --disable-pip-version-check --no-cache-dir -q"
+    return f"python -m venv .venv && {pip} {target}"
+
+
 def default_setup_command(source_dir: Path) -> str | None:
     """What to run when the repo gives no setup command: a venv with the project and pytest.
 
-    The sandbox's root filesystem is read-only, so packages go into /workspace/.venv, whose
-    bin directory leads PATH. Without a pyproject.toml there is nothing to install and the
-    answer is None. A project with no `dev` extra gets pytest installed next to it.
+    Without a pyproject.toml there is nothing to install and the answer is None. See
+    pip_install_command for the rest.
     """
     pyproject = source_dir / "pyproject.toml"
     if not pyproject.is_file():
         return None
-    target = "-e '.[dev]'" if _has_dev_extra(pyproject) else "-e . pytest"
-    # No pip cache: HOME is a 64 MB tmpfs, which a few large wheels would fill.
-    pip = ".venv/bin/pip install --disable-pip-version-check --no-cache-dir -q"
-    return f"python -m venv .venv && {pip} {target}"
+    try:
+        text = pyproject.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        text = ""  # a file that cannot be read names no dev extra
+    return pip_install_command(text)
 
 
 async def _run_setup(sandbox: Sandbox, command: str, timeout_s: int) -> None:

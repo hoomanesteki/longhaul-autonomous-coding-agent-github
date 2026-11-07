@@ -8,6 +8,7 @@ import shlex
 from dataclasses import dataclass
 from typing import Any
 
+from longhaul.context.truncate import split_lines
 from longhaul.contracts import Sandbox, ToolContext, ToolResult, ToolSpec
 from longhaul.tools import ToolError, to_utf8
 from longhaul.tools.paths import Resolved, resolve
@@ -44,21 +45,6 @@ def fail(output: str) -> ToolResult:
     return ToolResult(call_id="", ok=False, output=output)
 
 
-def split_lines(text: str) -> list[str]:
-    """The lines of `text` the way rg, sed and tracebacks count them.
-
-    Only "\\n" ends a line. str.splitlines also breaks at form feeds, vertical tabs,
-    NEL and the Unicode separators, which would shift every line number after one.
-    The "\\r" of a CRLF ending is dropped, so such a file reads like any other.
-    """
-    if not text:
-        return []
-    lines = text.split("\n")
-    if lines[-1] == "":
-        lines.pop()
-    return [ln.removesuffix("\r") for ln in lines]
-
-
 def format_diff(path: str, old: str, new: str) -> str:
     # Lines are cut at "\n" only, so the hunk numbers match read_file and rg. CRLF
     # endings are left out of the picture, as they are in read_file.
@@ -78,7 +64,7 @@ def format_diff(path: str, old: str, new: str) -> str:
     return out
 
 
-def _numbered(n: int, line: str, room: int) -> str:
+def numbered_line(n: int, line: str, room: int) -> str:
     prefix = f"{n:>6}\t"
     if len(prefix) + len(line) <= room:
         return prefix + line
@@ -86,32 +72,50 @@ def _numbered(n: int, line: str, room: int) -> str:
     return f"{prefix}{line[:space]} [line cut: {len(line) - space} more characters]"
 
 
+def page_end(total: int, start: int, end: int | None, what: str = "file") -> int | None:
+    """The last line of the range `start` to `end` in a text of `total` lines.
+
+    It is None for an empty text read from line 1. Raises ToolError for a range that cannot
+    be read, with a message that names the text as `what`.
+    """
+    if end is not None and end < start:
+        raise ToolError(f"end_line {end} is before start_line {start}")
+    if total == 0:
+        if start > 1:
+            raise ToolError(f"start_line {start} is beyond the end of the {what} (it is empty)")
+        return None
+    if start > total:
+        size = "1 line" if total == 1 else f"{total} lines"
+        raise ToolError(f"start_line {start} is beyond the end of the {what} ({size})")
+    return total if end is None else min(end, total)
+
+
 def number_lines(
-    text: str, start: int, end: int | None, max_chars: int = DEFAULT_READ_CHARS
+    text: str,
+    start: int,
+    end: int | None,
+    max_chars: int = DEFAULT_READ_CHARS,
+    *,
+    max_lines: int = MAX_READ_LINES,
+    what: str = "file",
 ) -> str:
     """Lines `start` to `end` with their numbers, as many as fit in `max_chars`.
 
-    A page also ends after MAX_READ_LINES lines. When it ends early, a footer names
-    the line to go on from. Raises ToolError for a range that cannot be read.
+    A page also ends after `max_lines` lines. When it ends early, a footer names the line to
+    go on from. Raises ToolError for a range that cannot be read. `what` names the text in
+    the messages: read_file pages a "file" and read_output pages an "output".
     """
     lines = split_lines(text)
     total = len(lines)
-    if end is not None and end < start:
-        raise ToolError(f"end_line {end} is before start_line {start}")
-    if not lines:
-        if start > 1:
-            raise ToolError(f"start_line {start} is beyond the end of the file (it is empty)")
-        return "(empty file)"
-    if start > total:
-        size = "1 line" if total == 1 else f"{total} lines"
-        raise ToolError(f"start_line {start} is beyond the end of the file ({size})")
-    last = total if end is None else min(end, total)
+    last = page_end(total, start, end, what)
+    if last is None:
+        return f"(empty {what})"
     room = max(max_chars - FOOTER_RESERVE, MIN_PAGE_CHARS)
     rows: list[str] = []
     used = 0
     n = start
-    while n <= last and n - start < MAX_READ_LINES:
-        row = _numbered(n, lines[n - 1], room)
+    while n <= last and n - start < max_lines:
+        row = numbered_line(n, lines[n - 1], room)
         if rows and used + len(row) + 1 > room:
             break
         rows.append(row)

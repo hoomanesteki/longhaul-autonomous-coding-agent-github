@@ -18,6 +18,7 @@ from longhaul.contracts import ProviderError, ProviderErrorKind
 from longhaul.durable import acts
 from longhaul.durable.activities import support
 from longhaul.durable.payload_guard import PayloadTooLargeError
+from longhaul.github.client import GitHubFatal, GitHubRetryable
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -183,6 +184,27 @@ def test_a_failure_that_is_not_retried_names_the_exception_type() -> None:
     assert "planner" in str(failure)
 
 
+# ---------- GitHub errors (failure mode F10) ----------
+def test_a_github_error_that_can_pass_is_retried_after_the_wait_github_gave() -> None:
+    failure = support.github_failure(GitHubRetryable("rate limited", 403, 90.0))
+    assert not failure.non_retryable
+    assert failure.type == "GitHubRetryable"
+    assert failure.next_retry_delay == timedelta(seconds=90)
+
+
+def test_a_github_error_without_a_wait_leaves_the_delay_to_the_policy() -> None:
+    failure = support.github_failure(GitHubRetryable("bad gateway", 502))
+    assert not failure.non_retryable
+    assert failure.next_retry_delay is None
+
+
+def test_a_github_error_that_asking_again_cannot_fix_is_not_retried() -> None:
+    failure = support.github_failure(GitHubFatal("GitHub GET /repos/a/b returned 404", 404))
+    assert failure.non_retryable
+    assert failure.type == "GitHubFatal"
+    assert "404" in str(failure)
+
+
 # ---------- blob names ----------
 @pytest.mark.parametrize("call_id", ["toolu_01ABC", "call_abc123", "toolu_a1b2c3d4e5f6a7b8_0"])
 def test_an_id_made_of_safe_characters_is_used_as_it_is(call_id: str) -> None:
@@ -214,3 +236,39 @@ def test_different_odd_ids_do_not_share_a_name() -> None:
     first = support.call_slug("functions.get:0")
     second = support.call_slug("functions.get:1")
     assert first != second
+
+
+# ---------- the meters of the tasks a worker is running (LH-404) ----------
+def test_a_task_gets_the_same_meter_every_time() -> None:
+    meters = support.Meters()
+
+    assert meters.for_task("lh-a") is meters.for_task("lh-a")
+    assert meters.for_task("lh-a") is not meters.for_task("lh-b")
+
+
+def test_a_new_meter_starts_from_the_default_rule() -> None:
+    assert support.Meters().for_task("lh-a").observations == 0
+
+
+def test_the_meters_of_the_oldest_tasks_are_dropped_first() -> None:
+    meters = support.Meters(capacity=2)
+    first = meters.for_task("lh-a")
+    meters.for_task("lh-b")
+    meters.for_task("lh-c")
+
+    assert meters.for_task("lh-a") is not first  # it was dropped and starts over
+
+
+def test_asking_for_a_meter_keeps_it_among_the_newest() -> None:
+    meters = support.Meters(capacity=2)
+    first = meters.for_task("lh-a")
+    meters.for_task("lh-b")
+    meters.for_task("lh-a")  # lh-a is in use again, so lh-b is the oldest
+    meters.for_task("lh-c")
+
+    assert meters.for_task("lh-a") is first
+
+
+def test_a_meter_cache_needs_room_for_a_task() -> None:
+    with pytest.raises(ValueError, match="capacity"):
+        support.Meters(capacity=0)

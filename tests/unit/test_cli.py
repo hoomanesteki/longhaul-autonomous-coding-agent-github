@@ -40,6 +40,7 @@ from longhaul.contracts import (
     SandboxLimits,
     ToolSpec,
 )
+from longhaul.github.intake import CUT_NOTE, FILE_CUT_NOTE, MAX_BODY_BYTES, clip_text
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
@@ -478,18 +479,19 @@ def test_anthropic_without_a_key_exits_2_before_docker(
     assert "ANTHROPIC_API_KEY" in result.stderr
 
 
-def test_a_provider_that_is_not_built_yet_exits_2_before_docker(
+def test_replay_without_a_recordings_folder_exits_2_before_docker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def no_docker() -> Any:
         raise AssertionError("docker was touched")
 
     monkeypatch.setattr(cli, "make_manager", no_docker)
-    monkeypatch.setenv("LONGHAUL_PROVIDER", "replay")  # a known name that has no provider yet
+    monkeypatch.setenv("LONGHAUL_PROVIDER", "replay")
+    monkeypatch.delenv("LONGHAUL_RECORDINGS_DIR", raising=False)
     args = ["run-local", "--path", str(CALC), "--issue-file", str(CALC / "ISSUE.md")]
     result = invoke(args)
     assert result.exit_code == 2
-    assert "not implemented yet" in result.stderr
+    assert "LONGHAUL_RECORDINGS_DIR" in result.stderr
 
 
 def test_a_missing_config_exits_2_and_says_where_to_set_it(
@@ -735,6 +737,42 @@ def test_read_issue_reads_utf8_and_reports_the_file(tmp_path: Path) -> None:
     (tmp_path / "blank.md").write_text("\n")
     with pytest.raises(ValueError, match=r"blank\.md"):
         cli.read_issue(tmp_path / "blank.md")
+
+
+def test_read_issue_cuts_a_body_over_the_github_limit(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A local task obeys the limit of a GitHub task (github/intake.py), so a 300 KB file cannot
+    # put a 300 KB body into the carry state of a run.
+    issue = tmp_path / "big.md"
+    issue.write_text("# Big issue\n\n" + "x" * 300_000, encoding="utf-8")
+
+    title, body = cli.read_issue(issue)
+
+    assert title == "Big issue"
+    assert body == "x" * MAX_BODY_BYTES + FILE_CUT_NOTE
+    assert "big.md" in capsys.readouterr().err  # the person is told, not only the model
+
+
+def test_the_cut_of_a_file_is_the_cut_of_a_github_body() -> None:
+    # Same function, same byte count, same place for the cut. Only the note differs, because
+    # the rest of a file is not on a GitHub issue.
+    text = "€" * 10_000  # three bytes each, so 8,000 bytes end inside a character
+    from_file = clip_text(text, MAX_BODY_BYTES, FILE_CUT_NOTE)
+    from_github = clip_text(text, MAX_BODY_BYTES)
+
+    assert from_file.removesuffix(FILE_CUT_NOTE) == from_github.removesuffix(CUT_NOTE)
+    assert len(from_github.removesuffix(CUT_NOTE).encode()) <= MAX_BODY_BYTES
+
+
+def test_read_issue_keeps_a_body_at_the_limit_whole(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    issue = tmp_path / "edge.md"
+    issue.write_text("# Edge\n\n" + "y" * MAX_BODY_BYTES, encoding="utf-8")
+
+    assert cli.read_issue(issue) == ("Edge", "y" * MAX_BODY_BYTES)
+    assert capsys.readouterr().err == ""
 
 
 def event(*calls: CallEvent, note: str | None = None, index: int = 2) -> TurnEvent:

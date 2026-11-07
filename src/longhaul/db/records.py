@@ -1,27 +1,48 @@
-"""The rows that activities write: one per model call and one per tool call.
+"""The rows that activities write: one per model call, tool call, checkpoint and event.
 
 `Recorder` is the small interface the activities use, so a unit test can run them without
-Postgres. `SqlRecorder` writes the `turns` and `tool_calls` tables and `MemoryRecorder` keeps
-the same rows in dicts. tests/integration/test_records.py runs the cases of
-tests/unit/test_records.py against both.
+Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints` and `events` tables and
+`MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a tool
+(`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in the
+`Recorder` protocol: only the delivery activities read rows, and they name what they need.
+tests/integration/test_records.py runs the cases of tests/unit/test_records.py against both.
 
-Both writes are upserts. Temporal runs an activity again after a crash or a timeout, and the
-second run writes the row the first run may already have written.
+Temporal runs an activity again after a crash or a timeout, and the second run writes what the
+first run may already have written. A turn, a tool call and a checkpoint are therefore written
+once, however often they are recorded: the first two as upserts on their key, the checkpoint by
+looking for the same sha first, because its table has no natural key. An event is a log line.
+The same event twice means that the thing happened twice, so it is written every time.
+
+Two of the totals in `tasks` come from here (LH-406). `record_request_fraction` keeps the largest
+share of the window that a request took, as a maximum, so it cannot count a request twice. A
+`compaction` event sets `tasks.compactions` to the number of different compaction events of the
+task, counted from the log and not added to a counter. An activity that ran again after its write
+went through leaves a second, identical line in the log (an event is a log line), and the count
+stays right. Two real compactions differ in the tokens they started from, so they are two. A
+task with no row in `tasks`, as in a local run, is not an error: the update changes nothing, as
+it does for the cost ledger (cost/ledger.py).
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from longhaul.contracts import Usage
-from longhaul.db.models import ToolCallRow, Turn
+from longhaul.context.tokens import cache_ratio
+from longhaul.contracts import BlobRef, Usage
+from longhaul.db.models import Checkpoint, Event, Task, ToolCallRow, Turn
+
+# The type of the event that the workflow records for a compaction (durable/workflows/task.py).
+# The workflow cannot import this module, so each side has the name, and a unit test keeps the two
+# equal.
+COMPACTION_EVENT = "compaction"
 
 
 @dataclass(frozen=True)
@@ -36,10 +57,19 @@ class TurnRecord:
     request_ref: str | None = None  # blob key of the transcript that was sent
     response_ref: str | None = None  # blob key of the reply; None when the call failed
     usage: Usage = field(default_factory=Usage)
-    cost_usd: float = 0.0  # 0.0 until the pricing table arrives (LH-701)
+    cost_usd: float = 0.0  # the price of the call, as the cost ledger has it
     stop_reason: str | None = None
     latency_ms: int | None = None
     ended_at: datetime | None = None
+
+    @property
+    def cache_ratio(self) -> float:
+        """cache_read / (input + cache_read) for the call (LH-405).
+
+        Worked out from `usage`, not stored beside it, so the ratio cannot disagree with the
+        counts it comes from.
+        """
+        return cache_ratio(self.usage)
 
 
 @dataclass(frozen=True)
@@ -60,6 +90,31 @@ class ToolCallRecord:
     post_sha: str | None = None
 
 
+@dataclass(frozen=True)
+class CheckpointRecord:
+    """One saved workspace state: a commit in the task's bare repo (ADR-0006).
+
+    `kind` is one of tool, step, compaction and bundle. tool_exec writes `tool` after each
+    commit. `bundle_ref` is set for a bundle only.
+    """
+
+    task_id: str
+    sha: str
+    kind: str
+    turn_index: int
+    step_id: str | None = None
+    bundle_ref: BlobRef | None = None
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One thing that happened to a task. `type` is one of the names in plan section 3.5."""
+
+    task_id: str
+    type: str
+    payload: dict[str, Any]
+
+
 class Recorder(Protocol):
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         """The attempt number for the next model call of a turn: one more than the rows so far.
@@ -72,6 +127,22 @@ class Recorder(Protocol):
 
     async def record_tool_call(self, record: ToolCallRecord) -> None: ...
 
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        """Save the checkpoint, unless this task already has one with the same sha and kind."""
+        ...
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        """Add an event to the log of the task. The payload must be JSON."""
+        ...
+
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        """Note that a request took `fraction` of the window. The task keeps the largest.
+
+        This is `tasks.max_fraction`. It only goes up, so recording a request again, or a smaller
+        one, changes nothing.
+        """
+        ...
+
 
 class MemoryRecorder:
     """The rows in memory, for tests. Public, so that a test can read what was written."""
@@ -79,6 +150,9 @@ class MemoryRecorder:
     def __init__(self) -> None:
         self.turns: list[TurnRecord] = []
         self.tool_calls: dict[str, ToolCallRecord] = {}
+        self.checkpoints: list[CheckpointRecord] = []
+        self.events: list[EventRecord] = []
+        self.max_fractions: dict[str, float] = {}
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -93,6 +167,27 @@ class MemoryRecorder:
 
     async def record_tool_call(self, record: ToolCallRecord) -> None:
         self.tool_calls[record.id] = record
+
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        if not any(_same_checkpoint(c, record) for c in self.checkpoints):
+            self.checkpoints.append(record)
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        self.events.append(EventRecord(task_id, type, dict(payload)))
+
+    async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
+        found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
+        # The position breaks a tie between two calls of one turn in favour of the one recorded
+        # last, as created_at does in the table.
+        latest = max(enumerate(found), key=lambda item: (item[1].turn_index, item[0]), default=None)
+        return None if latest is None else latest[1]
+
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        self.max_fractions[task_id] = max(fraction, self.max_fractions.get(task_id, 0.0))
+
+
+def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
+    return (a.task_id, a.sha, a.kind) == (b.task_id, b.sha, b.kind)
 
 
 _TURN_KEY = ("task_id", "turn_index", "attempt")
@@ -131,6 +226,64 @@ class SqlRecorder:
         async with self._sessions.begin() as session:
             await session.execute(stmt)
 
+    async def record_checkpoint(self, record: CheckpointRecord) -> None:
+        seen = select(Checkpoint.id).where(
+            Checkpoint.task_id == record.task_id,
+            Checkpoint.sha == record.sha,
+            Checkpoint.kind == record.kind,
+        )
+        async with self._sessions.begin() as session:
+            # No unique key to upsert on, so look first. Two attempts of one activity do not
+            # run at the same moment unless a worker hung past its timeout, and the cost of that
+            # race is one extra row.
+            if (await session.execute(seen.limit(1))).first() is None:
+                await session.execute(insert(Checkpoint).values(_checkpoint_values(record)))
+
+    async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
+        async with self._sessions.begin() as session:
+            session.add(Event(task_id=task_id, type=type, payload=dict(payload)))
+            if type == COMPACTION_EVENT:
+                # The new line has to be visible to the count, and a count is not an increment:
+                # see the module docstring.
+                await session.flush()
+                compactions = (
+                    select(func.count(distinct(Event.payload)))
+                    .where(Event.task_id == task_id, Event.type == COMPACTION_EVENT)
+                    .scalar_subquery()
+                )
+                await session.execute(
+                    update(Task).where(Task.id == task_id).values(compactions=compactions)
+                )
+
+    async def record_request_fraction(self, task_id: str, fraction: float) -> None:
+        # One statement, so two requests that finish together cannot lower the maximum.
+        stmt = (
+            update(Task)
+            .where(Task.id == task_id)
+            .values(max_fraction=func.greatest(Task.max_fraction, fraction))
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(stmt)
+
+    async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
+        """The call of this tool in the latest turn, or None if the task never used it.
+
+        A turn can hold several calls of one tool. The one written last wins, and `created_at`
+        says which that is. A retried call keeps the `created_at` of its first attempt, which
+        can only matter between two calls of one turn.
+        """
+        stmt = (
+            select(ToolCallRow)
+            .where(ToolCallRow.task_id == task_id, ToolCallRow.name == name)
+            .order_by(
+                ToolCallRow.turn_index.desc(), ToolCallRow.created_at.desc(), ToolCallRow.id.desc()
+            )
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            row = (await session.execute(stmt)).scalars().first()
+        return None if row is None else _tool_call_record(row)
+
 
 def _turn_values(r: TurnRecord) -> dict[str, Any]:
     return {
@@ -144,6 +297,7 @@ def _turn_values(r: TurnRecord) -> dict[str, Any]:
         "output_tokens": r.usage.output_tokens,
         "cache_read_tokens": r.usage.cache_read_tokens,
         "cache_write_tokens": r.usage.cache_write_tokens,
+        "cache_ratio": r.cache_ratio,
         # str() first: Decimal(0.1) would carry the binary rounding error of the float.
         "cost_usd": Decimal(str(r.cost_usd)),
         "stop_reason": r.stop_reason,
@@ -167,4 +321,32 @@ def _tool_call_values(r: ToolCallRecord) -> dict[str, Any]:
         "pre_sha": r.pre_sha,
         "post_sha": r.post_sha,
         "attempt": r.attempt,
+    }
+
+
+def _tool_call_record(row: ToolCallRow) -> ToolCallRecord:
+    return ToolCallRecord(
+        id=row.id,
+        task_id=row.task_id,
+        turn_index=row.turn_index,
+        name=row.name,
+        ok=row.ok,
+        attempt=row.attempt,
+        args_ref=row.args_ref,
+        exit_code=row.exit_code,
+        output_ref=row.output_ref,
+        duration_ms=row.duration_ms,
+        pre_sha=row.pre_sha,
+        post_sha=row.post_sha,
+    )
+
+
+def _checkpoint_values(r: CheckpointRecord) -> dict[str, Any]:
+    return {
+        "task_id": r.task_id,
+        "sha": r.sha,
+        "kind": r.kind,
+        "step_id": r.step_id,
+        "turn_index": r.turn_index,
+        "bundle_ref": r.bundle_ref.model_dump(mode="json") if r.bundle_ref is not None else None,
     }

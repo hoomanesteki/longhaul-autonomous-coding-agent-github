@@ -17,6 +17,7 @@ Script format::
           raise: overloaded          # a ProviderErrorKind value; replaces the reply
           retry_after_s: 2.0
           times: 2                   # raise for the first 2 identical requests only
+          delay_s: 3.0               # wait this long before the reply or the error
 
 Selection rule: the first step whose match conditions all hold wins. The
 state is derived from the request alone, so the provider is stateless and
@@ -40,6 +41,12 @@ only go with a raise. stop_reason has to fit the calls: tool_use needs one, end_
 allows none. The other reasons (max_tokens, stop_sequence, refusal, pause_turn,
 model_context_window_exceeded, other) take calls or none, so a test can offer a tool
 call that the loop must not run. stop_details only goes with a refusal.
+
+Delay. ``delay_s`` makes the provider wait before it answers, as a model that takes seconds
+does. It changes nothing about the answer, the ids or the usage. The chaos tests use it to have
+a model call that is still running when they kill the worker (tests/fixtures/scripts/
+inventory_fix.yaml). It applies to a raise step as well. It is at most 300 s, so that a typo
+cannot hang a test for hours.
 
 Stop reasons. Every reply sets raw_stop_reason to the stop reason, because there is
 no vendor string behind a script. A reply has no request_id.
@@ -87,6 +94,7 @@ unique inside a transcript, even one that was compacted, and across the
 transcripts of different roles and tasks.
 """
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -127,6 +135,7 @@ _USER_TEXT_TAIL_CHARS = 200
 _OUTPUT_TOKENS_PER_CALL = 50
 _ID_HASH_CHARS = 16
 _MERGE_TAG = "tag:yaml.org,2002:merge"
+MAX_DELAY_S = 300
 
 
 class _Strict(BaseModel):
@@ -159,6 +168,7 @@ class _Respond(_Strict):
     raise_: ProviderErrorKind | None = Field(default=None, alias="raise")
     retry_after_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     times: int | None = Field(default=None, ge=1)
+    delay_s: float | None = Field(default=None, ge=0, le=MAX_DELAY_S, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _only_responses_a_provider_can_give(self) -> Self:
@@ -445,6 +455,8 @@ class ScriptedProvider:
         self._require_role_line(req)
         index, step = self._select(req)
         resp = step.respond
+        if resp.delay_s:
+            await asyncio.sleep(resp.delay_s)
         if resp.raise_ is not None:
             if resp.times is not None:
                 key = (index, req.fingerprint)

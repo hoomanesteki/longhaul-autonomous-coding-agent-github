@@ -8,8 +8,15 @@ from datetime import UTC, datetime
 
 import pytest
 
-from longhaul.contracts import Usage
-from longhaul.db.records import MemoryRecorder, Recorder, ToolCallRecord, TurnRecord
+from longhaul.contracts import BlobRef, Usage
+from longhaul.db.records import (
+    CheckpointRecord,
+    EventRecord,
+    MemoryRecorder,
+    Recorder,
+    ToolCallRecord,
+    TurnRecord,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -78,6 +85,14 @@ async def test_turn_rows_keep_their_usage() -> None:
     assert (row.cost_usd, row.stop_reason) == (0.5, "end_turn")
 
 
+def test_a_turn_row_has_the_cache_ratio_of_its_usage() -> None:
+    # LH-405: cache_read / (input + cache_read), worked out from the usage, so a caller cannot
+    # record a ratio that disagrees with the counts next to it.
+    row = turn(usage=Usage(input_tokens=100, cache_read_tokens=300, cache_write_tokens=50))
+    assert row.cache_ratio == pytest.approx(0.75)
+    assert turn().cache_ratio == 0.0
+
+
 async def test_a_turn_row_needs_nothing_but_the_call_and_its_start() -> None:
     row = turn()
     assert (row.request_ref, row.response_ref, row.stop_reason) == (None, None, None)
@@ -105,3 +120,141 @@ def test_a_tool_call_row_defaults() -> None:
     assert (row.attempt, row.duration_ms) == (1, 0)
     assert (row.args_ref, row.output_ref, row.exit_code) == (None, None, None)
     assert (row.pre_sha, row.post_sha) == (None, None)
+
+
+# ---------- checkpoints and events (LH-206) ----------
+SHA = "a" * 40
+
+
+def checkpoint(sha: str = SHA, **fields: object) -> CheckpointRecord:
+    values: dict[str, object] = {"task_id": "lh-x", "sha": sha, "kind": "tool", "turn_index": 3}
+    return CheckpointRecord(**{**values, **fields})  # type: ignore[arg-type]
+
+
+async def test_checkpoints_are_kept_in_the_order_they_were_saved() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint("a" * 40, turn_index=1))
+    await recorder.record_checkpoint(checkpoint("b" * 40, turn_index=2))
+    assert [(c.sha, c.turn_index) for c in recorder.checkpoints] == [("a" * 40, 1), ("b" * 40, 2)]
+
+
+async def test_saving_the_same_checkpoint_again_keeps_one_row() -> None:
+    # A retried tool call that commits in the same second as its first try makes the same
+    # commit, and so the same sha.
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint())
+    await recorder.record_checkpoint(checkpoint())
+    assert len(recorder.checkpoints) == 1
+
+
+async def test_a_sha_can_be_a_checkpoint_of_two_kinds() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint(kind="tool"))
+    await recorder.record_checkpoint(checkpoint(kind="step", step_id="s1"))
+    await recorder.record_checkpoint(checkpoint("b" * 40, kind="tool"))
+    assert [(c.kind, c.sha[0]) for c in recorder.checkpoints] == [
+        ("tool", "a"),
+        ("step", "a"),
+        ("tool", "b"),
+    ]
+
+
+async def test_a_bundle_checkpoint_keeps_its_ref() -> None:
+    ref = BlobRef(key=f"tasks/lh-x/ckpt/{SHA}.bundle", sha256="b" * 64, size=9)
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(checkpoint(kind="bundle", bundle_ref=ref))
+    assert recorder.checkpoints[0].bundle_ref == ref
+
+
+def test_a_checkpoint_row_defaults() -> None:
+    row = checkpoint()
+    assert (row.step_id, row.bundle_ref) == (None, None)
+
+
+async def test_events_are_kept_in_order_with_their_payload() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "sandbox_recreated", {"head_sha": SHA})
+    await recorder.record_event("lh-y", "hint", {"by": "alice"})
+    assert recorder.events == [
+        EventRecord("lh-x", "sandbox_recreated", {"head_sha": SHA}),
+        EventRecord("lh-y", "hint", {"by": "alice"}),
+    ]
+
+
+async def test_an_event_keeps_a_copy_of_its_payload() -> None:
+    recorder = MemoryRecorder()
+    payload = {"head_sha": SHA}
+    await recorder.record_event("lh-x", "sandbox_recreated", payload)
+    payload["head_sha"] = "changed afterwards"
+    assert recorder.events[0].payload == {"head_sha": SHA}
+
+
+async def test_the_same_event_twice_is_two_events() -> None:
+    # An event is a log line. An activity that ran twice did the thing twice.
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "sandbox_recreated", {})
+    await recorder.record_event("lh-x", "sandbox_recreated", {})
+    assert len(recorder.events) == 2
+
+
+# ---------- the last call of a tool (LH-306) ----------
+def named(call_id: str, name: str, turn_index: int, task_id: str = "lh-x") -> ToolCallRecord:
+    return ToolCallRecord(
+        id=call_id, task_id=task_id, turn_index=turn_index, name=name, ok=True, exit_code=0
+    )
+
+
+async def test_the_last_call_of_a_tool_is_the_one_of_the_latest_turn() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("t1", "run_tests", 1))
+    await recorder.record_tool_call(named("t3", "run_tests", 3))
+    await recorder.record_tool_call(named("t2", "run_tests", 2))
+    await recorder.record_tool_call(named("t4", "read_file", 4))
+
+    found = await recorder.last_tool_call("lh-x", "run_tests")
+
+    assert found is not None
+    assert found.id == "t3"
+
+
+async def test_two_calls_in_one_turn_give_the_one_that_was_recorded_last() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("first", "run_tests", 5))
+    await recorder.record_tool_call(named("second", "run_tests", 5))
+
+    found = await recorder.last_tool_call("lh-x", "run_tests")
+
+    assert found is not None
+    assert found.id == "second"
+
+
+async def test_no_call_of_the_tool_gives_none() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_tool_call(named("t1", "read_file", 1))
+    await recorder.record_tool_call(named("t2", "run_tests", 1, task_id="lh-other"))
+
+    assert await recorder.last_tool_call("lh-x", "run_tests") is None
+
+
+# ---------- the share of the window (LH-406) ----------
+async def test_the_largest_share_of_the_window_is_kept() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.30)
+    await recorder.record_request_fraction("lh-x", 0.55)
+    await recorder.record_request_fraction("lh-x", 0.40)  # a smaller request changes nothing
+    assert recorder.max_fractions == {"lh-x": 0.55}
+
+
+async def test_the_share_is_kept_for_each_task() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-y", 0.20)
+    assert recorder.max_fractions == {"lh-x": 0.50, "lh-y": 0.20}
+
+
+async def test_recording_the_same_share_again_changes_nothing() -> None:
+    # An activity that runs again records what it recorded before.
+    recorder = MemoryRecorder()
+    await recorder.record_request_fraction("lh-x", 0.50)
+    await recorder.record_request_fraction("lh-x", 0.50)
+    assert recorder.max_fractions == {"lh-x": 0.50}

@@ -117,6 +117,8 @@ services:
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
     volumes:
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards that docker/grafana/provisioning/dashboards/longhaul.yaml loads.
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
       - "127.0.0.1:${LH_GRAFANA_PORT:-3000}:3000"
     depends_on:
@@ -127,6 +129,50 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+
+  # The worker starts sandbox containers, so it needs the Docker socket and the checkpoint
+  # folder. That is why it is in the profile `full` and a plain `make up` leaves it out:
+  #   docker compose --profile full up -d --build worker
+  # The socket gives the worker control of the host's Docker. Read "The worker in Docker" in
+  # docs/runbook.md first. The checkpoint folder is mounted at the same path as on the host,
+  # because the worker hands that path to the Docker daemon as the source of a sandbox mount.
+  worker:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: docker/worker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      minio-init:
+        condition: service_healthy
+    environment:
+      LONGHAUL_DATABASE_URL: "postgresql://longhaul:${LH_POSTGRES_PASSWORD:-longhaul}@postgres:5432/longhaul"
+      LONGHAUL_TEMPORAL_ADDRESS: temporal:7233
+      LONGHAUL_BLOB_ENDPOINT: http://minio:9000
+      LONGHAUL_BLOB_BUCKET: longhaul
+      LONGHAUL_BLOB_ACCESS_KEY: longhaul
+      LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+      LONGHAUL_CKPT_DIR: "${LH_CKPT_DIR:-/var/lib/longhaul/ckpt}"
+      # Inside the container the endpoint must listen on every interface, or the published port
+      # below would reach nothing. The port is published on 127.0.0.1 only, as all the others.
+      LONGHAUL_METRICS_HOST: 0.0.0.0
+      LONGHAUL_PROVIDER: "${LONGHAUL_PROVIDER:-scripted}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+      LONGHAUL_GITHUB_TOKEN: "${LONGHAUL_GITHUB_TOKEN:-}"
+    ports:
+      # The port that docker/prometheus/prometheus.yml scrapes as host.docker.internal:9464.
+      - "127.0.0.1:9464:9464"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - "${LH_CKPT_DIR:-/var/lib/longhaul/ckpt}:${LH_CKPT_DIR:-/var/lib/longhaul/ckpt}"
+    # Longer than the 30 s the worker waits for running activities, so docker stop does not
+    # kill it in the middle of its graceful stop.
+    stop_grace_period: 60s
 
 volumes:
   pgdata:

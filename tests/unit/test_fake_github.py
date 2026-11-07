@@ -858,8 +858,9 @@ async def test_unlisted_routes_and_methods_are_plain_github_404s(
 ) -> None:
     # Only the endpoints in the story exist. A call to any other one fails loudly.
     for method, path in [
-        ("GET", api("")),
-        ("GET", api("/branches/main")),
+        ("PATCH", api("")),
+        ("GET", api("/branches")),
+        ("GET", api("/git/refs/heads/main")),
         ("PATCH", api("/issues/1")),
         ("PUT", api("/issues/1/labels")),
         ("GET", "/docs"),
@@ -963,6 +964,44 @@ async def test_refs_pushed_to_the_bare_remote_are_visible(
     pr = created.json()
     assert (pr["head"]["sha"], pr["base"]["sha"]) == (pushed, base)
     assert pr["base"]["repo"]["default_branch"] == "main"
+
+
+async def test_the_repo_and_its_branches_are_read_from_the_bare_remote(
+    fake: FakeGitHub, gh: httpx2.AsyncClient, tmp_path: Path
+) -> None:
+    work = _work_repo(tmp_path / "work")
+    base = git("rev-parse", "HEAD", cwd=work)
+    git("branch", "-m", "trunk", cwd=work)
+    fake.seed_repo(
+        "acme/widgets", default_branch="trunk", remote=tmp_path / "remote.git", source=work
+    )
+
+    repo = await gh.get(api("", "acme/widgets"))
+    assert repo.status_code == 200
+    assert repo.json()["default_branch"] == "trunk"
+    assert repo.json()["full_name"] == "acme/widgets"
+
+    branch = await gh.get(api("/branches/trunk", "acme/widgets"))
+    assert branch.status_code == 200
+    assert branch.json()["commit"]["sha"] == base
+
+    # A branch pushed with git is visible at once, and a name with a slash is one path.
+    git("push", "-q", fake.clone_url("acme/widgets"), "HEAD:refs/heads/longhaul/7", cwd=work)
+    nested = await gh.get(api("/branches/longhaul/7", "acme/widgets"))
+    assert nested.json()["commit"]["sha"] == base
+
+
+async def test_a_missing_branch_or_repo_is_a_github_404(
+    fake: FakeGitHub, gh: httpx2.AsyncClient, tmp_path: Path
+) -> None:
+    fake.seed_repo("acme/empty", remote=tmp_path / "empty.git")
+
+    for path in (api("/branches/main", "acme/empty"), api("/branches/main"), api("", "acme/nope")):
+        response = await gh.get(path)
+        assert response.status_code == 404, path
+    assert (await gh.get(api("/branches/main", "acme/empty"))).json()["message"] == (
+        "Branch not found"
+    )
 
 
 def test_a_repo_without_a_remote_has_no_refs(fake: FakeGitHub) -> None:

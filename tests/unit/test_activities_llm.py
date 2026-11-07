@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -41,6 +42,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
+from longhaul.durable.scripts import script_key, upload_script
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -240,6 +242,15 @@ async def test_a_turn_row_is_written_for_the_call() -> None:
     assert row.ended_at is not None and row.ended_at >= row.started_at
 
 
+async def test_the_turn_row_carries_the_cache_ratio_of_the_call() -> None:
+    # LH-405: 5 tokens read from the cache and 100 sent plain. The 7 written are not in the ratio.
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    await rig.run(turn_input())
+
+    (row,) = rig.recorder.turns
+    assert row.cache_ratio == pytest.approx(5 / 105)
+
+
 async def test_a_later_turn_continues_from_the_stored_transcript() -> None:
     rig = Rig(reply("end_turn", TextBlock(text="Done.")))
     ref = await rig.put("transcript-1.json", answered())
@@ -373,6 +384,129 @@ async def test_a_pause_with_no_text_carries_nothing_forward() -> None:
     out = await rig.run(turn_input())
     assert out.stop_reason == "pause_turn"
     assert out.paused_ref is None
+
+
+# ---------- hints (LH-207) ----------
+HINT = "alice: use pytest -x"
+HINT_TEXT = "Hint from alice: use pytest -x"
+
+
+async def test_a_hint_reaches_the_model_as_text_after_the_tool_results() -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")))
+    ref = await rig.put("transcript-1.json", answered())
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+
+    (call,) = rig.provider.calls
+    assert call["messages"][:-1] == answered()[:-1]
+    assert call["messages"][-1] == Message(
+        role="user",
+        content=[
+            ToolResultBlock(tool_use_id="toolu_1", content="x = 1"),
+            TextBlock(text=HINT_TEXT),
+        ],
+    )
+
+
+async def test_a_hint_does_not_change_the_system_prompt() -> None:
+    # D7: the prompt is the same bytes on every call of a transcript, or the cache is lost.
+    rig = Rig(reply("end_turn"), reply("end_turn"))
+    ref = await rig.put("transcript-1.json", answered())
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref))
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+
+    plain, hinted = rig.provider.calls
+    assert plain["system"] == hinted["system"] == build_system_prompt(Role.CODER, SPEC)
+    assert HINT_TEXT not in hinted["system"]
+    assert hinted["tools"] == plain["tools"]
+
+
+async def test_a_hint_is_stored_in_the_transcript_and_not_sent_again() -> None:
+    # The workflow keeps passing every hint of the task, and the transcript is what tells the
+    # activity which of them the model has read.
+    rig = Rig(
+        reply("tool_use", use("toolu_2", path="b.py")),
+        reply("end_turn", TextBlock(text="Done.")),
+    )
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    stored = await rig.transcript(first.transcript_ref)
+    assert stored[2].content[-1] == TextBlock(text=HINT_TEXT)
+
+    answer = Message(role="user", content=[ToolResultBlock(tool_use_id="toolu_2", content="y")])
+    grown = await rig.put("transcript-2.json", [*stored, answer], turn=1)
+    await rig.run(turn_input(turn_index=2, transcript_ref=grown, hints=[HINT]))
+
+    sent = rig.provider.calls[1]["messages"]
+    texts = [b.text for m in sent for b in m.content if isinstance(b, TextBlock)]
+    assert texts.count(HINT_TEXT) == 1
+    assert sent[-1] == answer
+
+
+async def test_a_second_hint_is_added_beside_the_first_that_is_already_there() -> None:
+    rig = Rig(reply("end_turn", TextBlock(text="a")), reply("end_turn", TextBlock(text="b")))
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    # The reply ended the turn, so the next call starts from a user message again.
+    nudged = [
+        *await rig.transcript(first.transcript_ref),
+        Message(role="user", content=[TextBlock(text="Use tools or call finish.")]),
+    ]
+    again = await rig.put("transcript-2.json", nudged, turn=1)
+    await rig.run(turn_input(turn_index=2, transcript_ref=again, hints=[HINT, "bob: look at b.py"]))
+
+    last = rig.provider.calls[1]["messages"][-1]
+    assert [b.text for b in last.content if isinstance(b, TextBlock)] == [
+        "Use tools or call finish.",
+        "Hint from bob: look at b.py",
+    ]
+
+
+async def test_a_hint_that_came_with_the_start_is_in_the_first_message() -> None:
+    rig = Rig(reply("tool_use", use("toolu_1", path="a.py")))
+    out = await rig.run(turn_input(hints=[HINT]))
+
+    (call,) = rig.provider.calls
+    assert call["messages"] == [
+        Message(
+            role="user", content=[TextBlock(text=FIRST_USER_MESSAGE), TextBlock(text=HINT_TEXT)]
+        )
+    ]
+    stored = await rig.transcript(out.transcript_ref)
+    assert stored[0] == call["messages"][0]
+
+
+async def test_a_reply_that_is_not_stored_keeps_the_hint_for_the_next_call() -> None:
+    # A reply cut off at max_tokens adds nothing to the transcript. The hint goes with it, and
+    # the call that asks again sends it once more, so it is read once and stored once.
+    cut = reply("max_tokens", TextBlock(text="Writing"))
+    rig = Rig(cut, reply("end_turn", TextBlock(text="Done.")))
+    ref = await rig.put("transcript-1.json", answered())
+    first = await rig.run(turn_input(turn_index=1, transcript_ref=ref, hints=[HINT]))
+    assert first.transcript_ref == ref
+
+    second = await rig.run(
+        turn_input(
+            turn_index=1,
+            transcript_ref=first.transcript_ref,
+            hints=[HINT],
+            high_output_cap=True,
+        )
+    )
+    assert rig.provider.calls[0]["messages"][-1] == rig.provider.calls[1]["messages"][-1]
+    stored = await rig.transcript(second.transcript_ref)
+    texts = [b.text for m in stored for b in m.content if isinstance(b, TextBlock)]
+    assert texts.count(HINT_TEXT) == 1
+
+
+async def test_a_retry_of_the_activity_stores_the_same_transcript() -> None:
+    rig = Rig(
+        reply("end_turn", TextBlock(text="Done.")), reply("end_turn", TextBlock(text="Done."))
+    )
+    ref = await rig.put("transcript-1.json", answered())
+    inp = turn_input(turn_index=1, transcript_ref=ref, hints=[HINT])
+    first = await rig.run(inp)
+    second = await rig.run(inp, attempt=2)
+    assert await rig.transcript(first.transcript_ref) == await rig.transcript(second.transcript_ref)
 
 
 # ---------- the size of what crosses the boundary ----------
@@ -512,3 +646,101 @@ async def test_the_activity_heartbeats_while_the_model_thinks() -> None:
     await rig.run(turn_input(), heartbeat_timeout_s=0.3)
     # One at once and one every 0.1 s: the event loop is free while the call waits.
     assert len(rig.beats) >= 4
+
+
+# ---------- LH-208: a script that travels with the task ----------
+CALC_FIX = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "scripts" / "calc_fix.yaml"
+
+
+class CountingBlobs(MemoryBlobStore):
+    """A memory store that counts reads, to show that a task's script is fetched once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    async def get(self, ref: BlobRef) -> bytes:
+        self.reads.append(ref.key)
+        return await super().get(ref)
+
+
+def scripted_worker(provider: FakeProvider | None) -> tuple[LlmActivities, CountingBlobs]:
+    blobs = CountingBlobs()
+    activities = LlmActivities(
+        provider,  # type: ignore[arg-type]
+        blobs,
+        MemoryRecorder(),
+        TOOLS,
+        lambda role: CFG,
+    )
+    return activities, blobs
+
+
+async def run_turn(activities: LlmActivities, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+    return await ActivityEnvironment().run(activities.llm_turn, inp)
+
+
+async def test_a_task_script_answers_instead_of_the_provider_of_the_worker() -> None:
+    worker_provider = FakeProvider()  # no steps: any call to it fails the test
+    activities, blobs = scripted_worker(worker_provider)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    out = await run_turn(activities, turn_input(script_ref=ref))
+
+    assert [s.name for s in out.tool_call_summaries] == ["list_dir"]  # the first step of calc_fix
+    assert worker_provider.calls == []
+
+
+async def test_a_worker_without_a_provider_still_plays_the_script_of_a_task() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    out = await run_turn(activities, turn_input(script_ref=ref))
+    assert [s.name for s in out.tool_call_summaries] == ["list_dir"]
+
+
+async def test_the_script_of_a_task_is_fetched_once_and_then_kept() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await upload_script(blobs, SPEC.task_id, CALC_FIX)
+
+    first = await run_turn(activities, turn_input(script_ref=ref))
+    await run_turn(activities, turn_input(script_ref=ref, turn_index=1))
+
+    assert blobs.reads.count(script_key(SPEC.task_id)) == 1
+    assert first.tool_call_summaries
+
+
+async def test_a_task_without_a_script_uses_the_provider_of_the_worker() -> None:
+    worker_provider = FakeProvider(reply("end_turn", TextBlock(text="Done.")))
+    activities, _ = scripted_worker(worker_provider)
+
+    await run_turn(activities, turn_input())
+    assert len(worker_provider.calls) == 1
+
+
+async def test_a_worker_with_no_provider_refuses_a_task_without_a_script_for_good() -> None:
+    activities, _ = scripted_worker(None)
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input())
+    assert caught.value.non_retryable
+    assert "script" in str(caught.value)
+
+
+async def test_a_script_that_cannot_be_read_fails_for_good() -> None:
+    activities, blobs = scripted_worker(None)
+    ref = await blobs.put(b"steps: 3\n", key=script_key(SPEC.task_id))
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input(script_ref=ref))
+    assert caught.value.non_retryable
+    assert "invalid script" in str(caught.value)
+
+
+async def test_a_script_that_is_missing_from_the_store_fails_for_good() -> None:
+    activities, _ = scripted_worker(None)
+    ref = BlobRef(key=script_key(SPEC.task_id), sha256="0" * 64, size=1)
+
+    with pytest.raises(ApplicationError) as caught:
+        await run_turn(activities, turn_input(script_ref=ref))
+    assert caught.value.non_retryable

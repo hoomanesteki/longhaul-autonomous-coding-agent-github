@@ -1916,15 +1916,11 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 - **Cumulative tests:** `make gate PHASE=2`. That covers phases 0 to 2, including Phase 1's `test_calc_scripted` (the in-process loop still works) and `chaos_lite`.
 - **Manual smoke:**
   ```bash
-  make up && make sandbox-image
-  uv run longhaul worker &           # shell 1
-  WORKER=$!
-  uv run longhaul run --path tests/fixtures/repos/inventory --issue-file tests/fixtures/repos/inventory/ISSUE.md --provider scripted --script tests/fixtures/scripts/inventory_fix.yaml &
-  sleep 4 && kill -9 $WORKER && sleep 2 && uv run longhaul worker &
-  wait
+  make up && make sandbox-image && make migrate
+  scripts/chaos_kill.sh 3   # a worker, the inventory run, SIGKILL to the worker's own pid, a new worker
   # Temporal UI: workflow shows a retried activity; final status DONE
-  docker rm -f $(docker ps -q --filter label=longhaul.task_id) 2>/dev/null; echo "no leftovers"
   ```
+  The script starts `.venv/bin/longhaul worker` and kills that pid. With `uv run longhaul worker &`, `$!` is the pid of uv, which cannot pass a SIGKILL on, so the worker would keep running and nothing would be retried.
 
 ### Phase gate 2
 
@@ -1941,6 +1937,39 @@ The reviewer ran an adversarial review of everything merged during Phase 0 and P
 3. **Why pass references instead of the transcript?** Temporal stores every input and output in history. A 150 KB transcript per turn would blow past history limits in a few dozen turns and slow replay.
 4. **Is an LLM turn idempotent?** No. A retry costs a second call and may return a different answer. We accept that: the ledger records both attempts, and only the completed attempt's result enters history, so the workflow stays consistent.
 5. **How do you know the chaos test is meaningful?** It fails when the recovery code is removed (mutation check), and it asserts the final diff matches a no-kill reference, not just that something finished.
+
+### Phase 2 fix stories (from the gate)
+
+The first `make gate PHASE=2` and the independent gate review found the problems below. Each was reproduced with a failing test before it was fixed.
+
+#### LH-291 · Chaos kills by progress, and lint without a cache
+- **Epic:** E5 · **Points:** 2 · **Branch:** `fix/lh-291-chaos-kills-by-progress` · **Depends on:** LH-209
+- **Story:** As the reviewer, I want the seeded chaos runs to kill the worker whatever the speed of the machine, so that a red gate means a bug and not a busy laptop.
+- **Build:**
+  - `plan_kills` takes the reference run's activity lines instead of its wall time. A seeded kill waits for the k-th "activity ... started" line of the worker it kills, with k drawn from the reference's started lines after the first model turn and inside the first `WINDOW_SHARE` of them. It then waits a seeded pause no longer than that activity took in the reference. A later kill in the same run still waits for an activity of the new worker to end first.
+  - `Kill` gets `nth`, the number of matching lines to wait for in that worker's own log.
+  - `make check` and `make ci-local` run `ruff check --no-cache .`. The ruff cache kept the import order of a test that was linted before its new module existed, so a local check passed where CI would fail.
+- **Acceptance criteria:**
+  - [ ] `plan_kills` depends only on the seed and the reference's activity lines.
+  - [ ] A kill meets a run that is twice as fast or twice as slow as the reference.
+  - [ ] `pytest -m chaos_lite` passes twice in a row on a loaded machine.
+- **Tests:** `tests/unit/test_chaos_harness.py::test_a_kill_meets_a_run_that_is_faster_or_slower_than_the_reference`, `::test_a_seed_is_a_repeatable_plan`, `tests/unit/test_ci_config.py::test_make_lints_without_the_ruff_cache`
+- **Files:** `tests/chaos/harness.py`, `tests/chaos/test_kill_worker.py`, `Makefile`, tests
+
+#### LH-292 · Payload guard in the converter and root-proof tests
+- **Epic:** E4 · **Points:** 3 · **Branch:** `fix/lh-292-payload-converter-guard` · **Depends on:** LH-204
+- **Story:** As the reviewer, I want I2 enforced where payloads are written, so that an oversized input never reaches Temporal's history.
+- **Build:**
+  - The data converter that the client and the worker share refuses any single payload over 256,000 bytes with `PayloadTooLargeError`, on the encode path only. A workflow that schedules an oversized activity input fails with that error, and the payload is never written.
+  - `longhaul run` and `run-local` cut an issue body read from `--issue-file` at `intake.MAX_BODY_BYTES`, as the poller cuts a GitHub body.
+  - The two snapshot tests that skipped as root raise the read error another way and run as any user.
+- **Acceptance criteria:**
+  - [ ] A 300 KB payload is refused by the converter, and a 200 KB one passes.
+  - [ ] A workflow that schedules a 300 KB activity input never writes it to history.
+  - [ ] A 300 KB `--issue-file` runs, and no payload in its history is over 256 KB.
+  - [ ] No skip without an issue link remains in `tests/`.
+- **Tests:** `tests/unit/test_payload_converter.py`, `tests/integration/test_payload_guard_history.py`, `tests/unit/test_snapshot.py`
+- **Files:** `src/longhaul/durable/payload_converter.py`, `src/longhaul/durable/client.py`, `src/longhaul/durable/workflows/task.py`, `src/longhaul/cli.py`, `src/longhaul/github/intake.py`, ADR-0005, tests
 
 ---
 

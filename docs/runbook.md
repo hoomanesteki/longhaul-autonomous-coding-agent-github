@@ -348,10 +348,10 @@ The workflow watches the coder for four ways of going in circles (LH-505). It sh
 |---|---|---|
 | `repeated_failure` | The same command failed the same way this many times. Turns with no failing command do not break the streak. | 3 |
 | `tool_errors` | The last this many tool calls all failed. A turn with one good call ends the run. | 5 |
-| `edit_churn` | One region of a file was edited this many times in the last 10 turns and the number of passing tests did not move. Two edits are the same region when the smaller shares half or more of its lines with the other. | 4 |
-| `no_progress` | In this many turns no test run passed more tests than any run before it, and no plan step was finished. The first test count counts as a gain. | 15 |
+| `edit_churn` | One region of a file was edited this many times in the last 10 turns and the number of passing tests did not move. Two edits are the same region when they share half or more of the lines of the longer one, so a new file followed by fixes in other places of it is not churn. | 4 |
+| `no_progress` | In this many turns no test run passed more tests than any run before it, and no plan step was finished. The first test count counts as a gain, and so do the steps done when the window starts. | 15 |
 
-When a turn matches more than one rule, the first row that fits is the one recorded. A signal that fires empties the detector's window, so a pattern that goes on is reported again only after it has built up again from nothing. The window holds the last 30 turns in `CarryState.stuck_window`, which crosses a hand-over to a new run, and it serializes to under 8 KB.
+When a turn matches more than one rule, the first row that fits is the one recorded. A signal that fires empties the detector's window, so a pattern that goes on is reported again only after it has built up again from nothing. Because the window does not say how many steps were done before it started, `no_progress` can come one turn late after a signal, and never early. The window holds the last 30 turns in `CarryState.stuck_window`, which crosses a hand-over to a new run, and it serializes to under 8 KB, whatever the characters of the file names, since a path is cut to 48 bytes of JSON.
 
 The limits are the `stuck` section of the config. The workflow cannot read the config file and keeps a copy (`roles/stuck.py`, `DEFAULT_LIMITS`), so a worker whose `stuck.no_progress_turns`, `repeated_failure_count`, `churn_edits` or `consecutive_tool_errors` differs from it stops at the start and names the setting. `stuck.hint_wait_hours` is for LH-506 and is not checked.
 

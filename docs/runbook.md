@@ -215,7 +215,7 @@ The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` an
 
 ### Pull requests and labels
 
-A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a pull request. The pull request is ready for review when a verifier passed the work (see "The verifier and the send-back loop") and a draft when none did:
+A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a pull request. The pull request is ready for review when a verifier passed the work and at least one command of the pre-check backed it (see "The verifier and the send-back loop"), and a draft when not:
 
 | When | What the issue shows |
 |---|---|
@@ -346,14 +346,14 @@ A task with a plan does not trust `submit_for_review` (LH-504). The phase become
 
 | Half | What it does |
 |---|---|
-| The pre-check | Runs the test command of the repo, then every acceptance check of the plan that is a command, then `git_diff`. All of it is read-only: a file that a command writes is put back. A command that exits with a code other than 0, or does not finish, fails the review, whatever the verifier says. A repo with no test command runs none. |
+| The pre-check | Runs the test command of the repo, then every acceptance check of the plan that is a command, then `git_diff`. All of it is read-only: a file that a command writes is put back. A command that exits with a code other than 0, or does not finish, fails the review, whatever the verifier says. A repo with no test command and a plan with no command in its checks runs none, and the verdict decides alone. |
 | The verdict | A verifier with a fresh transcript gets the plan, the pre-check and the diff, reads the code with `list_dir`, `read_file`, `search`, `git_diff`, `run_tests` and `read_output`, and ends with `submit_verdict`: `passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. It has 15 turns for a round. |
 
 An acceptance check is a command when it starts with `$ ` or is a command in backticks and nothing else. The planner is told the mark. A check without it is read by the verifier and not run, so a sentence is never run as a command.
 
 | Result | What follows |
 |---|---|
-| The work passes | The task goes on as it did after `finish`. A task of an issue opens the pull request ready for review, with `Verified: <tests_summary>` in the body. |
+| The work passes | The task goes on as it did after `finish`. A task of an issue opens the pull request ready for review, with `Verified: <tests_summary>` in the body. When the pre-check ran no command, the counts are the verifier's word only, so the pull request is a draft and has no `Verified:` line. |
 | The work fails | The round is counted, the coder gets the user message `Review failed: <issues>. Fix step <send_back_step>.` at the end of its own transcript, and the phase is `coding` again. |
 | The work fails the third time | The task ends as `stuck` in the phase `failed`, with the reason and the last issues in the summary. A task of an issue has no pull request and keeps its labels (LH-507). |
 
@@ -363,7 +363,7 @@ The number of failed reviews is `loop.max_verify_rounds`, and it must equal `act
 |---|---|
 | `status()`, `longhaul status` | The phase `verifying` while the pre-check and the verifier run. |
 | Postgres, `events` | One `verdict` event for each round, with `passed`, `model_passed`, `precheck_passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. `passed` is the result, and the other two show which half failed. |
-| Postgres, `tool_calls` | The commands of the pre-check, with the ids `verify<round>-tests`, `verify<round>-check<n>` and `verify<round>-diff`. |
+| Postgres, `tool_calls` | The commands of the pre-check, with the ids `<task id>-verify<round>-tests`, `<task id>-verify<round>-check<n>` and `<task id>-verify<round>-diff`. The task id is part of the id because the table keys its rows by it. |
 | The pull request | Ready for review, with a `Verified:` line, after a pass. |
 
 ```sql
@@ -375,10 +375,10 @@ These ends of the review are fixed, so a caller can tell them apart without read
 
 | Outcome | Meaning |
 |---|---|
-| `stuck`: `the verifier sent the work back 3 times; last review: <issues>` | Three reviews in a row failed. |
+| `stuck`: `the work failed review 3 times; last review: <issues>` | Three reviews in a row failed. The coder was sent back after the first two, and the third ended the task. |
 | `error`: `verifier submitted an invalid verdict twice: <problems>` | The repair turn did not fix the verdict. This is not a failed round. |
 | `error`: `verifier submitted no verdict in 15 turns` | The verifier used all its turns reading. |
-| `error`: `turn limit` | The turns of the review count against `task_turns`, and the message that sends the coder back takes one too. |
+| `error`: `turn limit` | The turns of the review count against `task_turns`, and the message that sends the coder back takes one too. A coder that submits with no turn left gets no review, and no command of the pre-check runs. |
 
 ### Stopping a worker
 

@@ -374,7 +374,7 @@ def test_the_summary_of_an_ended_review_stays_short_and_plain() -> None:
 
 
 def test_a_long_list_of_problems_is_cut() -> None:
-    arguments = failing() | {"issues": [""] * 9}
+    arguments = verdict_input(issues=[""] * 9)
     answer = verifier.judge_submission(0, arguments, make_plan()).answer
     assert answer.count("\n- ") == verifier.MAX_PROBLEMS_SHOWN
     assert "and 4 more" in answer

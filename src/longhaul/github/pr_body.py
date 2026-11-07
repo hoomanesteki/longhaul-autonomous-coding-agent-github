@@ -21,6 +21,11 @@ The test line is built from the last `run_tests` call of the task, which the cal
 `tool_calls` table and the blob store. Only the closing line of pytest's output goes in, as the
 parser of the tool reads it, never the log itself, so the output of the repo's own code does not
 reach a page that people read.
+
+A pull request whose work a verifier passed (LH-504) also says "Verified: <counts>", where the
+counts are the `tests_summary` of the verdict. That is text from the model, so it gets the same
+treatment as the summary: one line, defused and cut. The caller opens a pull request as ready for
+review exactly when it passes this line, and as a draft when it passes none.
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ __all__ = [
     "MAX_FILES",
     "MAX_PATH_CHARS",
     "MAX_SUMMARY_CHARS",
+    "MAX_VERIFIED_CHARS",
     "TEMPLATE",
     "LastTestRun",
     "defuse",
@@ -51,6 +57,8 @@ MAX_FILES = 100
 MAX_PATH_CHARS = 200
 MAX_SUMMARY_CHARS = 4000
 SUMMARY_CUT = "(summary cut)"
+# The counts of a verdict are a short line such as "41 passed, 1 failed".
+MAX_VERIFIED_CHARS = 200
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
@@ -82,6 +90,14 @@ def _summary(text: str) -> str:
     if not text[MAX_SUMMARY_CHARS].isspace():
         cut = cut.rsplit(None, 1)[0] if len(cut.split()) > 1 else cut
     return f"{defuse(cut.rstrip())}\n\n{SUMMARY_CUT}"
+
+
+def _verified(counts: str | None) -> str:
+    """The counts the verifier gave, on one line, defused and cut. Empty when there are none."""
+    line = defuse(" ".join((counts or "").split()))
+    if len(line) <= MAX_VERIFIED_CHARS:
+        return line
+    return f"{line[: MAX_VERIFIED_CHARS - 3].rstrip()}..."
 
 
 def _path(path: str) -> str:
@@ -147,11 +163,13 @@ def render_pr_body(
     tests: LastTestRun | None,
     *,
     templates: Path,
+    verified: str | None = None,
 ) -> str:
     """The body for a pull request that closes issue `issue_number`.
 
     `files` is the diff stat of the branch, in the order git gave it. `templates` is the folder
-    that holds pr_body.md.j2 (settings.templates_path).
+    that holds pr_body.md.j2 (settings.templates_path). `verified` is the counts that a verifier
+    gave when it passed the work; a body without it has no "Verified" line.
     """
     listed = [{"path": _path(f.path), "counts": _counts(f)} for f in files[:MAX_FILES]]
     page = (
@@ -163,6 +181,7 @@ def render_pr_body(
             files=listed,
             hidden=max(len(files) - MAX_FILES, 0),
             tested=_tested(tests),
+            verified=_verified(verified),
             issue_number=int(issue_number),
         )
     )

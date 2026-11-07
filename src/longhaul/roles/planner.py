@@ -4,8 +4,9 @@ The planner is the first of the three roles of one task (ADR-0007). It runs insi
 before the coder, with its own prompt, its own tool list and its own transcript, in the same
 sandbox. It reads the issue, explores the code, reproduces the failure if it can, and ends by
 calling `submit_plan` with a `Plan` (contracts.py): 2 to 8 steps, each with a `done_when`, and
-acceptance checks with the commands that can be run first. A person can read the plan before any
-code is written, and the coder works from it (LH-503).
+acceptance checks with the commands that can be run first. A check that starts with "$ " is a
+command that the pipeline runs itself before the work is reviewed (roles/verifier.py). A person
+can read the plan before any code is written, and the coder works from it (LH-503).
 
 Read only. The tool list has no `edit_file` and no `write_file`, and `run_command` and `run_tests`
 are shell commands that could write anything. The workflow marks every planner call read-only,
@@ -93,7 +94,9 @@ RULES = (
     "- Write 2 to 8 steps. A step is one change that the coder can finish and check. Give its "
     "`files` and a `done_when` that says how to tell it is done.",
     "- Give `acceptance_checks` for the task as a whole. Put commands that can be run first, "
-    "such as the test command, and checks that can only be observed after them.",
+    "such as the test command, and checks that can only be observed after them. Start a check "
+    'that is a command with "$ ", as in "$ pytest -q": the pipeline runs those itself before '
+    "the work is reviewed, and a check without the mark is only read.",
     "- Name what could go wrong in `risks`, or leave it empty.",
     "- Call `submit_plan` once, with the whole plan. If the answer says the plan was not "
     "accepted, fix what it names and call it again. You get one repair, and a second plan "

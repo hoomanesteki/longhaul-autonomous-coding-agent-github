@@ -21,10 +21,11 @@ github/side_effects.py and both safe to run again:
    signs in with the token on the command line of that one git process, so the sandbox never sees
    it (ADR-0009). The push has a ledger row of its own (`push`, key `<task>:push:1`), which keeps
    the audit trail whole and lets a retry skip the push once it has landed.
-2. **Pull request.** `create_pr`, the plain function and not the activity, opens a draft with key
-   `<task>:pr:1`. It returns the URL of an open pull request from the same branch instead of
-   opening a second one, even when the ledger was lost. The request is a draft until a verifier
-   has passed the work (Phase 5).
+2. **Pull request.** `create_pr`, the plain function and not the activity, opens the pull request
+   with key `<task>:pr:1`. It returns the URL of an open pull request from the same branch instead
+   of opening a second one, even when the ledger was lost. The request is a draft unless a verifier
+   passed the work (LH-504): then `DeliverInput.verified_tests` holds its counts, the request is
+   ready for review, and the body says "Verified: <counts>".
 
 The body is built here, and not in the workflow, from what only the worker can read: the diff of
 the branch, and the `tool_calls` row and output blob of the last `run_tests` call. It is the same
@@ -250,7 +251,12 @@ class DeliveryActivities:
         files = await file_stats(inp.task_id, inp.base_sha, inp.head_sha, store=self._store)
         tests = await self._last_tests(inp.task_id)
         body = render_pr_body(
-            inp.issue_number, inp.summary, files, tests, templates=self._templates
+            inp.issue_number,
+            inp.summary,
+            files,
+            tests,
+            templates=self._templates,
+            verified=inp.verified_tests,
         )
         return PullRequestInput(
             task_id=inp.task_id,
@@ -259,7 +265,7 @@ class DeliveryActivities:
             base=inp.base_branch,
             title=inp.title,
             body=body,
-            draft=True,  # until a verifier has passed the work (Phase 5)
+            draft=inp.verified_tests is None,  # ready for review only once a verifier passed it
             idempotency_key=effect_key(inp.task_id, "pr", 1),
         )
 

@@ -173,7 +173,9 @@ class Context(StrictModel):
 
 
 class Loop(StrictModel):
-    max_verify_rounds: int
+    # The failed reviews after which a task ends as stuck. The workflow keeps a copy of the number
+    # in acts.MAX_VERIFY_ROUNDS, because it cannot read this file, and a unit test keeps them equal.
+    max_verify_rounds: int = Field(ge=1)
     continue_as_new_every_turns: int
     max_tokens_per_turn: int
     # The cap for the one retry of a turn that stopped on max_tokens.

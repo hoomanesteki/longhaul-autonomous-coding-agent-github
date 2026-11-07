@@ -13,10 +13,11 @@ whole transcript, together with the tool list that renders in front of it (ADR-0
 breakpoints are in providers/anthropic.py).
 
 Each role has an intro, rules and a tool guide of its own (block 1 and block 2), and shares the
-task block and the memory block. The coder's text is here. The planner's intro and rules are in
-roles/planner.py, which owns what the planner may do, and its tool guide is here, next to the
-coder's, because the two share most lines. A role also has its own first user message
-(`first_user_message`), and its own transcript, so each role has its own cached prefix (ADR-0007).
+task block and the memory block. The coder's text is here. The planner's and the verifier's intro
+and rules are in roles/planner.py and roles/verifier.py, which own what those roles may do, and
+their tool guides are here, next to the coder's, because the three share most lines. A role also
+has its own first user message (`first_user_message`), and its own transcript, so each role has its
+own cached prefix (ADR-0007).
 
 A coder with a plan (LH-503) has a text of its own too: `build_planned_system_prompt`, with the
 intro and rules of roles/coder.py. It works the steps, marks them with `update_step` and ends
@@ -60,7 +61,7 @@ of a transcript, because a change to a tool drops every cache (ADR-0003, appendi
 
 from longhaul.contracts import Message, Plan, Role, TaskSpec, TextBlock
 from longhaul.providers.base import format_role_line
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 
 RULES_HEADING = "## Rules"
 TOOLS_HEADING = "## Tools"
@@ -166,18 +167,42 @@ _PLANNER_PARALLEL = (
 )
 _PLANNER_TOOL_GUIDE = (_FIND, _PLANNER_RUN, _OUTPUT, _PLANNER_PARALLEL, _ERRORS)
 
-# Roles with a prompt: the intro, the rules and the tool guide. The verifier gets its own from
-# LH-504, and the compactor does not use this builder.
+_VERIFIER_RUN = (
+    "- Run the tests with `run_tests`. Pass `target` to run one file or one test id. A file that "
+    "a command writes is deleted again when the command ends."
+)
+_VERIFIER_DIFF = (
+    "- Your first message has the diff. Look at it again with `git_diff`, and read a whole file "
+    "with `read_file` where the diff alone does not show enough."
+)
+_VERIFIER_PARALLEL = (
+    f"- Independent tool calls can go in one reply. Send `{verifier.SUBMIT_VERDICT}` on its own."
+)
+_VERIFIER_TOOL_GUIDE = (
+    _FIND,
+    _VERIFIER_RUN,
+    _VERIFIER_DIFF,
+    _OUTPUT,
+    _VERIFIER_PARALLEL,
+    _ERRORS,
+)
+
+# Roles with a prompt: the intro, the rules and the tool guide. The compactor does not use this
+# builder.
 _ROLE_TEXT: dict[Role, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     Role.CODER: (_CODER_INTRO, _CODER_RULES, _TOOL_GUIDE),
     Role.PLANNER: (planner.INTRO, planner.RULES, _PLANNER_TOOL_GUIDE),
+    Role.VERIFIER: (verifier.INTRO, verifier.RULES, _VERIFIER_TOOL_GUIDE),
 }
 # The coder of a task that has a plan (LH-503).
 _PLANNED_CODER_TEXT = (coder.INTRO, coder.RULES, _PLANNED_TOOL_GUIDE)
 
 # The first user message of each role that has one of its own. Every other role starts as the
 # coder does.
-_FIRST_MESSAGE: dict[Role, str] = {Role.PLANNER: planner.FIRST_USER_MESSAGE}
+_FIRST_MESSAGE: dict[Role, str] = {
+    Role.PLANNER: planner.FIRST_USER_MESSAGE,
+    Role.VERIFIER: verifier.FIRST_USER_MESSAGE,
+}
 
 
 def first_user_message(role: Role, *, planned: bool = False) -> str:

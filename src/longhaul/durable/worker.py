@@ -50,6 +50,10 @@ What it is built from, and why each piece is what it is:
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
   the step updates, and every worker registers it.
+* The verifier (LH-504) has a tool list of its own as well: the read tools, `git_diff` and
+  `run_tests`, and `submit_verdict` (roles/verifier.py). It runs on tools that every worker has,
+  so it needs no activity of its own. The workflow keeps its own copy of `loop.max_verify_rounds`,
+  so a worker whose config holds another number stops before it takes a task.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. Without a token the worker still starts and still registers `poll_once`, so a
   worker for local runs needs none. A poll on it fails with the name of the setting, and the
@@ -119,7 +123,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.providers.base import get_provider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.telemetry import metrics
@@ -186,6 +190,13 @@ def build_parts(
             f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
             f"Set it to {acts.PLANNER_MAX_TURNS}"
         )
+    if cfg.loop.max_verify_rounds != acts.MAX_VERIFY_ROUNDS:
+        # The same reason as the planner's limit above.
+        raise ValueError(
+            f"loop.max_verify_rounds is {cfg.loop.max_verify_rounds}, but the workflow ends the "
+            f"task after {acts.MAX_VERIFY_ROUNDS} failed reviews and cannot be told otherwise. "
+            f"Set it to {acts.MAX_VERIFY_ROUNDS}"
+        )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
     try:
@@ -218,7 +229,10 @@ def build_parts(
         ledger=ledger,
         context=cfg.context,
         meters=meters,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     compactor = ContextActivities(

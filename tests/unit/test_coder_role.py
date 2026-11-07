@@ -287,6 +287,18 @@ async def test_finish_still_ends_a_task_that_has_a_plan() -> None:
     assert turn.ran == []
 
 
+async def test_only_submit_for_review_sends_the_work_to_the_verifier() -> None:
+    # A history from before the verifier ends on finish, and it must end the way it did. The
+    # work of a submit_for_review is reviewed before a pull request is marked ready (LH-504).
+    submitted = await Turn(make_plan()).go(call("submit_for_review", "t1", {"summary": "Done."}))
+    finished = await Turn(make_plan()).go(call("finish", "t1", {"summary": "Done."}))
+    asked = await Turn(make_plan()).go(call("ask_human", "t1", {"question": "Which one?"}))
+
+    assert (submitted.submitted, submitted.review) == ("Done.", True)
+    assert (finished.submitted, finished.review) == ("Done.", False)
+    assert (asked.submitted, asked.review) == (None, False)
+
+
 @pytest.mark.parametrize("name", ["submit_for_review", "finish"])
 @pytest.mark.parametrize("arguments", [{}, {"summary": "  "}, {"summary": 5}, None])
 async def test_a_submission_without_a_summary_is_answered_and_the_task_goes_on(

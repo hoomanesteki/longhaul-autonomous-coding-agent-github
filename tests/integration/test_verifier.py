@@ -58,6 +58,7 @@ from longhaul.contracts import (
     SandboxLimits,
     TaskSpec,
     TextBlock,
+    ToolResult,
     ToolResultBlock,
 )
 from longhaul.db.records import MemoryRecorder
@@ -100,7 +101,6 @@ AUTHOR = "longhaul <longhaul@users.noreply.github.com>"
 WAIT_S = 60.0
 DOCKER_WAIT_S = 600.0
 CFG = LoopConfig(model="test-model", max_turns=40, max_tokens_per_turn=1000, max_tokens_retry=5000)
-SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=2)
 SUMMARY = "Fixed add() so it returns the sum of its arguments. All tests pass."
 NEW_TEST = (
     "from calc import add\n\n\ndef test_add_negative() -> None:\n    assert add(-2, -3) == -5\n"
@@ -342,6 +342,7 @@ class Light:
     recorder: MemoryRecorder
     blobs: MemoryBlobStore
     boxes: Boxes
+    executed: list[acts.ToolExecInput]  # every tool call that ran, in order
 
 
 @pytest.fixture
@@ -367,8 +368,13 @@ def local_spec(test_command: str | None = None, **fields: Any) -> TaskSpec:
 
 @asynccontextmanager
 async def light(
-    env: WorkflowEnvironment, script: Path, *, hold: tuple[str, int] | None = None
+    env: WorkflowEnvironment,
+    script: Path,
+    *,
+    hold: tuple[str, int] | None = None,
+    step_tools: bool = True,
 ) -> AsyncIterator[Light]:
+    """A worker with a fake sandbox. `step_tools` False is a worker from before LH-503."""
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     provider = Probe(script, hold)
@@ -383,10 +389,17 @@ async def light(
             Role.PLANNER: planner.tool_specs(registry.specs()),
             Role.VERIFIER: verifier_role.tool_specs(registry.specs()),
         },
-        planned_tools=coder.tool_specs(registry.specs()),
+        planned_tools=coder.tool_specs(registry.specs()) if step_tools else None,
     )
     boxes = Boxes()
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
+    executed: list[acts.ToolExecInput] = []
+
+    @activity.defn(name=acts.TOOL_EXEC.name)
+    async def tool_exec(inp: acts.ToolExecInput) -> ToolResult:
+        executed.append(inp)
+        return await tools.tool_exec(inp)
+
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
         async with Worker(
@@ -395,7 +408,8 @@ async def light(
             workflows=[TaskWorkflow],
             activities=[
                 *llm.activities,
-                *tools.activities,
+                tool_exec,
+                tools.append_results,
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
                 *StepActivities(recorder).activities,
@@ -406,7 +420,7 @@ async def light(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield Light(queue, provider, recorder, blobs, boxes)
+            yield Light(queue, provider, recorder, blobs, boxes, executed)
     finally:
         await boxes.destroy_all()
 
@@ -576,9 +590,9 @@ async def test_send_back_then_pass(env: WorkflowEnvironment, tmp_path: Path) -> 
     """The first review fails on a planted missing edge case, the coder fixes it, the second
     passes, and the pull request is ready for review, not a draft."""
     async with real(env, tmp_path, write_script(tmp_path, send_back_run())) as world:
-        handle = await start_task(
-            world.client, world.spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
-        )
+        # No short heartbeat timeout: nothing here kills a worker, and on a busy machine a timeout
+        # of a few seconds starts a second attempt of a commit while the first still runs.
+        handle = await start_task(world.client, world.spec, task_queue=world.queue, plan=True)
         outcome = await result_of(handle, DOCKER_WAIT_S)
         status = await planned_status(handle)
 
@@ -787,20 +801,50 @@ async def test_the_coder_goes_back_to_its_own_transcript_after_the_review(
 
 
 # ---------- what the verifier may do ----------
-async def test_a_verifier_that_calls_a_tool_it_does_not_have_changes_nothing(
+async def test_every_call_of_the_review_is_read_only(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    edit = tool("edit_file", path=MODULE, old_str="    return a + b", new_str="    return a * b")
-    steps = [*clean_run()[:-1], verifier_turn(0, edit), verifier_turn(1, PASS)]
-    async with light(env, write_script(tmp_path, steps)) as world:
-        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
-        outcome = await result_of(handle)
+    """The pre-check, the diff and the verifier's own calls all run with `read_only` set.
 
-        assert outcome.kind is OutcomeKind.PR_OPENED
-        second = world.provider.of("verifier")[1]
-        assert "edit_file is not available while verifying" in results_of(second.messages[-1])[0]
-        (box,) = world.boxes.boxes.values()
-        assert b"return a + b" in await box.read_file(MODULE)
+    tool_exec puts the tree back after such a call (tests/integration/test_planner.py shows it for
+    the planner), so checking the work cannot change the work. The coder's calls are not.
+    """
+    steps = [
+        *clean_run()[:-1],
+        verifier_turn(0, tool("read_file", path=MODULE), tool("run_tests")),
+        verifier_turn(1, PASS),
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(
+            env.client, local_spec(BUG_GONE), task_queue=world.queue, plan=True
+        )
+        outcome = await result_of(handle)
+        executed = list(world.executed)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    by_id = {call.call.id: call for call in executed}
+    review = [c for c in executed if c.call.id.startswith("verify")]
+    assert [c.call.name for c in review] == ["run_command", "run_command", "git_diff"]
+    assert all(c.read_only for c in review)
+    asked = [c for c in executed if c.call.name in ("read_file", "run_tests")]
+    assert [c.call.name for c in asked] == ["read_file", "run_tests"]
+    assert all(c.read_only for c in asked)
+    coder_calls = [c for c in executed if c.call.name in ("edit_file", "write_file")]
+    assert len(coder_calls) == 2 and not any(c.read_only for c in coder_calls)
+    assert len(by_id) == len(executed)  # no id is used twice
+
+
+async def test_the_verifier_cannot_change_the_files_it_reviews(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """What the worker offers the verifier has no tool that writes (roles/verifier.py)."""
+    async with light(env, write_script(tmp_path, clean_run())) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        await result_of(handle)
+
+    (asked,) = world.provider.of("verifier")
+    assert not {"edit_file", "write_file", "run_command", "finish"} & set(asked.tool_names)
+    assert "submit_for_review" not in asked.tool_names and "update_step" not in asked.tool_names
 
 
 async def test_an_invalid_verdict_gets_one_repair_turn(
@@ -876,9 +920,15 @@ async def test_a_task_without_a_plan_is_not_verified(
 async def test_finish_in_a_task_with_a_plan_still_ends_it_without_a_review(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    """The coder is not offered `finish`. A history that ends on it replays as it was."""
+    """The coder is not offered `finish`. A history that ends on it replays as it was.
+
+    A worker from before LH-503 offers a planned coder the tools it had, `finish` among them.
+    """
     steps = [*plan_run(), coder_turn(0, tool("finish", summary="Nothing to change."))]
-    world, outcome, status = await run_light(env, tmp_path, steps)
+    async with light(env, write_script(tmp_path, steps), step_tools=False) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+        status = await planned_status(handle)
 
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Nothing to change.")
     assert status.phase is Phase.DONE

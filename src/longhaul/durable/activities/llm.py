@@ -90,6 +90,16 @@ transcript starts or not at all, so each of the three is the same for the life o
 The plan is the fifth block of the first message (agent/prompts.py), and the activity brings that
 block up to date before every call from the plan the workflow holds, which is how a step update
 reaches the model. A worker with no `planned_tools` offers such a coder `tools`, as it did before.
+
+The verifier (LH-504) has a transcript of its own, and its first message is built here, from what
+the workflow gathered before the first turn. The workflow cannot write blobs, so it runs the
+pre-check and the `git_diff` through tool_exec, which stores their full output, and hands over
+`LlmTurnInput.review`: each command with how it ended and the ref of its output, and the plan. The
+first message is then the line that starts the review, the plan block, the pre-check block and the
+diff block (roles/verifier.py renders the last two). Each output is cut to a head, a tail and a
+handle, so a long test log or diff costs the window what any tool output does, and the verifier
+pages through the rest with `read_output`. This happens when the transcript starts only. A later
+turn of the review reads the transcript, which holds that message already.
 """
 
 from __future__ import annotations
@@ -110,6 +120,7 @@ from longhaul.agent.prompts import (
     build_planned_system_prompt,
     build_system_prompt,
     first_user_message,
+    render_plan,
     with_plan,
 )
 from longhaul.agent.turns import (
@@ -125,6 +136,7 @@ from longhaul.context.evict import elide_old_outputs
 from longhaul.context.log import added_messages, append_to_log
 from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import ContextBudget, Decision, TokenMeter, count_request_chars
+from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
     Block,
@@ -155,11 +167,12 @@ from longhaul.durable.activities.support import (
 )
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
-from longhaul.roles import coder
+from longhaul.roles import coder, verifier
 from longhaul.settings import Context
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import chat_span
 from longhaul.tools.control import is_control_tool
+from longhaul.tools.output import output_handle
 
 
 @dataclass(frozen=True)
@@ -189,7 +202,7 @@ def _budget(context: Context | None) -> ContextBudget | None:
 
 def _answered_by_the_workflow(tool: str) -> bool:
     """True for a call whose answer is a line from the workflow, so no output to reserve for."""
-    return is_control_tool(tool) or tool in coder.CONTROL_TOOLS
+    return is_control_tool(tool) or tool in coder.CONTROL_TOOLS or tool == verifier.SUBMIT_VERDICT
 
 
 def _options(cfg: LoopConfig) -> CallOptions | None:
@@ -273,7 +286,7 @@ class LlmActivities:
                 if planned
                 else build_system_prompt(inp.role, inp.spec)
             )
-            stored = await self._transcript(inp, planned=planned)
+            stored = await self._transcript(inp, planned=planned, cap=cfg.tool_output_max_tokens)
             if planned and inp.plan is not None:
                 stored = with_plan(stored, inp.plan)  # a step update reaches the model here
             shown = show_hints(stored, inp.hints)
@@ -323,10 +336,43 @@ class LlmActivities:
         return small(out)
 
     # ----- the request -----
-    async def _transcript(self, inp: acts.LlmTurnInput, *, planned: bool) -> list[Message]:
-        if inp.transcript_ref is None:
-            return append_user_text([], first_user_message(inp.role, planned=planned))
-        return await self._blobs.get_json(inp.transcript_ref, list[Message])
+    async def _transcript(
+        self, inp: acts.LlmTurnInput, *, planned: bool, cap: int
+    ) -> list[Message]:
+        if inp.transcript_ref is not None:
+            return await self._blobs.get_json(inp.transcript_ref, list[Message])
+        messages = append_user_text([], first_user_message(inp.role, planned=planned))
+        if inp.role is Role.VERIFIER:
+            for text in await self._review_blocks(inp, cap):
+                messages = append_user_text(messages, text)
+        return messages
+
+    async def _review_blocks(self, inp: acts.LlmTurnInput, cap: int) -> list[str]:
+        """The blocks after the first line of a review: the plan, the pre-check and the diff.
+
+        The text of each output is read from its blob and cut by the rule of any tool output
+        (context/truncate.py), with the handle `out_<call id>` that read_output resolves. The
+        pre-check gets a smaller share than the diff, because the start of a test log has the
+        first failure and its end has the counts.
+        """
+        blocks: list[str] = []
+        if inp.plan is not None:
+            blocks.append(render_plan(inp.plan))
+        if inp.review is not None:
+            shown = [
+                (run, await self._shaped(run, verifier.CHECK_OUTPUT_TOKENS))
+                for run in inp.review.checks
+            ]
+            blocks.append(verifier.render_precheck(shown))
+            if inp.review.diff is not None:
+                blocks.append(verifier.render_diff(await self._shaped(inp.review.diff, cap)))
+        return blocks
+
+    async def _shaped(self, run: acts.CheckRun, max_tokens: int) -> str:
+        if run.output_ref is None:
+            return ""
+        text = (await self._blobs.get(run.output_ref)).decode("utf-8", errors="replace")
+        return shape_output(text, max_tokens, output_handle(run.call_id))
 
     async def _paused(self, ref: BlobRef | None) -> list[Block]:
         if ref is None:

@@ -16,10 +16,13 @@ from longhaul.contracts import (
     Outcome,
     OutcomeKind,
     Phase,
+    Plan,
+    PlanStep,
     RepoSettings,
     TaskSpec,
     TaskStatus,
 )
+from longhaul.durable import acts
 from longhaul.durable.workflows.task import (
     CancelRequest,
     PlanDecision,
@@ -155,3 +158,44 @@ def test_status_carries_the_outcome_once_there_is_one(wf: TaskWorkflow) -> None:
 )
 def test_cancel_summary_names_who_and_why(by: str, reason: str, expected: str) -> None:
     assert cancel_summary(by, reason) == expected
+
+
+# ---------- the plan in status() (LH-503) ----------
+def two_steps(*statuses: str) -> Plan:
+    steps = [
+        PlanStep(
+            id=f"s{n}",
+            description=f"Change module {n}",
+            done_when="the tests pass",
+            status=status,  # type: ignore[arg-type]
+        )
+        for n, status in enumerate(statuses, start=1)
+    ]
+    return Plan(summary="plan", steps=steps, acceptance_checks=["pytest -q"])
+
+
+def test_status_shows_the_plan_with_the_status_of_each_step(
+    wf: TaskWorkflow, state: CarryState
+) -> None:
+    state.phase = Phase.CODING
+    state.plan_version = 1
+    state.plan = two_steps("done", "doing")
+
+    shown = wf.status()
+
+    assert isinstance(shown, acts.PlannedStatus)
+    assert shown.plan is not None
+    assert [s.status for s in shown.plan.steps] == ["done", "doing"]
+    # The rest is the status it always was.
+    assert TaskStatus(**shown.model_dump(exclude={"plan"})) == TaskStatus(
+        task_id="lh-acme-calc-42",
+        phase=Phase.CODING,
+        turn_index=0,
+        cost_usd=0.0,
+        last_checkpoint=None,
+        plan_version=1,
+    )
+
+
+def test_status_is_the_plain_task_status_for_a_task_without_a_plan(wf: TaskWorkflow) -> None:
+    assert type(wf.status()) is TaskStatus

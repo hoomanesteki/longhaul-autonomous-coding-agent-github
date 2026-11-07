@@ -26,13 +26,16 @@ from longhaul.checkpoints.squash import (
     Group,
     NothingToDeliverError,
     PrBranch,
+    StepEnd,
     build_pr_branch,
     commit_subject,
     file_stats,
+    group_by_step,
     parse_author,
     pr_branch_name,
     repo_scope,
 )
+from longhaul.contracts import Plan, PlanStep
 from longhaul.settings import DEFAULT_GIT_AUTHOR
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
@@ -528,6 +531,193 @@ async def test_a_base_that_is_not_a_sha_is_refused(rig: Rig) -> None:
             store=rig.store,
             default_branch="main",
         )
+
+
+# ---------- one commit for each step of the plan (LH-503) ----------
+SUMMARY = "Fixed add() so it returns the sum. All tests pass."
+
+
+def planned(*statuses: str, descriptions: tuple[str, ...] = ()) -> Plan:
+    """A plan with one step for each status, named s1, s2 and so on."""
+    steps = [
+        PlanStep(
+            id=f"s{n}",
+            description=descriptions[n - 1] if descriptions else f"Change file {n}",
+            done_when="the tests pass",
+            status=status,  # type: ignore[arg-type]
+        )
+        for n, status in enumerate(statuses, start=1)
+    ]
+    return Plan(summary="plan", steps=steps, acceptance_checks=["pytest -q"])
+
+
+def grouped(plan: Plan, ends: list[StepEnd], head: str = "d" * 40) -> list[Group]:
+    return group_by_step(
+        plan, ends, summary=SUMMARY, head_sha=head, scope="calc", fallback=FALLBACK
+    )
+
+
+def test_group_by_step() -> None:
+    plan = planned("done", "done", "done")
+    ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s3", "c" * 40)]
+
+    groups = grouped(plan, ends)
+
+    # One group for each done step, titled from its description, and a last one for the work
+    # after the last step, titled from the summary.
+    assert groups == [
+        Group("fix(calc): change file 1", "a" * 40),
+        Group("fix(calc): change file 2", "b" * 40),
+        Group("fix(calc): change file 3", "c" * 40),
+        Group("fix(calc): fix add() so it returns the sum", "d" * 40),
+    ]
+
+
+def test_a_step_that_is_not_done_makes_no_group() -> None:
+    plan = planned("done", "doing", "skipped", "todo")
+    ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s3", "c" * 40)]
+
+    assert [g.title for g in grouped(plan, ends)] == [
+        "fix(calc): change file 1",
+        "fix(calc): fix add() so it returns the sum",
+    ]
+
+
+def test_a_done_step_with_no_checkpoint_makes_no_group() -> None:
+    # Its work is not lost: the group after it holds the tree up to its own checkpoint.
+    plan = planned("done", "done")
+    groups = grouped(plan, [StepEnd("s2", "b" * 40)])
+
+    assert [g.last_sha for g in groups] == ["b" * 40, "d" * 40]
+
+
+def test_a_checkpoint_of_a_step_the_plan_does_not_have_is_left_out() -> None:
+    plan = planned("done")
+    groups = grouped(plan, [StepEnd("s1", "a" * 40), StepEnd("s9", "b" * 40)])
+
+    assert [g.last_sha for g in groups] == ["a" * 40, "d" * 40]
+
+
+def test_the_groups_follow_the_order_the_steps_were_finished_in() -> None:
+    # Each group ends where the work was when the step was marked done, and a branch can only
+    # grow forward. A step finished out of order is committed where it was finished, which is
+    # step order whenever the plan is worked in order.
+    plan = planned("done", "done")
+    ends = [StepEnd("s2", "b" * 40), StepEnd("s1", "c" * 40)]
+
+    assert [g.title for g in grouped(plan, ends)][:2] == [
+        "fix(calc): change file 2",
+        "fix(calc): change file 1",
+    ]
+
+
+def test_a_step_that_was_finished_twice_counts_where_it_was_finished_last() -> None:
+    plan = planned("done", "done")
+    ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s1", "c" * 40)]
+
+    groups = grouped(plan, ends)
+
+    assert [(g.title, g.last_sha) for g in groups][:2] == [
+        ("fix(calc): change file 2", "b" * 40),
+        ("fix(calc): change file 1", "c" * 40),
+    ]
+
+
+def test_a_plan_with_no_done_step_is_one_group_titled_from_the_summary() -> None:
+    # What a task without a plan gets.
+    plan = planned("todo", "doing")
+
+    assert grouped(plan, []) == [Group("fix(calc): fix add() so it returns the sum", "d" * 40)]
+
+
+def test_the_title_of_a_step_follows_the_rules_of_the_subject() -> None:
+    plan = planned(
+        "done",
+        "done",
+        "done",
+        descriptions=(
+            "Fixes #7, see @alice",
+            "feat(math): add pow",
+            "",
+        ),
+    )
+    ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s3", "c" * 40)]
+
+    titles = [g.title for g in grouped(plan, ends)]
+
+    assert titles[0] == f"fix(calc): fixes #{ZWSP}7, see @{ZWSP}alice"
+    assert titles[1] == "feat(math): add pow"
+    assert titles[2] == f"fix(calc): {FALLBACK}"
+    assert all(len(title) <= MAX_SUBJECT_CHARS for title in titles)
+    assert all(LIVE_TEXT.search(title) is None for title in titles)
+
+
+async def test_each_done_step_is_one_commit_and_together_they_are_the_work(rig: Rig) -> None:
+    first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    second = rig.write({"c.txt": "new\n"}, "lh: write 2")
+    third = rig.write({"b.txt": "changed\n"}, "lh: edit 3")
+    rig.publish()
+    plan = planned("done", "done", "done")
+    ends = [StepEnd("s1", first), StepEnd("s2", second), StepEnd("s3", third)]
+
+    built = await rig.build(*grouped(plan, ends, third))
+
+    commits = rig.bare("rev-list", "--reverse", f"{rig.base}..{built.head_sha}").splitlines()
+    subjects = [rig.bare("log", "-1", "--format=%s", sha) for sha in commits]
+    # The last step ends at the head, so the group for the summary has nothing of its own.
+    assert subjects == [
+        "fix(calc): change file 1",
+        "fix(calc): change file 2",
+        "fix(calc): change file 3",
+    ]
+    assert rig.bare("diff", rig.base, built.head_sha) == rig.bare("diff", rig.base, third)
+
+
+async def test_a_step_with_no_changes_is_skipped(rig: Rig) -> None:
+    first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    head = rig.write({"c.txt": "new\n"}, "lh: write 2")
+    rig.publish()
+    plan = planned("done", "done", "done")
+    # s2 was marked done with nothing new since s1, and s3 at the head.
+    ends = [StepEnd("s1", first), StepEnd("s2", first), StepEnd("s3", head)]
+
+    built = await rig.build(*grouped(plan, ends, head))
+
+    subjects = [
+        rig.bare("log", "-1", "--format=%s", sha)
+        for sha in rig.bare("rev-list", "--reverse", f"{rig.base}..{built.head_sha}").splitlines()
+    ]
+    assert subjects == ["fix(calc): change file 1", "fix(calc): change file 3"]
+
+
+async def test_work_after_the_last_step_goes_in_a_last_commit_titled_from_the_summary(
+    rig: Rig,
+) -> None:
+    first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    head = rig.write({"c.txt": "after the last step\n"}, "lh: write 2")
+    rig.publish()
+    plan = planned("done")
+
+    built = await rig.build(*grouped(plan, [StepEnd("s1", first)], head))
+
+    commits = rig.bare("rev-list", "--reverse", f"{rig.base}..{built.head_sha}").splitlines()
+    assert [rig.bare("log", "-1", "--format=%s", sha) for sha in commits] == [
+        "fix(calc): change file 1",
+        "fix(calc): fix add() so it returns the sum",
+    ]
+    assert rig.bare("diff", rig.base, built.head_sha) == rig.bare("diff", rig.base, head)
+
+
+async def test_a_plan_with_no_done_step_builds_the_single_commit_of_a_task_without_a_plan(
+    rig: Rig,
+) -> None:
+    rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    head = rig.write({"c.txt": "new\n"}, "lh: write 2")
+    rig.publish()
+
+    built = await rig.build(*grouped(planned("todo", "todo"), [], head))
+
+    assert rig.bare("rev-list", f"{rig.base}..{built.head_sha}").splitlines() == [built.head_sha]
 
 
 # ---------- the diff stat ----------

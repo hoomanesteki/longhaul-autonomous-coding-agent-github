@@ -35,7 +35,7 @@ from temporalio.worker import Worker
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE
+from longhaul.agent.prompts import render_plan
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.contracts import (
@@ -70,7 +70,7 @@ from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities, effect_key
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.sandbox.docker_manager import TASK_LABEL, DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
@@ -425,8 +425,13 @@ async def test_plan_stored_and_posted(
         planned = world.provider.of("planner")
         assert len(planned) == 3
         assert set(planned[0].tool_names) == {*planner.TOOLS, "submit_plan"}
-        assert [m.role for m in world.provider.of("coder")[0].messages] == ["user"]
-        assert last_text(world.provider.of("coder")[0].messages) == FIRST_USER_MESSAGE
+        first = world.provider.of("coder")[0].messages
+        assert [m.role for m in first] == ["user"]
+        # The line that starts the work, then the plan with every step still to do (LH-503).
+        assert [b.text for b in first[0].content if isinstance(b, TextBlock)] == [
+            coder.FIRST_USER_MESSAGE,
+            render_plan(PLAN),
+        ]
 
         # Every turn has a role, and the numbering goes on from the planner's turns to the coder's.
         assert world.llm.asked == [

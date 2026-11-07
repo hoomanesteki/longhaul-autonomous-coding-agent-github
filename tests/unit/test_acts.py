@@ -19,6 +19,7 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Phase,
     Plan,
     PlanStep,
     ProgressNotes,
@@ -27,6 +28,7 @@ from longhaul.contracts import (
     Role,
     StopDetails,
     TaskSpec,
+    TaskStatus,
     ToolResult,
     Usage,
 )
@@ -75,6 +77,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "poll_once",
         "prepare_workspace",
         "record_event",
+        "record_step",
         "store_plan",
         "tool_exec",
     ]
@@ -95,6 +98,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
+        (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -134,6 +138,8 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
         # Not in the table. A plan is one row, so it is sized like append_results.
         pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
+        # Not in the table. A step update is one event and at most one checkpoint row.
+        pytest.param(acts.RECORD_STEP, 2 * 60, None, 3, id="record_step"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -895,6 +901,7 @@ def test_a_tool_call_is_not_read_only_unless_the_workflow_says_so() -> None:
 def test_the_plan_activities_are_registered_where_their_inputs_need_a_token() -> None:
     # Storing a plan needs the database only. Posting it needs a GitHub token.
     assert acts.STORE_PLAN in acts.ALL
+    assert acts.RECORD_STEP in acts.ALL and acts.RECORD_STEP not in acts.GITHUB
     assert acts.POST_PLAN in acts.GITHUB
     assert acts.STORE_PLAN not in acts.GITHUB and acts.POST_PLAN not in acts.ALL
 
@@ -916,6 +923,12 @@ PLAN = Plan(
 PLAN_SAMPLES: list[BaseModel] = [
     acts.StorePlanInput(task_id="lh-x", version=1, plan=PLAN),
     acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=1, plan=PLAN),
+    acts.RecordStepInput(
+        task_id="lh-x", step_id="s1", status="done", note="ok", head_sha=SHA, turn_index=4
+    ),
+    acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="s", base_sha=SHA, head_sha=SHA, plan=PLAN
+    ),
     acts.ToolExecInput(
         task_id="lh-x",
         turn_index=2,
@@ -941,3 +954,51 @@ def test_planner_payloads_survive_the_pydantic_data_converter(sample: BaseModel)
     payloads = converter.to_payloads([sample])
     assert converter.from_payloads(payloads, [type(sample)]) == [sample]
     assert_small(sample)
+
+
+# ---------- the coder with a plan (LH-503) ----------
+def test_a_step_update_names_one_of_the_statuses_of_the_plan() -> None:
+    with pytest.raises(ValidationError):
+        acts.RecordStepInput(
+            task_id="lh-x", step_id="s1", status="finished", head_sha=SHA, turn_index=1
+        )
+
+
+def test_the_delivery_of_a_task_without_a_plan_asks_for_one_commit() -> None:
+    inp = acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="s", base_sha=SHA, head_sha=SHA
+    )
+    assert inp.plan is None
+
+
+def test_status_is_a_task_status_that_also_carries_the_plan() -> None:
+    plain = TaskStatus(
+        task_id="lh-x",
+        phase=Phase.CODING,
+        turn_index=1,
+        cost_usd=0.0,
+        last_checkpoint=None,
+        plan_version=1,
+    )
+    planned = acts.PlannedStatus(**plain.model_dump(), plan=PLAN)
+
+    assert isinstance(planned, TaskStatus)
+    assert planned.plan == PLAN
+    assert acts.PlannedStatus(**plain.model_dump()).plan is None
+
+
+def test_a_client_reads_the_plan_when_it_asks_for_it_and_the_status_when_it_does_not() -> None:
+    converter = pydantic_data_converter.payload_converter
+    plain = TaskStatus(
+        task_id="lh-x",
+        phase=Phase.CODING,
+        turn_index=1,
+        cost_usd=0.0,
+        last_checkpoint=SHA,
+        plan_version=1,
+    )
+    planned = acts.PlannedStatus(**plain.model_dump(), plan=PLAN)
+    payloads = converter.to_payloads([planned])
+
+    assert converter.from_payloads(payloads, [acts.PlannedStatus]) == [planned]
+    assert converter.from_payloads(payloads, [TaskStatus]) == [plain]

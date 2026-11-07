@@ -17,7 +17,7 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.contracts import Plan, PlanStep
-from longhaul.db.records import MemoryRecorder, PlanRecord
+from longhaul.db.records import CheckpointRecord, EventRecord, MemoryRecorder, PlanRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.github.client import GitHubClient, PatAuth
@@ -37,6 +37,21 @@ PLAN = Plan(
     ],
     acceptance_checks=["pytest -q"],
 )
+
+
+SHA = "a" * 40
+
+
+def step_input(status: str = "done", **fields: Any) -> acts.RecordStepInput:
+    values: dict[str, Any] = {
+        "task_id": TASK,
+        "step_id": "s1",
+        "status": status,
+        "note": "the tests of add() pass",
+        "head_sha": SHA,
+        "turn_index": 6,
+    }
+    return acts.RecordStepInput(**{**values, **fields})
 
 
 class Broken(MemoryRecorder):
@@ -192,3 +207,65 @@ def test_the_comment_activity_is_the_one_the_workflow_calls(client: GitHubClient
     assert [fn.__temporal_activity_definition.name for fn in activities.activities] == [
         acts.POST_PLAN.name
     ]
+
+
+# ---------- record_step (LH-503) ----------
+async def test_a_step_that_is_done_gets_a_step_checkpoint_at_the_head() -> None:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(PlanActivities(recorder).record_step, step_input("done"))
+
+    assert recorder.checkpoints == [CheckpointRecord(TASK, SHA, "step", turn_index=6, step_id="s1")]
+
+
+@pytest.mark.parametrize("status", ["todo", "doing", "skipped"])
+async def test_a_step_that_is_not_done_gets_no_checkpoint(status: str) -> None:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(PlanActivities(recorder).record_step, step_input(status))
+    assert recorder.checkpoints == []
+
+
+async def test_every_update_is_an_event_with_the_note() -> None:
+    recorder = MemoryRecorder()
+    activities = PlanActivities(recorder)
+    await ActivityEnvironment().run(activities.record_step, step_input("doing", note=""))
+    await ActivityEnvironment().run(activities.record_step, step_input("done"))
+
+    assert recorder.events == [
+        EventRecord(
+            TASK,
+            "step_updated",
+            {"step_id": "s1", "status": "doing", "note": "", "head_sha": SHA, "turn_index": 6},
+        ),
+        EventRecord(
+            TASK,
+            "step_updated",
+            {
+                "step_id": "s1",
+                "status": "done",
+                "note": "the tests of add() pass",
+                "head_sha": SHA,
+                "turn_index": 6,
+            },
+        ),
+    ]
+
+
+async def test_recording_a_step_again_leaves_one_checkpoint() -> None:
+    recorder = MemoryRecorder()
+    activities = PlanActivities(recorder)
+    for _ in range(2):
+        await ActivityEnvironment().run(activities.record_step, step_input("done"))
+    assert len(recorder.checkpoints) == 1
+
+
+async def test_two_steps_done_at_one_sha_each_get_a_checkpoint() -> None:
+    recorder = MemoryRecorder()
+    activities = PlanActivities(recorder)
+    await ActivityEnvironment().run(activities.record_step, step_input("done", step_id="s1"))
+    await ActivityEnvironment().run(activities.record_step, step_input("done", step_id="s2"))
+    assert [c.step_id for c in recorder.checkpoints] == ["s1", "s2"]
+
+
+def test_record_step_is_registered_with_the_activities_of_every_worker() -> None:
+    names = [fn.__name__ for fn in PlanActivities(MemoryRecorder()).activities]
+    assert names == ["store_plan", "record_step"]

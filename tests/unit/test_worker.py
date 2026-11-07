@@ -28,7 +28,7 @@ from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner
 from longhaul.settings import EnvSettings, load_config
 from longhaul.telemetry import metrics
 
@@ -537,3 +537,26 @@ def test_a_worker_without_a_token_cannot_post_a_plan_but_still_stores_it(tmp_pat
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     names = names_of(parts)
     assert "store_plan" in names and "post_plan" not in names
+
+
+# ---------- the coder with a plan (LH-503) ----------
+def test_a_coder_with_a_plan_gets_the_step_tools_and_one_without_keeps_finish(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+
+    plain = [tool.name for tool in llm.tools_for(Role.CODER)]
+    planned = [tool.name for tool in llm.tools_for(Role.CODER, planned=True)]
+
+    assert "finish" in plain
+    assert not set(coder.CONTROL_TOOLS) & set(plain)
+    assert planned == [*(name for name in plain if name != "finish"), *coder.CONTROL_TOOLS]
+    # The flag is for the coder only: the planner has one list.
+    assert llm.tools_for(Role.PLANNER, planned=True) == llm.tools_for(Role.PLANNER)
+
+
+def test_a_worker_records_steps_with_the_recorder_of_the_rest(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    recording = activity_object(parts, "record_step")
+    assert recording._records is activity_object(parts, "llm_turn")._recorder

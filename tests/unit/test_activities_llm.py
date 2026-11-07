@@ -852,6 +852,7 @@ def planned_rig(*steps: Step) -> Rig:
     return rig
 
 
+@pytest.mark.phase5
 async def test_a_coder_with_a_plan_is_asked_with_its_own_prompt_tools_and_first_message() -> None:
     plan = make_plan()
     rig = planned_rig(reply("tool_use", use("toolu_1", path="a.py")))
@@ -866,6 +867,7 @@ async def test_a_coder_with_a_plan_is_asked_with_its_own_prompt_tools_and_first_
     assert (await rig.transcript(out.transcript_ref))[0] == first
 
 
+@pytest.mark.phase5
 async def test_a_coder_without_a_plan_is_asked_as_it_always_was() -> None:
     rig = planned_rig(reply("end_turn"))
     await rig.run(turn_input())
@@ -876,6 +878,7 @@ async def test_a_coder_without_a_plan_is_asked_as_it_always_was() -> None:
     assert call["messages"] == [FIRST]
 
 
+@pytest.mark.phase5
 async def test_the_system_prompt_and_tools_do_not_change_when_a_step_does() -> None:
     rig = planned_rig(reply("end_turn"), reply("end_turn"))
     first = await rig.run(turn_input(plan=make_plan("doing", "todo")))
@@ -890,6 +893,7 @@ async def test_the_system_prompt_and_tools_do_not_change_when_a_step_does() -> N
     assert one["tools"] == two["tools"]
 
 
+@pytest.mark.phase5
 async def test_a_step_update_rewrites_the_plan_block_of_the_first_message_in_place() -> None:
     rig = planned_rig(
         reply("tool_use", use("toolu_1", path="a.py")),
@@ -922,6 +926,7 @@ async def test_a_step_update_rewrites_the_plan_block_of_the_first_message_in_pla
     )
 
 
+@pytest.mark.phase5
 async def test_the_planner_gets_no_plan_block_whatever_the_input_holds() -> None:
     rig = planner_rig(reply("end_turn"))
     await rig.run(turn_input(role=Role.PLANNER, plan=make_plan()))
@@ -932,6 +937,7 @@ async def test_the_planner_gets_no_plan_block_whatever_the_input_holds() -> None
     ]
 
 
+@pytest.mark.phase5
 async def test_a_worker_without_step_tools_offers_a_coder_with_a_plan_the_default_list() -> None:
     # A worker built before the story passes none, and its coder keeps the tools it had.
     rig = Rig(reply("end_turn"))
@@ -939,6 +945,7 @@ async def test_a_worker_without_step_tools_offers_a_coder_with_a_plan_the_defaul
     assert rig.provider.calls[0]["tools"] == TOOLS
 
 
+@pytest.mark.phase5
 async def test_a_step_tool_call_is_returned_like_any_call() -> None:
     rig = planned_rig(reply("tool_use", use("toolu_1", "update_step", step_id="s1", status="done")))
     out = await rig.run(turn_input(plan=make_plan()))

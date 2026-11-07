@@ -557,6 +557,7 @@ def grouped(plan: Plan, ends: list[StepEnd], head: str = "d" * 40) -> list[Group
     )
 
 
+@pytest.mark.phase5
 def test_group_by_step() -> None:
     plan = planned("done", "done", "done")
     ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s3", "c" * 40)]
@@ -573,6 +574,7 @@ def test_group_by_step() -> None:
     ]
 
 
+@pytest.mark.phase5
 def test_a_step_that_is_not_done_makes_no_group() -> None:
     plan = planned("done", "doing", "skipped", "todo")
     ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s3", "c" * 40)]
@@ -583,6 +585,7 @@ def test_a_step_that_is_not_done_makes_no_group() -> None:
     ]
 
 
+@pytest.mark.phase5
 def test_a_done_step_with_no_checkpoint_makes_no_group() -> None:
     # Its work is not lost: the group after it holds the tree up to its own checkpoint.
     plan = planned("done", "done")
@@ -591,6 +594,7 @@ def test_a_done_step_with_no_checkpoint_makes_no_group() -> None:
     assert [g.last_sha for g in groups] == ["b" * 40, "d" * 40]
 
 
+@pytest.mark.phase5
 def test_a_checkpoint_of_a_step_the_plan_does_not_have_is_left_out() -> None:
     plan = planned("done")
     groups = grouped(plan, [StepEnd("s1", "a" * 40), StepEnd("s9", "b" * 40)])
@@ -598,6 +602,7 @@ def test_a_checkpoint_of_a_step_the_plan_does_not_have_is_left_out() -> None:
     assert [g.last_sha for g in groups] == ["a" * 40, "d" * 40]
 
 
+@pytest.mark.phase5
 def test_the_groups_follow_the_order_the_steps_were_finished_in() -> None:
     # Each group ends where the work was when the step was marked done, and a branch can only
     # grow forward. A step finished out of order is committed where it was finished, which is
@@ -611,6 +616,7 @@ def test_the_groups_follow_the_order_the_steps_were_finished_in() -> None:
     ]
 
 
+@pytest.mark.phase5
 def test_a_step_that_was_finished_twice_counts_where_it_was_finished_last() -> None:
     plan = planned("done", "done")
     ends = [StepEnd("s1", "a" * 40), StepEnd("s2", "b" * 40), StepEnd("s1", "c" * 40)]
@@ -623,6 +629,7 @@ def test_a_step_that_was_finished_twice_counts_where_it_was_finished_last() -> N
     ]
 
 
+@pytest.mark.phase5
 def test_a_plan_with_no_done_step_is_one_group_titled_from_the_summary() -> None:
     # What a task without a plan gets.
     plan = planned("todo", "doing")
@@ -630,6 +637,7 @@ def test_a_plan_with_no_done_step_is_one_group_titled_from_the_summary() -> None
     assert grouped(plan, []) == [Group("fix(calc): fix add() so it returns the sum", "d" * 40)]
 
 
+@pytest.mark.phase5
 def test_the_title_of_a_step_follows_the_rules_of_the_subject() -> None:
     plan = planned(
         "done",
@@ -652,6 +660,7 @@ def test_the_title_of_a_step_follows_the_rules_of_the_subject() -> None:
     assert all(LIVE_TEXT.search(title) is None for title in titles)
 
 
+@pytest.mark.phase5
 async def test_each_done_step_is_one_commit_and_together_they_are_the_work(rig: Rig) -> None:
     first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
     second = rig.write({"c.txt": "new\n"}, "lh: write 2")
@@ -673,6 +682,7 @@ async def test_each_done_step_is_one_commit_and_together_they_are_the_work(rig: 
     assert rig.bare("diff", rig.base, built.head_sha) == rig.bare("diff", rig.base, third)
 
 
+@pytest.mark.phase5
 async def test_a_step_with_no_changes_is_skipped(rig: Rig) -> None:
     first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
     head = rig.write({"c.txt": "new\n"}, "lh: write 2")
@@ -690,6 +700,7 @@ async def test_a_step_with_no_changes_is_skipped(rig: Rig) -> None:
     assert subjects == ["fix(calc): change file 1", "fix(calc): change file 3"]
 
 
+@pytest.mark.phase5
 async def test_work_after_the_last_step_goes_in_a_last_commit_titled_from_the_summary(
     rig: Rig,
 ) -> None:
@@ -708,6 +719,7 @@ async def test_work_after_the_last_step_goes_in_a_last_commit_titled_from_the_su
     assert rig.bare("diff", rig.base, built.head_sha) == rig.bare("diff", rig.base, head)
 
 
+@pytest.mark.phase5
 async def test_a_plan_with_no_done_step_builds_the_single_commit_of_a_task_without_a_plan(
     rig: Rig,
 ) -> None:

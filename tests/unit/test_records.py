@@ -160,6 +160,7 @@ async def test_a_sha_can_be_a_checkpoint_of_two_kinds() -> None:
     ]
 
 
+@pytest.mark.phase5
 async def test_two_steps_done_at_the_same_sha_are_two_checkpoints() -> None:
     # A step marked done with no new work since the one before has the same sha. Each step still
     # has its own row (LH-503), and a row written again is one row.
@@ -170,6 +171,7 @@ async def test_two_steps_done_at_the_same_sha_are_two_checkpoints() -> None:
     assert [(c.kind, c.step_id) for c in recorder.checkpoints] == [("step", "s1"), ("step", "s2")]
 
 
+@pytest.mark.phase5
 async def test_the_step_checkpoints_of_a_task_come_back_in_the_order_they_were_saved() -> None:
     recorder = MemoryRecorder()
     await recorder.record_checkpoint(checkpoint("a" * 40, kind="tool"))

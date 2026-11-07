@@ -386,6 +386,7 @@ async def test_checkpoints_of_other_shas_kinds_and_tasks_are_all_kept(
     assert scratch.query("SELECT count(*) FROM checkpoints") == [(4,)]
 
 
+@pytest.mark.phase5
 async def test_two_steps_done_at_the_same_sha_are_two_rows_and_a_repeat_is_not_a_third(
     scratch: Scratch, recorder: SqlRecorder
 ) -> None:
@@ -397,6 +398,7 @@ async def test_two_steps_done_at_the_same_sha_are_two_rows_and_a_repeat_is_not_a
     assert scratch.query("SELECT step_id FROM checkpoints ORDER BY id") == [("s1",), ("s2",)]
 
 
+@pytest.mark.phase5
 async def test_the_step_checkpoints_of_a_task_come_back_in_the_order_they_were_saved(
     recorder: SqlRecorder,
 ) -> None:

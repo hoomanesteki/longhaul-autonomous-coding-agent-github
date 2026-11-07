@@ -174,6 +174,7 @@ def two_steps(*statuses: str) -> Plan:
     return Plan(summary="plan", steps=steps, acceptance_checks=["pytest -q"])
 
 
+@pytest.mark.phase5
 def test_status_shows_the_plan_with_the_status_of_each_step(
     wf: TaskWorkflow, state: CarryState
 ) -> None:
@@ -197,5 +198,6 @@ def test_status_shows_the_plan_with_the_status_of_each_step(
     )
 
 
+@pytest.mark.phase5
 def test_status_is_the_plain_task_status_for_a_task_without_a_plan(wf: TaskWorkflow) -> None:
     assert type(wf.status()) is TaskStatus

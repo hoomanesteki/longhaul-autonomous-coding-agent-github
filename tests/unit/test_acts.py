@@ -957,6 +957,7 @@ def test_planner_payloads_survive_the_pydantic_data_converter(sample: BaseModel)
 
 
 # ---------- the coder with a plan (LH-503) ----------
+@pytest.mark.phase5
 def test_a_step_update_names_one_of_the_statuses_of_the_plan() -> None:
     with pytest.raises(ValidationError):
         acts.RecordStepInput(
@@ -964,6 +965,7 @@ def test_a_step_update_names_one_of_the_statuses_of_the_plan() -> None:
         )
 
 
+@pytest.mark.phase5
 def test_the_delivery_of_a_task_without_a_plan_asks_for_one_commit() -> None:
     inp = acts.BuildPrBranchInput(
         task_id="lh-x", repo="acme/calc", summary="s", base_sha=SHA, head_sha=SHA
@@ -971,6 +973,7 @@ def test_the_delivery_of_a_task_without_a_plan_asks_for_one_commit() -> None:
     assert inp.plan is None
 
 
+@pytest.mark.phase5
 def test_status_is_a_task_status_that_also_carries_the_plan() -> None:
     plain = TaskStatus(
         task_id="lh-x",
@@ -987,6 +990,7 @@ def test_status_is_a_task_status_that_also_carries_the_plan() -> None:
     assert acts.PlannedStatus(**plain.model_dump()).plan is None
 
 
+@pytest.mark.phase5
 def test_a_client_reads_the_plan_when_it_asks_for_it_and_the_status_when_it_does_not() -> None:
     converter = pydantic_data_converter.payload_converter
     plain = TaskStatus(

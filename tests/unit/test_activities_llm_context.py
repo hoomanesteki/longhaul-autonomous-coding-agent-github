@@ -383,6 +383,7 @@ async def test_a_finish_call_leaves_no_room_for_a_result() -> None:
         ("ask_human", {"question": "Which one?"}),
     ],
 )
+@pytest.mark.phase5
 async def test_a_step_tool_call_leaves_no_room_for_a_result(
     name: str, args: dict[str, str]
 ) -> None:

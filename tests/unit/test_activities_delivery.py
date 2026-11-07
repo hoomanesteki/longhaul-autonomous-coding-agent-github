@@ -182,6 +182,7 @@ async def groups_built_for(
     return [tuple(g) for g in seen["groups"]]
 
 
+@pytest.mark.phase5
 async def test_a_task_with_a_plan_gets_one_group_for_each_done_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,6 +201,7 @@ async def test_a_task_with_a_plan_gets_one_group_for_each_done_step(
     ]
 
 
+@pytest.mark.phase5
 async def test_the_tool_checkpoints_of_a_task_are_not_groups(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -211,6 +213,7 @@ async def test_the_tool_checkpoints_of_a_task_are_not_groups(
     assert groups == [("fix(calc): fix add()", SHA)]
 
 
+@pytest.mark.phase5
 async def test_a_task_without_a_plan_never_reads_the_step_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -223,6 +226,7 @@ async def test_a_task_without_a_plan_never_reads_the_step_checkpoints(
     assert groups == [("fix(calc): fix add()", SHA)]
 
 
+@pytest.mark.phase5
 async def test_the_title_of_the_pull_request_is_still_the_summary_with_a_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

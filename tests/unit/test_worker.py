@@ -540,6 +540,7 @@ def test_a_worker_without_a_token_cannot_post_a_plan_but_still_stores_it(tmp_pat
 
 
 # ---------- the coder with a plan (LH-503) ----------
+@pytest.mark.phase5
 def test_a_coder_with_a_plan_gets_the_step_tools_and_one_without_keeps_finish(
     tmp_path: Path,
 ) -> None:
@@ -556,6 +557,7 @@ def test_a_coder_with_a_plan_gets_the_step_tools_and_one_without_keeps_finish(
     assert llm.tools_for(Role.PLANNER, planned=True) == llm.tools_for(Role.PLANNER)
 
 
+@pytest.mark.phase5
 def test_a_worker_records_steps_with_the_recorder_of_the_rest(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     recording = activity_object(parts, "record_step")

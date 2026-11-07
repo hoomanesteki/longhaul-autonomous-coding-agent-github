@@ -29,6 +29,7 @@ from typing import Any
 
 import pytest
 import yaml
+from pydantic import TypeAdapter
 from temporalio import activity
 from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -37,6 +38,7 @@ from temporalio.worker import Replayer, Worker
 from tests.fakes.calc_remote import Github, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub, git
 
+from longhaul.agent import rules
 from longhaul.agent.loop import LoopConfig
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, render_plan
 from longhaul.blobs.memory import MemoryBlobStore
@@ -73,7 +75,7 @@ from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
-from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.durable.workflows.task import LOST_CALL, NOT_RUN_AFTER_LOSS, TaskWorkflow
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
@@ -219,13 +221,18 @@ def results_of(message: Message) -> list[str]:
 
 # ---------- a worker with a fake sandbox ----------
 class Boxes:
-    """The workspace activities of the light tests: one fake sandbox per task, with calc in it."""
+    """The workspace activities of the light tests: one fake sandbox per task, with calc in it.
 
-    def __init__(self) -> None:
+    With `gone` set, the tool activities never find a sandbox, as if the container died on
+    every call, and prepare_workspace and ensure_sandbox still answer.
+    """
+
+    def __init__(self, gone: bool = False) -> None:
         self.boxes: dict[str, FakeSandbox] = {}
+        self.gone = gone
 
     async def get(self, sandbox_id: str) -> Sandbox | None:
-        return self.boxes.get(sandbox_id)
+        return None if self.gone else self.boxes.get(sandbox_id)
 
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
@@ -286,7 +293,11 @@ def local_spec(**fields: Any) -> TaskSpec:
 
 @asynccontextmanager
 async def light(
-    env: WorkflowEnvironment, script: Path, *, hold_coder_call: int | None = None
+    env: WorkflowEnvironment,
+    script: Path,
+    *,
+    hold_coder_call: int | None = None,
+    lose_sandbox: bool = False,
 ) -> AsyncIterator[Light]:
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
@@ -301,7 +312,7 @@ async def light(
         role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
         planned_tools=coder.tool_specs(registry.specs()),
     )
-    boxes = Boxes()
+    boxes = Boxes(gone=lose_sandbox)
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
@@ -528,6 +539,81 @@ async def test_submit_for_review_ends_the_task_with_its_summary(
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary=SUMMARY)
     assert status.phase is Phase.DONE
     assert statuses(status.plan) == ["done", "done", "done"]
+
+
+# ---------- a reply with no call, and a sandbox that is lost ----------
+def last_text_of(message: Message) -> str:
+    return "\n".join(blocks(message))
+
+
+async def test_a_planned_coder_reply_without_a_call_is_nudged_to_submit_for_review(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """A coder with a plan is not offered finish, so the nudge may not send it there."""
+    steps = [
+        turn("planner", 0, tool("submit_plan", **PLAN_INPUT)),
+        {"match": {"role": "coder", "turn_index": 0}, "respond": {"text": "I changed add()."}},
+        coder_turn(1, SUBMIT),
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary=SUMMARY)
+    first, second = world.provider.of("coder")
+    assert last_text_of(second.messages[-1]) == coder.NUDGE
+    assert coder.NUDGE != rules.NUDGE
+    # The line names only a tool that the request offered.
+    named = {n for n in [*first.tool_names, "finish", "submit_plan"] if n in coder.NUDGE}
+    assert named == {"submit_for_review"} and named <= set(second.tool_names)
+    assert "finish" not in second.tool_names
+
+
+async def test_a_task_without_a_plan_keeps_the_nudge_to_finish(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [
+        {"match": {"role": "coder", "turn_index": 0}, "respond": {"text": "Done."}},
+        coder_turn(1, tool("finish", summary="Nothing to change.")),
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    _, second = world.provider.of("coder")
+    assert last_text_of(second.messages[-1]) == rules.NUDGE
+
+
+async def test_a_lost_sandbox_keeps_the_answers_of_the_step_updates_that_ran(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The step is recorded before the sandbox is lost, and the transcript says so."""
+    steps = [
+        turn("planner", 0, tool("submit_plan", **PLAN_INPUT)),
+        coder_turn(
+            0,
+            step("s9", "done"),
+            step("s1", "done", "add() adds"),
+            tool("run_tests"),
+            FIX,
+        ),
+    ]
+    async with light(env, write_script(tmp_path, steps), lose_sandbox=True) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+        final = await planned_status(handle)
+        (stored,) = [k for k in world.blobs.objects if k.endswith("/transcript-next.json")][-1:]
+        transcript = TypeAdapter(list[Message]).validate_json(world.blobs.objects[stored])
+
+    assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="sandbox lost")
+    assert statuses(final.plan) == ["done", "todo", "todo"]
+    assert [(c.kind, c.step_id) for c in world.recorder.checkpoints] == [("step", "s1")]
+    answers = results_of(transcript[-1])
+    assert "unknown step 's9'" in answers[0]
+    assert answers[1] == "s1 is now done."
+    assert answers[2] == LOST_CALL
+    assert answers[3] == NOT_RUN_AFTER_LOSS
 
 
 # ---------- hand-over and replay ----------

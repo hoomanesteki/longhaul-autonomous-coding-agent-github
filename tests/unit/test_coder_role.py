@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator
 
+from longhaul.agent import rules
 from longhaul.agent.prompts import (
     FIRST_USER_MESSAGE,
     PLAN_HEADING,
@@ -39,7 +40,7 @@ from longhaul.contracts import (
 )
 from longhaul.durable import acts
 from longhaul.providers.base import parse_role_line
-from longhaul.roles import coder
+from longhaul.roles import coder, planner
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
@@ -337,6 +338,52 @@ async def test_an_error_from_a_tool_is_not_caught() -> None:
         await coder.run_calls([call("run_tests", "t1", {})], broken, turn.update, turn.current)
 
 
+async def test_the_answers_given_before_an_error_stay_with_the_caller() -> None:
+    # The workflow ends the run when a tool loses its sandbox, and it still has to answer the
+    # calls that came before. A step update has no activity result of its own, so the answers
+    # are kept in the list the caller gives, as they are made.
+    turn = Turn(make_plan())
+
+    async def broken(summary: acts.ToolCallSummary) -> ToolResult:
+        raise ConnectionError("the sandbox is gone")
+
+    answered: list[ToolResult] = []
+    with pytest.raises(ConnectionError):
+        await coder.run_calls(
+            [
+                call("update_step", "t1", {"step_id": "s1", "status": "done"}),
+                call("update_step", "t2", {"step_id": "s9", "status": "done"}),
+                call("run_tests", "t3", {}),
+                call("edit_file", "t4", {"path": "a.py"}),
+            ],
+            broken,
+            turn.update,
+            turn.current,
+            answered=answered,
+        )
+
+    assert [(r.call_id, r.ok) for r in answered] == [("t1", True), ("t2", False)]
+    assert "s1" in answered[0].output and "done" in answered[0].output
+    assert "unknown step 's9'" in answered[1].output
+
+
+async def test_the_answers_are_also_the_results_when_the_caller_gives_a_list() -> None:
+    turn = Turn(make_plan())
+    answered: list[ToolResult] = []
+    got = await coder.run_calls(
+        [
+            call("edit_file", "t1", {"path": "a.py"}),
+            call("submit_for_review", "t2", {"summary": "x"}),
+        ],
+        turn.run,
+        turn.update,
+        turn.current,
+        answered=answered,
+    )
+    assert [r.call_id for r in answered] == ["t1", "t2"]
+    assert got.results == answered
+
+
 async def test_an_error_from_the_recorder_is_not_caught() -> None:
     turn = Turn(make_plan())
 
@@ -401,6 +448,22 @@ def test_the_prompt_tells_the_coder_to_work_the_plan_and_to_say_so() -> None:
     assert "`ask_human`" in rules
     assert re.search(r"not instructions", rules, re.IGNORECASE)
     assert re.search(r"small edits", rules, re.IGNORECASE)
+
+
+def test_the_nudge_of_a_coder_with_a_plan_names_a_tool_it_is_offered() -> None:
+    # A reply with no call is answered with this line. The coder with a plan is not offered
+    # `finish`, so the line from rules.py ("Use tools or call finish.") would send it to a tool it
+    # does not have.
+    registry = default_registry()
+    offered = {t.name for t in coder.tool_specs(registry.specs())}
+    nudge = coder.NUDGE
+
+    assert coder.SUBMIT_FOR_REVIEW in nudge
+    assert nudge != rules.NUDGE
+    known = {t.name for t in registry.specs()} | {rules.FINISH, planner.SUBMIT_PLAN}
+    known |= set(coder.CONTROL_TOOLS)
+    assert {name for name in known if name in nudge} <= offered
+    assert nudge.isascii() and nudge.endswith(".")
 
 
 def test_the_prompt_does_not_send_the_coder_after_finish_or_submit_plan() -> None:

@@ -25,6 +25,7 @@ from longhaul.github.intake import (
     MAX_BODY_BYTES,
     MAX_COMMENTS_BYTES,
     allowlisted_entry,
+    attempt_of,
     is_allowlisted,
     issue_to_spec,
     repo_rows,
@@ -233,6 +234,55 @@ def test_the_spec_uses_the_same_id() -> None:
     assert spec is not None
     assert spec.task_id == "lh-acme-my-repo-v2-9"
     assert spec.repo == "Acme/My.Repo_v2"  # the name as the config wrote it
+
+
+# --- the attempts of a task (LH-308) ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("attempt", "expected"),
+    [
+        (1, "lh-acme-calc-42"),
+        (2, "lh-acme-calc-42-a2"),
+        (3, "lh-acme-calc-42-a3"),
+        (12, "lh-acme-calc-42-a12"),
+    ],
+)
+def test_a_later_attempt_adds_a_suffix_to_the_task_id(attempt: int, expected: str) -> None:
+    assert task_id_for("acme/calc", 42, attempt=attempt) == expected
+
+
+@pytest.mark.parametrize("attempt", [0, -1, True, "2", 2.0])
+def test_an_attempt_is_a_positive_integer(attempt: Any) -> None:
+    with pytest.raises(ValueError, match="attempt"):
+        task_id_for("acme/calc", 42, attempt=attempt)
+
+
+@pytest.mark.parametrize(
+    ("task_id", "attempt"),
+    [
+        ("lh-acme-calc-42", 1),
+        ("lh-acme-calc-42-a2", 2),
+        ("lh-acme-calc-42-a10", 10),
+        ("lh-acme-calc-a2-5", 1),  # a repo called calc-a2 has no second attempt
+        ("lh-acme-calc-a2-5-a3", 3),
+    ],
+)
+def test_the_attempt_is_read_back_from_the_task_id(task_id: str, attempt: int) -> None:
+    assert attempt_of(task_id) == attempt
+
+
+def test_every_attempt_id_reads_back_as_its_attempt() -> None:
+    for attempt in (1, 2, 3, 9, 10, 99):
+        assert attempt_of(task_id_for("Acme/My.Repo_v2", 7, attempt=attempt)) == attempt
+
+
+def test_the_spec_of_a_later_attempt_has_the_id_of_the_attempt() -> None:
+    spec = issue_to_spec(entry(), issue(number=9), [], {}, attempt=3)
+
+    assert spec is not None
+    assert spec.task_id == "lh-acme-calc-9-a3"
+    assert spec.issue_number == 9
 
 
 # --- the spec ---------------------------------------------------------------------------------

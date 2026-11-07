@@ -21,6 +21,7 @@ The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/prog
 | Host ports | `LH_*_PORT` in `.env` | If another project holds a default port, change it here. For Postgres, Temporal and MinIO also change the matching `LONGHAUL_*` URL or address, because compose and the code read separate variables. |
 | Database password | `LH_POSTGRES_PASSWORD` in `.env` | Default `longhaul`. Keep the password inside `LONGHAUL_DATABASE_URL` the same. |
 | Config file | `LONGHAUL_CONFIG` | Default `config/longhaul.example.yaml`. |
+| GitHub address | `LONGHAUL_GITHUB_API_URL`, `LONGHAUL_GITHUB_WEB_URL` | Blank means `api.github.com` and `github.com`. A GitHub Enterprise server sets the API address (`https://host/api/v3`) and the web address (`https://host`), and the worker clones from and pushes to `<web address>/<owner>/<name>.git`. The end-to-end test of the issue-to-PR path points them at a FakeGitHub and a folder of bare repos. |
 
 ### Ports and the database password
 
@@ -367,15 +368,42 @@ The worker needs `LONGHAUL_GITHUB_TOKEN` to poll. Without it the worker still st
 | `longhaul poller resume` | Starts them again. |
 | `longhaul poller trigger` | Polls now. It works on a paused Schedule, and it does nothing while a poll is running. |
 
-Each poll is a workflow named `longhaul-poller-run-<time>` in the Temporal UI (http://localhost:8233). It returns four counts: the repos it looked at, the labeled issues it saw, the tasks it started and the issues that already had a task. A poll fails when a repo cannot be read, for example a typo in the config or a token without access to it. The other repos are still polled first, and the failure names the repo.
+Each poll is a workflow named `longhaul-poller-run-<time>` in the Temporal UI (http://localhost:8233). It returns five counts: the repos it looked at, the labeled issues it saw, the tasks it started, the issues that already had a task and the comment commands it carried out. A poll fails when a repo cannot be read, for example a typo in the config or a token without access to it. The other repos are still polled first, and the failure names the repo.
 
 What the poller does and does not do:
 
 - A task id is `lh-<owner>-<repo>-<issue number>`, in lowercase. The task is started once. A row in `tasks` keeps a finished task from starting again while the label stays on the issue.
 - Only the allowlist counts. A labeled issue on a repo that is not in the config, or is there with `allowlisted: false`, is never read.
-- The poller only reads from GitHub. It posts no comment and sets no label. The task does that itself (LH-306).
+- The poller reads from GitHub and writes one thing: the reply to a command from someone who may not steer a task (see the next section). It sets no label and posts no "Picked up" comment. The task does that itself (LH-306).
 - A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. Nothing pushes the branch or opens a pull request until LH-306 adds the delivery, so a finished task leaves no change on GitHub yet.
 - To change the label or the interval, edit the config, restart the worker, and run `longhaul poller install` again for the interval.
+
+## Steer a task from its issue
+
+A person with write access to the repo steers a task with a comment on its issue (LH-308). The comment has to begin with the command, and each poll of the poller carries out the commands that were written since the last one.
+
+| Comment | What happens |
+|---|---|
+| `/longhaul approve` | Sends `approve_plan` to the task. |
+| `/longhaul reject <feedback>` | Sends `reject_plan` with the feedback. |
+| `/longhaul hint <text>` | Sends `hint`, and the model sees the text on its next turn. |
+| `/longhaul budget +<usd> [turns +<n>]` | Sends `add_budget`, for example `/longhaul budget +5 turns +20`. |
+| `/longhaul cancel [reason]` | Sends `cancel`. The task cleans up and ends as cancelled. |
+| `/longhaul status` | Sends `report_status`. The task answers with a comment that gives its phase, turn, spend and last checkpoint. |
+| `/longhaul retry` | Starts the next attempt of a task that has ended, as `<task id>-a2`, `-a3` and so on, from the issue as it is now. |
+
+Rules that keep a command from doing something nobody meant:
+
+- **Only the first line counts.** A command is not recognised after other text, inside a code block or a quote, or with extra words. `/longhaul approve now` does nothing, and so does a comment that only mentions a command. Case does not matter. Nothing is posted for a comment that is not a command, so a typo shows no sign.
+- **Only people with write access may steer.** The poller asks GitHub for the role of the author (admin, maintain and write count) every time it meets a command from them. A person without it, and a person whose role GitHub will not tell, gets one reply on the issue, "Only maintainers can steer this task", for each task, and the command is dropped. Comments of bots and the comments of Longhaul itself are never commands.
+- **A command is carried out once.** Each task row keeps the time and id of the newest comment handled (`tasks.last_comment_at` and `last_comment_id`). The cursor moves after the signal was sent, so a poll that fails halfway and is retried sends only the commands it had not sent. A worker that dies between the signal and the write of the cursor sends that one command again.
+- **Comments from before the label are not commands.** A new task starts its cursor at the newest comment its spec was built from.
+- **A task that has ended takes no command but `retry`.** Temporal refuses a signal to a closed workflow, and the command is dropped, not kept for the next attempt. `retry` on a task that still runs does nothing. Commands go to the latest attempt of the issue.
+- **Issues that are closed or have lost the label are not read.** To stop a task whose label was removed, cancel it with `longhaul cancel` or in the Temporal UI.
+
+Each poll now reads the new comments of every open labeled issue that has a task, which is one more GitHub call for each such issue, and one more for each author of a command that the poll has not asked about yet.
+
+The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one draft pull request and the label `longhaul:pr-open`. It needs `make up` and `make sandbox-image`, and takes about two minutes.
 
 ## Kill the worker on purpose
 
@@ -562,7 +590,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
-| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
+| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a draft pull request (see "Steer a task from its issue") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |

@@ -537,3 +537,66 @@ def test_a_worker_without_a_token_cannot_post_a_plan_but_still_stores_it(tmp_pat
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     names = names_of(parts)
     assert "store_plan" in names and "post_plan" not in names
+
+
+# ---------- LH-308: the poller's ledger, and where GitHub is ----------
+async def test_the_poller_posts_its_replies_through_the_ledger_of_the_other_writes(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (writes,) = {
+            fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "post_comment"
+        }
+        assert poller_of(parts)._ledger is writes._ledger
+    finally:
+        await parts.close()
+
+
+async def test_a_worker_without_a_token_still_gives_the_poller_a_ledger(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    try:
+        assert isinstance(poller_of(parts)._ledger, SqlEffectLedger)
+    finally:
+        await parts.close()
+
+
+async def test_github_is_github_dot_com_by_default(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "https://api.github.com"
+        assert _workspace_of(parts)._github.clone_url("acme/calc") == (
+            "https://github.com/acme/calc.git"
+        )
+    finally:
+        await parts.close()
+
+
+async def test_the_api_and_the_clone_address_follow_the_settings(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            github_api_url="http://127.0.0.1:8099",
+            github_web_url=str(tmp_path / "remotes"),
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "http://127.0.0.1:8099"
+        assert _workspace_of(parts)._github.clone_url("acme/calc") == (
+            f"{tmp_path / 'remotes'}/acme/calc.git"
+        )
+    finally:
+        await parts.close()

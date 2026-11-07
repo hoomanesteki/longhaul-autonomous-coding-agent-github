@@ -28,6 +28,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
+from longhaul.github.side_effects import MemoryLedger
 from longhaul.settings import AppConfig, RepoEntry, load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
@@ -100,7 +101,9 @@ def temporal() -> FakeTemporal:
 def poller(
     github: GitHubClient | None, store: MemoryTaskStore, config: AppConfig | None = None
 ) -> PollerActivities:
-    return PollerActivities(github, store, config or config_with(entry()), task_queue=QUEUE)
+    return PollerActivities(
+        github, store, config or config_with(entry()), task_queue=QUEUE, ledger=MemoryLedger()
+    )
 
 
 async def poll(activities: PollerActivities, temporal: FakeTemporal) -> acts.PollResult:

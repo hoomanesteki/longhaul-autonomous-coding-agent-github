@@ -34,10 +34,13 @@ def test_task_columns_match_data_model() -> None:
         # The context totals of LH-406 (plan section 3.5 names them in that story).
         "input_tokens_total", "output_tokens_total", "cache_read_total", "compactions",
         "max_fraction",
+        "last_comment_at", "last_comment_id",
     }  # fmt: skip
     assert columns["id"].primary_key
     assert columns["issue_number"].nullable
     assert not columns["repo"].nullable
+    # The comment cursor of the poller (LH-308) is empty until the poller has set it.
+    assert columns["last_comment_at"].nullable and columns["last_comment_id"].nullable
 
 
 def test_task_context_totals_start_at_zero_and_are_never_null() -> None:

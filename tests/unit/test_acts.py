@@ -279,6 +279,18 @@ def test_the_server_can_ask_for_a_hand_over_at_any_turn() -> None:
     assert not acts.hand_off_due(7, suggested=False)
 
 
+@pytest.mark.parametrize("seconds", [0, -1])
+def test_tuning_rejects_a_status_grace_that_cannot_work(seconds: float) -> None:
+    with pytest.raises(ValidationError):
+        acts.Tuning(status_grace_s=seconds)
+
+
+def test_a_hand_over_waits_for_a_status_comment_as_long_as_the_tuning_says() -> None:
+    assert acts.status_grace() == acts.STATUS_GRACE == timedelta(seconds=30)
+    assert acts.status_grace(acts.Tuning(heartbeat_timeout_s=2)) == acts.STATUS_GRACE
+    assert acts.status_grace(acts.Tuning(status_grace_s=1.5)) == timedelta(seconds=1.5)
+
+
 def test_tuning_rejects_unknown_fields() -> None:
     # A misspelled knob would otherwise be dropped and the run would use the long timeouts.
     with pytest.raises(ValidationError):

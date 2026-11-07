@@ -461,6 +461,8 @@ def test_environment_wins_over_dotenv(isolated_cwd: Path, monkeypatch: pytest.Mo
         ("LONGHAUL_GITHUB_TOKEN", "github_token"),
         ("LONGHAUL_GITHUB_APP_ID", "github_app_id"),
         ("LONGHAUL_GITHUB_APP_KEY_PATH", "github_app_key_path"),
+        ("LONGHAUL_GITHUB_API_URL", "github_api_url"),
+        ("LONGHAUL_GITHUB_WEB_URL", "github_web_url"),
         ("LONGHAUL_ADMIN_TOKEN", "admin_token"),
         ("LONGHAUL_SCRIPT", "script"),
         ("LONGHAUL_RECORDINGS_DIR", "recordings_dir"),
@@ -742,3 +744,27 @@ def test_the_example_env_file_names_the_metrics_settings() -> None:
     example = _env_example()
     assert example["LONGHAUL_METRICS_PORT"] == "9464"
     assert example["LONGHAUL_METRICS_HOST"] == "127.0.0.1"
+
+
+# ---------- LH-308: where GitHub is ----------
+def test_github_is_github_dot_com_unless_the_environment_says_otherwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LONGHAUL_GITHUB_API_URL", raising=False)
+    monkeypatch.delenv("LONGHAUL_GITHUB_WEB_URL", raising=False)
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+    assert (settings.github_api_url, settings.github_web_url) == (None, None)
+
+
+def test_github_can_be_a_server_of_our_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "https://git.example.com/api/v3")
+    monkeypatch.setenv("LONGHAUL_GITHUB_WEB_URL", "https://git.example.com")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.github_api_url == "https://git.example.com/api/v3"
+    assert settings.github_web_url == "https://git.example.com"
+
+
+def test_env_example_lists_the_github_urls_blank() -> None:
+    env = _env_example()
+    assert env["LONGHAUL_GITHUB_API_URL"] == ""
+    assert env["LONGHAUL_GITHUB_WEB_URL"] == ""

@@ -90,6 +90,11 @@ class Task(Base):
     )
     compactions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     max_fraction: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
+    # The newest issue comment the poller has handled (LH-308): its time, for the `since` of the
+    # next request, and its id, which tells it from a comment of the same second. Null until the
+    # poller has picked the task up.
+    last_comment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_comment_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

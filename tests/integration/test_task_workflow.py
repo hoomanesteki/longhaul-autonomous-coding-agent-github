@@ -2654,3 +2654,208 @@ async def test_histories_of_a_run_with_a_mode_replay(env: WorkflowEnvironment) -
         data_converter=guarded_data_converter,
     )
     await replayer.replay_workflow(history)
+
+
+# ---------- LH-308: report_status ----------
+def status_posts(stubs: Stubs) -> list[CommentInput]:
+    """The comments of the activity post_comment, without the pickup."""
+    return [c for c in stubs.payloads(acts.POST_COMMENT.name) if ":status:" in c.idempotency_key]
+
+
+async def at_the_first_turn(
+    env: WorkflowEnvironment, stubs: Stubs, spec: TaskSpec, queue: str, **options: Any
+) -> WorkflowHandle[Any, Outcome]:
+    """Start the task and hold it inside its first model call, with the pickup already done."""
+    stubs.hold(acts.LLM_TURN.name)
+    handle = await start_task(env.client, spec, task_queue=queue, **options)
+    await wait_for_phase(handle, Phase.CODING)
+    await wait_until(lambda: acts.LLM_TURN.name in stubs.names(), "the turn to start")
+    return handle
+
+
+async def test_report_status_posts_a_status_comment_through_the_activity(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status comment")
+        seen = await handle.query(TaskWorkflow.status)
+        stubs.release(acts.LLM_TURN.name)
+        outcome = await result_of(handle)
+
+    (posted,) = status_posts(stubs)
+    assert posted == lifecycle.status_comment(gh_spec, seen, by="maintainer", n=1)
+    assert posted.idempotency_key == f"{gh_spec.task_id}:status:1"
+    assert "coding" in posted.body
+    assert outcome == FINISHED, "the status request did not disturb the task"
+
+
+async def test_each_status_request_gets_the_next_key(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+
+        for who in ("maintainer", "writer", "maintainer"):
+            await handle.signal(TaskWorkflow.report_status, who)
+        await wait_until(lambda: len(status_posts(stubs)) == 3, "three status comments")
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+
+    posts = sorted(status_posts(stubs), key=lambda c: c.idempotency_key)
+    assert [c.idempotency_key for c in posts] == [
+        f"{gh_spec.task_id}:status:{n}" for n in (1, 2, 3)
+    ]
+    assert [("`writer`" in c.body) for c in posts] == [False, True, False]
+
+
+async def test_a_replay_posts_no_status_comment_again(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status comment")
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 2, "the second status comment")
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)  # raises if a replay would change the commands
+
+
+async def test_the_status_count_survives_a_hand_over(env: WorkflowEnvironment) -> None:
+    # The key of a status comment is its number. A run that began again at 1 would reuse the key
+    # of an earlier comment with other text, and that is an error.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    stubs.hold_turn(4)  # the second run's second turn
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the first status comment")
+        stubs.release_turn(1)
+
+        await wait_until(lambda: stubs.started(4), "a turn of the second run")
+        assert len(stubs.run_ids) == 2
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 2, "the second status comment")
+        stubs.release_turn(4)
+        await result_of(handle)
+
+    assert [c.idempotency_key for c in status_posts(stubs)] == [
+        f"{spec.task_id}:status:1",
+        f"{spec.task_id}:status:2",
+    ]
+
+
+async def test_a_status_comment_that_cannot_be_posted_does_not_fail_the_task(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        stubs.fails = {
+            acts.POST_COMMENT.name: ApplicationError(
+                "Resource not accessible", type=acts.GITHUB_FATAL, non_retryable=True
+            )
+        }
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release(acts.LLM_TURN.name)
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+
+
+async def test_a_task_without_an_issue_has_nowhere_to_report_its_status(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, spec, queue)
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await handle.query(TaskWorkflow.status)  # the signal has been handled by now
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+
+    assert stubs.payloads(acts.POST_COMMENT.name) == []
+
+
+async def test_a_cancel_does_not_wait_for_a_status_comment(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue, tuning=SHORT_HEARTBEAT)
+        stubs.hold(acts.POST_COMMENT.name)  # the status comment cannot be posted
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+
+
+async def test_a_cancel_at_a_hand_over_does_not_wait_for_a_status_comment(
+    env: WorkflowEnvironment,
+) -> None:
+    # GitHub is failing, so the status comment keeps retrying. The task reaches its hand-over
+    # meanwhile, and a person who cancels there must not wait for the comment.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, heartbeat_timeout_s=2)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)  # the status comment cannot be posted
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+        await wait_until(lambda: acts.RECORD_EVENT.name in stubs.names(), "the hand-over")
+
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.CANCELLED, summary="cancelled by maintainer: enough")
+    assert len(stubs.run_ids) == 1, "the task did not hand over after the cancel"
+
+
+async def test_a_status_comment_that_is_still_posting_does_not_stop_the_hand_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # The hand-over gives the comment a short while, then goes on without it. The count is in
+    # the memo already, so the next status comment gets a new key.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, status_grace_s=1)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+    assert len(stubs.run_ids) == 2, "the task handed over while the status comment was pending"

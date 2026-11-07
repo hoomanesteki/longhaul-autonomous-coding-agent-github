@@ -157,6 +157,7 @@ docs/private/**
 - The file is not copied, because it names what it hides. A bad pattern, or an ignore file that cannot be read, stops the run before any sandbox exists.
 - Always skipped, whatever the file says: `.git`, `.venv`, `__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.egg-info`, `.DS_Store`, and `.env` and `.env.*` files (but not `.env.example`, `.env.sample` and `.env.template`). A secret in `/workspace` is as readable to the model as one in its environment.
 - Links and special files are skipped with a warning. The executable bit is kept.
+- A file called `.longhaulimage` is not copied either. It holds the name of one Docker image, and a task that goes through `longhaul worker` (the durable stack, for example from `eval/run.py`) runs in that image instead of `sandbox.image`. The SWE-bench eval writes it, because each instance needs its own environment. `longhaul run-local` does not read it. A file that holds more than one name, or a name that starts with `-`, stops the task before any sandbox exists.
 
 The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
 
@@ -595,7 +596,7 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 
 | Flag | Meaning |
 |---|---|
-| `--set custom` | The 15 custom tasks. `swebench` is accepted and refused until LH-902. |
+| `--set custom\|swebench` | `custom` is the 15 custom tasks. `swebench` is the 40 instances of `eval/swebench/subset.txt`, and `--limit` takes the first N of them (see "The SWE-bench set"). |
 | `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
 | `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
 | `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
@@ -640,6 +641,22 @@ uv run python eval/grade_custom.py calc-01 --patch eval/custom/reference/calc-01
 ```
 
 A failed setup raises an error and does not mark the patch as wrong, because the setup does not depend on the patch.
+
+### The SWE-bench set
+
+`--set swebench` runs the frozen subset of SWE-bench Verified (40 instances: 15 easy, 20 medium, 5 hard, seed 42) and has the official harness grade the patches. The runner works as for the custom set, with three differences:
+
+* Each task runs in an image made from the instance's own image, with its repo and conda environment, and the dollar cap is 4 (plan section 8.4). The runner builds the image and copies the repo to a temporary folder. The folder names the image in a file `.longhaulimage`, which the worker reads when it prepares the sandbox (`agent/workspace.py`, `read_image_file`) and when it makes a new one after a crash.
+* The result files say `not graded yet`. The runner also writes `predictions.jsonl`, with the test files of each instance cut out of the agent's diff.
+* `eval/swebench/grade.sh eval/results/<run id>` runs `python -m swebench.harness.run_evaluation` and puts `resolved` into the result file of each task that finished and into the summary. A task that ended any other way keeps the verdict the runner gave it.
+
+```bash
+uv sync --extra eval                    # swebench and datasets, which CI does not install
+uv run python eval/run.py --set swebench --config full --limit 3 --run-id swe-smoke-1
+eval/swebench/grade.sh eval/results/swe-smoke-1
+```
+
+The harness pulls the instance images (several GB each, built for x86_64) and wants about 120 GB of free disk for a full run, so run it on the eval VM. `eval/swebench/README.md` has the notes of the spike on the `swebench` package, the exact smoke command with the agent, how to check the grader with the reference patches, and the known limits.
 
 `make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
 

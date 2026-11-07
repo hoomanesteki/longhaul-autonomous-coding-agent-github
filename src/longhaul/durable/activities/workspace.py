@@ -45,6 +45,12 @@ Two metrics follow these activities (LH-704). A task is active from the end of p
 or from the first ensure_sandbox of a run that starts with a sandbox, and each rebuild counts in
 longhaul_sandbox_recreated_total. The end of the task is counted by record_event.
 
+A local folder can ask for a sandbox image of its own with a file called .longhaulimage (see
+agent/workspace.py). The eval of SWE-bench uses it: each instance comes with an image that holds
+the environment its tests need. Both prepare_workspace and ensure_sandbox read it, so a sandbox
+that is made again runs in the same image. A folder that is gone when the sandbox is made again
+cannot be asked, and the image of the worker is used.
+
 The setup command is `spec.settings.setup_command`, or the default of `longhaul run-local` when
 there is none. The default is read from the pyproject.toml of the workspace, so a recovery sets
 up what the workspace holds at `head_sha` and does not depend on the folder the task started
@@ -95,6 +101,7 @@ from longhaul.agent.workspace import (
     WorkspaceError,
     collect_source_files,
     pip_install_command,
+    read_image_file,
 )
 from longhaul.blobs.base import blob_key
 from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError, check_task_id
@@ -161,10 +168,11 @@ class WorkspaceMemory(CommandMemory, StructureMemory, Protocol):
 
 @dataclass(frozen=True)
 class LocalFolder:
-    """A folder to commit as the base of a task, and the files of it that go in."""
+    """A folder to commit as the base of a task, the files of it that go in, and its image."""
 
     path: Path
     files: list[SourceFile]
+    image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,7 +245,8 @@ class WorkspaceActivities:
             try:
                 await self._clear(task_id)
                 base_sha = await self._publish_base(task_id, source)
-                sandbox = await self._boot(task_id)
+                image = source.image if isinstance(source, LocalFolder) else None
+                sandbox = await self._boot(task_id, image)
                 await self._set_up(sandbox, spec)
                 await self._sandboxes.set_network(sandbox.id, False)
                 # The map comes first: it reads the workspace as the base commit has it, before
@@ -282,7 +291,8 @@ class WorkspaceActivities:
             raise WorkspaceError(
                 f"{repo!r}: a local repo needs an absolute path, as in {LOCAL_PREFIX}/abs/path"
             )
-        return LocalFolder(path, await asyncio.to_thread(collect_source_files, path))
+        files = await asyncio.to_thread(collect_source_files, path)
+        return LocalFolder(path, files, await asyncio.to_thread(read_image_file, path))
 
     async def _github_base(self, repo: str) -> GitHubBase:
         remote = self._remote(repo)
@@ -476,8 +486,12 @@ class WorkspaceActivities:
         # this activity made and did not get to report. Exactly one container may be live.
         await self._sandboxes.remove_containers(task_id)
         try:
-            sandbox = await self._boot(task_id)
-            await self._store.restore(sandbox, inp.head_sha)
+            image = await self._image_of(inp.spec)
+            sandbox = await self._boot(task_id, image)
+            # An image brings its own environment, built when the image was made, and the task has
+            # no setup command that could build it again. A volume that survived holds the only
+            # copy of what git ignores there, such as compiled extensions, so a restore keeps it.
+            await self._store.restore(sandbox, inp.head_sha, keep_ignored=image is not None)
             await self._set_up(sandbox, inp.spec)
             await self._sandboxes.set_network(sandbox.id, False)
         except BaseException:
@@ -498,11 +512,27 @@ class WorkspaceActivities:
         await self._clear(inp.task_id)
 
     # ---------- what both need ----------
-    async def _boot(self, task_id: str) -> Sandbox:
-        """A container with the network on and the repo at /ckpt, and a workspace cloned from it."""
+    async def _image_of(self, spec: TaskSpec) -> str | None:
+        """The image a local folder asks for, or None when it asks for none or is gone.
+
+        A bad image file was refused when the task was prepared, so it can only be missing now.
+        """
+        if not is_local(spec.repo):
+            return None
+        folder = Path(spec.repo[len(LOCAL_PREFIX) :])
+        try:
+            return await asyncio.to_thread(read_image_file, folder)
+        except WorkspaceError as exc:
+            raise not_retried(exc) from exc
+
+    async def _boot(self, task_id: str, image: str | None = None) -> Sandbox:
+        """A container with the network on and the repo at /ckpt, and a workspace cloned from it.
+
+        `image` is the one the task's folder asked for. Without it the image of the worker is used.
+        """
         sandbox = await self._sandboxes.create(
             task_id,
-            self._image,
+            image or self._image,
             self._limits,
             network=True,
             mounts=self._store.mounts(task_id),

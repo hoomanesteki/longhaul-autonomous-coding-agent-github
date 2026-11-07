@@ -19,8 +19,11 @@ config decides the model, the context settings and the memory. `--model`, `--mem
 `--context-mode` are recorded in the result files and `--model` is checked against the config,
 but none of them changes the worker. Start it with the config that you mean to measure.
 
-The SWE-bench set (LH-902) and the naive and single-shot configs (LH-903) are accepted as flags
-and refused with a message until their stories land.
+The SWE-bench set (LH-902) runs the same way, with three differences. The repo of a task is the
+copy of an instance image (eval/swebench/adapter.py), the task runs in the sandbox image of the
+instance, and the official harness grades the whole run afterwards: the files say `not graded yet`
+until `eval/swebench/grade.sh` has filled in `resolved`. The naive and single-shot configs (LH-903)
+are accepted as flags and refused with a message until their story lands.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +51,8 @@ from temporalio.client import Client, WorkflowFailureError, WorkflowHandle  # no
 from temporalio.service import RPCError, RPCStatusCode  # noqa: E402
 
 from eval import custom_tasks, grade_custom, results  # noqa: E402
+from eval.swebench import adapter as swebench_adapter  # noqa: E402
+from eval.swebench import images as swebench_images  # noqa: E402
 from longhaul.agent.workspace import DEFAULT_TEST_COMMAND  # noqa: E402
 from longhaul.blobs.base import BlobStoreBase  # noqa: E402
 from longhaul.checkpoints.git_store import CheckpointError, GitCheckpointStore  # noqa: E402
@@ -88,8 +94,9 @@ WALL_MARGIN_S = 300.0
 # How much of an exception goes into a result file.
 FAILURE_CHARS = 500
 
-# Plan section 8.4: the caps that every config and every set shares.
+# Plan section 8.4: the caps that every config shares. The dollar cap differs between the sets.
 CUSTOM_BUDGETS = Budgets(task_usd=2.0, task_turns=150, task_wall_minutes=120)
+SWEBENCH_BUDGETS = swebench_adapter.BUDGETS
 
 PAUSED_PHASES = frozenset({Phase.PAUSED, Phase.AWAITING_PLAN_APPROVAL})
 RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
@@ -179,8 +186,6 @@ def parse_args(argv: Sequence[str] | None = None) -> RunOptions:
             "--run-id must be 1 to 40 letters, digits, '.', '_' or '-', starting with a letter "
             f"or a digit, not {args.run_id!r}"
         )
-    if args.task_set == "swebench":
-        parser.error("--set swebench is not available yet: the SWE-bench adapter comes with LH-902")
     if args.config != "full":
         parser.error(f"--config {args.config} is not available yet: the baselines come with LH-903")
     provider = args.provider
@@ -209,12 +214,30 @@ def parse_args(argv: Sequence[str] | None = None) -> RunOptions:
 
 
 # ---------- tasks ----------
-def select_tasks(options: RunOptions) -> list[custom_tasks.CustomTask]:
+Task = custom_tasks.CustomTask | swebench_adapter.Instance
+
+
+class TaskDriver(Protocol):
+    """What a task set other than the custom one adds to the run (see SwebenchDriver).
+
+    `prepared` makes the task's spec, with whatever it needs on this machine, for as long as the
+    body of the `async with` runs. `patch` turns the diff of the agent into the patch that is
+    graded. `grade` gives the verdict, or None when it comes later.
+    """
+
+    def prepared(self, task: Any, workflow_id: str) -> AbstractAsyncContextManager[TaskSpec]: ...
+
+    def patch(self, task: Any, patch: str) -> str: ...
+
+    async def grade(self, task: Any, patch: str) -> tuple[bool | None, str]: ...
+
+
+def select_tasks(options: RunOptions) -> list[Task]:
     """The tasks of the set in file order, cut to the first `limit`."""
-    if options.task_set != "custom":
-        raise ValueError(f"the {options.task_set} set is not available yet")
+    if options.task_set == "swebench":
+        return list(swebench_adapter.select_instances(options.limit))
     tasks = custom_tasks.load_tasks()
-    return tasks[: options.limit] if options.limit is not None else tasks
+    return list(tasks[: options.limit] if options.limit is not None else tasks)
 
 
 def check_tasks(tasks: Sequence[custom_tasks.CustomTask]) -> None:
@@ -237,7 +260,7 @@ def check_tasks(tasks: Sequence[custom_tasks.CustomTask]) -> None:
                 )
 
 
-def script_for(options: RunOptions, task: custom_tasks.CustomTask) -> Path | None:
+def script_for(options: RunOptions, task: Task) -> Path | None:
     """The script the scripted provider plays for this task, or None for the worker's provider."""
     script = options.script
     if script is None or not script.is_dir():
@@ -248,7 +271,7 @@ def script_for(options: RunOptions, task: custom_tasks.CustomTask) -> Path | Non
     return path
 
 
-def workflow_id_for(run_id: str, task: custom_tasks.CustomTask) -> str:
+def workflow_id_for(run_id: str, task: Task) -> str:
     """The id of the workflow. It names the run, so two runs of one task never meet."""
     return f"{WORKFLOW_PREFIX}{run_id}-{task.id}"
 
@@ -450,6 +473,8 @@ class RunContext:
     model: str
     commit: str
     folder: Path
+    # None for the custom set. The SWE-bench set brings a driver of its own.
+    driver: TaskDriver | None = None
     wall_limit_s: float = (CUSTOM_BUDGETS.task_wall_minutes * 60) + WALL_MARGIN_S
 
 
@@ -527,7 +552,7 @@ async def clean_up(ctx: RunContext, workflow_id: str) -> None:
             await remove(workflow_id)
 
 
-def identity(ctx: RunContext, task: custom_tasks.CustomTask) -> dict[str, Any]:
+def identity(ctx: RunContext, task: Task) -> dict[str, Any]:
     """The fields that every result of this run shares, whether the task finished or not."""
     options = ctx.options
     return {
@@ -545,7 +570,7 @@ def identity(ctx: RunContext, task: custom_tasks.CustomTask) -> dict[str, Any]:
     }
 
 
-async def run_one(ctx: RunContext, task: custom_tasks.CustomTask) -> results.TaskResult:
+async def run_one(ctx: RunContext, task: Task) -> results.TaskResult:
     """Run one task and write its result file.
 
     When the runner itself fails on the task, with a lost connection or a database error, the
@@ -560,7 +585,7 @@ async def run_one(ctx: RunContext, task: custom_tasks.CustomTask) -> results.Tas
 
 
 async def record_failure(
-    ctx: RunContext, task: custom_tasks.CustomTask, started_at: datetime, exc: Exception
+    ctx: RunContext, task: Task, started_at: datetime, exc: Exception
 ) -> results.TaskResult:
     """Write the result of a task that the runner could not run to the end."""
     ended_at = datetime.now(UTC)
@@ -589,33 +614,57 @@ async def record_failure(
     return result
 
 
-async def execute_task(
-    ctx: RunContext, task: custom_tasks.CustomTask, started_at: datetime
-) -> results.TaskResult:
+def prepared_spec(
+    ctx: RunContext, task: Task, workflow_id: str
+) -> AbstractAsyncContextManager[TaskSpec]:
+    """The spec of the task, held for as long as the task needs what was made for it."""
+    if ctx.driver is not None:
+        return ctx.driver.prepared(task, workflow_id)
+    if not isinstance(task, custom_tasks.CustomTask):
+        raise ValueError(f"the task {task.id} needs a driver of its own set")
+    return contextlib.nullcontext(build_spec(task, workflow_id))
+
+
+async def grade_task(
+    ctx: RunContext, task: Task, outcome: Outcome, patch: str, workflow_id: str
+) -> tuple[bool | None, str]:
+    """The verdict of the task. In the SWE-bench set it comes later, from the official harness."""
+    if ctx.driver is None:
+        if not isinstance(task, custom_tasks.CustomTask):
+            raise ValueError(f"the task {task.id} needs a driver of its own set")
+        return await grade(ctx, task, outcome, patch, workflow_id)
+    if outcome.kind is not OutcomeKind.PR_OPENED:
+        return False, f"not graded: the task ended as {outcome.kind.value}"
+    return await ctx.driver.grade(task, patch)
+
+
+async def execute_task(ctx: RunContext, task: Task, started_at: datetime) -> results.TaskResult:
     options = ctx.options
     workflow_id = workflow_id_for(options.run_id, task)
     script = script_for(options, task)
     script_ref = await upload_script(ctx.blobs, workflow_id, script) if script else None
-    try:
-        await start_task(
-            ctx.client,
-            build_spec(task, workflow_id),
-            task_queue=ctx.settings.task_queue,
-            script=script_ref,
-        )
-        live = TemporalTask(ctx.client, workflow_id)
-        watched = await watch(
-            live, pause_timeout_s=options.pause_timeout_s, wall_limit_s=ctx.wall_limit_s
-        )
-        outcome = await read_outcome(live.handle, watched.stopped_by)
-        ended_at = datetime.now(UTC)
-        final = await try_status(live.handle) or watched.status
-        patch, unreadable = await read_patch(ctx.store, workflow_id, final)
-        resolved, grading = await grade(ctx, task, outcome, patch, workflow_id)
-        cost_usd, tokens = await ledger_totals(ctx.sessions, workflow_id)
-    except BaseException:
-        await abandon(ctx, workflow_id)
-        raise
+    # The folder and the image of a SWE-bench task stay until the task has ended: the worker reads
+    # them again when it has to make a new sandbox.
+    async with prepared_spec(ctx, task, workflow_id) as spec:
+        try:
+            await start_task(
+                ctx.client, spec, task_queue=ctx.settings.task_queue, script=script_ref
+            )
+            live = TemporalTask(ctx.client, workflow_id)
+            watched = await watch(
+                live, pause_timeout_s=options.pause_timeout_s, wall_limit_s=ctx.wall_limit_s
+            )
+            outcome = await read_outcome(live.handle, watched.stopped_by)
+            ended_at = datetime.now(UTC)
+            final = await try_status(live.handle) or watched.status
+            patch, unreadable = await read_patch(ctx.store, workflow_id, final)
+            if ctx.driver is not None:
+                patch = ctx.driver.patch(task, patch)
+            resolved, grading = await grade_task(ctx, task, outcome, patch, workflow_id)
+            cost_usd, tokens = await ledger_totals(ctx.sessions, workflow_id)
+        except BaseException:
+            await abandon(ctx, workflow_id)
+            raise
     await clean_up(ctx, workflow_id)
     if unreadable and outcome.kind is OutcomeKind.PR_OPENED:
         grading = f"{grading} ({unreadable})"
@@ -650,9 +699,7 @@ def describe(result: results.TaskResult) -> str:
 
 
 # ---------- the run ----------
-async def run_tasks(
-    ctx: RunContext, tasks: Sequence[custom_tasks.CustomTask]
-) -> list[results.TaskResult]:
+async def run_tasks(ctx: RunContext, tasks: Sequence[Task]) -> list[results.TaskResult]:
     """Run the tasks, `concurrency` at a time, and return their results in task order.
 
     run_one turns a failure of one task into its result, so one bad task never cancels the
@@ -660,7 +707,7 @@ async def run_tasks(
     """
     gate = asyncio.Semaphore(ctx.options.concurrency)
 
-    async def limited(task: custom_tasks.CustomTask) -> results.TaskResult:
+    async def limited(task: Task) -> results.TaskResult:
         async with gate:
             return await run_one(ctx, task)
 
@@ -679,7 +726,9 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
     cfg = load_config(config_path(settings))
     model = resolve_model(options, cfg)
     tasks = select_tasks(options)
-    await asyncio.to_thread(check_tasks, tasks)
+    await asyncio.to_thread(
+        check_tasks, [t for t in tasks if isinstance(t, custom_tasks.CustomTask)]
+    )
     for task in tasks:
         script_for(options, task)
     if settings.database_url is None:
@@ -692,6 +741,7 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
 
     engine = make_engine(settings.database_url.get_secret_value())
     sandboxes = DockerSandboxManager()
+    driver = swebench_adapter.SwebenchDriver() if options.task_set == "swebench" else None
     started_at = datetime.now(UTC)
     try:
         ctx = RunContext(
@@ -708,12 +758,17 @@ async def run_eval(options: RunOptions, settings: EnvSettings) -> results.Summar
             model=model,
             commit=git_sha(),
             folder=folder,
+            driver=driver,
         )
         finished = await run_tasks(ctx, tasks)
     finally:
         await engine.dispose()
     summary = results.summarize(finished, started_at=started_at, ended_at=datetime.now(UTC))
     results.write_summary(folder, summary)
+    if driver is not None:
+        swebench_adapter.write_predictions(
+            folder / swebench_adapter.PREDICTIONS_FILE, swebench_adapter.predictions_for_run(folder)
+        )
     return summary
 
 
@@ -729,13 +784,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     try:
         summary = asyncio.run(run_eval(options, EnvSettings()))
-    except (ValueError, ConnectionError, custom_tasks.HiddenTestsVisibleError) as exc:
+    except (
+        ValueError,
+        ConnectionError,
+        custom_tasks.HiddenTestsVisibleError,
+        swebench_images.ImageError,
+    ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    folder = options.results_dir / summary.run_id
+    if options.task_set == "swebench":
+        # The harness has not seen the patches yet, so a count of resolved tasks would say 0.
+        print(
+            f"run {summary.run_id}: {summary.attempted} tasks run, not graded yet, "
+            f"${summary.cost_usd:.4f}, {summary.intervention_needed} needed a person ({folder})"
+        )
+        print(f"next: eval/swebench/grade.sh {folder}")
+        return 0
     print(
         f"run {summary.run_id}: {summary.resolved} of {summary.attempted} resolved, "
-        f"${summary.cost_usd:.4f}, {summary.intervention_needed} needed a person "
-        f"({options.results_dir / summary.run_id})"
+        f"${summary.cost_usd:.4f}, {summary.intervention_needed} needed a person ({folder})"
     )
     return 0
 

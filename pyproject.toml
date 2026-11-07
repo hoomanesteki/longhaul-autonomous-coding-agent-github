@@ -39,6 +39,10 @@ longhaul = "longhaul.cli:app"
 memory = [
     "fastembed>=0.9.1",
 ]
+eval = [
+    "datasets>=5.1.0",
+    "swebench==5.0.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.6,<0.14.0"]
@@ -115,6 +119,12 @@ extra_checks = true
 module = ["longhaul.db.migrations.*"]
 disallow_untyped_defs = false
 disallow_untyped_calls = false
+
+# datasets is part of the optional "eval" extra, which the unit tests and CI do not install.
+# eval/swebench imports it inside the functions that need it.
+[[tool.mypy.overrides]]
+module = ["datasets"]
+ignore_missing_imports = true
 
 # fastembed is the optional "memory" extra, so the base install that CI type-checks does not
 # have it. LocalEmbedder imports it lazily.

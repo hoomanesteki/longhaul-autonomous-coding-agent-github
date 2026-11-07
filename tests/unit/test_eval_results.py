@@ -228,3 +228,37 @@ def test_the_summary_is_written_next_to_the_results(tmp_path: Path) -> None:
     path = results.write_summary(tmp_path, summary)
     assert path == tmp_path / "summary.json"
     assert results.Summary.model_validate_json(path.read_text(encoding="utf-8")) == summary
+
+
+# ---------- a verdict that comes later (LH-902) ----------
+def test_a_verdict_is_written_into_a_result_that_exists(tmp_path: Path) -> None:
+    results.write_result(tmp_path, make_result(resolved=None, grading="not graded yet"))
+
+    changed = results.set_verdict(tmp_path, "calc-01", resolved=True, grading="resolved")
+
+    assert (changed.resolved, changed.grading) == (True, "resolved")
+    assert results.read_results(tmp_path) == [changed]
+    assert changed.model_dump(exclude={"resolved", "grading"}) == make_result().model_dump(
+        exclude={"resolved", "grading"}
+    )
+
+
+def test_a_verdict_can_be_replaced_by_a_later_one(tmp_path: Path) -> None:
+    results.write_result(tmp_path, make_result(resolved=True))
+
+    results.set_verdict(tmp_path, "calc-01", resolved=None, grading="the harness failed")
+
+    assert results.read_results(tmp_path)[0].resolved is None
+
+
+def test_a_verdict_for_a_task_without_a_result_is_an_error(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="calc-01"):
+        results.set_verdict(tmp_path, "calc-01", resolved=True, grading="resolved")
+
+
+def test_a_verdict_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
+    results.write_result(tmp_path, make_result())
+
+    results.set_verdict(tmp_path, "calc-01", resolved=False, grading="no")
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["calc-01.json"]

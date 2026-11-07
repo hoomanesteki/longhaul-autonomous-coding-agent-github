@@ -2,7 +2,9 @@
 
 One run writes `eval/results/<run_id>/<task_id>.json` for each task and a `summary.json`. Every
 number in the README comes from these files, so a file says which run, config, model and commit
-it belongs to. A result file is written once. The grader fills `resolved` before it is written.
+it belongs to. A result file is written once. The grader fills `resolved` before it is written,
+except in the SWE-bench set, where the official harness grades the whole run afterwards and
+`set_verdict` puts its answers into the files.
 
 The fields that later phases fill (compactions, verify rounds, stuck reasons) start at honest
 zeros and empty lists. A zero here means "not measured yet" until the phase that counts them has
@@ -11,6 +13,7 @@ landed, and the summary does not report them.
 
 from __future__ import annotations
 
+import os
 import re
 import statistics
 from datetime import datetime
@@ -134,6 +137,24 @@ def write_result(folder: Path, result: TaskResult) -> Path:
     with path.open("x", encoding="utf-8") as handle:
         handle.write(result.model_dump_json(indent=2) + "\n")
     return path
+
+
+def set_verdict(folder: Path, task_id: str, *, resolved: bool | None, grading: str) -> TaskResult:
+    """Change `resolved` and `grading` of a result that was written without a verdict.
+
+    The SWE-bench harness grades a whole run after it, so its verdicts reach the files later.
+    Nothing else in the file changes. The new file replaces the old one in one step, so a reader
+    never sees half of it.
+    """
+    path = folder / f"{check_task_id(task_id)}.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"no result for task {task_id} in {folder}")
+    current = TaskResult.model_validate_json(path.read_text(encoding="utf-8"))
+    changed = current.model_copy(update={"resolved": resolved, "grading": grading})
+    scratch = path.with_name(path.name + ".tmp")
+    scratch.write_text(changed.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    os.replace(scratch, path)
+    return changed
 
 
 def read_results(folder: Path) -> list[TaskResult]:

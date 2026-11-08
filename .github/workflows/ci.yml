@@ -402,7 +402,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
-      - uses: quarto-dev/quarto-actions/setup@v2
+      # The setup downloads Quarto from GitHub; one failed download should not fail the run.
+      - id: quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+        continue-on-error: true
+        with:
+          version: 1.10.18
+      - if: steps.quarto.outcome == 'failure'
+        uses: quarto-dev/quarto-actions/setup@v2
         with:
           version: 1.10.18
       - name: Render the docs site
@@ -442,7 +449,7 @@ jobs:
       - name: Install gitleaks
         run: |
           base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
-          curl -sSfL "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          curl -sSfL --retry 5 --retry-all-errors "${base}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
           echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
           mkdir -p "$RUNNER_TEMP/gitleaks"
           tar -xzf gitleaks.tar.gz -C "$RUNNER_TEMP/gitleaks" gitleaks

@@ -126,3 +126,48 @@ def test_the_schema_is_the_same_with_and_without_the_console(console: Path) -> N
     # console/openapi.json is generated from the app with no folder. A folder in the
     # environment must not put the file routes into it.
     assert create_app(console_dir=console).openapi() == openapi_schema()
+
+
+def test_the_schema_dump_ignores_a_console_folder_that_has_no_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `make api-types` runs on a fresh clone, where LONGHAUL_CONSOLE_DIR may name a dist/ that
+    # does not exist yet. The dump needs no console and must not read the setting.
+    monkeypatch.setenv("LONGHAUL_CONSOLE_DIR", str(tmp_path / "missing"))
+    get_settings.cache_clear()
+    try:
+        assert openapi_schema()["info"]["title"]
+    finally:
+        get_settings.cache_clear()
+
+
+@pytest.mark.parametrize("path", ["/%00", "/a%00b", "/assets/%00"])
+def test_a_path_with_a_nul_byte_gets_the_page_and_not_a_500(console: Path, path: str) -> None:
+    client = TestClient(create_app(console_dir=console))
+
+    response = client.get(path)
+
+    assert response.status_code == 200
+    assert response.text == INDEX
+
+
+def test_head_on_the_root_is_answered(console: Path) -> None:
+    client = TestClient(create_app(console_dir=console))
+
+    assert client.head("/").status_code == 200
+
+
+@pytest.mark.parametrize("method", ["post", "put", "patch", "delete"])
+def test_an_unknown_api_address_is_a_404_for_every_method(console: Path, method: str) -> None:
+    # A typo in the URL of an action must not come back as "405 Method Not Allowed".
+    client = TestClient(create_app(console_dir=console))
+
+    response = client.request(method, "/api/nope")
+
+    assert response.status_code == 404
+
+
+def test_a_wrong_method_on_a_real_api_address_is_still_a_405(console: Path) -> None:
+    client = TestClient(create_app(console_dir=console))
+
+    assert client.post("/api/repos").status_code == 405

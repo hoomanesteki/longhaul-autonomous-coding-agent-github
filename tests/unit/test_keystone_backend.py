@@ -10,16 +10,17 @@ also asks for a pause, and the task id keeps every call of one task in one Keyst
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import AsyncIterator
 
 import pytest
-from longhaul.tools.backend import DirectBackend, Ran
-from longhaul.tools.keystone_backend import KeystoneBackend
-from longhaul.tools.mcp_server import CONTEXT_KEY
 from tests.fakes.fake_keystone import AWAIT_TOOL, FakeKeystone, running_keystone
 
 from longhaul.contracts import ToolCall, ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.tools.backend import DirectBackend, Ran
+from longhaul.tools.keystone_backend import KeystoneBackend
+from longhaul.tools.mcp_server import CONTEXT_KEY
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -228,8 +229,10 @@ async def test_a_session_is_closed_when_the_backend_is(
 async def test_the_bearer_token_is_read_for_every_request(
     keystone: FakeKeystone, sandbox: FakeSandbox
 ) -> None:
-    tokens = iter(["first", "second", "third", "fourth", "fifth", "sixth"])
-    found = KeystoneBackend(keystone.url, token=lambda: next(tokens))
+    # A call is more than one HTTP request (the handshake, the call, the close), so the source
+    # hands out a new token every time it is asked.
+    count = itertools.count()
+    found = KeystoneBackend(keystone.url, token=lambda: f"token-{next(count)}")
     try:
         await run(found, sandbox, "run_command", command="echo 1")
         await run(found, sandbox, "run_command", command="echo 2")

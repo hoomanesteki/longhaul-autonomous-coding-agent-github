@@ -9,11 +9,18 @@ key is refused before any tool is found, because the tools run commands.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx2
 import mcp_types as types
 import pytest
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
+from tests.fakes.fake_keystone import serve_app
+
+from longhaul.contracts import Sandbox
+from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.mcp_server import (
     CONTEXT_KEY,
     KEY_HEADER,
@@ -22,12 +29,6 @@ from longhaul.tools.mcp_server import (
     build_server,
     exposed_names,
 )
-from mcp import Client
-from mcp.client.streamable_http import streamable_http_client
-from tests.fakes.fake_keystone import serve_app
-
-from longhaul.contracts import Sandbox
-from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -64,8 +65,10 @@ def text_of(result: types.CallToolResult) -> str:
     return "".join(b.text for b in result.content if isinstance(b, types.TextContent))
 
 
-@pytest.fixture
-async def client(sandbox: FakeSandbox) -> AsyncIterator[Client]:
+@asynccontextmanager
+async def connected(sandbox: FakeSandbox) -> AsyncIterator[Client]:
+    """A client of the server, in memory. It is opened inside the test and not in a fixture,
+    because the SDK needs to enter and leave a client in the same task."""
     server = build_server(default_registry(), Boxes(sandbox))
     async with Client(server) as found:
         yield found
@@ -81,13 +84,18 @@ def test_the_sandbox_tools_are_exposed_and_the_local_ones_are_not() -> None:
     assert "read_output" not in names
 
 
-async def test_the_server_is_called_longhaul_sandbox(client: Client) -> None:
+async def test_the_server_is_called_longhaul_sandbox(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        assert client.server_info is not None
+        name = client.server_info.name
+
     assert SERVER_NAME == "longhaul-sandbox"
-    assert client.initialize_result.server_info.name == SERVER_NAME
+    assert name == SERVER_NAME
 
 
-async def test_every_tool_requires_the_context_the_worker_sends(client: Client) -> None:
-    listed = await client.list_tools()
+async def test_every_tool_requires_the_context_the_worker_sends(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        listed = await client.list_tools()
 
     names = {tool.name for tool in listed.tools}
     assert names == exposed_names(default_registry())
@@ -101,60 +109,86 @@ async def test_every_tool_requires_the_context_the_worker_sends(client: Client) 
 
 
 # ---------- calls ----------
-async def test_a_call_runs_in_the_sandbox_the_context_names(
-    client: Client, sandbox: FakeSandbox
-) -> None:
-    result = await client.call_tool(
-        "run_command", {"command": "cat notes.txt", CONTEXT_KEY: context()}
-    )
+async def test_a_call_runs_in_the_sandbox_the_context_names(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_command", {"command": "cat notes.txt", CONTEXT_KEY: context()}
+        )
 
     assert not result.is_error
     assert text_of(result).startswith("exit code: 0")
     assert "one" in text_of(result)
 
 
-async def test_a_tool_that_fails_is_an_error_result(client: Client) -> None:
-    result = await client.call_tool("run_command", {"command": "exit 3", CONTEXT_KEY: context()})
+async def test_a_command_that_exits_nonzero_keeps_its_exit_code(sandbox: FakeSandbox) -> None:
+    # As in direct mode, a command that exits with an error ran: it is a result, not a failure of
+    # the tool. Only a timeout is one.
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_command", {"command": "exit 3", CONTEXT_KEY: context()}
+        )
+
+    assert not result.is_error
+    assert text_of(result).startswith("exit code: 3")
+    assert result.structured_content == {"exit_code": 3}
+
+
+async def test_a_command_that_times_out_is_an_error_result_with_its_exit_code(
+    sandbox: FakeSandbox,
+) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_command", {"command": "sleep 5", "timeout_s": 1, CONTEXT_KEY: context()}
+        )
 
     assert result.is_error
-    assert text_of(result).startswith("exit code: 3")
+    assert text_of(result).startswith("timed out after 1 s")
+    assert isinstance(result.structured_content, dict)
+    assert "exit_code" in result.structured_content
 
 
 async def test_input_the_model_got_wrong_is_an_error_result_with_the_registrys_words(
-    client: Client,
+    sandbox: FakeSandbox,
 ) -> None:
-    result = await client.call_tool("read_file", {"path": "missing.txt", CONTEXT_KEY: context()})
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "read_file", {"path": "missing.txt", CONTEXT_KEY: context()}
+        )
 
     assert result.is_error
     assert "missing.txt" in text_of(result)
 
 
-async def test_a_call_without_the_context_is_refused(client: Client) -> None:
-    result = await client.call_tool("run_command", {"command": "echo hi"})
+async def test_a_call_without_the_context_is_refused(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool("run_command", {"command": "echo hi"})
 
     assert result.is_error
     assert CONTEXT_KEY in text_of(result)
 
 
-async def test_a_call_for_a_sandbox_that_is_gone_is_refused(client: Client) -> None:
-    result = await client.call_tool(
-        "run_command", {"command": "echo hi", CONTEXT_KEY: context("sbx-9")}
-    )
+async def test_a_call_for_a_sandbox_that_is_gone_is_refused(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_command", {"command": "echo hi", CONTEXT_KEY: context("sbx-9")}
+        )
 
     assert result.is_error
     assert "sbx-9" in text_of(result)
 
 
-async def test_a_tool_the_server_does_not_expose_is_refused(client: Client) -> None:
-    result = await client.call_tool("finish", {"summary": "done", CONTEXT_KEY: context()})
+async def test_a_tool_the_server_does_not_expose_is_refused(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool("finish", {"summary": "done", CONTEXT_KEY: context()})
 
     assert result.is_error
     assert "unknown tool" in text_of(result)
 
 
-async def test_the_context_is_not_passed_on_to_the_tool(client: Client) -> None:
+async def test_the_context_is_not_passed_on_to_the_tool(sandbox: FakeSandbox) -> None:
     # read_file's schema forbids extra properties, so passing the context on would fail it.
-    result = await client.call_tool("read_file", {"path": "notes.txt", CONTEXT_KEY: context()})
+    async with connected(sandbox) as client:
+        result = await client.call_tool("read_file", {"path": "notes.txt", CONTEXT_KEY: context()})
 
     assert not result.is_error
     assert "one" in text_of(result)

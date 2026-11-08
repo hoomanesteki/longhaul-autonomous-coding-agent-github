@@ -25,8 +25,6 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.tools.backend import ToolBackend
-from longhaul.tools.keystone_backend import KeystoneBackend
 from temporalio import activity
 from temporalio.client import WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -73,6 +71,8 @@ from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.settings import Context
+from longhaul.tools.backend import ToolBackend
+from longhaul.tools.keystone_backend import KeystoneBackend
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase5]

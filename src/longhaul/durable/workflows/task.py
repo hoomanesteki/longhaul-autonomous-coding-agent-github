@@ -170,7 +170,8 @@ config file, and a worker whose config differs stops at the start. Replay: the e
 command this adds, and only on a turn where a rule fires, so a history in which none does replays
 as it was.
 
-The pause for a hint (LH-506, ADR-0007). A stuck signal from `_watch`, or a good `ask_human` call,
+The pause for a hint (LH-506, ADR-0007). A stuck signal from `_watch`, a good `ask_human` call, or
+a call that a Keystone gateway holds for approval (LH-909, `ToolExecResult.approval_question`),
 pauses the task in `_pause`:
 
 1. The phase becomes PAUSED. The workflow notes how many hints and budget top-ups it has by now,
@@ -597,6 +598,14 @@ class _Ran:
     finish: str | None
     question: str | None = None
     review: bool = False
+
+
+def _held_for_approval(results: Sequence[ToolResult]) -> str | None:
+    """The question of the first call in `results` that a gateway holds for a person, if any."""
+    for result in results:
+        if isinstance(result, acts.ToolExecResult) and result.approval_question is not None:
+            return result.approval_question
+    return None
 
 
 class _Answered(Protocol):
@@ -1633,8 +1642,13 @@ class TaskWorkflow:
                 await self._relieve(index, sampled.context_decision)
             return ended
         stuck_now: StuckSignal | None
+        held = _held_for_approval(finished)
         if ran.question is not None:
             stuck_now = StuckSignal(reason=StuckReason.AGENT_ASKED, evidence=[ran.question])
+        elif held is not None:
+            # A gateway holds a call for a person (LH-909). The pause asks them as it does for
+            # `ask_human`, with the gateway's reason as the question.
+            stuck_now = StuckSignal(reason=StuckReason.AGENT_ASKED, evidence=[held])
         else:
             stuck_now = await self._watch(index, calls, ran.results, finished)
         if stuck_now is not None:

@@ -24,12 +24,12 @@ import os
 from collections.abc import AsyncIterator
 
 import pytest
-from longhaul.tools.backend import Ran
-from longhaul.tools.keystone_backend import KeystoneBackend
-from longhaul.tools.mcp_server import build_app, serving
 
 from longhaul.contracts import Sandbox, ToolCall, ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.tools.backend import Ran
+from longhaul.tools.keystone_backend import KeystoneBackend
+from longhaul.tools.mcp_server import build_app, serving
 from longhaul.tools.registry import default_registry
 
 pytestmark = [

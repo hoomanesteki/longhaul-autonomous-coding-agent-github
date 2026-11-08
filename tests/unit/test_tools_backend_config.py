@@ -14,11 +14,11 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.tools.backend import DirectBackend
-from longhaul.tools.keystone_backend import KeystoneBackend, build_backend
 from pydantic import ValidationError
 
 from longhaul.settings import AppConfig, EnvSettings, Tools, load_config
+from longhaul.tools.backend import DirectBackend
+from longhaul.tools.keystone_backend import KeystoneBackend, build_backend
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
 
@@ -70,19 +70,19 @@ def test_a_config_without_the_section_is_direct(tmp_path: Path) -> None:
 
 
 def test_keystone_mode_reads_the_address_and_the_upstream_name(tmp_path: Path) -> None:
-    cfg = config_with({"backend": "keystone", "keystone": {"url": URL}}, tmp_path)
+    cfg = config_with({"backend": "keystone", "gateway": {"url": URL}}, tmp_path)
 
     assert cfg.tools.backend == "keystone"
-    assert cfg.tools.keystone is not None
-    assert cfg.tools.keystone.url == URL
+    assert cfg.tools.gateway is not None
+    assert cfg.tools.gateway.url == URL
     # The id Keystone gives an upstream has no hyphen, so the default is the MCP server's name
     # with an underscore.
-    assert cfg.tools.keystone.upstream == "longhaul_sandbox"
-    assert cfg.tools.keystone.listen_host == "127.0.0.1"
+    assert cfg.tools.gateway.upstream == "longhaul_sandbox"
+    assert cfg.tools.gateway.listen_host == "127.0.0.1"
 
 
 def test_keystone_mode_without_an_address_is_refused(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="tools.keystone"):
+    with pytest.raises(ValidationError, match="tools.gateway"):
         config_with({"backend": "keystone"}, tmp_path)
 
 
@@ -104,7 +104,7 @@ def test_direct_builds_the_direct_backend() -> None:
 
 
 def keystone_tools() -> Tools:
-    return Tools.model_validate({"backend": "keystone", "keystone": {"url": URL}})
+    return Tools.model_validate({"backend": "keystone", "gateway": {"url": URL}})
 
 
 def test_keystone_mode_needs_a_token(monkeypatch: pytest.MonkeyPatch) -> None:

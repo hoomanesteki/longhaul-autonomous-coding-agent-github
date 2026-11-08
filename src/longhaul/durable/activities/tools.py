@@ -72,6 +72,14 @@ without running it. This reset is the guarantee under both: whatever a shell com
 call and the coder start from the checkpoint. A read-only call that has no `pre_sha` has nothing to
 go back to and is left as it is.
 
+Where the tool runs is the backend's business (tools/backend.py). By default it runs in the
+sandbox through the registry. With `tools.backend: keystone` (LH-909) the call goes through a
+Keystone gateway first, which may deny it or hold it for a person. A denial is a failed result
+like any other. A call held for approval also returns `approval_question`, and the workflow
+pauses the task with it as the question. Everything around the call is the same either way. A
+call that left the process can fail because the sandbox vanished and still come back as a
+result, so after a failed one the sandbox is looked up again.
+
 A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
 finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
 again from the same `pre_sha`. The error is raised for a container that was gone before the
@@ -94,7 +102,6 @@ from longhaul.agent.turns import (
     TranscriptError,
     answer_tool_calls,
     append_user_text,
-    tool_step,
     validate_pairs,
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key, call_slug
@@ -117,6 +124,7 @@ from longhaul.durable.activities.signals import call_signal
 from longhaul.durable.activities.support import heartbeating, not_retried, small
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import tool_span
+from longhaul.tools.backend import DirectBackend, ToolBackend
 from longhaul.tools.exec import RunTests
 from longhaul.tools.output import output_handle, store_output
 from longhaul.tools.registry import ToolRegistry
@@ -210,6 +218,7 @@ class ToolActivities:
         *,
         checkpoints: WorkspaceCheckpoints,
         tool_output_max_tokens: int = 4000,
+        backend: ToolBackend | None = None,
     ) -> None:
         if registry.blobs is not blobs:
             raise ValueError(
@@ -222,6 +231,7 @@ class ToolActivities:
         self._recorder = recorder
         self._checkpoints = checkpoints
         self._output_max_tokens = tool_output_max_tokens
+        self._backend: ToolBackend = backend if backend is not None else DirectBackend()
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -251,9 +261,13 @@ class ToolActivities:
                     arguments=call.input,
                 ) as span:
                     began = time.monotonic()
-                    result = await tool_step(self._registry, sandbox, call, ctx)
+                    ran = await self._backend.run(
+                        self._registry, sandbox, call, ctx, sandbox_id=inp.sandbox_id
+                    )
+                    result = ran.result
                     self._time(call.name, time.monotonic() - began)
                     span.record(result)
+                    await self._check_remote_failure(inp.sandbox_id, result)
                 if inp.read_only:
                     post_sha = None
                     if await self._discard(sandbox, inp.pre_sha):
@@ -285,6 +299,7 @@ class ToolActivities:
             pre_sha=inp.pre_sha,
             post_sha=post_sha,
             signal=signal,
+            approval_question=ran.approval_question,
         )
         await self._recorder.record_tool_call(
             ToolCallRecord(
@@ -310,6 +325,16 @@ class ToolActivities:
                 CheckpointRecord(inp.task_id, post_sha, "tool", inp.turn_index)
             )
         return small(returned)
+
+    async def _check_remote_failure(self, sandbox_id: str, result: ToolResult) -> None:
+        """Raise when a call that left the process failed because the sandbox vanished.
+
+        A tool that runs in this process raises when its sandbox is gone, and the handler below
+        reports it. A tool that ran behind a gateway answers with a failed result instead, and
+        the cause would be lost. So after a failed remote call the sandbox is looked up again.
+        """
+        if self._backend.remote and not result.ok and await self._is_gone(sandbox_id):
+            raise _gone(sandbox_id)
 
     def _test_command(self) -> str | None:
         """The command that run_tests runs, which the facts of a test run name it by."""

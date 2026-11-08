@@ -14,7 +14,6 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from longhaul.tools.keystone_backend import KeystoneBackend
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_keystone import FakeKeystone, running_keystone
@@ -25,6 +24,7 @@ from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.tools.keystone_backend import KeystoneBackend
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]

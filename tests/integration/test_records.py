@@ -510,3 +510,29 @@ async def test_a_call_comes_back_with_every_field_it_was_written_with(
     await recorder.record_tool_call(written)
 
     assert await recorder.last_tool_call("lh-acme-calc-42", "run_tests") == written
+
+
+# ---------- the end of a task, for the janitor (LH-507) ----------
+def date_events(scratch: Scratch, task_id: str, kind: str, moment: datetime) -> None:
+    with psycopg.connect(scratch.url) as conn:
+        conn.execute(
+            "UPDATE events SET ts = %s WHERE task_id = %s AND type = %s", (moment, task_id, kind)
+        )
+
+
+async def test_the_outcome_event_dates_the_end_of_a_task(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    for task_id in ("lh-old-1", "lh-new-2", "lh-running-3"):
+        await recorder.record_event(task_id, "stuck", {})  # any other event is not an end
+    await recorder.record_event("lh-old-1", "outcome", {"kind": "stuck"})
+    await recorder.record_event("lh-new-2", "outcome", {"kind": "error"})
+    date_events(scratch, "lh-old-1", "outcome", T0)
+    date_events(scratch, "lh-running-3", "stuck", T0)
+
+    ids = ["lh-old-1", "lh-new-2", "lh-running-3", "lh-unknown-4"]
+    assert await recorder.ended_before(ids, T1) == {"lh-old-1"}
+    assert await recorder.ended_before(ids, datetime.now(UTC)) == {"lh-old-1", "lh-new-2"}
+    assert await recorder.ended_before([], datetime.now(UTC)) == set()
+    # Only the ids asked about come back.
+    assert await recorder.ended_before(["lh-new-2"], T1) == set()

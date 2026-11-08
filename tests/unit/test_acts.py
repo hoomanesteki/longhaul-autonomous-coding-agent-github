@@ -19,6 +19,8 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Outcome,
+    OutcomeKind,
     Phase,
     Plan,
     PlanStep,
@@ -72,6 +74,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     assert sorted(names) == [
         "append_results",
         "bundle_checkpoint",
+        "clean_repos",
         "cleanup",
         "compact",
         "ensure_sandbox",
@@ -104,6 +107,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
         (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
+        (acts.CLEAN_REPOS, NoneType, acts.JanitorResult),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -813,6 +817,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         "create_pr",
         "deliver",
         "post_comment",
+        "post_final",
         "post_plan",
         "remove_label",
     ]
@@ -859,6 +864,8 @@ def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
         pytest.param(acts.DELIVER, 10 * 60, 60, 5, id="deliver"),
         # The plan comment is a post_comment whose body the activity renders.
         pytest.param(acts.POST_PLAN, 2 * 60, None, 10, id="post_plan"),
+        # The final comment is a post_comment whose body the activity renders (LH-507).
+        pytest.param(acts.POST_FINAL, 2 * 60, None, 10, id="post_final"),
     ],
 )
 def test_github_timeouts_and_attempts_match_section_3_7(
@@ -870,7 +877,15 @@ def test_github_timeouts_and_attempts_match_section_3_7(
 
 
 @pytest.mark.parametrize(
-    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR, acts.POST_PLAN]
+    "act",
+    [
+        acts.POST_COMMENT,
+        acts.ADD_LABEL,
+        acts.REMOVE_LABEL,
+        acts.CREATE_PR,
+        acts.POST_PLAN,
+        acts.POST_FINAL,
+    ],
 )
 def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
     assert act.retry.maximum_interval == timedelta(minutes=5)
@@ -926,6 +941,19 @@ GITHUB_SAMPLES: list[BaseModel] = [
     ),
     CommentInput(task_id="lh-x", repo="acme/calc", number=42, body="hi", idempotency_key="k:a:1"),
     LabelInput(task_id="lh-x", repo="acme/calc", number=42, label="l", idempotency_key="k:a:1"),
+    acts.PostFinalInput(
+        task_id="lh-x",
+        repo="acme/calc",
+        number=42,
+        outcome=Outcome(kind=OutcomeKind.STUCK, summary="no hint in 24 hours"),
+        plan=Plan(summary="s", steps=[], acceptance_checks=["pytest -q"]),
+        base_sha="b" * 40,
+        head_sha=SHA,
+        turns=9,
+        cost_usd=0.5,
+    ),
+    acts.CleanupInput(task_id="lh-x", sandbox_id="sbx-1", reason="stuck", keep_repo=True),
+    acts.JanitorResult(removed=["lh-old-1"], kept=2, failed=0),
 ]
 
 
@@ -1180,3 +1208,39 @@ def test_a_summarize_input_needs_a_pause_number_from_one() -> None:
             evidence=[],
             pause=0,
         )
+
+
+# ---------- LH-507: how a task ends ----------
+def test_the_janitor_runs_on_every_worker_and_the_final_comment_needs_a_token() -> None:
+    # Sweeping repos needs the database and the disk. Posting the report needs GitHub.
+    assert acts.CLEAN_REPOS in acts.ALL and acts.CLEAN_REPOS not in acts.GITHUB
+    assert acts.POST_FINAL in acts.GITHUB and acts.POST_FINAL not in acts.ALL
+
+
+def test_a_bare_repo_is_kept_for_seven_days_after_its_task_ends() -> None:
+    assert timedelta(days=7) == acts.REPO_RETENTION
+
+
+def test_cleanup_removes_the_repo_unless_the_caller_keeps_it() -> None:
+    # A workflow from before LH-507 sent no flag, and its cleanup removed the repo too.
+    assert acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="r").keep_repo is False
+
+
+def test_the_final_comment_has_one_key_for_the_whole_task() -> None:
+    assert acts.FINAL_COMMENT == "final"
+
+
+def test_the_error_trace_is_cut_far_below_the_payload_guard() -> None:
+    assert 0 < acts.ERROR_TRACE_CHARS * 4 < 16_000
+
+
+def test_the_draft_on_stuck_switch_rides_in_the_memo_beside_the_others() -> None:
+    keys = {
+        acts.OPEN_DRAFT_MEMO_KEY,
+        acts.PLAN_MEMO_KEY,
+        acts.SCRIPT_MEMO_KEY,
+        acts.TUNING_MEMO_KEY,
+        acts.CONTEXT_MODE_MEMO_KEY,
+        acts.STATUS_MEMO_KEY,
+    }
+    assert len(keys) == 6

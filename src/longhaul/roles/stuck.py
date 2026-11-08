@@ -29,6 +29,10 @@ the activities. `tool_exec` works out a `CallSignal` for each call that edits or
 (durable/activities/signals.py), and `read_turn` folds the signals of a turn, with the results of
 its calls, into one `TurnSignal`.
 
+The pause that follows a signal (LH-506) is in the workflow. This module holds the two things it
+needs that are pure: how many pauses a task gets (MAX_PAUSES) and the outcomes of a task that a
+person does not unblock.
+
 The window is bounded by construction. It holds the last 30 turns, and the edited regions of a
 turn older than the last 10 are dropped, since only EDIT_CHURN reads them and it looks 10 turns
 back. The text for the evidence (`TurnNotes`) is not kept at all: a rule fires on the turn it
@@ -38,20 +42,29 @@ feeds the detector the largest signals it can be given and checks that the windo
 
 A signal that fires empties the window. Without that the same pattern would fire again on the next
 turn, and the one after, until the agent broke it. The pause and hint flow (LH-506) acts on the
-signal and starts from a clean window, and a pattern that goes on after it builds up again from
-nothing. The detector watches the coder only: it ignores everything it is given in the planning
-phase, where reading the same file three times is the job.
+signal, empties the window again when a person answers, and a pattern that goes on after it
+builds up again from nothing. The detector watches the coder only: it ignores everything it is
+given in the planning phase, where reading the same file three times is the job.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Protocol
 
 from pydantic import BaseModel, Field
 
-from longhaul.contracts import Phase, StuckReason, StuckSignal, ToolResult, TurnSignal
+from longhaul.contracts import (
+    Outcome,
+    OutcomeKind,
+    Phase,
+    StuckReason,
+    StuckSignal,
+    ToolResult,
+    TurnSignal,
+)
 
 # The turns the window holds, and how many of the latest ones EDIT_CHURN reads (plan LH-505).
 WINDOW_TURNS = 30
@@ -386,3 +399,53 @@ class StuckDetector:
                 self._window = []
                 return StuckSignal(reason=reason, evidence=evidence)
         return None
+
+
+# ---------- when a person does not unblock the task ----------
+# A task pauses at most this many times. A fourth signal ends it: three hints that did not help
+# say that the next one will not either, and the money is better kept (plan LH-506).
+MAX_PAUSES = 3
+# The summary of an outcome is read in a list. The full evidence is in the `stuck` event.
+MAX_SUMMARY_CHARS = 300
+
+
+def _what(signal: StuckSignal) -> str:
+    """What the task was stuck on, in a line: the evidence, or the question it asked."""
+    reason = signal.reason.value.replace("_", " ")
+    first = " ".join(signal.evidence[0].split()) if signal.evidence else ""
+    if signal.reason is StuckReason.AGENT_ASKED:
+        return f"asked a person: {first}" if first else "asked a person"
+    return f"{reason}: {first}" if first else reason
+
+
+def _cut(text: str) -> str:
+    return text if len(text) <= MAX_SUMMARY_CHARS else text[: MAX_SUMMARY_CHARS - 3] + "..."
+
+
+def _plural(count: int, unit: str) -> str:
+    return f"{count} {unit}" if count == 1 else f"{count} {unit}s"
+
+
+def _waited(wait: timedelta) -> str:
+    """The wait in the largest unit that holds it in whole numbers: 24 hours, 90 seconds."""
+    seconds = int(wait.total_seconds())
+    for size, unit in ((3600, "hour"), (60, "minute")):
+        if seconds >= size and seconds % size == 0:
+            return _plural(seconds // size, unit)
+    return _plural(seconds, "second")
+
+
+def unanswered_outcome(signal: StuckSignal, wait: timedelta) -> Outcome:
+    """The end of a task whose question nobody answered within `wait`."""
+    return Outcome(
+        kind=OutcomeKind.STUCK,
+        summary=_cut(f"stuck, {_what(signal)}; no hint in {_waited(wait)}"),
+    )
+
+
+def pauses_used_outcome(signal: StuckSignal) -> Outcome:
+    """The end of a task that is stuck again after its last pause."""
+    return Outcome(
+        kind=OutcomeKind.STUCK,
+        summary=_cut(f"stuck, {_what(signal)}; {MAX_PAUSES} hints did not unblock the task"),
+    )

@@ -175,6 +175,7 @@ class Stubs:
             self.bundle_checkpoint,
             self.record_event,
             self.compact,
+            self.summarize_for_human,
             self.post_comment,
             self.add_label,
             self.remove_label,
@@ -318,6 +319,13 @@ class Stubs:
         if acts.COMPACT.name in self.fails:
             raise self.fails[acts.COMPACT.name]
         return self.compaction(inp)
+
+    @activity.defn(name=acts.SUMMARIZE_FOR_HUMAN.name)
+    async def summarize_for_human(self, inp: acts.SummarizeInput) -> acts.SummarizeOutput:
+        # The pause for a hint (LH-506). No test here plants a stuck pattern, but a worker of the
+        # workflow registers every activity it can call.
+        await self._enter(acts.SUMMARIZE_FOR_HUMAN.name, inp)
+        return acts.SummarizeOutput(comment="the question", question="?", status="ok")
 
     async def _github(self, name: str, payload: Any) -> None:
         await self._enter(name, payload)

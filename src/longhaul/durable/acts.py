@@ -51,6 +51,12 @@ The plan gate (LH-502) adds `decide_plan`, which records who approved or rejecte
 plan on its row of the `plans` table. It is one row update, so it is sized like `store_plan` and
 every worker registers it.
 
+The pause for a person (LH-506) adds `summarize_for_human`. It is a compactor model call and a
+template, so it has the numbers of `compact`: 10 minutes, 5 attempts, the backoff and the
+non-retryable error kinds of a model call, and a heartbeat timeout. It writes no row but the ledger
+rows of its calls. The comment itself is posted by `post_comment`, so every worker registers the
+first and only a worker with a token the second.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -92,6 +98,7 @@ from longhaul.contracts import (
     Role,
     StopDetails,
     StopReason,
+    StuckReason,
     TaskSpec,
     TaskStatus,
     ToolResult,
@@ -142,11 +149,12 @@ FORCED_KEEP_RECENT_TURNS = 2
 # file, so the number is copied from `loop.planner_max_turns`. A unit test keeps the two equal.
 PLANNER_MAX_TURNS = 20
 
-# The hours a task waits for a person before it gives up (LH-502), the same number as
-# `stuck.hint_wait_hours` of the config. The plan gate waits this long for an approval, and the
-# pauses of Phases 5 and 7 wait this long for a hint or a budget. The workflow cannot read the
-# config file, so the number is copied here, a unit test keeps the two equal, and a worker whose
-# config holds another number stops before it takes a task.
+# The hours a task waits for a person before it gives up, the same number as
+# `stuck.hint_wait_hours` of the config. The plan gate (LH-502) waits this long for an approval,
+# and a paused task (LH-506) this long for a hint, a budget top-up or a cancel before it ends as
+# stuck. The workflow cannot read the config file, so the number is copied here, a unit test keeps
+# the two equal, and a worker whose config holds another number stops before it takes a task
+# (durable/worker.py).
 HINT_WAIT_HOURS = 24
 
 # The failed reviews after which a task ends as stuck (LH-504). The workflow cannot read the config
@@ -359,8 +367,8 @@ class LlmTurnInput(BaseModel):
     # prompt is the same bytes. None means the task has no block.
     memory_ref: BlobRef | None = None
     # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
-    # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
-    # LH-506 builds on this.
+    # the ones that are not in the transcript yet (turns.show_hints). A hint is cut to
+    # agent/hints.MAX_HINT_BYTES when it arrives.
     hints: list[str] = Field(default_factory=list)
     # D8: the one retry of a turn that stopped on max_tokens runs at the higher cap. The
     # activity maps this to the number in the config, which the workflow cannot read.
@@ -514,6 +522,47 @@ class CompactOutput(BaseModel):
     tokens_before: int = Field(ge=0)
     tokens_after: int = Field(ge=0)
     folded_turns: int = Field(ge=0)  # the turns that this compaction removed from the view
+    cost_usd: float = Field(default=0.0, ge=0)
+
+
+# What the question for a person came to. The three are human_summary.SummaryStatus, and a test
+# keeps them equal.
+SummaryStatus = Literal["ok", "repaired", "fallback"]
+
+
+class SummarizeInput(BaseModel):
+    """What summarize_for_human needs to write the question for a person (LH-506).
+
+    `transcript_ref` is the view of the coder's transcript, None before the first turn has
+    stored one. `reason` and `evidence` are those of the StuckSignal; for AGENT_ASKED the one line
+    of evidence is the question the coder asked. `pause` is the number of this pause, counted from
+    1, and goes into the title of the comment. `turn_index` is the turn that ended in the signal,
+    for the ledger rows.
+    """
+
+    task_id: str
+    turn_index: int
+    spec: TaskSpec
+    transcript_ref: BlobRef | None
+    notes: ProgressNotes | None = None
+    reason: StuckReason
+    evidence: list[str] = Field(default_factory=list)
+    pause: int = Field(ge=1)
+    # The script of the task, as in LlmTurnInput. The compactor is scripted in a scripted run.
+    script_ref: BlobRef | None = None
+
+
+class SummarizeOutput(BaseModel):
+    """The comment to show a person, and the question in it.
+
+    `comment` is the whole text for the issue, under 250 words. A local task has no issue, so the
+    workflow records it in the `paused` event. `cost_usd` is what the compactor's calls cost on
+    the ledger.
+    """
+
+    comment: str
+    question: str
+    status: SummaryStatus
     cost_usd: float = Field(default=0.0, ge=0)
 
 
@@ -835,6 +884,26 @@ COMPACT = Act(
     ),
 )
 
+SUMMARIZE_FOR_HUMAN = Act(
+    "summarize_for_human",
+    SummarizeInput,
+    SummarizeOutput,
+    start_to_close=timedelta(minutes=10),
+    heartbeat=timedelta(seconds=30),
+    retry=RetryPolicy(
+        initial_interval=timedelta(seconds=2),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=120),
+        maximum_attempts=5,
+        non_retryable_error_types=[
+            ProviderErrorKind.INVALID_REQUEST.value,
+            ProviderErrorKind.AUTH.value,
+            ProviderErrorKind.CONTEXT_TOO_LONG.value,
+            _OVERSIZED,
+        ],
+    ),
+)
+
 # Backoff for a write to GitHub: the first retry comes quickly, and the wait doubles up to the
 # five minutes of section 3.7. GitHub's own advice (a rate limit) replaces it for one attempt.
 _GITHUB_ERRORS = [_OVERSIZED, GITHUB_FATAL, *SIDE_EFFECT_ERRORS]
@@ -946,6 +1015,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     RECORD_EVENT,
     POLL_ONCE,
     COMPACT,
+    SUMMARIZE_FOR_HUMAN,
     STORE_PLAN,
     RECORD_STEP,
     DECIDE_PLAN,
@@ -997,6 +1067,9 @@ class Tuning(BaseModel):
     # and append_results), and settings.Context.for_window says what it changes. The long-task
     # test needs a window that 62 turns fill, and the config's holds a task of hundreds of them.
     window_tokens: int | None = Field(default=None, ge=1)
+    # How long a paused task waits for a hint, in seconds, in place of HINT_WAIT_HOURS. The test
+    # server skips a 24 hour timer, but a test against a real server cannot wait for one.
+    hint_wait_s: float | None = Field(default=None, gt=0)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:
@@ -1047,16 +1120,22 @@ def continue_as_new_every(tuning: Tuning | None = None) -> int:
     return CONTINUE_AS_NEW_EVERY_TURNS
 
 
-def hint_wait() -> timedelta:
-    """How long a task waits for a person to answer: the plan gate, and later the pauses."""
-    return timedelta(hours=HINT_WAIT_HOURS)
-
-
 def status_grace(tuning: Tuning | None = None) -> timedelta:
     """The wait of a hand-over for a status comment: the run's tuning, or STATUS_GRACE."""
     if tuning is not None and tuning.status_grace_s is not None:
         return timedelta(seconds=tuning.status_grace_s)
     return STATUS_GRACE
+
+
+def hint_wait(tuning: Tuning | None = None) -> timedelta:
+    """How long a task waits for a person: the run's tuning, or HINT_WAIT_HOURS.
+
+    The plan gate passes no tuning and always waits HINT_WAIT_HOURS. A pause for a hint passes the
+    run's, so that a test against a real server can wait less.
+    """
+    if tuning is not None and tuning.hint_wait_s is not None:
+        return timedelta(seconds=tuning.hint_wait_s)
+    return timedelta(hours=HINT_WAIT_HOURS)
 
 
 def hand_off_due(turn_index: int, tuning: Tuning | None = None, *, suggested: bool = False) -> bool:

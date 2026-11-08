@@ -42,6 +42,15 @@ Blob keys. The new view is `turns/<turn>/transcript-compact-<attempt>.json`, or
 a turn and a proactive one after it belong to the same turn, and neither may overwrite the
 other.
 
+The question for a person (LH-506). The same class holds `summarize_for_human`, which the workflow
+calls when a task pauses. It is another job for the compactor model, so it has the model and effort
+of that role, a ledger row for every billed call, and a scripted answer in a scripted run (the
+script matches `role: compactor` and tells the two jobs apart by the words of the request). The
+activity loads the view, renders its last turns, asks (context.human_summary), and renders the
+comment from templates/stuck_comment.md.j2 (github/stuck_comment.py). A compactor that gives
+nothing usable still leaves a comment, built from the evidence. The comment is returned and not
+posted: a GitHub write is the side-effect activities' job, with an idempotency key.
+
 Who answers. As in llm_turn, a task with a script is answered by it, so a scripted run gets a
 scripted compactor (`match: {role: compactor}`).
 """
@@ -50,6 +59,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from temporalio import activity
@@ -65,6 +75,11 @@ from longhaul.context.compact import (
     find_cut,
     halve_cut,
     render_for_compaction,
+)
+from longhaul.context.human_summary import (
+    build_request,
+    fallback_summary,
+    summarize,
 )
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
@@ -90,18 +105,25 @@ from longhaul.durable.activities.support import (
     small,
 )
 from longhaul.durable.scripts import TaskProviders
+from longhaul.github.stuck_comment import render_stuck_comment
 from longhaul.providers.base import turn_index
-from longhaul.settings import Context
+from longhaul.settings import PROJECT_ROOT, Context
+
+# The turns of the transcript that the question for a person shows the compactor: the ones where
+# the agent got stuck. The older ones are in the notes, when there are any.
+RECENT_TURNS = 6
 
 
 class ContextActivities:
-    """The compact activity and what it needs.
+    """The compact and summarize_for_human activities and what they need.
 
     `provider`, `tools` and `config_for` are those of LlmActivities: the provider answers tasks
     without a script, the tools and the system prompt are what the token counts are made of, and
     `config_for(Role.COMPACTOR)` gives the compactor's model and effort. `context` is the policy
     of the context section, of which only `keep_recent_turns` is used here. `meters` is shared
     with the model turns of the worker. `ledger` is the cost ledger, as in LlmActivities.
+    `templates` is the folder of the Jinja templates (settings.templates_path), for the comment
+    that summarize_for_human renders.
     """
 
     def __init__(
@@ -114,6 +136,7 @@ class ContextActivities:
         *,
         ledger: Ledger | None = None,
         meters: Meters | None = None,
+        templates: Path | None = None,
     ) -> None:
         if context.keep_recent_turns < 1:
             raise ValueError(
@@ -127,11 +150,12 @@ class ContextActivities:
         self._context = context
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
         self._meters = meters if meters is not None else Meters()
+        self._templates = templates if templates is not None else PROJECT_ROOT / "templates"
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
         """What to register on a worker."""
-        return [self.compact]
+        return [self.compact, self.summarize_for_human]
 
     @activity.defn(name=acts.COMPACT.name)
     async def compact(self, inp: acts.CompactInput) -> acts.CompactOutput:
@@ -164,7 +188,9 @@ class ContextActivities:
         spent: list[Decimal] = []
 
         async def ledger_row(usage: Usage) -> None:
-            spent.append(await self._charge(inp, cfg.model, usage))
+            spent.append(
+                await self._charge(inp.task_id, inp.spec.repo, inp.turn_index, cfg.model, usage)
+            )
 
         try:
             async with heartbeating():
@@ -215,6 +241,53 @@ class ContextActivities:
             )
         )
 
+    @activity.defn(name=acts.SUMMARIZE_FOR_HUMAN.name)
+    async def summarize_for_human(self, inp: acts.SummarizeInput) -> acts.SummarizeOutput:
+        inp = small(inp)
+        view: list[Message] = []
+        if inp.transcript_ref is not None:
+            view = await self._blobs.get_json(inp.transcript_ref, list[Message])
+        provider = await provider_for_task(
+            self._scripts, self._provider, inp.task_id, inp.script_ref
+        )
+        cfg = self._config_for(Role.COMPACTOR)
+        request = build_request(
+            task=task_statement(inp.spec),
+            reason=inp.reason,
+            evidence=inp.evidence,
+            notes=inp.notes,
+            recent=render_for_compaction(view[find_cut(view, RECENT_TURNS) :]),
+        )
+        spent: list[Decimal] = []
+
+        async def ledger_row(usage: Usage) -> None:
+            spent.append(
+                await self._charge(inp.task_id, inp.spec.repo, inp.turn_index, cfg.model, usage)
+            )
+
+        try:
+            async with heartbeating():
+                got = await summarize(
+                    provider,
+                    cfg.model,
+                    request,
+                    fallback_summary(inp.spec.title, inp.reason, inp.evidence),
+                    effort=cfg.effort,
+                    on_billed=ledger_row,
+                )
+        except ProviderError as exc:
+            raise provider_failure(exc) from exc
+        return small(
+            acts.SummarizeOutput(
+                comment=render_stuck_comment(
+                    got.summary, inp.reason, inp.pause, templates=self._templates
+                ),
+                question=got.summary.question,
+                status=got.status,
+                cost_usd=float(sum(spent, Decimal(0))),
+            )
+        )
+
     def _mode(self, asked: ContextMode | None) -> ContextMode:
         """The mode of this call: the one the run asked for, else the one in the config."""
         return asked if asked is not None else self._context.mode
@@ -237,7 +310,9 @@ class ContextActivities:
             # The cut came from find_cut, so this is a bug and asking again changes nothing.
             raise not_retried(exc) from exc
 
-    async def _charge(self, inp: acts.CompactInput, model: str, usage: Usage) -> Decimal:
+    async def _charge(
+        self, task_id: str, repo: str, turn_index: int, model: str, usage: Usage
+    ) -> Decimal:
         """Put one compactor call on the ledger and return what it cost.
 
         A model without a price fails for good: a retry would call the compactor again, and none
@@ -245,7 +320,7 @@ class ContextActivities:
         """
         try:
             return await self._ledger.record(
-                inp.task_id, inp.spec.repo, model, inp.turn_index, activity.info().attempt, usage
+                task_id, repo, model, turn_index, activity.info().attempt, usage
             )
         except PricingError as exc:
             raise not_retried(exc) from exc

@@ -166,6 +166,8 @@ class Stack:
     server: RunningServer
     repo: str
     queue: str = field(default_factory=lambda: f"lh-e2e-pr-{uuid.uuid4().hex[:8]}")
+    # The script the worker plays. tests/e2e/test_stuck_flow.py runs the same stack with another.
+    script: Path = SCRIPT
     processes: list[subprocess.Popen[str]] = field(default_factory=list)
     task_ids: list[str] = field(default_factory=list)
 
@@ -215,7 +217,7 @@ class Stack:
             LONGHAUL_CKPT_DIR=str(self.tmp_path / "ckpt"),
             LONGHAUL_CONFIG=str(self.config_file),
             LONGHAUL_PROVIDER="scripted",
-            LONGHAUL_SCRIPT=str(SCRIPT),
+            LONGHAUL_SCRIPT=str(self.script),
             LONGHAUL_GITHUB_TOKEN=TOKEN,
             LONGHAUL_GITHUB_API_URL=self.server.url,
             LONGHAUL_GITHUB_WEB_URL=str(self.remotes),

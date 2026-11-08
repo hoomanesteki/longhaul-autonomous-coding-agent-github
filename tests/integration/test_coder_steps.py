@@ -62,6 +62,7 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
+from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
@@ -82,6 +83,7 @@ from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
+from longhaul.settings import Context
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase5]
@@ -102,6 +104,14 @@ WAIT_S = 60.0
 DOCKER_WAIT_S = 600.0
 CFG = LoopConfig(model="test-model", max_turns=30, max_tokens_per_turn=1000, max_tokens_retry=5000)
 SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=2)
+CONTEXT = Context(
+    window_tokens=200_000,
+    compact_at=0.6,
+    hard_limit=0.85,
+    keep_recent_turns=6,
+    elide_tool_outputs_after_turns=4,
+    tool_output_max_tokens=2_000,
+)
 SUMMARY = "Fixed add() so it returns the sum of its arguments. All tests pass."
 NEW_TEST = (
     "from calc import add\n\n\ndef test_add_negative() -> None:\n    assert add(-2, -3) == -5\n"
@@ -153,6 +163,22 @@ def step(step_id: str, status: str, note: str | None = None) -> dict[str, Any]:
         arguments["note"] = note
     return tool("update_step", **arguments)
 
+
+# The compactor model writes the question for a person when the coder asks one (LH-506).
+ASK_SUMMARY: dict[str, Any] = {
+    "match": {"role": "compactor", "user_text_contains": "Why the agent is stuck"},
+    "respond": {
+        "tool_calls": [
+            tool(
+                "record_stuck_summary",
+                goal="Fix add() in calc.",
+                tried=["Read the module", "Marked the first step as doing"],
+                guess="add() should take numbers of any kind.",
+                question="Should add() take floats?",
+            )
+        ]
+    },
+}
 
 FIX = tool("edit_file", path=MODULE, old_str="    return a - b", new_str="    return a + b")
 ADD_TEST = tool("write_file", path=NEW_TEST_FILE, content=NEW_TEST)
@@ -320,6 +346,9 @@ async def light(
         },
         planned_tools=coder.tool_specs(registry.specs()),
     )
+    questions = ContextActivities(
+        provider, blobs, registry.specs(), lambda role: CFG, CONTEXT, templates=TEMPLATES
+    )
     boxes = Boxes(gone=lose_sandbox)
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
@@ -330,6 +359,7 @@ async def light(
             workflows=[TaskWorkflow],
             activities=[
                 *llm.activities,
+                *questions.activities,
                 *tools.activities,
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
@@ -513,13 +543,14 @@ async def test_every_update_is_an_event_and_only_done_leaves_a_checkpoint(
     ]
 
 
-async def test_ask_human_ends_the_task_as_stuck_with_the_question(
+async def test_ask_human_pauses_and_ends_stuck_when_nobody_answers(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    """LH-506 builds the pause. Until then the question is recorded and the task ends."""
+    """The question is recorded and the task waits. With no answer it ends stuck (LH-506)."""
     steps = [
         turn("planner", 0, tool("submit_plan", **PLAN_INPUT)),
         coder_turn(0, step("s1", "doing"), tool("ask_human", question="Should add() take floats?")),
+        ASK_SUMMARY,
     ]
     async with light(env, write_script(tmp_path, steps)) as world:
         handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
@@ -529,7 +560,7 @@ async def test_ask_human_ends_the_task_as_stuck_with_the_question(
     assert outcome.kind is OutcomeKind.STUCK
     assert outcome.pr_url is None
     assert "Should add() take floats?" in outcome.summary
-    assert status.phase is Phase.PAUSED
+    assert status.phase is Phase.FAILED
     assert status.outcome == outcome
     assert statuses(status.plan) == ["doing", "todo", "todo"]
     (asked,) = [e for e in world.recorder.events if e.type == "paused"]
@@ -656,6 +687,7 @@ async def test_histories_of_a_planned_run_replay(env: WorkflowEnvironment, tmp_p
         coder_turn(0, step("s9", "done"), step("s1", "doing"), FIX),
         coder_turn(1, step("s1", "done")),
         coder_turn(2, tool("ask_human", question="Which one?")),
+        ASK_SUMMARY,
     ]
     async with light(env, write_script(tmp_path, three_step_run())) as world:
         finished = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)

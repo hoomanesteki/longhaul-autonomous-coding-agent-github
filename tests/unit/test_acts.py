@@ -27,6 +27,7 @@ from longhaul.contracts import (
     RepoSettings,
     Role,
     StopDetails,
+    StuckReason,
     TaskSpec,
     TaskStatus,
     ToolResult,
@@ -82,6 +83,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "record_event",
         "record_step",
         "store_plan",
+        "summarize_for_human",
         "tool_exec",
     ]
     assert len(set(names)) == len(names)
@@ -1151,7 +1153,8 @@ def test_a_plain_tool_result_reads_as_one_without_facts() -> None:
 # ---------- LH-502: the plan gate ----------
 @pytest.mark.phase5
 def test_the_plan_wait_follows_the_configured_hint_wait() -> None:
-    # Same reason as the tool timeout: the workflow cannot read the config file.
+    # Same reason as the tool timeout: the workflow cannot read the config file, so it keeps a
+    # copy of stuck.hint_wait_hours. The plan gate and the pause for a hint (LH-506) both use it.
     config = load_config(ROOT / "config" / "longhaul.example.yaml")
     assert config.stuck.hint_wait_hours == acts.HINT_WAIT_HOURS == 24
 
@@ -1232,3 +1235,33 @@ def test_a_delivery_is_not_verified_unless_the_workflow_says_so() -> None:
     )
     assert inp.verified_tests is None
     assert inp.model_copy(update={"verified_tests": "3 passed"}).verified_tests == "3 passed"
+
+
+# ---------- LH-506: the pause for a hint ----------
+def test_a_pause_waits_a_day_for_a_hint_unless_the_run_says_less() -> None:
+    assert acts.hint_wait() == timedelta(hours=24)
+    assert acts.hint_wait(acts.Tuning()) == timedelta(hours=24)
+    assert acts.hint_wait(acts.Tuning(hint_wait_s=90)) == timedelta(seconds=90)
+
+
+def test_summarize_for_human_is_an_activity_of_every_worker() -> None:
+    # It is a model call and a template, with no GitHub write: the comment is posted by
+    # post_comment, which only a worker with a token registers.
+    assert acts.SUMMARIZE_FOR_HUMAN in acts.ALL
+    assert acts.SUMMARIZE_FOR_HUMAN not in acts.GITHUB
+    assert acts.SUMMARIZE_FOR_HUMAN.heartbeat is not None
+
+
+def test_a_summarize_input_needs_a_pause_number_from_one() -> None:
+    with pytest.raises(ValidationError):
+        acts.SummarizeInput(
+            task_id="lh-x",
+            turn_index=1,
+            spec=TaskSpec(
+                task_id="lh-x", repo="acme/calc", settings=RepoSettings(repo="acme/calc")
+            ),
+            transcript_ref=None,
+            reason=StuckReason.NO_PROGRESS,
+            evidence=[],
+            pause=0,
+        )

@@ -233,8 +233,9 @@ def test_stuck_limits_the_workflow_cannot_follow_stop_the_worker(tmp_path: Path)
 
 
 def test_a_hint_wait_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
-    # The plan gate waits as long as the workflow's own copy of stuck.hint_wait_hours says, so a
-    # different number in the file would be read, accepted and ignored (LH-502).
+    # The plan gate (LH-502) and the pause for a hint (LH-506) wait as long as the workflow's own
+    # copy of stuck.hint_wait_hours says, so a different number in the file would be read,
+    # accepted and ignored.
     stuck = CONFIG.stuck.model_copy(update={"hint_wait_hours": 48})
     config = CONFIG.model_copy(update={"stuck": stuck})
     with pytest.raises(ValueError, match=r"stuck\.hint_wait_hours.*48.*24"):

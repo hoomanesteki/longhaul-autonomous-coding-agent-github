@@ -52,8 +52,11 @@ What it is built from, and why each piece is what it is:
   another number stops before it takes a task. The stuck detector (LH-505) is the same: the
   workflow keeps a copy of the four limits in `stuck`, and `tool_exec` returns the facts it reads.
   The plan gate (LH-502) records who decided a plan through `decide_plan`, which every worker
-  registers with `store_plan`. Its wait is the workflow's own copy of `stuck.hint_wait_hours`,
-  and a worker whose config holds another number stops before it takes a task for the same reason.
+  registers with `store_plan`. Its wait, and the wait of the pause for a hint (LH-506), are the
+  workflow's own copy of `stuck.hint_wait_hours`, so a worker whose config holds another number
+  stops before it takes a task for the same reason. `summarize_for_human`, which writes the
+  question for a person, is an activity of the compactor and renders its comment from the
+  templates folder.
 * The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
@@ -268,6 +271,21 @@ def _check_stuck_limits(cfg: AppConfig) -> None:
             )
 
 
+def _check_hint_wait(cfg: AppConfig) -> None:
+    """Refuse a config whose `stuck.hint_wait_hours` the workflow does not use.
+
+    The plan gate (LH-502) and the pause for a hint (LH-506) run in the workflow, which cannot
+    read the config file and waits for acts.HINT_WAIT_HOURS. Like the stuck limits, a different
+    number would be accepted and then ignored on every task.
+    """
+    if cfg.stuck.hint_wait_hours != acts.HINT_WAIT_HOURS:
+        raise ValueError(
+            f"stuck.hint_wait_hours is {cfg.stuck.hint_wait_hours}, but the workflow waits "
+            f"{acts.HINT_WAIT_HOURS} hours for a person and cannot be told otherwise. "
+            f"Set it to {acts.HINT_WAIT_HOURS}"
+        )
+
+
 def build_parts(
     settings: EnvSettings, cfg: AppConfig, sandboxes: DockerSandboxManager
 ) -> WorkerParts:
@@ -285,13 +303,7 @@ def build_parts(
             f"Set it to {acts.PLANNER_MAX_TURNS}"
         )
     _check_stuck_limits(cfg)
-    if cfg.stuck.hint_wait_hours != acts.HINT_WAIT_HOURS:
-        # Same reason: the plan gate waits as long as the workflow's copy says (LH-502).
-        raise ValueError(
-            f"stuck.hint_wait_hours is {cfg.stuck.hint_wait_hours}, but the workflow waits "
-            f"{acts.HINT_WAIT_HOURS} hours for a person and cannot be told otherwise. "
-            f"Set it to {acts.HINT_WAIT_HOURS}"
-        )
+    _check_hint_wait(cfg)
     if cfg.loop.max_verify_rounds != acts.MAX_VERIFY_ROUNDS:
         # The same reason as the planner's limit above.
         raise ValueError(
@@ -346,6 +358,7 @@ def build_parts(
         cfg.context,
         ledger=ledger,
         meters=meters,
+        templates=templates_path(settings),
     )
     tools = ToolActivities(
         registry,

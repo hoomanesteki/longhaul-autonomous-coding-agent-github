@@ -140,7 +140,12 @@ def config_for(role: Role) -> LoopConfig:
 
 # ---------- the long task ----------
 def coder_turn(turn: int) -> dict[str, Any]:
-    command_line = f"printf 'turn {turn} line %s: output of the test run\\n' $(seq 1 14)"
+    # The closing line is a pytest summary with one more passed test each turn, so that the stuck
+    # detector sees progress. Without it the task would pause for a hint after 15 turns (LH-506).
+    command_line = (
+        f"printf 'turn {turn} line %s: output of the test run\\n' $(seq 1 14); "
+        f"printf '{turn + 1} passed in 0.01s\\n'"
+    )
     return {
         "match": {"role": "coder", "turn_index": turn},
         "respond": {

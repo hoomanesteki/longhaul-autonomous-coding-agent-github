@@ -10,8 +10,8 @@ goes:
 | paused for a person | `longhaul:needs-human` is added |
 | resumed | `longhaul:needs-human` is removed |
 
-Pause and resume arrive in Phases 5 and 7. Their helpers are here so that those stories only
-have to call them.
+The pause for a hint (LH-506) uses the last two rows and `stuck_comment`. The pause for a budget
+(Phase 7) will use the same helpers.
 
 The plan gate (LH-502) asks for a person in the same way, with its own helpers and its own keys.
 A key is final: the ledger of side_effects.py calls a write with a key done and does not repeat
@@ -56,6 +56,7 @@ __all__ = [
     "pickup_comment",
     "plan_review_comment",
     "status_comment",
+    "stuck_comment",
 ]
 
 WORKING = "longhaul:working"
@@ -170,6 +171,22 @@ def plan_review_comment(spec: TaskSpec, version: int, *, hours: int) -> CommentI
             f"it revised. The task waits {hours} hours for an answer and then stops as stuck."
         ),
         idempotency_key=key_of(spec.task_id, "plan_review", version),
+    )
+
+
+def stuck_comment(spec: TaskSpec, pause: int, body: str) -> CommentInput:
+    """The question that a paused task asks on its issue. `pause` counts the pauses from 1.
+
+    Each pause is a separate effect, so the key holds its number: `<task>:stuck:<n>`. The body is
+    rendered by the summarize_for_human activity (github/stuck_comment.py), and the workflow
+    passes it on as it is.
+    """
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=body,
+        idempotency_key=key_of(spec.task_id, "stuck", pause),
     )
 
 

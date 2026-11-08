@@ -367,8 +367,8 @@ A coder that has a plan works it one step at a time (LH-503). It reads the plan 
 | Tool | What it does |
 |---|---|
 | `update_step(step_id, status, note)` | Sets the status of one step. A step that is `done` gets a checkpoint. A step id or a status the plan does not have is answered with an error and changes nothing. |
-| `submit_for_review(summary)` | Ends the coding and starts the review (next section). A task of an issue goes on to open the pull request once the work passes. |
-| `ask_human(question)` | Asks a person. The pause flow is not built yet (LH-506), so the task records the question and ends as `stuck`, in the phase `paused`, with the question in the summary. |
+| `submit_for_review(summary)` | Ends the coding and starts the review (see "The verifier and the send-back loop"). A task of an issue goes on to open the pull request once the work passes. |
+| `ask_human(question)` | Asks a person. The task pauses as it does for a stuck signal (see "The pause and the hint" below) and goes back to coding when someone answers. |
 
 A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, without a review and with a draft pull request, for a worker or a history from before the verifier. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
 
@@ -387,7 +387,7 @@ SELECT step_id, sha, turn_index FROM checkpoints WHERE task_id = 'lh-acme-calc-4
 
 ### The stuck detector
 
-The workflow watches the coder for four ways of going in circles (LH-505). It shows each coder turn that does not end the run to the detector in `roles/stuck.py`, and records one `stuck` event when a rule fires. The planner is never watched. The pause and the question to a person are LH-506, so for now the event is the whole reaction and the task goes on.
+The workflow watches the coder for four ways of going in circles (LH-505). It shows each coder turn that does not end the run to the detector in `roles/stuck.py`, and records one `stuck` event when a rule fires, and then pauses the task for a hint. The planner is never watched.
 
 | Reason | Fires when | Default |
 |---|---|---|
@@ -398,7 +398,7 @@ The workflow watches the coder for four ways of going in circles (LH-505). It sh
 
 When a turn matches more than one rule, the first row that fits is the one recorded. A signal that fires empties the detector's window, so a pattern that goes on is reported again only after it has built up again from nothing. Because the window does not say how many steps were done before it started, `no_progress` can come one turn late after a signal, and never early. The window holds the last 30 turns in `CarryState.stuck_window`, which crosses a hand-over to a new run, and it serializes to under 8 KB, whatever the characters of the file names, since a path is cut to 48 bytes of JSON.
 
-The limits are the `stuck` section of the config. The workflow cannot read the config file and keeps a copy (`roles/stuck.py`, `DEFAULT_LIMITS`), so a worker whose `stuck.no_progress_turns`, `repeated_failure_count`, `churn_edits` or `consecutive_tool_errors` differs from it stops at the start and names the setting. `stuck.hint_wait_hours` is the wait of the plan gate, and it is checked the same way (see "The plan gate").
+The limits are the `stuck` section of the config. The workflow cannot read the config file and keeps a copy (`roles/stuck.py`, `DEFAULT_LIMITS`), so a worker whose `stuck.no_progress_turns`, `repeated_failure_count`, `churn_edits` or `consecutive_tool_errors` differs from it stops at the start and names the setting. So does a worker whose `stuck.hint_wait_hours` is not 24 (`acts.HINT_WAIT_HOURS`), since the pause below and the plan gate wait for that long.
 
 `tool_exec` works out the facts that the rules need, because only the activity sees the whole text of a result (`durable/activities/signals.py`). The hash of a failed command covers the command, its exit code and the last 20 lines of stderr. When stderr names no error, the last 20 lines of stdout are added, because pytest prints its report there. Run times and memory addresses are taken out first, so the same failure on two runs hashes alike.
 
@@ -407,6 +407,37 @@ SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = '
 ```
 
 The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+
+### The pause and the hint
+
+A stuck signal, or a call to `ask_human`, pauses the task (LH-506). The workflow sets the phase to `paused` and asks the compactor model for a short question. Then it posts the question on the issue and adds the label `longhaul:needs-human`. A task of a folder (`local:`) has no issue, so the text goes into the `paused` event instead (`payload.comment`).
+
+The comment has four parts and fits in 250 words. It ends with the commands that answer it:
+
+```text
+## Longhaul needs a hint: repeated failure (pause 1)
+
+### What I'm trying to do
+### What I tried
+### My current guess
+### Question
+```
+
+Answer it with a comment from someone who has write access:
+
+| Comment | What happens |
+|---|---|
+| `/longhaul hint <text>` | The text goes to the coder as "Hint from <user>: <text>" on its next turn. A hint is cut to 2,000 bytes, with a note that says so. |
+| `/longhaul budget +$2` | Also unblocks the task, because a top-up may be what it needed. |
+| `/longhaul cancel` | Ends the task as cancelled. |
+
+A hint or a top-up removes the label, records a `resumed` event, empties the detector's window and puts the task back in `coding`. The task waits 24 hours. With no answer it ends as `stuck` in the phase `failed`, and the summary says how long it waited. A task pauses at most three times: a fourth signal ends it as `stuck` and says that three hints did not unblock it. The final comment and the labels of those ends come with LH-507.
+
+Each pause has its own comment key, `<task id>:stuck:<n>`, so a retry posts nothing twice. The compactor's calls for the question are on the cost ledger like any others, one row for each call, under the turn that was stuck.
+
+```sql
+SELECT type, payload->>'reason' AS reason, payload->>'pause' AS pause, ts FROM events WHERE task_id = 'lh-acme-calc-42' AND type IN ('stuck', 'paused', 'resumed') ORDER BY id;
+```
 
 ### The plan gate
 

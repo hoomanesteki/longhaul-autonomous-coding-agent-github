@@ -467,6 +467,33 @@ async def test_the_projection_of_the_request_is_returned() -> None:
     assert out.request_tokens == estimate(messages)
 
 
+async def test_the_next_request_is_projected_with_room_for_the_results_of_the_calls() -> None:
+    # The next request holds this reply and the results of its calls, so a budget check prices
+    # that size and not the one that was sent (LH-702). A call that the workflow answers itself
+    # has no result to make room for, so the two replies differ by about one result.
+    messages = rounds(2, lines=5)
+    policy = context()
+
+    async def next_tokens(call: ToolUseBlock) -> int:
+        rig = Rig(reply("tool_use", call), policy=policy)
+        out = await rig.run(turn_input(turn_index=2, transcript_ref=await rig.put(messages)))
+        assert out.next_request_tokens > 0
+        return out.next_request_tokens
+
+    read = await next_tokens(use("c1", "read_file", path="notes.txt"))
+    answered = await next_tokens(use("c1", "update_step", step_id="s1", status="done"))
+
+    assert read - answered > policy.tool_output_max_tokens * 0.75
+
+
+async def test_without_a_context_policy_the_next_request_is_not_projected() -> None:
+    rig = Rig(reply("tool_use", use("call-9")))
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=await rig.put(rounds(8))))
+
+    assert out.next_request_tokens == 0
+
+
 async def test_the_meter_learns_from_the_replies_of_a_task() -> None:
     # The provider counts seven characters to a token. After the first reply the meter knows,
     # and the second request is projected at that ratio and not at 3.5.

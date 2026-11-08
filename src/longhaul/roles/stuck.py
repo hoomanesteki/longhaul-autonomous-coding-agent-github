@@ -435,6 +435,11 @@ def _waited(wait: timedelta) -> str:
     return _plural(seconds, "second")
 
 
+def waited_text(wait: timedelta) -> str:
+    """The wait in the words of an outcome, such as "24 hours" or "90 seconds"."""
+    return _waited(wait)
+
+
 def unanswered_outcome(signal: StuckSignal, wait: timedelta) -> Outcome:
     """The end of a task whose question nobody answered within `wait`."""
     return Outcome(

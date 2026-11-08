@@ -66,6 +66,7 @@ async def start_task(
     context_mode: ContextMode | None = None,
     plan: bool = False,
     open_draft_on_stuck: bool = False,
+    enforce_budgets: bool = False,
 ) -> WorkflowHandle[TaskWorkflow, Outcome]:
     """Start the workflow for a task. Its id is the task id.
 
@@ -82,13 +83,24 @@ async def start_task(
     its partial work (LH-507). The poller passes the repo's setting. It is in the memo for the
     same reasons, and a task started without it opens no such draft.
 
+    `enforce_budgets` has the task check its budgets before every model turn and pause when a
+    limit would be crossed (LH-702). The poller asks for it, because a task nobody watches must not
+    run up a bill. A task started without it ends at its turn limit with ERROR "turn limit", and a
+    local run keeps that. The switch is in the state and not in the memo: the state is what a
+    hand-over carries, and a history that began before the story has no such field.
+
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run
     once the old one closed, and the poller would rerun a finished task for as long as the
     label stays on the issue. Namespace retention bounds the second case, so the `tasks`
     table stays the record of what ran.
     """
-    state = RunState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
+    state = RunState(
+        spec=spec,
+        phase=Phase.QUEUED,
+        started_at=datetime.now(UTC),
+        enforce_budgets=enforce_budgets,
+    )
     memo: dict[str, Any] = {}
     if tuning is not None:
         memo[TUNING_MEMO_KEY] = tuning

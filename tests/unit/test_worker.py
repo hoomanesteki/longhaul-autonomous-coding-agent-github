@@ -963,3 +963,42 @@ def test_a_verify_round_limit_the_workflow_cannot_follow_stops_the_worker(tmp_pa
     config = CONFIG.model_copy(update={"loop": loop})
     with pytest.raises(ValueError, match=r"loop\.max_verify_rounds.*5.*3"):
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
+# ---------- LH-702: budgets ----------
+def test_every_worker_checks_budgets_against_its_own_ledger(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    checking = activity_object(parts, "check_budget")
+    assert checking._spending is activity_object(parts, "llm_turn")._ledger
+    assert isinstance(checking._spending, SqlLedger)
+
+
+def test_the_budget_check_prices_a_role_with_the_model_of_that_role(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    checking = activity_object(parts, "check_budget")
+    assert checking._config_for(Role.PLANNER).model == CONFIG.models.planner
+    assert checking._config_for(Role.CODER).model == CONFIG.models.coder
+
+
+async def test_a_worker_with_a_token_posts_the_budget_comment_through_the_writes_ledger(
+    tmp_path: Path,
+) -> None:
+    templates = tmp_path / "templates"
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests", templates_dir=templates),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        posting = activity_object(parts, "post_budget")
+        writes = activity_object(parts, "post_comment")
+        assert posting._ledger is writes._ledger
+        assert posting._templates == templates
+    finally:
+        await parts.close()
+
+
+def test_a_worker_without_a_token_still_checks_budgets_but_posts_nothing(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    names = names_of(parts)
+    assert "check_budget" in names and "post_budget" not in names

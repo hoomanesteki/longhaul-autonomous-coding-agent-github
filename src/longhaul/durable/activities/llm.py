@@ -574,22 +574,25 @@ class LlmActivities:
         view: list[Message],
         calls: list[ToolCall],
         mode: ContextMode,
-    ) -> Decision:
-        """What to do before the next turn, from the projection of the request after this one.
+    ) -> tuple[Decision, int]:
+        """What to do before the next turn, and how large that request is expected to be.
+
+        The decision comes from the projection of the request after this one.
 
         That request has one more result elided than this one (eviction runs at the start of a
         turn, and the reply just made ages the others), and it holds the results of the calls
         just made. Those are not known yet, and each is at most tool_output_max_tokens, so that
         is what is reserved. A `finish` call has no result to reserve for. A mode without
-        compaction has nothing to do before the next turn, whatever the projection says.
+        compaction has nothing to do before the next turn, whatever the projection says, and the
+        size is still returned, for the budget check. It is 0 without a context policy.
         """
         policy, budget = self._context, self._budget
-        if policy is None or budget is None or not mode.compacts:
-            return "ok"
+        if policy is None or budget is None:
+            return "ok", 0
         upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
         pending = sum(1 for call in calls if not _answered_by_the_workflow(call.name))
-        tokens = meter.projected(system, upcoming, tools)
-        return budget.decide(tokens + pending * policy.tool_output_max_tokens)
+        tokens = meter.projected(system, upcoming, tools) + pending * policy.tool_output_max_tokens
+        return (budget.decide(tokens) if mode.compacts else "ok"), tokens
 
     # ----- the call -----
     async def _ask(
@@ -711,6 +714,7 @@ class LlmActivities:
         if carried:
             paused_ref = await self._blobs.put_json(carried, key(f"paused-{attempt}.json"))
         usage = resp.usage
+        decision, next_tokens = self._decide(meter, system, tools, grown, calls, mode)
         return acts.LlmTurnOutput(
             transcript_ref=transcript_ref,
             tool_calls_ref=tool_calls_ref,
@@ -725,8 +729,9 @@ class LlmActivities:
             raw_stop_reason=resp.raw_stop_reason,
             response_ref=response_ref,
             paused_ref=paused_ref,
-            context_decision=self._decide(meter, system, tools, grown, calls, mode),
+            context_decision=decision,
             request_tokens=projected,
+            next_request_tokens=next_tokens,
         )
 
     @staticmethod

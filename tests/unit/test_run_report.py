@@ -268,6 +268,20 @@ def test_a_long_timeline_is_cut_with_a_note() -> None:
     assert "left out" in timeline
 
 
+def test_a_long_timeline_keeps_how_the_run_ended() -> None:
+    folds = [
+        event(s, "compaction", tokens_before=9, tokens_after=3, folded_turns=2)
+        for s in range(1, MAX_TIMELINE_ROWS + 41)
+    ]
+    ended = event(900, "outcome", kind="pr_opened", repo="acme/calc")
+
+    timeline = section(render(a_run(events=[*folds, ended])), "Timeline")
+
+    assert "| Ended | pr opened |" in timeline
+    first, last = timeline.index("Planning"), timeline.index("Ended")
+    assert first < timeline.index("left out") < last, "the gap sits between the two ends"
+
+
 def test_the_tool_table_has_calls_errors_and_time_for_each_tool() -> None:
     tools = section(render(), "Tool usage")
 
@@ -345,6 +359,77 @@ def test_the_interventions_say_who_did_what_and_when() -> None:
     assert "| 2026-11-03 09:02:50 | bob | Added $1.50 and 10 turns to the budget |" in text
     assert "| 2026-11-03 09:09:40 | carol | Cancelled the task: not needed |" in text
     assert text.index("09:02:30") < text.index("09:02:50") < text.index("09:03:10")
+
+
+def test_a_cancel_the_workflow_recorded_is_an_intervention() -> None:
+    # The workflow writes the cancel only as the outcome event (task.py cancel_summary).
+    data = a_run(
+        events=[
+            event(
+                580,
+                "outcome",
+                kind="cancelled",
+                repo="acme/calc",
+                summary="cancelled by cli: review smoke | not needed",
+            )
+        ]
+    )
+
+    text = section(render(data), "Interventions")
+
+    assert "| 2026-11-03 09:09:40 | cli | Cancelled the task: review smoke \\| not needed |" in text
+    assert "\\\\|" not in text
+
+
+def test_a_cancel_with_no_reason_names_who_cancelled() -> None:
+    data = a_run(events=[event(580, "outcome", kind="cancelled", summary="cancelled by dana")])
+
+    text = section(render(data), "Interventions")
+
+    assert "| dana | Cancelled the task |" in text
+
+
+def test_a_cancel_is_listed_once_when_both_events_exist() -> None:
+    data = a_run(
+        events=[
+            event(579, "cancelled", by="carol", reason="not needed"),
+            event(580, "outcome", kind="cancelled", summary="cancelled by carol: not needed"),
+        ]
+    )
+
+    text = section(render(data), "Interventions")
+
+    assert text.count("Cancelled the task") == 1
+
+
+def test_an_outcome_that_is_not_a_cancel_is_not_an_intervention() -> None:
+    data = a_run(plans=[], events=[event(600, "outcome", kind="stuck", summary="cancelled by x")])
+
+    assert "Nobody stepped in" in section(render(data), "Interventions")
+
+
+def test_a_pause_answered_with_a_budget_top_up_is_an_intervention() -> None:
+    data = a_run(
+        plans=[],
+        events=[
+            event(210, "paused", reason="budget", pause=1, question="More?"),
+            event(270, "resumed", pause=1, via="budget", turn_index=2),
+        ],
+    )
+
+    text = section(render(data), "Interventions")
+
+    assert "Nobody stepped in" not in text
+    assert "| 2026-11-03 09:04:30 | unknown | Added budget to answer pause 1 |" in text
+
+
+def test_a_hint_with_a_pipe_is_escaped_once() -> None:
+    data = a_run(events=[event(150, "hint", by="bob", text="use a | b")])
+
+    text = section(render(data), "Interventions")
+
+    assert "| bob | Gave a hint: use a \\| b |" in text
+    assert "\\\\|" not in text
 
 
 def test_an_answer_to_a_pause_counts_when_no_hint_event_was_kept() -> None:

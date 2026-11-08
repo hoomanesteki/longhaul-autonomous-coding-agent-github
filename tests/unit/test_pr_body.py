@@ -238,6 +238,16 @@ def test_a_huge_report_is_cut_so_the_body_stays_under_60000_characters() -> None
     assert body.count("<details>") == body.count("</details>") == 1
 
 
+def test_a_report_that_fills_the_room_exactly_still_leaves_the_body_under_the_limit() -> None:
+    bare_size = len(render_with(None))
+    framed = len(render_with("x")) - bare_size - 1
+    room = MAX_BODY_CHARS - bare_size - framed
+
+    for size in (room - 1, room, room + 1):
+        body = render_with("y" * size)
+        assert len(body) < MAX_BODY_CHARS, size
+
+
 def test_the_cut_falls_on_a_line_boundary() -> None:
     long_report = "### Timeline\n\n" + "".join(f"| row {n:05d} |\n" for n in range(20_000))
 

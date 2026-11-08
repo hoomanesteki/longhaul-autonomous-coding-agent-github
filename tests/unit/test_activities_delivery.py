@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jinja2 import TemplateNotFound, TemplateSyntaxError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -544,3 +545,20 @@ async def test_a_report_that_cannot_be_read_is_left_to_the_retry_policy(
 
     with pytest.raises(ConnectionError):
         await run(make_with_reports(reports).deliver, deliver_input())
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ValueError("a plan row is invalid"),
+        TemplateNotFound("run_report.md.j2"),
+        TemplateSyntaxError("unexpected end of template", 1),
+    ],
+)
+async def test_a_report_that_cannot_be_built_does_not_stop_the_pull_request(
+    monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    body = await delivered_body(monkeypatch, StoredReports(fault))
+
+    assert "<details>" not in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"

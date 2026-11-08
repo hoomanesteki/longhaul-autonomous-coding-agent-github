@@ -33,6 +33,15 @@ function Source({ item }: { item: Item }) {
   );
 }
 
+/** The agent stores a repo map as minified JSON, which is one unreadable line until it is indented. */
+function prettyMap(content: string): string {
+  try {
+    return JSON.stringify(JSON.parse(content), null, 2);
+  } catch {
+    return content;
+  }
+}
+
 /** The content of an item. A repo map is long and meant to be read as a tree, so it folds away. */
 function Content({ item, id }: { item: Item; id: string }) {
   if (item.kind === "repo_map") {
@@ -40,7 +49,7 @@ function Content({ item, id }: { item: Item; id: string }) {
       <details className="mt-2 rounded border border-slate-200">
         <summary id={id} className="cursor-pointer px-3 py-2 text-sm font-medium">Repo map</summary>
         <pre className="max-h-96 overflow-auto border-t border-slate-200 p-3 font-mono text-xs whitespace-pre">
-          {item.content}
+          {prettyMap(item.content)}
         </pre>
       </details>
     );

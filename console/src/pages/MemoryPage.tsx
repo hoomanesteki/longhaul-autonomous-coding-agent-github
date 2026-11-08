@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 
 import { approveMemory, listMemory, listRepos, rejectMemory } from "../api/client";
@@ -8,7 +8,7 @@ import MemoryItemRow from "../components/MemoryItemRow";
 type Item = components["schemas"]["MemoryItemView"];
 type Decision = "approve" | "reject";
 
-/** The API's own ceiling for one page of items. A repo with more shows a note instead of a gap. */
+/** The API's own ceiling for one page of items. A tab with more shows a note instead of a gap. */
 const LIMIT = 1_000;
 
 const TABS = [
@@ -23,13 +23,14 @@ function tabOf(value: string | null): (typeof TABS)[number] {
   return TABS.find((tab) => tab.key === value) ?? TABS[0];
 }
 
-const memoryKey = (repo: string | undefined) => ["memory", repo] as const;
+const memoryKey = (repo: string | undefined, status?: Item["status"]) =>
+  status === undefined ? (["memory", repo] as const) : (["memory", repo, status] as const);
 
 /**
  * What the agent knows about a repo, and the candidates waiting for a decision.
  *
- * The page loads every item of the repo once and sorts them into tabs on the client, so the tab
- * counts are always right and a decision moves an item between tabs without another request.
+ * Each tab asks the API for its own status. The API lists oldest first and cuts at the limit, so
+ * one list of all statuses would push the newest items, the candidates, out of a busy repo.
  * The repo and the tab live in the address, so a reload or a shared link opens the same view.
  */
 export default function MemoryPage() {
@@ -40,27 +41,39 @@ export default function MemoryPage() {
   const repo = params.get("repo") ?? repos.data?.[0]?.repo;
   const tab = tabOf(params.get("tab"));
 
-  const items = useQuery({
-    queryKey: memoryKey(repo),
-    queryFn: () => listMemory({ repo, limit: LIMIT }),
-    enabled: repo !== undefined,
+  const lists = useQueries({
+    queries: TABS.map((entry) => ({
+      queryKey: memoryKey(repo, entry.status),
+      queryFn: () => listMemory({ repo, status: entry.status, limit: LIMIT }),
+      enabled: repo !== undefined,
+    })),
   });
+  const items = lists[TABS.findIndex((entry) => entry.key === tab.key)]!;
 
   const decide = useMutation({
     mutationFn: ({ id, decision }: { id: string; decision: Decision }) =>
       decision === "approve" ? approveMemory(id) : rejectMemory(id),
     onSuccess: (updated) => {
-      // Show the new status at once; the refetch below confirms it.
-      queryClient.setQueryData<Item[]>(memoryKey(updated.repo), (old) =>
-        old?.map((item) => (item.id === updated.id ? updated : item)),
-      );
+      // Show the item in its new tab at once; the refetch below confirms it. Every tab of the
+      // repo is refetched, because the one the item left and the one it joined both changed.
+      for (const entry of TABS) {
+        queryClient.setQueryData<Item[]>(memoryKey(updated.repo, entry.status), (old) => {
+          if (old === undefined) return old;
+          const rest = old.filter((item) => item.id !== updated.id);
+          return entry.status === updated.status ? [...rest, updated] : rest;
+        });
+      }
       void queryClient.invalidateQueries({ queryKey: memoryKey(updated.repo) });
     },
   });
 
   function show(next: { repo?: string; tab?: TabKey }) {
     const search = new URLSearchParams(params);
-    if (next.repo !== undefined) search.set("repo", next.repo);
+    if (next.repo !== undefined) {
+      search.set("repo", next.repo);
+      // A failed decision belongs to the repo it was made on.
+      decide.reset();
+    }
     if (next.tab !== undefined) search.set("tab", next.tab);
     setParams(search, { replace: true });
   }
@@ -69,8 +82,7 @@ export default function MemoryPage() {
   // A repo named in the address stays selectable even if the repo list has not caught up.
   if (repo !== undefined && !repoNames.includes(repo)) repoNames.push(repo);
 
-  const counts = (status: Item["status"]) => items.data?.filter((i) => i.status === status).length;
-  const shown = items.data?.filter((item) => item.status === tab.status) ?? [];
+  const shown = items.data ?? [];
 
   return (
     <section>
@@ -105,7 +117,7 @@ export default function MemoryPage() {
 
           <div role="tablist" aria-label="Memory status" className="mt-4 flex gap-1 border-b">
             {TABS.map((entry) => {
-              const count = counts(entry.status);
+              const count = lists[TABS.indexOf(entry)]!.data?.length;
               const selected = entry.key === tab.key;
               return (
                 <button
@@ -164,9 +176,9 @@ export default function MemoryPage() {
                 ))}
               </ul>
             )}
-            {(items.data?.length ?? 0) >= LIMIT && (
+            {shown.length >= LIMIT && (
               <p className="mt-3 text-sm text-slate-600">
-                Showing the first {LIMIT} items of this repo.
+                Showing the first {LIMIT} items of this tab.
               </p>
             )}
           </div>

@@ -304,7 +304,7 @@ describe("memory page", () => {
 
       const row = await screen.findByRole("listitem", { name: /content of m-1/ });
       expect(within(row).queryByRole("link")).not.toBeInTheDocument();
-      expect(within(row).getByText("../../etc?x=1")).toBeInTheDocument();
+      expect(within(row).getByText(/\.\.\/\.\.\/etc\?x=1/)).toBeInTheDocument();
     });
   });
 
@@ -356,9 +356,7 @@ describe("memory page", () => {
     });
 
     it("says so when there are no repos", async () => {
-      fetchStub.mockImplementation((input) =>
-        Promise.resolve(String(input) === "/api/repos" ? json([]) : json([])),
-      );
+      fetchStub.mockResolvedValue(json([]));
       renderPage();
 
       expect(await screen.findByText("No repos yet.")).toBeInTheDocument();

@@ -39,10 +39,12 @@ longhaul = "longhaul.cli:app"
 memory = [
     "fastembed>=0.9.1",
 ]
-# The SWE-bench set (eval/swebench): `uv sync --extra eval`. It is large, so CI and the worker
-# image leave it out. What every eval run needs is the `eval` dependency group below.
+# The SWE-bench set (eval/swebench) and the charts of the results report (eval/report):
+# `uv sync --extra eval`. It is large, so CI and the worker image leave it out. What every eval
+# run needs is the `eval` dependency group below.
 eval = [
     "datasets>=5.1.0",
+    "matplotlib>=3.10",
     "swebench==5.0.2",
 ]
 
@@ -135,6 +137,12 @@ disallow_untyped_calls = false
 # eval/swebench imports it inside the functions that need it.
 [[tool.mypy.overrides]]
 module = ["datasets"]
+ignore_missing_imports = true
+
+# matplotlib is in the same extra. eval/report/charts.py imports it inside the function that
+# draws, and the report builder runs without it.
+[[tool.mypy.overrides]]
+module = ["matplotlib", "matplotlib.*"]
 ignore_missing_imports = true
 
 # rank_bm25 ships no type information.

@@ -1006,6 +1006,34 @@ The harness pulls the instance images (several GB each, built for x86_64) and wa
 
 `make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
 
+### Build the results page
+
+`eval/report/build_report.py` turns the result files of finished runs into `docs/results.md` and its charts in `docs/img/`. It reads only `eval/results/<run id>/`, so the numbers on the page are the numbers in the files, and the footer lists the run ids and the git sha it was built at.
+
+```bash
+uv sync --extra eval                    # matplotlib draws the charts; without it the page has no images
+uv run python eval/report/build_report.py swe-single-shot swe-naive swe-full \
+  custom-single-shot custom-naive custom-full custom-full-2 \
+  abl-full abl-no-compaction abl-no-memory chaos-2026-11-20
+```
+
+| What the builder does | Why |
+|---|---|
+| Takes the headline model from the first run that is not an ablation | The headline tables hold one model. List the headline runs first. |
+| Puts a run in a table by what its files say: config, set, context mode, memory switch | The run id is a name the operator chose, so nothing depends on it. |
+| Pairs each ablation (`--context-mode no_compaction`, `--memory off`) with the plain `full` run on the same model that shares the most tasks | The comparison is paired on the tasks that both runs attempted. |
+| Computes Wilson 95% intervals and McNemar's exact test (`eval/report/stats.py`, no scipy) | The resolve rates come from 15 or 40 tasks, so the intervals matter more than the points. |
+| Counts a task that was not graded as attempted and not resolved | It follows the resolve rate of plan section 8.5. The page names the runs that have such tasks. |
+| Adds no date | The same files give the same page. |
+| Shows a task that ended before grading with the end summary of the result file as its reason | The grader line of such a task only repeats the outcome. A task that was graded and failed keeps the grader line. |
+
+Two steps of the real run are easy to miss, and `docs/results.md` (the placeholder) lists both:
+
+* **The chaos recordings.** `eval/chaos/chaos.py --record --provider anthropic` records the four chaos tasks with a real model (it needs `ANTHROPIC_API_KEY`). Without it the suite replays the committed scripted recordings, and the builder refuses its summary without `--allow-scripted`.
+* **The memory ablation.** `--memory off` is only recorded. Start the worker on a copy of the config with `memory.mode: "off"` (`LONGHAUL_CONFIG=...`) before the "without" run, and run a warm-up pass with memory on before the "with" run, as plan section 8.4 asks.
+
+With no run ids it writes the placeholder, which says that no real run exists and gives the commands to make one. `docs/results.md` stays that placeholder until a real run is reported. `tests/unit/test_report_tables.py` accepts the placeholder or a page the builder wrote: it reads the run ids and the git sha from the footer of the committed page, rebuilds the page from `eval/results`, and fails when the two differ, so commit the result folders with the page. Runs that a script played (`provider: scripted`) are refused, because their numbers say nothing about a model. `--allow-scripted` builds a dry-run page from them, with a notice above the first number, to try the builder. The fixtures behind the tests are in `tests/fixtures/eval_results/` and `scripts/make_eval_result_fixtures.py` rewrites them.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.

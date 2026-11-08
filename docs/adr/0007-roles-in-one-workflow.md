@@ -48,6 +48,7 @@ Easier:
 - Cancel, hints, budgets, cost and the hand-over every 40 turns work for every role with no new plumbing, because there is one workflow and one history.
 - The handoff from the planner to the coder is a value in `CarryState`. The sandbox needs no handoff, and the coder starts where the planner left the tree: the checkpoint.
 - The plan gate (LH-502) is a wait inside the same workflow, and the verifier (LH-504) can send work back to the coder by changing the phase.
+  - The gate holds the plan in the phase `AWAITING_PLAN_APPROVAL` for up to `stuck.hint_wait_hours`. A rejection goes back to the planner as a message in its own transcript, which the workflow kept for that reason, and the planner writes the next version, at most three. Because one workflow owns the planner, the wait and the coder, the signals of a person (`approve_plan`, `reject_plan`, `cancel`) reach all of them at the same id, and a decision that arrives during planning is still there when the gate asks.
 
 Harder:
 

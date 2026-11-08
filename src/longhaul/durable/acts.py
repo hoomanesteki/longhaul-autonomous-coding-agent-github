@@ -47,6 +47,9 @@ read inside the activity, so the workflow, which may not read files, passes the 
 The coder with a plan (LH-503) adds one more, `record_step`. It writes the event of a step update
 and, for a step that is done, the `step` checkpoint at the head of the work. Like `store_plan` it
 is a database write of a row or two, sized like `append_results`, and every worker registers it.
+The plan gate (LH-502) adds `decide_plan`, which records who approved or rejected a version of the
+plan on its row of the `plans` table. It is one row update, so it is sized like `store_plan` and
+every worker registers it.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -138,6 +141,13 @@ FORCED_KEEP_RECENT_TURNS = 2
 # The turns the planner gets to submit its plan (LH-501). The workflow cannot read the config
 # file, so the number is copied from `loop.planner_max_turns`. A unit test keeps the two equal.
 PLANNER_MAX_TURNS = 20
+
+# The hours a task waits for a person before it gives up (LH-502), the same number as
+# `stuck.hint_wait_hours` of the config. The plan gate waits this long for an approval, and the
+# pauses of Phases 5 and 7 wait this long for a hint or a budget. The workflow cannot read the
+# config file, so the number is copied here, a unit test keeps the two equal, and a worker whose
+# config holds another number stops before it takes a task.
+HINT_WAIT_HOURS = 24
 
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
@@ -604,6 +614,19 @@ class PlannedStatus(TaskStatus):
     plan: Plan | None = None
 
 
+class DecidePlanInput(BaseModel):
+    """What decide_plan needs: a version of the plan, and the decision a person made on it.
+
+    `by` is the login that sent the signal. Deciding the same version again changes nothing,
+    so a retry of the activity cannot turn a rejection into an approval.
+    """
+
+    task_id: str
+    version: int = Field(ge=1)
+    approved: bool
+    by: str
+
+
 class DeliverInput(BaseModel):
     """What deliver needs: the branch to push, and the facts for the title and the body."""
 
@@ -867,6 +890,14 @@ RECORD_STEP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+DECIDE_PLAN = Act(
+    "decide_plan",
+    DecidePlanInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -881,6 +912,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     COMPACT,
     STORE_PLAN,
     RECORD_STEP,
+    DECIDE_PLAN,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -977,6 +1009,11 @@ def continue_as_new_every(tuning: Tuning | None = None) -> int:
     if tuning is not None and tuning.continue_as_new_every_turns is not None:
         return tuning.continue_as_new_every_turns
     return CONTINUE_AS_NEW_EVERY_TURNS
+
+
+def hint_wait() -> timedelta:
+    """How long a task waits for a person to answer: the plan gate, and later the pauses."""
+    return timedelta(hours=HINT_WAIT_HOURS)
 
 
 def status_grace(tuning: Tuning | None = None) -> timedelta:

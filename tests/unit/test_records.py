@@ -316,3 +316,61 @@ async def test_each_version_of_a_plan_and_each_task_has_a_row_of_its_own() -> No
     await recorder.record_plan(PlanRecord("lh-y", 1, a_plan("other task")))
     assert sorted(recorder.plans) == [("lh-x", 1), ("lh-x", 2), ("lh-y", 1)]
     assert recorder.plans[("lh-x", 2)].plan.summary == "second"
+
+
+# ---------- LH-502: the decision on a plan ----------
+async def test_a_plan_starts_with_no_decision() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    assert recorder.plans[("lh-x", 1)].decided_by is None
+
+
+async def test_approving_a_plan_records_the_status_and_who_decided() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    await recorder.record_plan_decision("lh-x", 1, approved=True, decided_by="alice")
+    assert recorder.plans[("lh-x", 1)] == PlanRecord(
+        "lh-x", 1, a_plan(), status="approved", decided_by="alice"
+    )
+
+
+async def test_rejecting_a_plan_records_the_status_and_who_decided() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    await recorder.record_plan_decision("lh-x", 1, approved=False, decided_by="bob")
+    assert recorder.plans[("lh-x", 1)].status == "rejected"
+    assert recorder.plans[("lh-x", 1)].decided_by == "bob"
+
+
+async def test_a_decision_touches_only_its_own_version() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan("first")))
+    await recorder.record_plan(PlanRecord("lh-x", 2, a_plan("second")))
+    await recorder.record_plan_decision("lh-x", 1, approved=False, decided_by="bob")
+    assert recorder.plans[("lh-x", 2)].status == "proposed"
+
+
+async def test_the_first_decision_stands_when_the_activity_runs_again() -> None:
+    # Temporal runs decide_plan again after a crash, and a late retry must not turn a rejection
+    # into an approval or change who decided.
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    await recorder.record_plan_decision("lh-x", 1, approved=False, decided_by="bob")
+    await recorder.record_plan_decision("lh-x", 1, approved=True, decided_by="alice")
+    assert recorder.plans[("lh-x", 1)].status == "rejected"
+    assert recorder.plans[("lh-x", 1)].decided_by == "bob"
+
+
+async def test_a_decision_on_a_plan_that_was_never_stored_changes_nothing() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan_decision("lh-x", 1, approved=True, decided_by="alice")
+    assert recorder.plans == {}
+
+
+async def test_storing_a_plan_again_keeps_its_decision() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    await recorder.record_plan_decision("lh-x", 1, approved=True, decided_by="alice")
+    await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
+    assert recorder.plans[("lh-x", 1)].status == "approved"
+    assert recorder.plans[("lh-x", 1)].decided_by == "alice"

@@ -49,6 +49,9 @@ What it is built from, and why each piece is what it is:
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
   another number stops before it takes a task. The stuck detector (LH-505) is the same: the
   workflow keeps a copy of the four limits in `stuck`, and `tool_exec` returns the facts it reads.
+  The plan gate (LH-502) records who decided a plan through `decide_plan`, which every worker
+  registers with `store_plan`. Its wait is the workflow's own copy of `stuck.hint_wait_hours`,
+  and a worker whose config holds another number stops before it takes a task for the same reason.
 * The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
@@ -273,6 +276,13 @@ def build_parts(
             f"Set it to {acts.PLANNER_MAX_TURNS}"
         )
     _check_stuck_limits(cfg)
+    if cfg.stuck.hint_wait_hours != acts.HINT_WAIT_HOURS:
+        # Same reason: the plan gate waits as long as the workflow's copy says (LH-502).
+        raise ValueError(
+            f"stuck.hint_wait_hours is {cfg.stuck.hint_wait_hours}, but the workflow waits "
+            f"{acts.HINT_WAIT_HOURS} hours for a person and cannot be told otherwise. "
+            f"Set it to {acts.HINT_WAIT_HOURS}"
+        )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
     try:

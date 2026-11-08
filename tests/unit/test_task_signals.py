@@ -98,12 +98,11 @@ def test_a_negative_top_up_cannot_lower_a_budget(wf: TaskWorkflow, state: CarryS
     assert (state.extra_budget_usd, state.extra_turns) == (2.0, 0)
 
 
-def test_approving_a_plan_stores_the_flag_and_the_decision(
-    wf: TaskWorkflow, state: CarryState
-) -> None:
+def test_approving_a_plan_stores_the_decision(wf: TaskWorkflow, state: CarryState) -> None:
     wf.approve_plan("bob")
-    assert state.plan_approved is True
     assert wf.plan_decision == PlanDecision(approved=True, by="bob")
+    # Only the gate sets the flag, when it takes the decision (tests/unit/test_plan_gate_state.py).
+    assert state.plan_approved is False
 
 
 def test_rejecting_a_plan_stores_the_feedback(wf: TaskWorkflow, state: CarryState) -> None:

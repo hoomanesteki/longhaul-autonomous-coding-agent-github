@@ -232,6 +232,15 @@ def test_stuck_limits_the_workflow_cannot_follow_stop_the_worker(tmp_path: Path)
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
+def test_a_hint_wait_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The plan gate waits as long as the workflow's own copy of stuck.hint_wait_hours says, so a
+    # different number in the file would be read, accepted and ignored (LH-502).
+    stuck = CONFIG.stuck.model_copy(update={"hint_wait_hours": 48})
+    config = CONFIG.model_copy(update={"stuck": stuck})
+    with pytest.raises(ValueError, match=r"stuck\.hint_wait_hours.*48.*24"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.blobs, S3BlobStore)
@@ -535,6 +544,13 @@ def test_a_worker_stores_plans_with_the_recorder_of_the_rest(tmp_path: Path) -> 
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     store = activity_object(parts, "store_plan")
     assert store._records is activity_object(parts, "llm_turn")._recorder
+
+
+def test_every_worker_registers_the_plan_decision(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    decide = activity_object(parts, "decide_plan")
+    assert decide is activity_object(parts, "store_plan")
+    assert decide._records is activity_object(parts, "llm_turn")._recorder
 
 
 async def test_a_worker_with_a_token_posts_plans_through_the_ledger_of_the_writes(

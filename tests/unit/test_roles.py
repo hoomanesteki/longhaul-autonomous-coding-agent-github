@@ -424,3 +424,46 @@ def test_the_summaries_of_the_planning_phase_are_plain_ascii() -> None:
     assert planner.no_plan_outcome(20).summary.isascii()
     ended = planner.judge_submission(1, plan_input(steps=1)).outcome
     assert ended is not None and ended.summary.isascii()
+
+
+# ---------- LH-502: the plan gate ----------
+def test_a_plan_has_at_most_three_versions() -> None:
+    assert planner.MAX_PLAN_VERSIONS == 3
+
+
+def test_a_plan_that_is_never_approved_ends_the_run_as_stuck() -> None:
+    outcome = planner.not_approved_outcome()
+    assert outcome.kind is OutcomeKind.STUCK
+    assert outcome.summary == "plan not approved"
+    assert outcome.pr_url is None
+
+
+def test_a_plan_nobody_answers_ends_the_run_as_stuck_with_the_wait_in_the_summary() -> None:
+    outcome = planner.undecided_outcome(24)
+    assert outcome.kind is OutcomeKind.STUCK
+    assert outcome.summary == "plan not approved: no decision in 24 hours"
+
+
+def test_the_two_ends_of_a_refused_plan_can_be_told_apart() -> None:
+    assert planner.not_approved_outcome().summary != planner.undecided_outcome(24).summary
+
+
+def test_the_feedback_of_a_rejection_reaches_the_planner_with_the_version_it_rejects() -> None:
+    text = planner.revision_request(2, "use pytest -x, not a custom runner")
+    assert "version 2" in text
+    assert "use pytest -x, not a custom runner" in text
+    assert "submit_plan" in text
+
+
+def test_a_rejection_without_feedback_still_asks_for_a_new_plan() -> None:
+    text = planner.revision_request(1, "   ")
+    assert "version 1" in text
+    assert "no feedback" in text
+    assert "submit_plan" in text
+
+
+def test_the_texts_of_the_plan_gate_are_plain_ascii() -> None:
+    assert planner.not_approved_outcome().summary.isascii()
+    assert planner.undecided_outcome(24).summary.isascii()
+    assert planner.revision_request(1, "x").isascii()
+    assert planner.revision_request(1, "").isascii()

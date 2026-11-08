@@ -406,6 +406,33 @@ SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = '
 
 The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
 
+### The plan gate
+
+A repo can ask for a person to read the plan before any code is written (LH-502). Set `plan_approval_required: true` for the repo in the config. A task that plans on such a repo holds its plan after the planner submits it:
+
+| Step | What happens |
+|---|---|
+| The plan is stored and posted | As above. The phase becomes `awaiting_plan_approval`. |
+| The issue asks for a person | The label `longhaul:needs-human` goes on, and a comment says how to answer. A task on a local folder has no issue and asks nobody. |
+| `/longhaul approve` | The `plans` row for that version becomes `approved` with `decided_by` and `decided_at`, the label comes off, and the coder starts. |
+| `/longhaul reject <feedback>` | The row becomes `rejected`, the label comes off, and the planner revises its plan in the transcript it already has. The feedback reaches it as a message from you. The new version is stored, posted and put to the same wait. |
+| No answer for 24 hours | The task ends as `stuck` with the summary `plan not approved: no decision in 24 hours`. The row stays `proposed` and the label stays on, because a person is still needed. |
+
+The planner writes at most three versions. A third rejection ends the task as `stuck` with the summary `plan not approved`. Each version has its own 20 planner turns and its own repair turn, and every turn counts against `task_turns`.
+
+The wait is `stuck.hint_wait_hours` of the config, 24 hours. The workflow keeps its own copy (`acts.HINT_WAIT_HOURS`), so a worker whose config holds another number stops at the start and names the setting.
+
+Things to know:
+
+- **An answer can come early.** An approval or a rejection sent while the planner is still working is kept and used when the plan is ready, without waiting. It applies to one version: a decision is used once.
+- **A late answer does nothing.** After the coder has started, `/longhaul approve` and `/longhaul reject` find no plan to decide on.
+- **A cancel works at any time**, also during the wait.
+- **The gate is not repeated after a hand-over.** A task that has a plan does not plan again, so it does not ask again either.
+
+```sql
+SELECT version, status, decided_by, decided_at FROM plans WHERE task_id = 'lh-acme-calc-42' ORDER BY version;
+```
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

@@ -336,6 +336,8 @@ def test_a_long_console_hint_is_cut_for_the_issue() -> None:
         (2.5, 10, "$2.50 and 10 turns"),
         (2.5, 0, "$2.50"),
         (0.0, 1, "1 turn"),
+        (0.004, 0, "<$0.01"),
+        (0.004, 3, "<$0.01 and 3 turns"),
     ],
 )
 def test_a_console_budget_top_up_says_what_was_added(usd: float, turns: int, said: str) -> None:

@@ -3367,3 +3367,22 @@ async def test_a_console_comment_that_cannot_be_posted_does_not_fail_the_task(
         outcome = await result_of(handle)
 
     assert outcome == FINISHED
+
+
+async def test_a_console_comment_that_waits_on_github_does_not_hold_back_the_cleanup(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    # The sandbox goes first when a task ends: GitHub can be down for a long while, and a
+    # container must not wait for a comment.
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        stubs.hold(acts.POST_COMMENT.name)
+        await handle.signal(TaskWorkflow.hint, args=["console", "use vendor/"])
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the console comment")
+        stubs.release(acts.LLM_TURN.name)
+        await wait_until(lambda: bool(stubs.wound_up), "the cleanup, with the comment still held")
+        stubs.release(acts.POST_COMMENT.name)
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED

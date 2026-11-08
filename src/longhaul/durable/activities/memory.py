@@ -38,9 +38,12 @@ nothing to learn from, and the activity makes no model call for it. A worker wit
 (`memory.enabled` off) makes none either, and answers "skipped".
 
 Failures. A provider error is retried by kind, as in the other model calls. A store that cannot be
-written raises, and Temporal runs the attempt again, which asks the model again and gets a row on
-the ledger of its own (invariant I6). The same note written twice is one row, since the store
-keeps one row for one text. After the attempts are spent the workflow logs the failure and the
+written raises, and Temporal runs the attempt again. The cleaned answer of the model is kept in a
+blob (`lessons.json`, under the memory folder of the task) before the first write, so the next
+attempt stores the same notes and asks no one: a model that is asked twice words its notes in two
+ways, and the store would keep both sets. The call is billed once, with a ledger row (invariant
+I6), and the kept answer carries its cost. The same note written twice is one row, since the
+store keeps one row for one text. After the attempts are spent the workflow logs the failure and the
 task keeps the outcome it had: lessons are a bonus and never change how a task ended.
 
 As in every activity that calls a model, a task with a script is answered by it, so a scripted
@@ -96,6 +99,8 @@ __all__ = [
 
 # The name of the blob, under the memory folder of the task. A retried attempt writes the same key.
 BLOCK_NAME = "memory-block.txt"
+# The answer of extract_lessons, kept so that a retried attempt stores what the first one got.
+LESSONS_NAME = "lessons.json"
 
 
 class MemoryActivities:
@@ -199,6 +204,7 @@ class LessonActivities:
         self._sink = sink
         self._events = events
         self._provider = provider
+        self._blobs = blobs
         self._scripts = TaskProviders(blobs)
         self._config_for = config_for
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
@@ -215,12 +221,54 @@ class LessonActivities:
         skipped = acts.ExtractLessonsOutput(status="skipped", source_ref=ref)
         if self._sink is None:
             return skipped
+        # A retry after a half-written store must write what the first attempt got, not what a
+        # model says on a second ask. The answer is kept before any write for that reason.
+        key = blob_key(inp.task_id, "memory", 0, LESSONS_NAME)
+        got = await self._asked_before(key)
+        if got is None:
+            got = await self._ask(inp, ref, key)
+        if got is None:
+            return skipped
+        for lesson in got.items:
+            await self._sink.add_candidate(
+                MemoryItem(
+                    id="",  # the store makes the id
+                    repo=inp.spec.repo,
+                    kind=lesson.kind,
+                    content=lesson.content,
+                    status="candidate",
+                    source="task",
+                ),
+                source_ref=ref,
+            )
+        log.info("task %s: %d lessons stored for %s", inp.task_id, len(got.items), ref)
+        return small(got)
+
+    async def _asked_before(self, key: str) -> acts.ExtractLessonsOutput | None:
+        """The answer an earlier attempt kept, or None when no attempt got that far."""
+        try:
+            data = await self._blobs.get_by_key(key)
+        except BlobNotFoundError:
+            return None
+        try:
+            return acts.ExtractLessonsOutput.model_validate_json(data)
+        except ValueError as exc:
+            # Only this activity writes the key, so this is damage. Asking again is the cure.
+            log.warning(
+                "the kept lessons at %s cannot be read, so the model is asked: %s", key, exc
+            )
+            return None
+
+    async def _ask(
+        self, inp: acts.ExtractLessonsInput, ref: str, key: str
+    ) -> acts.ExtractLessonsOutput | None:
+        """Ask the compactor model and keep its cleaned answer, or None with nothing to ask."""
         stuck, issues = lessons.signals_from_events(
             await self._events.events_of(inp.task_id, lessons.EVENT_TYPES)
         )
         if inp.plan is None and inp.notes is None and not stuck and not issues:
             # Nothing happened that a note could be about, such as a task cancelled at once.
-            return skipped
+            return None
         provider = await provider_for_task(
             self._scripts, self._provider, inp.task_id, inp.script_ref
         )
@@ -240,32 +288,21 @@ class LessonActivities:
         )
         try:
             async with heartbeating():
-                got = await lessons.extract(
+                found = await lessons.extract(
                     provider, cfg.model, request, effort=cfg.effort, on_billed=ledger_row
                 )
         except ProviderError as exc:
             raise provider_failure(exc) from exc
-        for lesson in got.lessons:
-            await self._sink.add_candidate(
-                MemoryItem(
-                    id="",  # the store makes the id
-                    repo=inp.spec.repo,
-                    kind=lesson.kind,
-                    content=lesson.content,
-                    status="candidate",
-                    source="task",
-                ),
-                source_ref=ref,
-            )
-        log.info("task %s: %d lessons stored for %s", inp.task_id, len(got.lessons), ref)
-        return small(
+        answer = small(
             acts.ExtractLessonsOutput(
-                status=got.status,
+                status=found.status,
                 source_ref=ref,
-                items=[acts.LessonNote(kind=n.kind, content=n.content) for n in got.lessons],
+                items=[acts.LessonNote(kind=n.kind, content=n.content) for n in found.lessons],
                 cost_usd=float(sum(spent, Decimal(0))),
             )
         )
+        await self._blobs.put(answer.model_dump_json().encode(), key=key)
+        return answer
 
     async def _charge(self, inp: acts.ExtractLessonsInput, model: str, usage: Usage) -> Decimal:
         """Put one call on the ledger and return what it cost.

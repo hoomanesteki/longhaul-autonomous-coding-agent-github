@@ -13,8 +13,9 @@ The model is not trusted to follow the limits, so `clean_items` applies them aga
   with its point;
 - an item that is only generic advice is dropped. The check is a short list of phrases, such as
   "write tests" and "read the code". A phrase alone does not drop a note: "Write tests in
-  tests/unit/test_inventory.py" names a path of the repo and stays. Only a note with a phrase
-  and nothing of the repo in it goes;
+  tests/unit/test_inventory.py" names a path of the repo and stays, and so does a note that
+  says three more words of substance without any path. Only a note with a phrase and almost
+  nothing else goes;
 - `@` and `#` before a name or a number are removed, because a note comes back in a prompt, and
   in a comment that the agent writes from it, again and again;
 - the same note twice is kept once, and no more than 5 are kept.
@@ -147,6 +148,7 @@ GENERIC_PHRASES: tuple[str, ...] = (
 # Something of the repo: a code span, a path, a dotted name, a snake_case or CamelCase name, a
 # call or a `::` test id. A note that has one is about this repo, whatever else it says.
 _ANCHOR = re.compile(r"`|/|\b[A-Za-z_]\w*\.[A-Za-z_]\w+|\w_\w|[a-z][A-Z]|\(\)|::")
+_AND_OR = re.compile(r"\band/or\b", re.IGNORECASE)
 _MENTION = re.compile(r"[@#](?=\w)")
 _NOT_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -155,12 +157,38 @@ def _plain(text: str) -> str:
     return _NOT_ALNUM.sub(" ", text.lower()).strip()
 
 
+# Words that carry no fact of a repo. What is left of a note once a blocklisted phrase and these
+# words are taken out says whether the note holds anything of its own.
+_FILLER_TEXT = """
+a an the and or but nor so to of in on at by for with from as into onto it its this that
+these those is are was were be been being do does did you your we our they their i me my
+not no also always please should must need needs can could will would may might just
+before after when while if then than once again first every each any all
+"""
+_FILLER = frozenset(_FILLER_TEXT.split())
+# A note with fewer content words than this, outside a blocklisted phrase, is generic advice.
+MIN_CONTENT_WORDS = 3
+
+
 def is_generic(text: str) -> bool:
-    """Whether a note is advice for any repo: a blocklisted phrase and nothing of this repo."""
+    """Whether a note is advice for any repo: a blocklisted phrase and little else.
+
+    A note names something of the repo in one of two ways. It has an anchor (a code span, a path,
+    a dotted or snake_case name), or it says enough in plain words once the phrase is taken out:
+    "Run the tests with make check; plain pytest skips the integration marker" names a command
+    and a pitfall without a single code span.
+    """
     plain = f" {_plain(text)} "
-    if not any(f" {phrase} " in plain for phrase in GENERIC_PHRASES):
+    hits = [phrase for phrase in GENERIC_PHRASES if f" {phrase} " in plain]
+    if not hits:
         return False
-    return _ANCHOR.search(text) is None
+    # "and/or" is prose, not a path.
+    if _ANCHOR.search(_AND_OR.sub(" ", text)) is not None:
+        return False
+    for phrase in hits:
+        # The look-arounds find a phrase that repeats, where the spaces are shared.
+        plain = re.sub(rf"(?<!\S){phrase}(?!\S)", " ", plain)
+    return sum(1 for word in plain.split() if word not in _FILLER) < MIN_CONTENT_WORDS
 
 
 def _trim(text: str) -> str:

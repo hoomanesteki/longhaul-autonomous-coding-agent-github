@@ -35,6 +35,8 @@ export LONGHAUL_CKPT_DIR="$WORK/ckpt"
 # The task brings its script, so the worker needs no provider setting and no key.
 unset ANTHROPIC_API_KEY OPENAI_API_KEY LONGHAUL_SCRIPT
 export LONGHAUL_PROVIDER=scripted
+# Any free port for the metrics, so the demo does not fight another worker for 9464.
+export LONGHAUL_METRICS_PORT=0
 
 WORKER_PID=""
 RUN_PID=""

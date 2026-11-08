@@ -496,6 +496,9 @@ class Stack:
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.root / "ckpt"),
             LONGHAUL_CONFIG=str(hash_embedder_config(self.root)),
+            # Port 0 asks for any free port, so a chaos worker never fights another worker on
+            # this machine for the metrics port (LH-704's default is 9464).
+            LONGHAUL_METRICS_PORT="0",
             **self.worker_env,
         )
         return env

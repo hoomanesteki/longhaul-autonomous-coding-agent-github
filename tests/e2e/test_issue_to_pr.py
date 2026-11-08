@@ -366,6 +366,9 @@ async def label_to_pr(stack: Stack) -> None:
     assert pull["head"]["ref"] == f"longhaul-pr/{issue}"
     assert f"Closes #{issue}" in pull["body"], pull["body"]
     assert "3 passed" in pull["body"], pull["body"]
+    # The run report from the tables is in the body (LH-705).
+    assert "<summary>Run report</summary>" in pull["body"], pull["body"]
+    assert "### Overview" in pull["body"], pull["body"]
     assert set(fake.branches(repo)) == {"main", f"longhaul-pr/{issue}"}, "main was not pushed to"
 
     # The issue shows one "Picked up" comment, the plan once, and the final comment with the link

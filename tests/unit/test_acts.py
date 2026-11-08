@@ -88,6 +88,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "store_plan",
         "summarize_for_human",
         "tool_exec",
+        "write_run_report",
     ]
     assert len(set(names)) == len(names)
 
@@ -110,6 +111,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
         (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
         (acts.CLEAN_REPOS, NoneType, acts.JanitorResult),
+        (acts.WRITE_RUN_REPORT, acts.RunReportInput, BlobRef),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -155,6 +157,8 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
         # Not in the table. A step update is one event and at most one checkpoint row.
         pytest.param(acts.RECORD_STEP, 2 * 60, None, 3, id="record_step"),
+        # Section 3.7: 2 minutes and 3 attempts. A few queries and one blob write.
+        pytest.param(acts.WRITE_RUN_REPORT, 2 * 60, None, 3, id="write_run_report"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -1336,3 +1340,15 @@ def test_a_poll_and_a_sweep_at_their_longest_fit_in_one_run_of_the_poller() -> N
     sweep = acts.CLEAN_REPOS.start_to_close * acts.CLEAN_REPOS.retry.maximum_attempts
     waits = timedelta(seconds=5 + 10 + 5)
     assert poll + sweep + waits < acts.POLLER_RUN_TIMEOUT
+
+
+# ---------- LH-705: the run report ----------
+def test_the_run_report_is_written_on_every_worker_because_it_needs_no_token() -> None:
+    # It reads the database and the blob store, and the CLI prints the same text.
+    assert acts.WRITE_RUN_REPORT in acts.ALL and acts.WRITE_RUN_REPORT not in acts.GITHUB
+
+
+def test_the_run_report_input_is_a_task_id_and_an_optional_outcome() -> None:
+    inp = acts.RunReportInput(task_id="lh-x")
+
+    assert (inp.task_id, inp.outcome) == ("lh-x", None)

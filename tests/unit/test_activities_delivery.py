@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jinja2 import TemplateNotFound, TemplateSyntaxError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -539,3 +540,91 @@ async def test_a_test_call_with_no_output_reference_has_no_summary_line(
     request = await last_request(monkeypatch, recorder=recorder)
 
     assert "no pytest summary line" in request.body
+
+
+# ---------- the run report in the body (LH-705) ----------
+class StoredReports:
+    """The part of RunReports that deliver uses, with a fixed text."""
+
+    def __init__(self, text: str | Exception) -> None:
+        self.text = text
+        self.asked: list[tuple[str, str | None]] = []
+
+    async def stored_or_new(self, task_id: str, *, outcome: str | None = None) -> str:
+        self.asked.append((task_id, outcome))
+        if isinstance(self.text, Exception):
+            raise self.text
+        return self.text
+
+
+def make_with_reports(reports: StoredReports) -> DeliveryActivities:
+    return DeliveryActivities(
+        None,  # type: ignore[arg-type]
+        FakeRemote(),  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        MemoryLedger(),
+        MemoryRecorder(),
+        MemoryBlobStore(),
+        author=AUTHOR,
+        templates=ROOT / "templates",
+        reports=reports,
+    )
+
+
+async def delivered_body(monkeypatch: pytest.MonkeyPatch, reports: StoredReports) -> str:
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    await run(make_with_reports(reports).deliver, deliver_input())
+    return str(seen[0].body)
+
+
+async def test_the_body_embeds_the_run_report_of_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    reports = StoredReports("### Overview\n\n| Turns | 8 |\n")
+
+    body = await delivered_body(monkeypatch, reports)
+
+    assert "<summary>Run report</summary>" in body
+    assert "| Turns | 8 |" in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"
+    assert reports.asked == [(TASK, "pr_opened")]
+
+
+async def test_a_worker_with_no_reports_opens_the_pull_request_without_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = await last_request(monkeypatch)
+
+    assert "<details>" not in request.body
+
+
+async def test_a_report_that_cannot_be_read_is_left_to_the_retry_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ready(monkeypatch)
+    reports = StoredReports(ConnectionError("the database is down"))
+
+    with pytest.raises(ConnectionError):
+        await run(make_with_reports(reports).deliver, deliver_input())
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ValueError("a plan row is invalid"),
+        TemplateNotFound("run_report.md.j2"),
+        TemplateSyntaxError("unexpected end of template", 1),
+    ],
+)
+async def test_a_report_that_cannot_be_built_does_not_stop_the_pull_request(
+    monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    body = await delivered_body(monkeypatch, StoredReports(fault))
+
+    assert "<details>" not in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"

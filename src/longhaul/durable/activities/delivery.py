@@ -33,6 +33,11 @@ bytes on every attempt (github/pr_body.py), because `create_pr` refuses a reused
 text. Everything it needs is fixed in the input of the activity or in rows that no longer change
 once the task has finished.
 
+The body also carries the run report of the task (LH-705, reports/render.py), inside a `<details>`
+block. The report is stored the first time it is built and read back on every later attempt
+(durable/activities/report.py), so the retried body is the same bytes even if the tables have
+grown. A worker built without a report source opens the pull request without one.
+
 Failures. A GitHub error is retryable or not as the client classified it (support.github_failure).
 A request that no retry can fix, such as a key used for another effect, a bad name or a template
 that is missing, is not retried. A push to the default branch (failure mode F15) is not retried
@@ -66,6 +71,7 @@ from longhaul.checkpoints.squash import (
     pr_branch_name,
     repo_scope,
 )
+from longhaul.contracts import OutcomeKind
 from longhaul.db.records import CheckpointRecord, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import github_failure, heartbeating, not_retried, small
@@ -103,6 +109,12 @@ class DeliveryRecords(Protocol):
     async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]: ...
 
 
+class ReportSource(Protocol):
+    """Where deliver gets the run report of a task: RunReports, or a fake in a test."""
+
+    async def stored_or_new(self, task_id: str, *, outcome: str | None = None) -> str: ...
+
+
 class DeliveryActivities:
     """build_pr_branch and deliver, with what they need.
 
@@ -125,6 +137,7 @@ class DeliveryActivities:
         *,
         author: str,
         templates: Path,
+        reports: ReportSource | None = None,
     ) -> None:
         parse_author(author)
         self._store = store
@@ -135,6 +148,7 @@ class DeliveryActivities:
         self._blobs = blobs
         self._author = author
         self._templates = templates
+        self._reports = reports
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -258,6 +272,7 @@ class DeliveryActivities:
             templates=self._templates,
             verified=inp.verified_tests,
             partial=inp.partial,
+            report=await self._report(inp.task_id, partial=inp.partial),
         )
         return PullRequestInput(
             task_id=inp.task_id,
@@ -269,6 +284,27 @@ class DeliveryActivities:
             draft=inp.verified_tests is None,  # ready for review only once a verifier passed it
             idempotency_key=effect_key(inp.task_id, "pr", 1),
         )
+
+    async def _report(self, task_id: str, *, partial: bool) -> str | None:
+        """The run report for the body, or None for a worker with no report source.
+
+        The outcome is `pr_opened` because this is the activity that opens the pull request and
+        the workflow records the outcome after it. The draft of a stuck task (`partial`, LH-507)
+        is opened in the wind-up of a task that ended `stuck`, before that outcome is recorded,
+        so its report says `stuck`. A task the database does not know has nothing
+        to report, and a retry would find the same, so the body goes without. So does a report
+        that cannot be built, for the same reason.
+        """
+        if self._reports is None:
+            return None
+        try:
+            kind = OutcomeKind.STUCK if partial else OutcomeKind.PR_OPENED
+            return await self._reports.stored_or_new(task_id, outcome=kind.value)
+        except (LookupError, ValueError, TemplateError) as exc:
+            # The report is optional. A folder of templates from before it, or a plan row that
+            # fails validation, must not stop a pull request whose branch is already pushed.
+            log.warning("no run report for task %s: %s", task_id, exc)
+            return None
 
     # ---------- what the body says about the tests ----------
     async def _last_tests(self, task_id: str) -> LastTestRun | None:

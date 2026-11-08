@@ -357,6 +357,20 @@ def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: P
     assert parts.github is None
 
 
+async def test_the_delivery_activity_of_a_worker_has_the_report_source(tmp_path: Path) -> None:
+    # Without it every pull request goes out with no run report, and no other test would notice.
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (deliver,) = [fn for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"]
+        assert deliver.__self__._reports is not None
+    finally:
+        await parts.close()
+
+
 # ---------- one GitHub client (LH-305 and LH-307) ----------
 async def test_the_poller_and_the_clone_share_one_github_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

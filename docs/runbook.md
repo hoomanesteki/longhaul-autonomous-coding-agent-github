@@ -208,6 +208,7 @@ The worker stops at its start with a message that names `uv sync --extra memory`
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
 | `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
 | `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow, the compactions and the largest request of the task (`context: 5 compactions, max_fraction 0.59`) and, once it ended, the outcome. |
+| `longhaul report TASK_ID` | Prints the run report of the task as markdown (see "The run report"). It reads the database only, so it works while the task runs, after it ended, and for a task of `longhaul run`. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
 
 ### What `run` does
@@ -270,6 +271,23 @@ The body comes from `templates/pr_body.md.j2`: the summary, the changes per file
 A worker talks to github.com unless it is told otherwise. `LONGHAUL_GITHUB_API_URL` names another REST API, and `LONGHAUL_GITHUB_CLONE_BASE` names the folder or server that repos are cloned from and pushed to, as `<base>/<owner>/<name>.git`. It wins over `LONGHAUL_GITHUB_WEB_URL`, which does the same for the web address of a GitHub Enterprise server. The full chaos suite sets the API address and the clone base to point a worker at a FakeGitHub on this machine (see "The full chaos suite"). The token is only sent with git requests to github.com, so a clone base never receives it.
 
 Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
+
+### The run report
+
+A pull request carries a report of how the agent got there, inside a collapsed `<details>` block called "Run report", above the `Closes #<n>` line (`Refs #<n>` on the draft of a stuck task, whose report gives the outcome as stuck). `longhaul report TASK_ID` prints the same text. It has six sections:
+
+| Section | What it shows |
+|---|---|
+| Overview | The issue, the outcome, the wall time, the turns by role, the cost, the tokens and the cache ratio. |
+| Timeline | Planning, the wait for approval, coding, pauses, compactions, recoveries (a sandbox that was rebuilt, a hand-over to a new run) and the verifier rounds, in the order they happened. At most 60 entries. A longer timeline keeps its first and last entries, so that the end of the run is always there, and a row says how many entries were left out of the middle. |
+| Tool usage | Calls, errors and time for each tool, busiest first, and a total. |
+| Plan | The version in force, who decided on it, and the status each step ended in. |
+| Interventions | Who did what and when: plan decisions, hints, budget top-ups, answers to a pause and cancels. |
+| Candidate lessons | The items that lesson extraction drafted, from the newest `lessons` event. A task whose lessons are not drafted yet shows none. |
+
+The report is built from the database (`turns`, `tool_calls`, `events`, `plans`, `cost_ledger`, and `tasks` when the task has a row), never from the workflow. The cost, the tokens and the cache ratio are sums over the cost ledger, so they include the compactor and the calls that were retried. The turns are counted from `turns` by role and turn index. A task with no `tasks` row is reported from the other tables and shows as "local task". A task with no rows at all exits `longhaul report` with `no task <id> in the database`.
+
+`deliver` stores the report as a blob (`tasks/<task>/report/run-report.md`) the first time it builds it, and a retried attempt reads that copy, so the body of the pull request is the same bytes every time. The body stays under 60,000 characters: the report is cut at the end of a line, with a note, to the room that the rest of the body leaves. The activity `write_run_report` builds a fresh copy of the report and replaces the blob. Text that people or the model wrote has its mentions and issue references broken up, as in the rest of the body, and any key that matches the log redaction patterns shows as `[redacted]`.
 
 ### The prompt cache
 

@@ -1,6 +1,6 @@
 """The `longhaul` command line.
 
-Five commands and two groups, `memory` and `poller`. `run-local` copies a folder into a Docker
+Six commands and two groups, `memory` and `poller`. `run-local` copies a folder into a Docker
 sandbox, lets the agent work on the issue in a text file, and prints what it did. No Temporal
 and no database are involved, so it is the quickest way to watch the agent work.
 
@@ -8,6 +8,11 @@ The other four use the durable stack that `make up` starts. `worker` runs the pr
 the work (durable/worker.py). `run` starts a task for a folder on that stack and follows it
 until it ends. `status` and `cancel` ask about a task by its id, or stop it. They are separate
 commands because a task outlives `run`: Ctrl-C ends the command and the task goes on.
+
+`report TASK_ID` prints the run report of a task (LH-705): how it went, what it cost, which tools
+it used, its plan, who stepped in and the lessons drafted from it. It reads the database of
+LONGHAUL_DATABASE_URL, so it works for a task that ended, one that still runs and one that has no
+`tasks` row. The markdown goes to stdout and nothing else does, so it can be piped to a file.
 
 `poller` is the group that manages the Temporal Schedule which finds labeled GitHub issues and
 starts a task for each one (LH-307, durable/schedule.py). `poller install` creates the Schedule
@@ -60,6 +65,7 @@ from typing import Annotated, Any
 import typer
 import yaml
 from docker.errors import DockerException, ImageNotFound
+from jinja2 import TemplateError
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import (
@@ -108,8 +114,10 @@ from longhaul.github.intake import FILE_CUT_NOTE, MAX_BODY_BYTES, clip_text
 from longhaul.memory.embedder import LocalEmbedder
 from longhaul.memory.store import KINDS, STATUSES, MemoryEntry, PgMemoryStore
 from longhaul.providers.base import get_provider
+from longhaul.reports.data import read_report_data
+from longhaul.reports.render import render_run_report
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, config_path, load_config
+from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
 from longhaul.tools.git import NO_CHANGES
 from longhaul.tools.registry import ToolRegistry, default_registry
 
@@ -143,6 +151,9 @@ DURABLE_ERRORS = (*RUN_ERRORS, RPCError, WorkflowAlreadyStartedError, BlobError,
 # Failures of the database or of the request to the memory commands, which they report in one
 # line: a missing item, a blank name, a database that is not configured or cannot be reached.
 MEMORY_ERRORS = (LookupError, ValueError, OSError, SQLAlchemyError)
+# Failures of `report`: a task that is not in the database, a missing setting or template, and a
+# database that cannot be reached.
+REPORT_ERRORS = (LookupError, ValueError, OSError, SQLAlchemyError, TemplateError)
 # The approver when `--by` is not given and the machine has no user name to offer.
 FALLBACK_APPROVER = "cli"
 # The longest content that `memory list` prints on its line.
@@ -422,6 +433,36 @@ def cancel(
         typer.echo(f"error: {describe(exc, task_id)}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
     typer.echo(f"cancel sent to task {task_id}")
+
+
+# ---------- the run report ----------
+@app.command("report")
+def report(
+    task_id: Annotated[str, typer.Argument(help="The task id that `longhaul run` printed.")],
+) -> None:
+    """Print the run report of a task as markdown, from the database."""
+    try:
+        text = asyncio.run(read_report(task_id))
+    except REPORT_ERRORS as exc:
+        typer.echo(f"error: {describe(exc, task_id)}", err=True)
+        raise typer.Exit(EXIT_ERROR) from None
+    typer.echo(text, nl=not text.endswith("\n"))
+
+
+async def read_report(task_id: str) -> str:
+    """The report of one task. A function of its own so that unit tests can replace it."""
+    try:
+        url = database_url()
+    except RuntimeError as exc:  # LONGHAUL_DATABASE_URL is not set; the command says so
+        raise ValueError(str(exc)) from exc
+    # One short loop per command: a pooled connection would wait for a loop that is gone.
+    engine = make_engine(url, pooled=False)
+    try:
+        sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
+        data = await read_report_data(sessions, task_id)
+    finally:
+        await engine.dispose()
+    return render_run_report(data, templates=templates_path(EnvSettings()))
 
 
 # ---------- memory ----------

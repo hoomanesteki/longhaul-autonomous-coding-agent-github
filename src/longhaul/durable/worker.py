@@ -62,6 +62,9 @@ What it is built from, and why each piece is what it is:
   through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
   that PollerWorkflow runs after each poll: it removes the bare repos under LONGHAUL_CKPT_DIR of
   tasks that ended more than seven days ago. A worker sweeps the repos on its own disk.
+* The run report (LH-705) is `write_run_report`, which every worker registers: it reads the tables
+  and writes one blob. `deliver` makes the same report for the body of the pull request, so the
+  templates folder must hold run_report.md.j2 as well.
 * The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
@@ -143,6 +146,7 @@ from longhaul.durable.activities.plan import (
     PlanCommentActivities,
     StepActivities,
 )
+from longhaul.durable.activities.report import ReportActivities, RunReports, sql_reader
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -398,6 +402,8 @@ def build_parts(
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
     janitor = JanitorActivities(store, recorder)
+    run_reports = RunReports(sql_reader(sessions), blobs, templates=templates_path(settings))
+    reports = ReportActivities(run_reports)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
@@ -416,6 +422,7 @@ def build_parts(
                 blobs,
                 author=settings.git_author,
                 templates=templates_path(settings),
+                reports=run_reports,
             ).activities,
             *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
             *FinalCommentActivities(
@@ -433,6 +440,7 @@ def build_parts(
             *plans.activities,
             *steps.activities,
             *janitor.activities,
+            *reports.activities,
             *poller.activities,
             *delivery,
         ],

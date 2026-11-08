@@ -14,9 +14,11 @@ import pytest
 
 from longhaul.checkpoints.squash import FileStat
 from longhaul.github.pr_body import (
+    MAX_BODY_CHARS,
     MAX_FILES,
     MAX_SUMMARY_CHARS,
     MAX_VERIFIED_CHARS,
+    REPORT_CUT_NOTE,
     LastTestRun,
     defuse,
     render_pr_body,
@@ -254,3 +256,96 @@ def test_a_body_of_finished_work_is_the_same_with_or_without_the_flag() -> None:
 
 def test_a_body_of_partial_work_is_the_same_bytes_every_time() -> None:
     assert render(partial=True).encode() == render(partial=True).encode()
+
+
+# ---------- the run report (LH-705) ----------
+REPORT = "### Overview\n\n| Turns | 8 |\n\n### Timeline\n\nNothing to show.\n"
+
+
+def render_with(report: str | None, **options: object) -> str:
+    return render_pr_body(
+        42,
+        "Fixed add().",
+        [FileStat("src/calc.py", 1, 1)],
+        PASSED,
+        templates=TEMPLATES,
+        report=report,
+        **options,  # type: ignore[arg-type]
+    )
+
+
+def test_the_run_report_sits_in_a_details_block_before_the_closing_line() -> None:
+    body = render_with(REPORT)
+
+    assert "<details>\n<summary>Run report</summary>\n\n### Overview" in body
+    assert body.index("</details>") < body.index("Closes #42")
+    assert body.rstrip().splitlines()[-1] == "Closes #42"
+    assert "\n\n</details>\n" in body, "a blank line before the closing tag keeps markdown inside"
+
+
+def test_a_body_without_a_report_has_no_details_block() -> None:
+    assert "<details>" not in render_with(None)
+    assert render_with(None) == render()
+
+
+def test_a_body_with_a_report_is_the_same_bytes_every_time() -> None:
+    assert render_with(REPORT) == render_with(REPORT)
+
+
+def test_a_huge_report_is_cut_so_the_body_stays_under_60000_characters() -> None:
+    long_report = (
+        "### Timeline\n\n" + "| 00:01:00 | Compaction | 90,000 to 12,000 tokens |\n" * 3000
+    )
+
+    body = render_with(long_report)
+
+    assert len(body) < MAX_BODY_CHARS
+    assert REPORT_CUT_NOTE in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"
+    assert body.count("<details>") == body.count("</details>") == 1
+
+
+def test_a_report_that_fills_the_room_exactly_still_leaves_the_body_under_the_limit() -> None:
+    bare_size = len(render_with(None))
+    framed = len(render_with("x")) - bare_size - 1
+    room = MAX_BODY_CHARS - bare_size - framed
+
+    for size in (room - 1, room, room + 1):
+        body = render_with("y" * size)
+        assert len(body) < MAX_BODY_CHARS, size
+
+
+def test_the_cut_falls_on_a_line_boundary() -> None:
+    long_report = "### Timeline\n\n" + "".join(f"| row {n:05d} |\n" for n in range(20_000))
+
+    body = render_with(long_report)
+
+    kept = body.split(REPORT_CUT_NOTE)[0]
+    last_row = [line for line in kept.splitlines() if line.startswith("| row")][-1]
+    assert last_row.endswith(" |"), "no row is cut in the middle"
+
+
+def test_a_body_with_a_long_summary_and_many_files_still_fits_with_its_report() -> None:
+    files = [FileStat(f"src/pkg/module_{n}/" + "x" * 150 + ".py", n, n) for n in range(300)]
+    long_report = "### Timeline\n\n" + "| a | b |\n" * 10_000
+
+    body = render_pr_body(
+        42, "word " * 2000, files, PASSED, templates=TEMPLATES, report=long_report
+    )
+
+    assert len(body) < MAX_BODY_CHARS
+
+
+def test_a_report_is_left_out_when_the_rest_of_the_body_leaves_no_room() -> None:
+    body = render_with(REPORT, limit=len(render_with(None)) + 10)
+
+    assert "<details>" not in body
+
+
+def test_the_report_of_verified_partial_work_sits_between_the_verified_line_and_refs() -> None:
+    body = render_with(REPORT, verified="41 passed", partial=True)
+
+    assert body.index("Verified: 41 passed") < body.index("<details>")
+    assert body.index("</details>") < body.index("Refs #42")
+    assert body.rstrip().splitlines()[-1] == "Refs #42"
+    assert not re.search(r"(?i)\bcloses\s+#\d+", body)

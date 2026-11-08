@@ -57,8 +57,8 @@ async def list_memory(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> list[MemoryItemView]:
     """Memory items, oldest first. With no `repo`, the items of every repo."""
-    entries = await ctx.memory.list_items(repo, status=status, kind=kind)
-    return [view(entry) for entry in entries[:limit]]
+    entries = await ctx.memory.list_items(repo, status=status, kind=kind, limit=limit)
+    return [view(entry) for entry in entries]
 
 
 @router.post("/{item_id}/approve")

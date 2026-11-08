@@ -20,7 +20,7 @@ from sqlalchemy import DateTime, Integer, Text, cast, func, literal, select, tup
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from longhaul.api import paging
-from longhaul.api.redaction import redact_json
+from longhaul.api.redaction import redact, redact_json
 from longhaul.api.schemas import (
     PlanView,
     RepoView,
@@ -62,7 +62,7 @@ def _summary(task: Task) -> TaskSummary:
         title=task.title,
         status=task.status,
         phase=task.phase,
-        outcome=task.outcome,
+        outcome=None if task.outcome is None else redact(task.outcome),
         pr_url=task.pr_url,
         model_coder=task.model_coder,
         cost_usd=float(task.cost_usd),
@@ -137,7 +137,8 @@ async def latest_plan(sessions: Sessions, task_id: str) -> PlanView | None:
         {
             "version": row.version,
             "status": row.status,
-            "plan": row.plan,
+            # The planner may have copied text from the repo, so the plan is redacted like a turn.
+            "plan": redact_json(row.plan),
             "decided_by": row.decided_by,
             "decided_at": row.decided_at,
             "created_at": row.created_at,

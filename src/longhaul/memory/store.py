@@ -191,12 +191,17 @@ class PgMemoryStore:
         return [_item_of(row) for row in rows]
 
     async def list_items(
-        self, repo: str | None = None, *, status: str | None = None, kind: str | None = None
+        self,
+        repo: str | None = None,
+        *,
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int | None = None,
     ) -> list[MemoryEntry]:
         """The items of `repo`, oldest first, optionally of one status and one kind.
 
         With no `repo` the items of every repo are listed, which is what the console shows when
-        no repo is picked.
+        no repo is picked. `limit` keeps the first n in that order.
         """
         # The vector is 384 numbers per row and nothing here shows it.
         stmt = select(MemoryItemRow).options(defer(MemoryItemRow.embedding))
@@ -207,6 +212,8 @@ class PgMemoryStore:
         if kind is not None:
             stmt = stmt.where(MemoryItemRow.kind == kind)
         stmt = stmt.order_by(MemoryItemRow.created_at, MemoryItemRow.id)
+        if limit is not None:
+            stmt = stmt.limit(limit)
         async with self._sessions() as session:
             return [_entry_of(row) for row in await session.scalars(stmt)]
 

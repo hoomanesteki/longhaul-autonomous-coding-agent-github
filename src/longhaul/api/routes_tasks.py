@@ -14,7 +14,7 @@ edge of a page, and the line numbers of a page are those of the redacted text.
 from __future__ import annotations
 
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import TypeAdapter
@@ -86,8 +86,23 @@ async def get_task(task_id: str, ctx: Ctx) -> TaskDetail:
         raise not_found("task")
     state, live = await live_status(ctx, task_id)
     return TaskDetail(
-        task=task, workflow=state, live=live, plan=await queries.latest_plan(ctx.sessions, task_id)
+        task=task,
+        workflow=state,
+        live=None if live is None else redact_status(live),
+        plan=await queries.latest_plan(ctx.sessions, task_id),
     )
+
+
+def redact_status(status: TaskStatus) -> TaskStatus:
+    """The status with the text that a model wrote redacted: the pause reason and the summary."""
+    changes: dict[str, Any] = {}
+    if status.paused_reason is not None:
+        changes["paused_reason"] = redact(status.paused_reason)
+    if status.outcome is not None:
+        changes["outcome"] = status.outcome.model_copy(
+            update={"summary": redact(status.outcome.summary)}
+        )
+    return status.model_copy(update=changes)
 
 
 async def live_status(ctx: ApiContext, task_id: str) -> tuple[LiveState, TaskStatus | None]:

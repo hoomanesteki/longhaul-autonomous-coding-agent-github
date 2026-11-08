@@ -33,6 +33,9 @@ TEMPORAL_ERRORS = (ConnectionError, OSError, RPCError, TimeoutError)
 # What reading a stored blob raises: a store that is down or damaged, or JSON that does not fit.
 STORE_ERRORS = (BlobError, BotoCoreError, ClientError, ValidationError, ValueError)
 
+# The RPC statuses that mean the server did not answer.
+UNREACHABLE = frozenset({RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED})
+
 
 def not_found(what: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"no such {what}")
@@ -46,6 +49,11 @@ def temporal_failure(exc: Exception) -> HTTPException:
             return HTTPException(status_code=409, detail="the task has ended")
         return HTTPException(status_code=404, detail="no such running task")
     log.warning("temporal request failed: %s: %s", type(exc).__name__, exc)
+    if isinstance(exc, RPCError) and exc.status not in UNREACHABLE:
+        # The server answered and refused: a permission or a rate limit is not an outage.
+        return HTTPException(
+            status_code=502, detail=f"Temporal refused the request: {exc.status.name}"
+        )
     return HTTPException(status_code=503, detail="Temporal is not reachable")
 
 

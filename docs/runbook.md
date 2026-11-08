@@ -933,7 +933,7 @@ With `tools.backend: keystone` the path of one tool call is:
 tool_exec -> Keystone /mcp -> Keystone policy, approval, audit -> the worker's MCP server -> the sandbox
 ```
 
-The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
+The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. Those two never leave the worker, so Keystone does not audit them. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
 
 What the agent sees:
 
@@ -942,8 +942,13 @@ What the agent sees:
 | allow | The tool's own result, as in direct mode |
 | deny, or any other refusal (rate limit, budget, a rejected approval) | A failed result (`ok=False`) with Keystone's text: `[keystone:KS_DENIED] call <id> denied: <reason>` |
 | require approval, and nobody decides within Keystone's hold time (`approvals.wait_seconds`) | A failed result that says the call did not run, and the task pauses. The reason is the question, as in the pause for a hint |
+| the worker's tool server failed or did not answer (`KS_UPSTREAM_ERROR`, `KS_UPSTREAM_TIMEOUT`) | Nothing: `tool_exec` raises and Temporal runs the activity again from the checkpoint, as it does when direct mode meets a Docker error. A timeout means the upstream's `timeout_s` is too short for the command, see step 3 |
 
-A paused task waits for a hint, a budget top-up or a cancel (see "The pause and the hint"). Approve or reject the request in Keystone's console, then send the hint: `/longhaul hint approved in Keystone, go ahead` on the issue, or `POST /api/tasks/{id}/hint` of the console API for a local task. The model calls the same tool again, and the worker settles the request that Keystone is holding with `keystone__await_approval` and does not ask a second time. If Keystone is down, `tool_exec` raises and Temporal runs the activity again. The worker never falls back to running a tool unchecked.
+A paused task waits for a hint, a budget top-up or a cancel (see "The pause and the hint"). Approve or reject the request in Keystone's console, then send the hint: `/longhaul hint approved in Keystone, go ahead` on the issue, or `POST /api/tasks/{id}/hint` of the console API for a local task. The model calls the same tool again, and the worker settles the request that Keystone is holding with `keystone__await_approval` and does not ask a second time.
+
+That works only while Keystone still has the request and the session that made it. Keystone lets a request be used once, by the session that asked, within `approvals.ttl_seconds` (900 seconds unless you change it), and it drops a session that has been idle for 30 minutes. A pause can wait up to a day for a hint, and the worker keeps the request id in memory. So approve in Keystone and send the hint within that time, and raise `ttl_seconds` in Keystone's config if your reviewers are slower. If the time ran out, the worker restarted, or another worker takes the call, Keystone refuses the old request. The agent is told the approval could not be used and that the call did not run. Its next call makes a new request, which a person has to approve again and which pauses the task a second time.
+
+If Keystone is down, `tool_exec` raises and Temporal runs the activity again. The worker never falls back to running a tool unchecked.
 
 ### Point a worker at Keystone
 
@@ -980,8 +985,8 @@ A paused task waits for a hint, a budget top-up or a cancel (see "The pause and 
      credential_mode: static
      credential_env: {X-Api-Key: LONGHAUL_SANDBOX_MCP_KEY}
      tools:
-       run_command: {risk: medium, extract: {path: "$.command | lower"}}
-       run_tests: {risk: medium}
+       run_command: {risk: medium, timeout_s: 660, extract: {path: "$.command | lower"}}
+       run_tests: {risk: medium, timeout_s: 660}
        read_file: {risk: low}
        list_dir: {risk: low}
        search: {risk: low}
@@ -989,6 +994,8 @@ A paused task waits for a hint, a budget top-up or a cancel (see "The pause and 
        edit_file: {risk: medium}
        write_file: {risk: medium}
    ```
+
+   Set `timeout_s` on `run_command` and `run_tests`. Keystone stops waiting for an upstream after 30 seconds unless the tool says more, while a command in the sandbox may run for 600 seconds (`TOOL_TIMEOUT_S`, with `sandbox.command_timeout_s` as the default of the call). With the default, a test run of 45 seconds comes back as `KS_UPSTREAM_TIMEOUT`, `tool_exec` retries it, and the worker's server may still be running the first attempt. Keep `timeout_s` above the longest command the sandbox allows: 660 covers the 600 seconds and a margin. Keystone's own client also gives up on an upstream that sends nothing for 300 seconds, so a quiet command that runs longer than that can still be cut short. The worker does not check this setting, because it cannot see Keystone's config.
 
    Keystone reads the key from `LONGHAUL_SANDBOX_MCP_KEY` in its own environment at start and keeps it encrypted in its vault. It needs the same value as the worker. Keystone refuses an upstream on a private address unless `KEYSTONE_ALLOW_PRIVATE_UPSTREAMS` is `true`, which its compose file sets. Keystone in Docker reaches this machine as `host.docker.internal`, so the worker has to listen on an address that is not only the loopback (`listen_host: 0.0.0.0`). Do that only on a machine whose network you trust: the key is the only thing that protects the server. A Keystone that runs on the host can use `http://127.0.0.1:8765/mcp` and the default `listen_host`.
 
@@ -1013,10 +1020,11 @@ export KEYSTONE_URL=http://localhost:8080/mcp
 export KEYSTONE_TOKEN=$(scripts/get_token.sh olivia ops-agent)   # in the Keystone checkout
 export LONGHAUL_SANDBOX_MCP_KEY=<the same key Keystone has>
 export KEYSTONE_UPSTREAM_HOST=0.0.0.0                            # when Keystone runs in Docker
+export KEYSTONE_ADMIN_TOKEN=<a token of an admin of the tenant>  # optional: also checks the audit log
 uv run pytest tests/integration/test_keystone_backend.py -v
 ```
 
-Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check: with an admin token, `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` on Keystone, or `keystone audit export`, must list both calls, the allowed one and the denied one, with the session id of the run.
+Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check. With `KEYSTONE_ADMIN_TOKEN` set, the test reads `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` itself and checks that the allowed call and the denied one are both there, with the task id of the run in their arguments and one session id. Without the token it skips that half and says so. You can read the same rows with `keystone audit export`.
 
 ## Run the evaluation
 

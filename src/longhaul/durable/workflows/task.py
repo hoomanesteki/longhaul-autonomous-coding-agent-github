@@ -165,6 +165,14 @@ over a Continue-As-New. The handler is best effort: a status that cannot be post
 does not fail the task, and a cancel does not wait for it, not in a turn and not at a hand-over
 (see `_settle_handlers`). It posts for a task of an issue only.
 
+A hint, a budget top-up or a plan decision that comes from the console (`by` is
+`acts.CONSOLE_NAME`) is repeated on the issue as a short comment (LH-805), so that the issue shows
+every steer. The handlers stay plain methods: `_mirror` builds the comment and starts a task that
+posts it, with the key `console:<n>`. The count is carried in the memo like the status count, the
+posts are given a short while to finish at a hand-over and at the end (`_settle_mirrors`), and a
+post that fails is logged and does not fail the task. A cancel is not repeated, because the final
+comment already names who cancelled. Replay: the mirror is behind `workflow.patched(MIRROR_PATCH)`.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 

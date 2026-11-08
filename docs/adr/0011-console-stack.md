@@ -30,7 +30,7 @@ Four facts shape the stack:
 | Approve, reject, hint, budget, cancel | A signal, through `durable/client.py`, sent with `by="console"` |
 | Approve and reject a memory item | `PgMemoryStore.promote` and `reject`, which keep the rules of ADR-0010 |
 
-The API sends only the signals that a person can send, and it sends them under the name `console`. The workflow records the name: a hint reaches the model as `console: <text>`, and a cancel ends with "cancelled by console". The API starts no workflow and changes no state of one in any other way. A task therefore behaves the same whether it was steered from the console, an issue comment or the CLI.
+The API sends only the signals that a person can send, and it sends them under the name `console`. The workflow records the name: a hint reaches the model as `console: <text>`, and a cancel ends with "cancelled by console". For a task of an issue the workflow also repeats a hint, a budget top-up and a plan decision from the console as a short comment on the issue (LH-805), so the issue shows every steer. The API starts no workflow and changes no state of one in any other way. A task therefore behaves the same whether it was steered from the console, an issue comment or the CLI.
 
 **The page works without Temporal.** The detail of a task has a `workflow` field (`running`, `closed`, `not_found` or `unreachable`) and a `live` status that is empty when nobody can answer. The list, the timeline, the turns and the memory pages come from the database alone. The actions answer 503 when Temporal is down, 404 for a task that has no workflow and 409 for one that has ended. `/healthz` checks the database only, for the same reason.
 

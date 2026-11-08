@@ -103,6 +103,8 @@ def compose_env(ports: Ports) -> dict[str, str]:
         "LH_POSTGRES_PORT": str(ports.postgres),
         "LH_TEMPORAL_PORT": str(ports.temporal),
         "LH_TEMPORAL_UI_PORT": str(ports.temporal_ui),
+        # Compose would take it from the shell or .env, while database_url() cannot.
+        "LH_POSTGRES_PASSWORD": POSTGRES_PASSWORD,
     }
 
 

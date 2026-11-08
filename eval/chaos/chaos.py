@@ -277,6 +277,8 @@ def judge(
         completed, outcome, same_diff = False, "error", False
     else:
         problems = survived(run, reference.run, kills=0)
+        if run_plan.kinds and not any(k.landed for k in kills):
+            problems.append(f"none of the {len(run_plan.kinds)} planned kills happened")
         completed = run.outcome.kind is OutcomeKind.PR_OPENED
         outcome, same_diff = run.outcome.kind.value, run.diff == reference.run.diff
     return RunResult(

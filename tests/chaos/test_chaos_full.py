@@ -93,6 +93,8 @@ def test_the_runs_survived_their_kills(summary: dict[str, Any]) -> None:
     for found in summary["results"]:
         assert found["problems"] == []
         assert found["diff_equals_reference"]
+        # A run that was never crashed shows nothing about surviving a crash.
+        assert any(k["landed"] for k in found["kills"]), found["kills"]
     assert summary["survived"] == RUNS
 
 

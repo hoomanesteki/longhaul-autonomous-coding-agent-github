@@ -24,7 +24,7 @@
   "completed": 20,
   "completion_rate": 1.0,
   "diff_matches": 20,
-  "survived": 20,
+  "survived": 18,
   "kills_planned": {
     "worker": 10,
     "sandbox": 12,
@@ -950,7 +950,9 @@
       "completed": true,
       "outcome": "pr_opened",
       "diff_equals_reference": true,
-      "problems": [],
+      "problems": [
+        "none of the 3 planned kills happened"
+      ],
       "ledger_rows": 5,
       "extra_ledger_rows": 0,
       "cost_usd": 0.01995,
@@ -990,7 +992,9 @@
       "completed": true,
       "outcome": "pr_opened",
       "diff_equals_reference": true,
-      "problems": [],
+      "problems": [
+        "none of the 1 planned kills happened"
+      ],
       "ledger_rows": 5,
       "extra_ledger_rows": 0,
       "cost_usd": 0.020216,

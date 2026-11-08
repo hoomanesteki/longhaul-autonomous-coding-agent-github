@@ -18,7 +18,9 @@
   "completed": true,
   "outcome": "pr_opened",
   "diff_equals_reference": true,
-  "problems": [],
+  "problems": [
+    "none of the 1 planned kills happened"
+  ],
   "ledger_rows": 5,
   "extra_ledger_rows": 0,
   "cost_usd": 0.020216,

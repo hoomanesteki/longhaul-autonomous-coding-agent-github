@@ -62,8 +62,8 @@ from alembic import command
 from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
-from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
-from temporalio.service import RPCError
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowFailureError, WorkflowHandle
+from temporalio.service import RPCError, RPCStatusCode
 
 from longhaul import cli
 from longhaul.blobs.s3 import S3BlobStore
@@ -91,6 +91,23 @@ SCRATCH_PREFIX = "longhaul_chaos_"
 # machine must not look dead.
 HEARTBEAT_TIMEOUT_S = 5.0
 RUN_TIMEOUT_S = 1200
+# RPC errors that a restart of the server cannot cause, so that trying again cannot help.
+NOT_TRANSIENT = frozenset(
+    {
+        RPCStatusCode.NOT_FOUND,
+        RPCStatusCode.INVALID_ARGUMENT,
+        RPCStatusCode.PERMISSION_DENIED,
+        RPCStatusCode.UNAUTHENTICATED,
+        RPCStatusCode.UNIMPLEMENTED,
+        RPCStatusCode.FAILED_PRECONDITION,
+        RPCStatusCode.ALREADY_EXISTS,
+    }
+)
+# How long the read of the final status may take, restarts of Temporal included. No worker
+# answering the query would otherwise keep it going for ever, as the run's own timeout is over.
+STATUS_TIMEOUT_S = 300.0
+# The pause between two tries of a call to a Temporal that is restarting.
+RETRY_PAUSE_S = 1.0
 WORKER_START_TIMEOUT_S = 180
 # How long a kill waits for its line, its condition and the restart of its worker.
 KILL_WAIT_S = 400
@@ -697,9 +714,7 @@ class Stack:
             stop.set()  # a kill that is still waiting has nothing left to kill
         points = await killing
 
-        status = await self.through_restarts(
-            lambda: read_status(get_task(client, task_id), timeout_s=60)
-        )
+        status = await self.final_status(client, task_id)
         assert status.last_checkpoint is not None, status
         store = GitCheckpointStore(blobs, root=self.root / "ckpt")
         diff = await store.diff(task_id, status.last_checkpoint)
@@ -718,17 +733,28 @@ class Stack:
         )
 
     @staticmethod
+    async def final_status(client: Client, task_id: str) -> TaskStatus:
+        """The status of an ended task. It gives up with TimeoutError after STATUS_TIMEOUT_S."""
+        async with asyncio.timeout(STATUS_TIMEOUT_S):
+            return await Stack.through_restarts(
+                lambda: read_status(get_task(client, task_id), timeout_s=60)
+            )
+
+    @staticmethod
     async def through_restarts[T](call: Callable[[], Awaitable[T]]) -> T:
         """Make a call to Temporal again while the server is down or coming back.
 
         A restart of the server (LH-904) cuts the connection of this process too, and the SDK
-        reports that as an RPC error. The run's own timeout bounds the wait.
+        reports that as an RPC error. Only the errors that a restart causes are tried again. A
+        call that waits for something has its own timeout around it.
         """
         while True:
             try:
                 return await call()
-            except RPCError:
-                await asyncio.sleep(1.0)
+            except RPCError as exc:
+                if exc.status in NOT_TRANSIENT:
+                    raise
+                await asyncio.sleep(RETRY_PAUSE_S)
 
     async def _outcome(self, handle: WorkflowHandle[Any, Outcome]) -> Outcome:
         return await self.through_restarts(handle.result)

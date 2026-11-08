@@ -47,7 +47,7 @@ With seed 7 every kind is hit at least four times across the twenty runs.
 | `resume_latency_s` | for each kill that an activity followed, the seconds from the end of the kill (or of the restart) to the start of that activity, from the timestamps in Temporal's history |
 | `side_effects`, `expected_side_effects` | comments, label changes and pull requests found on the FakeGitHub, against the ones that a task writes (1, 3 and 1) |
 | `duplicate_side_effects`, `missing_side_effects` | the writes beyond and below the expected ones |
-| `problems` | why a run does not count as survived: a fork in the checkpoints, a different diff, a run that did not finish |
+| `problems` | why a run does not count as survived: a fork in the checkpoints, a different diff, a run that did not finish, a run in which none of the planned kills happened |
 
 The summary adds `temporal_heals`, the restarts of Temporal that the watchdog made (see below).
 

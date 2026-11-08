@@ -83,6 +83,8 @@ class RunResult(BaseModel):
             self.completed
             and self.diff_equals_reference
             and not self.problems
+            # A run that was never crashed shows nothing about surviving a crash.
+            and (not self.kills_planned or any(k.landed for k in self.kills))
             and self.duplicate_side_effects == 0
             and self.missing_side_effects == 0
         )

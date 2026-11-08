@@ -66,7 +66,7 @@ from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.settings import Context
 from longhaul.tools.registry import default_registry
@@ -117,6 +117,10 @@ def turn(role: str, index: int, *calls: dict[str, Any]) -> dict[str, Any]:
 
 FAIL = tool("run_command", command=FAILING_COMMAND)
 FINISH = tool("finish", summary=SUMMARY)
+# The work a planned coder submits is reviewed (LH-504), and this verdict passes it.
+VERDICT = tool(
+    "submit_verdict", passed=True, tests_run="pytest -q", tests_summary="2 passed", issues=[]
+)
 
 # The compactor answers the question for a person. A request for notes has other words in it.
 SUMMARY_STEP = {
@@ -278,7 +282,10 @@ async def light(
         registry.specs(),
         config_for,
         ledger=costs,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     questions = ContextActivities(
@@ -553,6 +560,7 @@ async def test_ask_human_pauses_the_task_and_a_hint_goes_back_to_coding(
             "match": {"role": "coder", "turn_index": 1},
             "respond": {"tool_calls": [tool("submit_for_review", summary=SUMMARY)]},
         },
+        turn("verifier", 0, VERDICT),
         SUMMARY_STEP,
     ]
     async with light(env, write_script(tmp_path, steps)) as world:
@@ -585,6 +593,7 @@ async def test_a_question_then_a_hint_clears_the_failures_that_came_before_it(
         turn("coder", 2, tool("ask_human", question="Which copy of inv do the tests import?")),
         turn("coder", 3, FAIL),
         turn("coder", 4, tool("submit_for_review", summary=SUMMARY)),
+        turn("verifier", 0, VERDICT),
         SUMMARY_STEP,
     ]
     async with light(env, write_script(tmp_path, steps)) as world:

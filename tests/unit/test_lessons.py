@@ -98,6 +98,7 @@ def test_generic_filtered() -> None:
         "  READ THE CODE first!  ",
         "It helps to write tests and read the code.",
         "Check edge cases.",
+        "Write tests and/or read the code.",
     ],
 )
 def test_the_blocklist_ignores_case_and_punctuation(text: str) -> None:
@@ -111,6 +112,9 @@ def test_the_blocklist_ignores_case_and_punctuation(text: str) -> None:
         "Run the tests with `pytest -q` from the repo root.",
         "Read the code of Inventory.remove: it hides a KeyError.",
         REMOVE,
+        "Run the tests with make check; plain pytest skips the integration marker.",
+        "Run tests with tox -e py312, not plain pytest.",
+        "Handle errors from the inventory API: it returns 200 with an error body.",
     ],
 )
 def test_a_note_that_names_something_of_the_repo_is_kept(text: str) -> None:

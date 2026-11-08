@@ -110,13 +110,22 @@ class FakeProvider:
 class Sink:
     """The write side of the memory store: it keeps what was added and the source it names."""
 
-    def __init__(self, *, fail: Exception | None = None) -> None:
+    def __init__(self, *, fail: Exception | None = None, fail_after: int | None = None) -> None:
         self.added: list[tuple[MemoryItem, str | None]] = []
         self.fail = fail
+        # A store that goes down after `fail_after` writes, once: the next attempt finds it up.
+        self.fail_after = fail_after
 
     async def add_candidate(self, item: MemoryItem, *, source_ref: str | None = None) -> str:
         if self.fail is not None:
             raise self.fail
+        if self.fail_after is not None and len(self.added) == self.fail_after:
+            self.fail_after = None
+            raise ConnectionError("the connection dropped")
+        # The real store keeps one row for one text and one source.
+        for number, (known, ref) in enumerate(self.added, start=1):
+            if (known.content, ref) == (item.content, source_ref):
+                return f"item-{number}"
         self.added.append((item, source_ref))
         return f"item-{len(self.added)}"
 
@@ -284,6 +293,43 @@ async def test_a_store_that_cannot_be_written_fails_the_attempt_so_it_is_retried
 
     with pytest.raises(ConnectionError):
         await rig.run(lesson_input())
+
+
+async def test_a_retry_after_a_partial_write_stores_the_first_answer_and_asks_no_more() -> None:
+    first = [
+        {"kind": "lesson", "content": LESSON},
+        {"kind": "pitfall", "content": PITFALL},
+        {
+            "kind": "convention",
+            "content": "Tests for Inventory live in tests/unit/test_inventory.py.",
+        },
+    ]
+    # A model that is asked again words its notes in another way.
+    second = [
+        {
+            "kind": "lesson",
+            "content": "Inventory.remove now raises InventoryError for a missing sku.",
+        },
+        {
+            "kind": "pitfall",
+            "content": "The Inventory fixture in conftest.py is shared by the session.",
+        },
+        {"kind": "convention", "content": "Put Inventory tests in tests/unit/test_inventory.py."},
+    ]
+    rig = Rig(reply(first), reply(second), sink=Sink(fail_after=2))
+
+    with pytest.raises(ConnectionError):
+        await rig.run(lesson_input(), attempt=1)
+    out = await rig.run(lesson_input(), attempt=2)
+
+    assert [item.content for item, _ in rig.sink.added] == [n["content"] for n in first]
+    assert len(rig.provider.calls) == 1
+    assert [n.content for n in out.items] == [n["content"] for n in first]
+    assert (out.status, out.source_ref) == ("ok", "17")
+    # The first attempt paid for the call and has the only ledger row. The result still carries
+    # its cost, since the workflow adds up what the activity reports.
+    assert len(rig.ledger.entries) == 1
+    assert out.cost_usd == pytest.approx(float(rig.ledger.entries[0].usd))
 
 
 def test_the_activity_is_registered_under_the_name_the_workflow_calls() -> None:

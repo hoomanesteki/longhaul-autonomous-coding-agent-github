@@ -179,6 +179,9 @@ class Stubs:
         self.memory_block = ref("memory/memory-block.txt")
         self.prepared_with: dict[str, Any] = {}
         self.lessons: list[tuple[list[str], acts.ExtractLessonsInput]] = []
+        # The final comment, the lessons and the outcome note in the order they ran. The comment
+        # and the note are kept apart from `every`, so this list shows where the lessons sit.
+        self.wind_up: list[str] = []
         self.lesson_events: list[acts.RecordEventInput] = []
         self.lessons_output = acts.ExtractLessonsOutput(
             status="ok",
@@ -270,6 +273,7 @@ class Stubs:
     @activity.defn(name=acts.EXTRACT_LESSONS.name)
     async def extract_lessons(self, inp: acts.ExtractLessonsInput) -> acts.ExtractLessonsOutput:
         self.lessons.append((list(self.every), inp))
+        self.wind_up.append("lessons")
         if acts.EXTRACT_LESSONS.name in self.fails:
             raise self.fails[acts.EXTRACT_LESSONS.name]
         return self.lessons_output
@@ -345,6 +349,7 @@ class Stubs:
     async def record_event(self, inp: acts.RecordEventInput) -> None:
         if inp.type == acts.OUTCOME_EVENT:
             self.outcomes.append((activity.info().workflow_run_id, inp))
+            self.wind_up.append("outcome note")
             if acts.RECORD_EVENT.name in self.fails:
                 raise self.fails[acts.RECORD_EVENT.name]
             return
@@ -392,6 +397,7 @@ class Stubs:
         # of a task that ended on its own is, so the lists of GitHub activities below stay what
         # they were. It does not wait at a gate: the wind-up must not hang a test that holds one.
         self.finals.append(inp)
+        self.wind_up.append("final comment")
         return "comment-final"
 
     @activity.defn(name=acts.BUILD_PR_BRANCH.name)
@@ -3332,9 +3338,13 @@ async def test_a_finished_task_with_memory_asks_for_its_lessons_once_after_the_w
     outcome, _ = await play(env, stubs, gh_spec)
 
     assert outcome == FINISHED
-    ((_, asked),) = stubs.lessons
+    ((before, asked),) = stubs.lessons
     assert asked.task_id == gh_spec.task_id
     assert asked.outcome == FINISHED
+    # The pull request is open and the labels are set before the lessons are asked, and the note
+    # that the metrics count from comes after them.
+    assert before[-len(DELIVERY) :] == DELIVERY
+    assert stubs.wind_up == ["final comment", "lessons", "outcome note"]
     assert asked.spec.issue_number == 42
     assert asked.turn_index == 2
     assert len(stubs.finals) == 1

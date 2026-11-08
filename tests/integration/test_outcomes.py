@@ -59,6 +59,7 @@ from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.checkpoints.squash import FileStat
 from longhaul.contracts import (
+    BlobRef,
     Budgets,
     Outcome,
     OutcomeKind,
@@ -133,6 +134,27 @@ class Stubs(Boxes):
         self.branches: list[acts.BuildPrBranchInput] = []
         self.deliveries: list[acts.DeliverInput] = []
         self.build_error: ApplicationError | None = None
+        # LH-605: a worker with memory loads a block at the start and asks for lessons at the end.
+        # Each ask is kept with the number of draft pull requests opened before it.
+        self.with_memory = False
+        self.blobs: MemoryBlobStore | None = None
+        self.lessons: list[tuple[int, acts.ExtractLessonsInput]] = []
+
+    @activity.defn(name=acts.PREPARE_WORKSPACE.name)
+    async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
+        prepared = await super().prepare_workspace(spec)
+        return prepared.model_copy(update={"memory_enabled": self.with_memory})
+
+    @activity.defn(name=acts.LOAD_MEMORY.name)
+    async def load_memory(self, inp: acts.LoadMemoryInput) -> BlobRef:
+        assert self.blobs is not None
+        key = f"tasks/{inp.spec.task_id}/memory/0000/memory-block.txt"
+        return await self.blobs.put(b"", key=key)
+
+    @activity.defn(name=acts.EXTRACT_LESSONS.name)
+    async def extract_lessons(self, inp: acts.ExtractLessonsInput) -> acts.ExtractLessonsOutput:
+        self.lessons.append((len(self.deliveries), inp))
+        return acts.ExtractLessonsOutput(status="skipped", source_ref="")
 
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
@@ -263,6 +285,7 @@ async def rig(
         templates=TEMPLATES,
     )
     stubs = Stubs()
+    stubs.blobs = blobs
     tools = ToolActivities(registry, stubs, blobs, recorder, checkpoints=NoCheckpoints())
     fake = FakeGitHub()
     seed_calc(fake, tmp_path / "gh")
@@ -292,6 +315,8 @@ async def rig(
                 stubs.bundle_checkpoint,
                 stubs.build_pr_branch,
                 stubs.deliver,
+                stubs.load_memory,
+                stubs.extract_lessons,
             ],
             workflow_runner=workflow_runner(),
         ):
@@ -559,6 +584,20 @@ async def test_a_stuck_task_opens_a_draft_when_the_repo_asks_for_one(
         body = world.final_comment()
         assert PR_URL in body and "draft pull request" in body
         assert world.labels() == {lifecycle.NEEDS_HUMAN, lifecycle.PR_OPEN}
+
+
+async def test_the_lessons_of_a_stuck_task_are_asked_after_its_draft_is_open(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, FAILS, tmp_path) as world:
+        world.stubs.with_memory = True
+        outcome = await end_the_task(env, world, world.spec(), "stuck", open_draft_on_stuck=True)
+
+        # The pull request number is the source of the candidates, so the draft comes first.
+        ((drafts, asked),) = world.stubs.lessons
+        assert outcome.pr_url == PR_URL
+        assert drafts == 1
+        assert asked.outcome.pr_url == PR_URL
 
 
 async def test_a_stuck_task_opens_no_draft_unless_asked(

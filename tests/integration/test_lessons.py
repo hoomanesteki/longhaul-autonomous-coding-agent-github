@@ -19,7 +19,6 @@ import pytest
 import yaml
 from alembic import command
 from alembic.config import Config
-from longhaul.memory.lessons import TOOL_NAME
 from psycopg import sql
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
@@ -44,6 +43,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.memory import LessonActivities
 from longhaul.durable.scripts import upload_script
 from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.lessons import TOOL_NAME
 from longhaul.memory.store import PgMemoryStore
 from longhaul.settings import EnvSettings, get_settings
 

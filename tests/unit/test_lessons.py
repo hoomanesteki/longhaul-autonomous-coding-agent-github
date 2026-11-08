@@ -8,18 +8,6 @@ keeps every request. The rules under test are the ones of the story: at most 5 i
 from typing import Any
 
 import pytest
-from longhaul.memory.lessons import (
-    LESSON_TOOL,
-    MAX_CHARS,
-    MAX_ITEMS,
-    TOOL_NAME,
-    Lesson,
-    build_request,
-    clean_items,
-    extract,
-    is_generic,
-    source_ref,
-)
 
 from longhaul.contracts import (
     LLMResponse,
@@ -36,6 +24,18 @@ from longhaul.contracts import (
     Usage,
 )
 from longhaul.memory import lessons
+from longhaul.memory.lessons import (
+    LESSON_TOOL,
+    MAX_CHARS,
+    MAX_ITEMS,
+    TOOL_NAME,
+    Lesson,
+    build_request,
+    clean_items,
+    extract,
+    is_generic,
+    source_ref,
+)
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 
@@ -125,7 +125,7 @@ def test_an_item_over_300_characters_is_trimmed() -> None:
     assert len(kept.content) <= MAX_CHARS
     assert kept.content.startswith("Inventory.remove raises InventoryError")
     # The cut falls between words, so a note never ends in half a name.
-    assert kept.content.endswith("unknown.") or kept.content.endswith("InventoryError")
+    assert kept.content.split()[-1] in long.split()
 
 
 def test_a_trimmed_item_is_still_checked_for_being_generic() -> None:

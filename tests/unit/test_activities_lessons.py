@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.memory.lessons import TOOL_NAME
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -39,6 +38,7 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.memory import LessonActivities
+from longhaul.memory.lessons import TOOL_NAME
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase6]
 

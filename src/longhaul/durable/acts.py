@@ -54,6 +54,11 @@ non-retryable error kinds of a model call, and a heartbeat timeout. It writes no
 rows of its calls. The comment itself is posted by `post_comment`, so every worker registers the
 first and only a worker with a token the second.
 
+The lessons of a finished task (LH-605) add `extract_lessons`. It is a compactor model call and a
+few rows of the memory table, so it has the model-call policy of `summarize_for_human` with 3
+attempts: a task has ended when it runs, and its lessons are a bonus that a worker can give up on.
+It sits in `ALL` because the workflow names it on any worker that keeps memory.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -200,6 +205,10 @@ FINAL_COMMENT = "final"
 # when every character is four bytes of JSON.
 ERROR_EVENT = "error"
 ERROR_TRACE_CHARS = 3000
+# The `type` of the record_event call that keeps the lessons drafted for a finished task (LH-605),
+# for the run report. The payload holds the `status`, the `source_ref` (the pull request number or
+# the task id), the `count` and the `items`, each with its `kind` and its `content`.
+LESSONS_EVENT = "lessons"
 # How long the bare repo of a task that has ended is kept. The checkpoints in it are how a person
 # looks at what a stuck or failed task did, and the janitor (clean_repos) deletes the repo after
 # this long. A repo whose task has no outcome belongs to a task that is still running and is
@@ -549,6 +558,55 @@ class SummarizeOutput(BaseModel):
     question: str
     status: SummaryStatus
     cost_usd: float = Field(default=0.0, ge=0)
+
+
+LessonKindName = Literal["lesson", "pitfall", "convention"]
+LessonsStatus = Literal["ok", "unusable", "skipped"]
+
+
+class ExtractLessonsInput(BaseModel):
+    """What extract_lessons needs to draft the lessons of a finished task (LH-605).
+
+    `plan` and `notes` are the last ones the workflow holds, and `outcome` is how the task ended,
+    with the pull request link when there is one. The stuck events and the verifier's issues are
+    not here: they are in the events table, and the activity reads them. `turn_index` is the
+    ledger row's turn. The script lets a scripted run answer the compactor, as in
+    SummarizeInput.
+    """
+
+    task_id: str
+    turn_index: int = Field(ge=0)
+    spec: TaskSpec
+    outcome: Outcome
+    plan: Plan | None = None
+    notes: ProgressNotes | None = None
+    script_ref: BlobRef | None = None
+
+
+class LessonNote(BaseModel):
+    """One lesson as the workflow records it in the `lessons` event."""
+
+    kind: LessonKindName
+    content: str
+
+
+class ExtractLessonsOutput(BaseModel):
+    """What extract_lessons did.
+
+    `status` is "ok" when the model answered (and `items` may be empty), "unusable" when its
+    answer held no call to read, and "skipped" when the worker has no store or the task left
+    nothing to learn from, in which case no model was called. `items` are the notes that were
+    stored as candidates, and `source_ref` is the pull request number or the task id they carry.
+    """
+
+    status: LessonsStatus
+    source_ref: str
+    items: list[LessonNote] = Field(default_factory=list)
+    cost_usd: float = Field(default=0.0, ge=0)
+
+    @property
+    def stored(self) -> int:
+        return len(self.items)
 
 
 class CleanupInput(BaseModel):
@@ -911,6 +969,28 @@ SUMMARIZE_FOR_HUMAN = Act(
     ),
 )
 
+# The lessons of a finished task (LH-605). One compactor call and a few inserts. A worker gives up
+# after 3 attempts, and the task has ended on its own all the same.
+EXTRACT_LESSONS = Act(
+    "extract_lessons",
+    ExtractLessonsInput,
+    ExtractLessonsOutput,
+    start_to_close=timedelta(minutes=5),
+    heartbeat=timedelta(seconds=30),
+    retry=RetryPolicy(
+        initial_interval=timedelta(seconds=2),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=60),
+        maximum_attempts=3,
+        non_retryable_error_types=[
+            ProviderErrorKind.INVALID_REQUEST.value,
+            ProviderErrorKind.AUTH.value,
+            ProviderErrorKind.CONTEXT_TOO_LONG.value,
+            _OVERSIZED,
+        ],
+    ),
+)
+
 # Backoff for a write to GitHub: the first retry comes quickly, and the wait doubles up to the
 # five minutes of section 3.7. GitHub's own advice (a rate limit) replaces it for one attempt.
 _GITHUB_ERRORS = [_OVERSIZED, GITHUB_FATAL, *SIDE_EFFECT_ERRORS]
@@ -1039,6 +1119,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     POLL_ONCE,
     COMPACT,
     SUMMARIZE_FOR_HUMAN,
+    EXTRACT_LESSONS,
     STORE_PLAN,
     RECORD_STEP,
     CLEAN_REPOS,

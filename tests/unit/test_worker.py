@@ -688,6 +688,13 @@ def loader_of(parts: worker.WorkerParts) -> Any:
     return found
 
 
+def lessons_of(parts: worker.WorkerParts) -> Any:
+    (found,) = [
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "extract_lessons"
+    ]
+    return found
+
+
 def with_memory(**fields: Any) -> AppConfig:
     values = {"enabled": True, "embedder": "hash", **fields}
     return CONFIG.model_copy(update={"memory": Memory(**values)})
@@ -718,6 +725,8 @@ def test_a_worker_with_memory_shares_one_store_between_the_workspace_and_the_pro
     loader = loader_of(parts)
     assert loader._memory is parts.memory
     assert loader._blobs is parts.blobs
+    # extract_lessons writes its candidates to the same store (LH-605).
+    assert lessons_of(parts)._sink is parts.memory
 
 
 @pytest.mark.phase6
@@ -735,6 +744,8 @@ def test_a_worker_with_memory_off_builds_no_store_and_keeps_the_activity(tmp_pat
     # The workflow names load_memory, so the worker keeps answering it: with an empty block.
     assert names_of(parts) == sorted(act.name for act in acts.ALL)
     assert loader_of(parts)._memory is None
+    # The workflow asks only a task that loaded a block, and the activity still answers.
+    assert lessons_of(parts)._sink is None
 
 
 @pytest.mark.phase6

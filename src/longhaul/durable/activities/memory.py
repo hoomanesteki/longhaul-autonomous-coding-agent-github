@@ -1,4 +1,7 @@
-"""The load_memory activity: the memory block of a task, written once for the whole task (LH-604).
+"""The memory activities: the block a task starts with (LH-604), and the lessons it leaves (LH-605).
+
+load_memory
+-----------
 
 The workflow calls it once, after prepare_workspace, and keeps the ref it returns. Every model
 turn and every compaction reads that blob and puts the text at the end of the system prompt
@@ -18,26 +21,78 @@ runs without them is the task of before Phase 6. A repo map that is gone from th
 left out and logged, since asking again would not bring it back. A worker with no store
 (`memory.enabled` off) answers with an empty block, which the workflow does not ask for in the
 first place (acts.PrepareWorkspaceOutput.memory_enabled).
+
+extract_lessons
+---------------
+The workflow calls it once when a task has ended, on every ending path, after the final comment
+and the labels, so no one waits for a model. The compactor model gets the plan, the last progress
+notes, the stuck events and the issues of the verifier (longhaul.memory.lessons) and drafts up to
+5 notes. They are stored as `candidate` items with `source = task` and the pull request number as
+`source_ref`, or the task id when there is none. A person or a merged pull request approves them
+later (ADR-0010, LH-606), and until then they stay out of every prompt.
+
+The plan, the notes and the outcome come in with the call, since the workflow holds them. The
+stuck events and the verdicts are read from the events table, because the workflow wrote them
+there and keeps nothing else of them. A task with no plan, no notes and no such events has
+nothing to learn from, and the activity makes no model call for it. A worker with no store
+(`memory.enabled` off) makes none either, and answers "skipped".
+
+Failures. A provider error is retried by kind, as in the other model calls. A store that cannot be
+written raises, and Temporal runs the attempt again, which asks the model again and gets a row on
+the ledger of its own (invariant I6). The same note written twice is one row, since the store
+keeps one row for one text. After the attempts are spent the workflow logs the failure and the
+task keeps the outcome it had: lessons are a bonus and never change how a task ended.
+
+As in every activity that calls a model, a task with a script is answered by it, so a scripted
+run gets a scripted compactor (`match: {role: compactor}`).
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Sequence
+from decimal import Decimal
+from typing import Any, Protocol
 
 from temporalio import activity
 
-from longhaul.blobs.base import BlobIntegrityError, BlobNotFoundError, blob_key
+from longhaul.agent.loop import LoopConfig
+from longhaul.blobs.base import BlobIntegrityError, BlobNotFoundError, BlobStoreBase, blob_key
 from longhaul.context.tokens import estimate_tokens
-from longhaul.contracts import BlobRef, BlobStore
+from longhaul.contracts import (
+    BlobRef,
+    BlobStore,
+    LLMProvider,
+    MemoryItem,
+    ProviderError,
+    Role,
+    Usage,
+)
+from longhaul.cost.ledger import Ledger, NoLedger
+from longhaul.cost.pricing import PricingError
+from longhaul.db.records import EventRecord
 from longhaul.durable import acts
-from longhaul.durable.activities.support import small
+from longhaul.durable.activities.support import (
+    heartbeating,
+    not_retried,
+    provider_failure,
+    provider_for_task,
+    small,
+)
+from longhaul.durable.scripts import TaskProviders
+from longhaul.memory import lessons
 from longhaul.memory.retrieve import DEFAULT_BUDGET_TOKENS, MemoryReader, render_memory_block
 
 log = logging.getLogger(__name__)
 
-__all__ = ["BLOCK_NAME", "MemoryActivities", "read_memory_block"]
+__all__ = [
+    "BLOCK_NAME",
+    "EventReader",
+    "LessonActivities",
+    "LessonSink",
+    "MemoryActivities",
+    "read_memory_block",
+]
 
 # The name of the blob, under the memory folder of the task. A retried attempt writes the same key.
 BLOCK_NAME = "memory-block.txt"
@@ -108,3 +163,119 @@ async def read_memory_block(blobs: BlobStore, ref: BlobRef | None) -> str:
     if ref is None:
         return ""
     return (await blobs.get(ref)).decode("utf-8")
+
+
+# ---------- the lessons of a finished task ----------
+class LessonSink(Protocol):
+    """Where the candidates go: PgMemoryStore.add_candidate, which keeps one row for one note."""
+
+    async def add_candidate(self, item: MemoryItem, *, source_ref: str | None = None) -> str: ...
+
+
+class EventReader(Protocol):
+    """Where the activity reads the events of a task: the recorder (db.records)."""
+
+    async def events_of(self, task_id: str, types: Sequence[str]) -> list[EventRecord]: ...
+
+
+class LessonActivities:
+    """extract_lessons, with the store it writes to and the compactor model it asks.
+
+    `sink` is None on a worker that keeps no memory. `provider` answers tasks without a script,
+    and `config_for(Role.COMPACTOR)` gives the model and effort of the compactor, as in
+    ContextActivities. `ledger` is the cost ledger, shared with the other model calls.
+    """
+
+    def __init__(
+        self,
+        sink: LessonSink | None,
+        events: EventReader,
+        provider: LLMProvider | None,
+        blobs: BlobStoreBase,
+        config_for: Callable[[Role], LoopConfig],
+        *,
+        ledger: Ledger | None = None,
+    ) -> None:
+        self._sink = sink
+        self._events = events
+        self._provider = provider
+        self._scripts = TaskProviders(blobs)
+        self._config_for = config_for
+        self._ledger: Ledger = NoLedger() if ledger is None else ledger
+
+    @property
+    def activities(self) -> list[Callable[..., Any]]:
+        """What to register on a worker."""
+        return [self.extract_lessons]
+
+    @activity.defn(name=acts.EXTRACT_LESSONS.name)
+    async def extract_lessons(self, inp: acts.ExtractLessonsInput) -> acts.ExtractLessonsOutput:
+        inp = small(inp)
+        ref = lessons.source_ref(inp.outcome.pr_url, inp.task_id)
+        skipped = acts.ExtractLessonsOutput(status="skipped", source_ref=ref)
+        if self._sink is None:
+            return skipped
+        stuck, issues = lessons.signals_from_events(
+            await self._events.events_of(inp.task_id, lessons.EVENT_TYPES)
+        )
+        if inp.plan is None and inp.notes is None and not stuck and not issues:
+            # Nothing happened that a note could be about, such as a task cancelled at once.
+            return skipped
+        provider = await provider_for_task(
+            self._scripts, self._provider, inp.task_id, inp.script_ref
+        )
+        cfg = self._config_for(Role.COMPACTOR)
+        spent: list[Decimal] = []
+
+        async def ledger_row(usage: Usage) -> None:
+            spent.append(await self._charge(inp, cfg.model, usage))
+
+        request = lessons.build_request(
+            title=inp.spec.title,
+            outcome=inp.outcome,
+            plan=inp.plan,
+            notes=inp.notes,
+            stuck=stuck,
+            issues=issues,
+        )
+        try:
+            async with heartbeating():
+                got = await lessons.extract(
+                    provider, cfg.model, request, effort=cfg.effort, on_billed=ledger_row
+                )
+        except ProviderError as exc:
+            raise provider_failure(exc) from exc
+        for lesson in got.lessons:
+            await self._sink.add_candidate(
+                MemoryItem(
+                    id="",  # the store makes the id
+                    repo=inp.spec.repo,
+                    kind=lesson.kind,
+                    content=lesson.content,
+                    status="candidate",
+                    source="task",
+                ),
+                source_ref=ref,
+            )
+        log.info("task %s: %d lessons stored for %s", inp.task_id, len(got.lessons), ref)
+        return small(
+            acts.ExtractLessonsOutput(
+                status=got.status,
+                source_ref=ref,
+                items=[acts.LessonNote(kind=n.kind, content=n.content) for n in got.lessons],
+                cost_usd=float(sum(spent, Decimal(0))),
+            )
+        )
+
+    async def _charge(self, inp: acts.ExtractLessonsInput, model: str, usage: Usage) -> Decimal:
+        """Put one call on the ledger and return what it cost.
+
+        A model without a price fails for good: a retry would call the model again, and none of
+        its calls could be priced.
+        """
+        try:
+            return await self._ledger.record(
+                inp.task_id, inp.spec.repo, model, inp.turn_index, activity.info().attempt, usage
+            )
+        except PricingError as exc:
+            raise not_retried(exc) from exc

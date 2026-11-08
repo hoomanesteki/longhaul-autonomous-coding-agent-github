@@ -6,6 +6,7 @@ adds the ledger's totals and the worst case of the next call. The wall clock is 
 workflow judges it from its own time.
 """
 
+import math
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -17,12 +18,18 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.agent.loop import LoopConfig
+from longhaul.context.tokens import DEFAULT_CHARS_PER_TOKEN
 from longhaul.contracts import BlobRef, Budgets, Plan, PlanStep, RepoSettings, Role, TaskSpec, Usage
 from longhaul.cost.budget import BudgetNumbers, BudgetReason, BudgetVerdict
 from longhaul.cost.ledger import MemoryLedger
 from longhaul.cost.pricing import Pricing
 from longhaul.durable import acts
-from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
+from longhaul.durable.activities.cost import (
+    SHOWN_EXTRA_CHARS,
+    BudgetActivities,
+    BudgetCommentActivities,
+    _review_tokens,
+)
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger as EffectLedger
 from longhaul.github.side_effects import effect_key, marker
@@ -147,6 +154,18 @@ async def test_the_brief_of_a_review_counts_in_the_first_request_of_the_verifier
     # brief adds what the cut leaves and not the size of the blobs.
     assert projected_of(briefed) > projected_of(bare)
     assert projected_of(briefed) - projected_of(bare) < Decimal("0.02")
+
+
+def test_a_cut_output_is_counted_at_the_ratio_the_task_has_learned() -> None:
+    # Code can run at 2 characters per token. The cut keeps cap * 3.5 characters, so a capped
+    # output costs more tokens than the cap, and the estimate must say so.
+    cfg = LoopConfig(model=SONNET, tool_output_max_tokens=1_000)
+    brief = acts.ReviewBrief(checks=[], diff=a_review(diff_bytes=1_000_000).diff)
+    kept = math.floor(1_000 * DEFAULT_CHARS_PER_TOKEN) + SHOWN_EXTRA_CHARS
+    assert _review_tokens(brief, cfg, 2.0) == math.ceil(kept / 2.0)
+    assert _review_tokens(brief, cfg, 2.0) > 1_000
+    small_diff = acts.ReviewBrief(checks=[], diff=a_review(diff_bytes=300).diff)
+    assert _review_tokens(small_diff, cfg, 2.0) == 150
 
 
 async def test_a_request_that_follows_another_is_priced_from_the_last_one() -> None:

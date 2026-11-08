@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check site site-preview gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate
 
 PHASE ?= 0
 
@@ -62,6 +62,15 @@ console-check:
 	npm --prefix console run typecheck
 	npm --prefix console test
 	npm --prefix console run build
+
+# The browser test of the console (LH-808). Playwright starts scripts/seed_demo.sh itself, which
+# needs `make up` and `make sandbox-image` first and takes a couple of minutes to seed. To look at
+# the seeded console by hand instead, run ./scripts/seed_demo.sh after the build.
+console-e2e:
+	npm --prefix console ci
+	npm --prefix console run build
+	npm --prefix console exec -- playwright install chromium
+	npm --prefix console run e2e
 
 # The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
 # are read from docs/, so there is nothing to copy before a render.

@@ -7,7 +7,7 @@ const SHIPPED = { title: "Fix add() so it sums", repo: "demo/calc-shipped" };
 const STUCK = { title: "Fix add() after a hint" };
 const PLAN = { title: "Fix add() after a plan review" };
 const LESSONS = [
-  "Run python -m pytest -q before submitting, because one failing file can hide behind a passing one.",
+  "Run the whole suite with python -m pytest -q before you submit a fix.",
   "calc.add and calc.multiply both live in src/calc/__init__.py.",
 ];
 

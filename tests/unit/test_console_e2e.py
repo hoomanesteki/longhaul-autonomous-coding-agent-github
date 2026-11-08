@@ -14,6 +14,7 @@ import importlib.util
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -49,6 +50,8 @@ def load_driver() -> ModuleType:
     spec = importlib.util.spec_from_file_location("demo_stack", DRIVER)
     assert spec and spec.loader, "scripts/demo_stack.py is missing"
     module = importlib.util.module_from_spec(spec)
+    # A dataclass looks its module up by name while the class body runs.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -138,11 +141,11 @@ def test_the_demo_config_loads_like_any_other(demo: ModuleType, tmp_path: Path) 
     assert [r.repo for r in loaded.repos] == [s.repo for s in demo.SCENARIOS]
 
 
-def test_the_issues_carry_the_marker_only_where_the_script_keys_on_it(demo: ModuleType) -> None:
-    bodies = {s.key: s.body("The issue text.") for s in demo.SCENARIOS}
-    assert demo.STUCK_MARKER in bodies["stuck"]
-    assert demo.STUCK_MARKER not in bodies["shipped"] + bodies["plan"]
-    assert all(body.startswith("The issue text.") for body in bodies.values())
+def test_only_the_stuck_repo_has_the_file_the_script_keys_on(demo: ModuleType) -> None:
+    marked = {s.key: s.marker_file for s in demo.SCENARIOS if s.marker_file}
+    assert marked == {"stuck": demo.STUCK_MARKER}
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert f'request_contains: "{demo.STUCK_MARKER}"' in script
 
 
 # ---------- the scripted model ----------
@@ -162,10 +165,10 @@ TOOLS = [
 
 
 async def ask(
-    provider: ScriptedProvider, role: str, history: list[str], issue: str, hint: str | None = None
+    provider: ScriptedProvider, role: str, history: list[str], hint: str | None = None
 ) -> LLMResponse:
     """The answer to a request after `len(history)` turns, each with the given tool result."""
-    messages = [Message(role="user", content=[TextBlock(text=issue)])]
+    messages = [Message(role="user", content=[TextBlock(text="Start.")])]
     for n, result in enumerate(history):
         messages.append(
             Message(role="assistant", content=[ToolUseBlock(id=f"toolu_{n}", name="x", input={})])
@@ -195,48 +198,56 @@ def provider(tmp_path: Path) -> ScriptedProvider:
     return ScriptedProvider(without_waits(SCRIPT, tmp_path))
 
 
+def listing(demo: ModuleType, key: str) -> str:
+    """What list_dir returns for the root of a scenario's repo: the files of the calc fixture."""
+    scenario = next(s for s in demo.SCENARIOS if s.key == key)
+    return "\n".join(["pyproject.toml", "src/", "tests/", scenario.marker_file or ""]).strip()
+
+
+@pytest.mark.parametrize("key", ["shipped", "plan"])
 async def test_a_task_without_the_marker_plans_and_fixes_the_bug(
-    provider: ScriptedProvider, demo: ModuleType
+    provider: ScriptedProvider, demo: ModuleType, key: str
 ) -> None:
-    issue = demo.SCENARIOS[0].body("add() returns the difference")
-    assert names(await ask(provider, "planner", [], issue)) == ["list_dir"]
-    assert names(await ask(provider, "planner", ["ok", "ok"], issue)) == ["submit_plan"]
-    assert names(await ask(provider, "coder", [], issue)) == ["list_dir"]
-    assert names(await ask(provider, "coder", ["ok"] * 2, issue)) == ["edit_file"]
-    done = await ask(provider, "coder", ["ok", "ok", "ok", "3 passed"], issue)
+    seen = listing(demo, key)
+    assert names(await ask(provider, "planner", [])) == ["list_dir"]
+    assert names(await ask(provider, "planner", [seen, "ok"])) == ["submit_plan"]
+    assert names(await ask(provider, "coder", [])) == ["list_dir"]
+    assert names(await ask(provider, "coder", [seen])) == ["read_file"]
+    assert names(await ask(provider, "coder", [seen, "ok"])) == ["edit_file"]
+    assert names(await ask(provider, "coder", [seen, "ok", "ok"])) == ["run_tests"]
+    done = await ask(provider, "coder", [seen, "ok", "ok", "3 passed"])
     assert names(done) == ["update_step", "update_step", "submit_for_review"]
 
 
-async def test_the_task_with_the_marker_runs_the_suite_until_it_is_stuck(
+async def test_the_task_with_the_marker_lists_the_repo_and_runs_the_suite_until_it_is_stuck(
     provider: ScriptedProvider, demo: ModuleType
 ) -> None:
-    issue = demo.SCENARIOS[1].body("add() returns the difference")
-    for turns in range(3):
-        assert names(await ask(provider, "coder", ["1 failed"] * turns, issue)) == ["run_tests"]
+    seen = listing(demo, "stuck")
+    assert names(await ask(provider, "coder", [])) == ["list_dir"]
+    for runs in range(3):
+        assert names(await ask(provider, "coder", [seen, *["1 failed"] * runs])) == ["run_tests"]
 
 
 async def test_the_hint_lets_the_stuck_task_fix_the_bug_and_wait_before_it_does(
-    provider: ScriptedProvider, demo: ModuleType, tmp_path: Path
+    provider: ScriptedProvider, demo: ModuleType
 ) -> None:
-    issue = demo.SCENARIOS[1].body("add() returns the difference")
-    failed = ["1 failed"] * 3
-    hinted = await ask(provider, "coder", failed, issue, hint="Hint from console: use +")
+    failed = [listing(demo, "stuck"), "1 failed", "1 failed", "1 failed"]
+    hinted = await ask(provider, "coder", failed, hint="Hint from console: use +")
     assert names(hinted) == ["edit_file"]
     # The wait is what keeps the phase at coding long enough for the console to show it. The
     # copy in the provider fixture has it taken out, so read it from the file.
     steps: list[dict[str, Any]] = yaml.safe_load(SCRIPT.read_text(encoding="utf-8"))["steps"]
     hint_step = next(s for s in steps if s["match"].get("user_text_contains") == "Hint from")
     assert hint_step["respond"]["delay_s"] >= 20
-    after = await ask(provider, "coder", [*failed, "ok"], issue)
-    assert names(after) == ["run_tests"]
-    done = await ask(provider, "coder", [*failed, "ok", "3 passed"], issue)
+    assert names(await ask(provider, "coder", [*failed, "ok"])) == ["run_tests"]
+    done = await ask(provider, "coder", [*failed, "ok", "3 passed"])
     assert names(done)[-1] == "submit_for_review"
 
 
 async def test_the_compactor_writes_the_question_of_the_stuck_task(
     provider: ScriptedProvider,
 ) -> None:
-    reply = await ask(provider, "compactor", [], "Why the agent is stuck: the same failure.")
+    reply = await ask(provider, "compactor", [], hint="Why the agent is stuck: the same failure.")
     assert names(reply) == ["record_stuck_summary"]
 
 

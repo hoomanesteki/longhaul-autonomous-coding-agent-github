@@ -72,6 +72,8 @@ def test_numbers_are_written_the_same_way_everywhere() -> None:
     assert sections.minutes(None) == "n/a"
     assert sections.p_value(0.0006) == "<0.001"
     assert sections.p_value(0.109375) == "0.109"
+    assert sections.p_text(0.0006) == "p < 0.001"
+    assert sections.p_text(0.109375) == "p = 0.109"
 
 
 # ---------- which runs are the headline ----------
@@ -107,6 +109,14 @@ def test_an_ablation_is_paired_with_a_run_of_its_model_on_the_same_tasks() -> No
     assert (pairing.with_run.run_id, pairing.without_run.run_id) == ("with", "without")
     assert pairing.task_ids == ("b", "c")  # only the tasks that both runs attempted
     assert layout.memory == []
+
+
+def test_the_partner_is_the_plain_run_that_covers_the_most_tasks() -> None:
+    narrow = make_run("narrow", ["a", "b"], model="haiku-x")
+    wide = make_run("wide", ["a", "b", "c", "d"], model="haiku-x")
+    off = make_run("off", ["a", "b", "c"], model="haiku-x", memory="off")
+    (pairing,) = runs.arrange([make_run("head", ["a"]), narrow, wide, off]).memory
+    assert pairing.with_run.run_id == "wide"
 
 
 def test_an_ablation_without_a_partner_is_left_out_and_does_not_fail() -> None:

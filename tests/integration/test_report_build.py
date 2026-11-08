@@ -88,8 +88,13 @@ def page(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
 
 def test_sections_present(page: tuple[str, Path]) -> None:
     text, _ = page
-    found = [line for line in text.splitlines() if line.startswith("#")]
-    assert [line for line in found if line in HEADINGS] == HEADINGS
+    # A heading may carry the size of its set, as in "Table 1: ... (n=40)".
+    found = [
+        next(wanted for wanted in HEADINGS if line.startswith(wanted))
+        for line in text.splitlines()
+        if any(line.startswith(wanted) for wanted in HEADINGS)
+    ]
+    assert found == HEADINGS
     # A section that has data does not say that it has none.
     for title in ("Table 1", "Table 2", "Table 3", "Table 4", "Table 5"):
         body = text.split(f"## {title}")[1].split("\n## ")[0]
@@ -115,7 +120,7 @@ def test_mcnemar_pairs_come_from_the_files(page: tuple[str, Path]) -> None:
     c = sum(1 for t in full if naive[t] and not full[t])
     line = next(line for line in text.splitlines() if line.startswith("McNemar") and "b = " in line)
     assert f"b = {b}, c = {c}" in line
-    assert re.search(r"p = (\d\.\d+|<0\.001)", line)
+    assert re.search(r"p (=|<) \d\.\d+", line)
 
 
 def test_footer_names_the_runs_and_the_commit(page: tuple[str, Path]) -> None:
@@ -146,7 +151,8 @@ def test_unresolved_tasks_are_listed_with_a_reason(page: tuple[str, Path]) -> No
     assert len(rows) >= len(unresolved)
     for task in unresolved:
         assert any(f"| {task} |" in row for row in rows), task
-    assert all(row.count("|") == table.splitlines()[0].count("|") for row in rows)
+    header = next(line for line in table.splitlines() if line.startswith("| Task |"))
+    assert all(row.count("|") == header.count("|") for row in rows)
 
 
 def test_charts_are_written_next_to_the_page(page: tuple[str, Path]) -> None:

@@ -440,7 +440,7 @@ def test_the_report_is_the_same_bytes_every_time() -> None:
 def test_the_report_has_no_dash_characters_that_the_style_check_bans() -> None:
     text = render()
 
-    assert "—" not in text and "–" not in text
+    assert chr(0x2014) not in text and chr(0x2013) not in text
 
 
 def test_a_long_text_is_cut_to_a_line() -> None:

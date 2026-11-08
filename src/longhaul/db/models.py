@@ -194,9 +194,11 @@ class PlanRow(Base):
     """One version of the plan of a task (LH-501).
 
     The planner's plan is version 1. A plan that a person rejects is followed by a new version
-    (LH-502), and the old row is marked superseded, so the table is the history of the plan and
+    (LH-502), and the old row is marked rejected, so the table is the history of the plan and
     the workflow's CarryState holds only the version in force. `plan` is the contract (`Plan`)
-    as JSON. `decided_by` and `decided_at` stay empty until someone approves or rejects it.
+    as JSON. `decided_by` and `decided_at` stay empty until someone approves or rejects it, and
+    a plan that nobody answers stays proposed. `superseded` is for a later story that replaces a
+    plan without a decision.
     """
 
     __tablename__ = "plans"

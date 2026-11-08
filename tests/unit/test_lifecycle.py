@@ -354,3 +354,69 @@ def test_a_console_plan_decision_is_one_short_line() -> None:
     assert approved == "Plan approved from console."
     assert rejected.startswith("Plan rejected from console:")
     assert "split step 2" in rejected
+
+
+# ---------- LH-502: the plan gate ----------
+def test_waiting_for_a_plan_decision_adds_needs_human_and_deciding_removes_it() -> None:
+    (waiting,) = lifecycle.on_plan_review(spec(), 1)
+    (decided,) = lifecycle.on_plan_decided(spec(), 1)
+
+    assert (waiting.add, waiting.label.label) == (True, "longhaul:needs-human")
+    assert (decided.add, decided.label.label) == (False, "longhaul:needs-human")
+    assert (waiting.label.number, decided.label.number) == (42, 42)
+
+
+def test_the_plan_gate_keys_cannot_meet_the_keys_of_a_pause() -> None:
+    # A later pause counts from 1 and adds the same label. If its key matched the one of the
+    # first plan review, the ledger would call the write done and the label would never be set.
+    s = spec()
+    gate = [*lifecycle.on_plan_review(s, 1), *lifecycle.on_plan_decided(s, 1)]
+    pause = [*lifecycle.on_pause(s, 1), *lifecycle.on_resume(s, 1)]
+    gate_keys = {step.label.idempotency_key for step in gate}
+    pause_keys = {step.label.idempotency_key for step in pause}
+    assert gate_keys.isdisjoint(pause_keys)
+
+
+def test_each_version_of_the_plan_has_review_keys_of_its_own() -> None:
+    s = spec()
+    first, second = lifecycle.on_plan_review(s, 1)[0], lifecycle.on_plan_review(s, 2)[0]
+    assert first.label.idempotency_key == effect_key("lh-acme-calc-42", "label_plan_review_on", 1)
+    assert first.label.idempotency_key != second.label.idempotency_key
+    assert lifecycle.on_plan_decided(s, 1)[0].label.idempotency_key == effect_key(
+        "lh-acme-calc-42", "label_plan_review_off", 1
+    )
+    assert lifecycle.on_plan_decided(s, 1)[0].label.idempotency_key != (
+        lifecycle.on_plan_decided(s, 2)[0].label.idempotency_key
+    )
+
+
+def test_the_review_comment_tells_the_maintainer_how_to_answer() -> None:
+    comment = lifecycle.plan_review_comment(spec(), 2, hours=24)
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert "version 2" in comment.body
+    assert "/longhaul approve" in comment.body
+    assert "/longhaul reject <feedback>" in comment.body
+    assert "24 hours" in comment.body
+    assert not has_marker(comment.body)
+    assert comment.idempotency_key == effect_key("lh-acme-calc-42", "plan_review", 2)
+
+
+def test_the_review_comment_does_not_start_with_a_command() -> None:
+    # The poller reads the first line of a comment. A comment of ours has the marker and is
+    # dropped anyway, but the text must not be able to pass for an order if it is quoted.
+    body = lifecycle.plan_review_comment(spec(), 1, hours=24).body
+    assert not body.lstrip().lower().startswith("/longhaul")
+
+
+def test_every_plan_gate_key_is_valid_and_distinct() -> None:
+    s = spec()
+    keys = [
+        *(step.label.idempotency_key for step in lifecycle.on_plan_review(s, 1)),
+        *(step.label.idempotency_key for step in lifecycle.on_plan_decided(s, 1)),
+        lifecycle.plan_review_comment(s, 1, hours=24).idempotency_key,
+    ]
+    assert len(set(keys)) == len(keys)
+    for key in keys:
+        workflow_id, purpose, seq = key.split(":")
+        assert effect_key(workflow_id, purpose, int(seq)) == key

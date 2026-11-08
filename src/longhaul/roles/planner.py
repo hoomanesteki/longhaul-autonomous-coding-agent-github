@@ -25,6 +25,13 @@ answered with every problem, as an error result, and the planner may call `submi
 second failure ends the run with an ERROR outcome whose summary names the problems. Every
 `submit_plan` call is answered, so the transcript keeps its tool_use and tool_result pairs.
 
+The plan gate (LH-502). On a repo that asks for it, a person reads the plan before the coder
+starts and approves it or rejects it with feedback. A rejection puts the feedback in front of the
+planner as a message from the user, and the planner revises its plan in the same transcript, so it
+still has what it read. It may be asked for three versions. The third rejection, or no answer in
+`hint_wait_hours`, ends the task as stuck, with a summary that tells the two apart. The wait itself
+is the workflow's; the texts and the limit are here.
+
 The module has no I/O and imports only the contracts and the turn rules, so the workflow can
 import it (invariant I1). The prompt text is here, and agent/prompts.py puts it together with the
 tool guide.
@@ -39,7 +46,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from longhaul.agent.rules import CallLike, error
-from longhaul.contracts import Outcome, Plan, ToolResult, ToolSpec
+from longhaul.contracts import Outcome, OutcomeKind, Plan, ToolResult, ToolSpec
 
 # The control tool that ends the planning phase.
 SUBMIT_PLAN = "submit_plan"
@@ -57,6 +64,9 @@ TOOLS: tuple[str, ...] = (
 
 MIN_STEPS = 2
 MAX_STEPS = 8
+# How many versions of the plan a person is asked about. The planner writes version 1, and each
+# rejection has it write the next, until this many have been rejected.
+MAX_PLAN_VERSIONS = 3
 # How often an invalid plan is sent back. The first failure is the repair turn, and the next
 # one ends the run.
 MAX_REPAIRS = 1
@@ -240,6 +250,36 @@ def invalid_plan_outcome(problems: Sequence[str]) -> Outcome:
 def no_plan_outcome(turns: int) -> Outcome:
     """The end of a run whose planner used all its turns without submitting a plan."""
     return error(f"planner submitted no plan in {turns} turns")
+
+
+# ---------- the plan gate ----------
+NOT_APPROVED = "plan not approved"
+
+
+def not_approved_outcome() -> Outcome:
+    """The end of a run whose last allowed version of the plan was rejected."""
+    return Outcome(kind=OutcomeKind.STUCK, summary=NOT_APPROVED)
+
+
+def undecided_outcome(hours: int) -> Outcome:
+    """The end of a run that waited `hours` for a decision on its plan and got none."""
+    return Outcome(kind=OutcomeKind.STUCK, summary=f"{NOT_APPROVED}: no decision in {hours} hours")
+
+
+def revision_request(version: int, feedback: str) -> str:
+    """What the planner reads after a person rejected version `version` of its plan.
+
+    It reaches the planner as a hint from the person (the text after "Hint from <login>: "), so
+    the coder, which has its own transcript, is never shown it. A rejection with no text still
+    asks for a new plan.
+    """
+    given = feedback.strip()
+    first = (
+        f"Your plan (version {version}) was rejected. Feedback: {given}"
+        if given
+        else f"Your plan (version {version}) was rejected, and no feedback was given."
+    )
+    return f"{first}\nRevise the plan to answer it, then call submit_plan with the whole plan."
 
 
 def judge_submission(failures: int, arguments: Mapping[str, Any] | None) -> Submission:

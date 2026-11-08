@@ -59,6 +59,10 @@ task and writes one blob, so every worker registers it. The workflow does not ca
 `deliver` makes the report for the body of the pull request, and a later wind-up can call the
 activity to keep a final copy.
 
+The plan gate (LH-502) adds `decide_plan`, which records who approved or rejected a version of the
+plan on its row of the `plans` table. It is one row update, so it is sized like `store_plan` and
+every worker registers it.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -148,10 +152,11 @@ STATUS_GRACE = timedelta(seconds=30)
 # `context.keep_recent_turns`, which the workflow cannot read, so the activity reads it.
 FORCED_KEEP_RECENT_TURNS = 2
 
-# How long a paused task waits for a hint, a budget top-up or a cancel before it ends as stuck
-# (LH-506). The workflow cannot read the config file, so the number is copied from
-# `stuck.hint_wait_hours`. A unit test keeps the two equal, and a worker whose config differs
-# stops at the start (durable/worker.py).
+# How long a task waits for a person before it ends as stuck: a paused task waits for a hint, a
+# budget top-up or a cancel (LH-506), and the plan gate waits for an approval (LH-502). The
+# workflow cannot read the config file, so the number is copied from `stuck.hint_wait_hours`. A
+# unit test keeps the two equal, and a worker whose config differs stops at the start
+# (durable/worker.py).
 HINT_WAIT_HOURS = 24
 
 # The turns the planner gets to submit its plan (LH-501). The workflow cannot read the config
@@ -698,6 +703,19 @@ class PlannedStatus(TaskStatus):
     plan: Plan | None = None
 
 
+class DecidePlanInput(BaseModel):
+    """What decide_plan needs: a version of the plan, and the decision a person made on it.
+
+    `by` is the login that sent the signal. Deciding the same version again changes nothing,
+    so a retry of the activity cannot turn a rejection into an approval.
+    """
+
+    task_id: str
+    version: int = Field(ge=1)
+    approved: bool
+    by: str
+
+
 class DeliverInput(BaseModel):
     """What deliver needs: the branch to push, and the facts for the title and the body."""
 
@@ -1023,6 +1041,14 @@ RECORD_STEP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+DECIDE_PLAN = Act(
+    "decide_plan",
+    DecidePlanInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 # The report on the issue when a task ends (LH-507). It is a post_comment whose body the activity
 # renders from the diff stats and a template, so it has the policy of post_comment and sits in
 # GITHUB with the other writes.
@@ -1076,6 +1102,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     RECORD_STEP,
     CLEAN_REPOS,
     WRITE_RUN_REPORT,
+    DECIDE_PLAN,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -1186,7 +1213,10 @@ def status_grace(tuning: Tuning | None = None) -> timedelta:
 
 
 def hint_wait(tuning: Tuning | None = None) -> timedelta:
-    """The wait of a pause for a hint: the run's tuning, or HINT_WAIT_HOURS."""
+    """How long a task waits for a person to answer, at the plan gate and at a pause for a hint.
+
+    The run's tuning, or HINT_WAIT_HOURS.
+    """
     if tuning is not None and tuning.hint_wait_s is not None:
         return timedelta(seconds=tuning.hint_wait_s)
     return timedelta(hours=HINT_WAIT_HOURS)

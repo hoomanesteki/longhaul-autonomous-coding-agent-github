@@ -546,6 +546,13 @@ def test_a_worker_stores_plans_with_the_recorder_of_the_rest(tmp_path: Path) -> 
     assert store._records is activity_object(parts, "llm_turn")._recorder
 
 
+def test_every_worker_registers_the_plan_decision(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    decide = activity_object(parts, "decide_plan")
+    assert decide is activity_object(parts, "store_plan")
+    assert decide._records is activity_object(parts, "llm_turn")._recorder
+
+
 async def test_a_worker_with_a_token_posts_plans_through_the_ledger_of_the_writes(
     tmp_path: Path,
 ) -> None:

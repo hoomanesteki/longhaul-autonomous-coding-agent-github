@@ -1,8 +1,8 @@
-"""store_plan and post_plan: how a plan is kept and told to the issue (LH-501).
+"""store_plan, decide_plan and post_plan: how a plan is kept, decided and told to the issue.
 
-Both run inside temporalio's ActivityEnvironment. store_plan writes to the memory recorder.
-post_plan posts to a FakeGitHub through the idempotent write of github/side_effects.py, so the
-tests also show the key, the marker and what a retry does.
+All three run inside temporalio's ActivityEnvironment (LH-501, LH-502). store_plan and decide_plan
+write to the memory recorder. post_plan posts to a FakeGitHub through the idempotent write of
+github/side_effects.py, so the tests also show the key, the marker and what a retry does.
 """
 
 from __future__ import annotations
@@ -63,6 +63,13 @@ class Broken(MemoryRecorder):
         raise ConnectionError("the database is down")
 
 
+class BrokenDecision(MemoryRecorder):
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        raise ConnectionError("the database is down")
+
+
 # ---------- store_plan ----------
 async def test_store_plan_writes_the_proposed_plan() -> None:
     recorder = MemoryRecorder()
@@ -87,11 +94,59 @@ async def test_a_database_that_is_down_is_left_to_the_retry_policy() -> None:
         await ActivityEnvironment().run(PlanActivities(Broken()).store_plan, inp)
 
 
-def test_the_store_activity_is_the_one_the_workflow_calls() -> None:
+def test_the_store_activities_are_the_ones_the_workflow_calls() -> None:
     activities = PlanActivities(MemoryRecorder())
     assert [fn.__temporal_activity_definition.name for fn in activities.activities] == [  # type: ignore[attr-defined]
-        acts.STORE_PLAN.name
+        acts.STORE_PLAN.name,
+        acts.DECIDE_PLAN.name,
     ]
+
+
+# ---------- decide_plan (LH-502) ----------
+async def stored() -> MemoryRecorder:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).store_plan,
+        acts.StorePlanInput(task_id=TASK, version=1, plan=PLAN),
+    )
+    return recorder
+
+
+async def test_decide_plan_records_an_approval_with_who_approved() -> None:
+    recorder = await stored()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).decide_plan,
+        acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice"),
+    )
+    assert recorder.plans[(TASK, 1)] == PlanRecord(
+        TASK, 1, PLAN, status="approved", decided_by="alice"
+    )
+
+
+async def test_decide_plan_records_a_rejection_with_who_rejected() -> None:
+    recorder = await stored()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).decide_plan,
+        acts.DecidePlanInput(task_id=TASK, version=1, approved=False, by="bob"),
+    )
+    assert recorder.plans[(TASK, 1)].status == "rejected"
+    assert recorder.plans[(TASK, 1)].decided_by == "bob"
+
+
+async def test_decide_plan_twice_leaves_the_first_decision() -> None:
+    recorder = await stored()
+    activities = PlanActivities(recorder)
+    first = acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice")
+    await ActivityEnvironment().run(activities.decide_plan, first)
+    await ActivityEnvironment().run(activities.decide_plan, first)
+    assert recorder.plans[(TASK, 1)].decided_by == "alice"
+    assert len(recorder.plans) == 1
+
+
+async def test_decide_plan_leaves_a_database_that_is_down_to_the_retry_policy() -> None:
+    inp = acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice")
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(PlanActivities(BrokenDecision()).decide_plan, inp)
 
 
 # ---------- post_plan ----------

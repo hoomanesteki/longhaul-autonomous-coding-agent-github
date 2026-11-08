@@ -183,7 +183,11 @@ class Stack:
     def write_config(self) -> None:
         """The example config with the one repo of this test in the allowlist."""
         config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-        config["repos"] = [{**config["repos"][0], "repo": self.repo}]
+        # The example repo holds every plan for a person. This test has none to answer, and the
+        # gate has its own tests (tests/integration/test_plan_gate.py).
+        config["repos"] = [
+            {**config["repos"][0], "repo": self.repo, "plan_approval_required": False}
+        ]
         # The local embedder needs the memory extra and a model download (LH-604). The hash one
         # needs neither, and the worker still keeps its memory.
         config["memory"]["embedder"] = "hash"

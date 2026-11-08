@@ -1,12 +1,17 @@
-"""The store_plan, post_plan and record_step activities: what happens to a plan (LH-501, LH-503).
+"""The store_plan, decide_plan, post_plan and record_step activities: what happens to a plan.
 
 The workflow cannot write to Postgres and cannot read a template, so it hands the plan to two
-activities when the planner submits it (LH-501), and each step update of the coder to a third
-(LH-503).
+activities when the planner submits it (LH-501), the decision of a person on it to a third
+(LH-502), and each step update of the coder to a fourth (LH-503).
 
 `store_plan` writes version `n` of the plan to the `plans` table as `proposed`. The rows are the
-history of the plan: the workflow's CarryState holds only the plan in force, and a reviewer, the
-console and the plan gate (LH-502) read the table. A retry writes the same row again.
+history of the plan: the workflow's CarryState holds only the plan in force, and a reviewer and the
+console read the table. A retry writes the same row again.
+
+`decide_plan` records the answer of the plan gate on that row: `approved` or `rejected`, the login
+of the person and the time. The first answer stands. A retry after a crash, or a second signal
+that reached the workflow, finds the row decided and changes nothing, so a rejection cannot turn
+into an approval after the fact.
 
 `post_plan` is for a task of an issue. It renders the plan as a checklist (github/plan_comment.py)
 and posts it with the idempotent comment write of github/side_effects.py, under the key
@@ -52,9 +57,13 @@ STEP_EVENT = "step_updated"
 
 
 class PlanRecords(Protocol):
-    """The part of the recorder that store_plan uses."""
+    """The part of the recorder that store_plan and decide_plan use."""
 
     async def record_plan(self, record: PlanRecord) -> None: ...
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None: ...
 
 
 class StepRecords(Protocol):
@@ -66,7 +75,7 @@ class StepRecords(Protocol):
 
 
 class PlanActivities:
-    """store_plan, with the recorder it writes through. Every worker registers it."""
+    """store_plan and decide_plan, with the recorder they write through. Every worker has both."""
 
     def __init__(self, records: PlanRecords) -> None:
         self._records = records
@@ -74,12 +83,19 @@ class PlanActivities:
     @property
     def activities(self) -> list[Callable[..., Any]]:
         """What to register on a worker."""
-        return [self.store_plan]
+        return [self.store_plan, self.decide_plan]
 
     @activity.defn(name=acts.STORE_PLAN.name)
     async def store_plan(self, inp: acts.StorePlanInput) -> None:
         inp = small(inp)
         await self._records.record_plan(PlanRecord(inp.task_id, inp.version, inp.plan))
+
+    @activity.defn(name=acts.DECIDE_PLAN.name)
+    async def decide_plan(self, inp: acts.DecidePlanInput) -> None:
+        inp = small(inp)
+        await self._records.record_plan_decision(
+            inp.task_id, inp.version, approved=inp.approved, decided_by=inp.by
+        )
 
 
 class StepActivities:

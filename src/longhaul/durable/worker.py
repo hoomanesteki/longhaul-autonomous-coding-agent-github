@@ -49,8 +49,10 @@ What it is built from, and why each piece is what it is:
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
   another number stops before it takes a task. The stuck detector (LH-505) is the same: the
   workflow keeps a copy of the four limits in `stuck`, and `tool_exec` returns the facts it reads.
-  The pause for a hint (LH-506) waits `stuck.hint_wait_hours`, which the workflow cannot read
-  either, so a worker whose config holds another number stops too. `summarize_for_human`, which
+  The pause for a hint (LH-506) and the plan gate (LH-502) wait `stuck.hint_wait_hours`, which
+  the workflow cannot read either, so a worker whose config holds another number stops too. The
+  gate records who decided a plan through `decide_plan`, which every worker registers with
+  `store_plan`. `summarize_for_human`, which
   writes the question for a person, is an activity of the compactor and renders its comment from
   the templates folder.
 * The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers

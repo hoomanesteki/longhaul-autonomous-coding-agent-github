@@ -695,6 +695,12 @@ class CheckBudgetInput(BaseModel):
 
     `high_output_cap` is set for the retry of a reply that stopped at max_tokens, which is sent
     with the larger cap, so the call is priced with that cap and not the usual one.
+
+    `last_input_tokens` is 0 for the first request of a transcript, which has no earlier request
+    to measure. The workflow then also sends what that request is made of, and the activity
+    prices it: the task for the system prompt, the plan, the ref of the memory block and the
+    review brief of a verifier. They stay empty for every later request, so a long history does
+    not carry them on each check.
     """
 
     task_id: str
@@ -707,6 +713,10 @@ class CheckBudgetInput(BaseModel):
     extra_turns: int = Field(default=0, ge=0)
     spent_task_usd: float = Field(default=0.0, ge=0)
     last_input_tokens: int = Field(default=0, ge=0)
+    spec: TaskSpec | None = None
+    plan: Plan | None = None
+    memory_ref: BlobRef | None = None
+    review: ReviewBrief | None = None
     now: datetime
 
 

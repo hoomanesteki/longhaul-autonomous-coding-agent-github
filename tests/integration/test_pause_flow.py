@@ -383,12 +383,13 @@ async def test_a_hint_resumes_the_task_and_it_finishes(
     ]
     (asked,) = world.events("paused")
     assert asked["reason"] == "repeated_failure" and asked["pause"] == 1
+    assert asked["kind"] == "hint"
     assert asked["question"] == QUESTION
     # A local task has no issue to comment on, so the comment is recorded in the event.
     for heading in ("What I'm trying to do", "What I tried", "My current guess", "Question"):
         assert f"### {heading}" in asked["comment"]
     (resumed,) = world.events("resumed")
-    assert resumed["pause"] == 1 and resumed["via"] == "hint"
+    assert resumed["pause"] == 1 and resumed["via"] == "hint" and resumed["kind"] == "hint"
 
 
 async def test_the_model_sees_the_hint_on_the_turn_after_the_pause(
@@ -481,7 +482,9 @@ async def test_a_budget_top_up_also_resumes_the_task(
 
     assert outcome.kind is OutcomeKind.PR_OPENED
     (resumed,) = world.events("resumed")
-    assert resumed["via"] == "budget"
+    # The pause was for a hint, so the top-up that answers it keeps the hint family: the run report
+    # pairs it with the stuck pause and not with a budget pause of the same number.
+    assert resumed["via"] == "budget" and resumed["kind"] == "hint"
 
 
 async def test_a_cancel_ends_a_paused_task(env: WorkflowEnvironment, tmp_path: Path) -> None:

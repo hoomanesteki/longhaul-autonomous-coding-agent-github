@@ -425,13 +425,25 @@ def run(
             "steps for the planner role as well.",
         ),
     ] = False,
+    budgets: Annotated[
+        bool,
+        typer.Option(
+            "--budgets/--no-budgets",
+            help="Check the budgets before every model call (task dollars, turns and time, and "
+            "the dollars of the repo per day), and pause the task when a limit would be crossed. "
+            "On by default, so that a real provider cannot run up a bill nobody sees. With "
+            "--no-budgets the task ends at its turn limit and nothing else stops it.",
+        ),
+    ] = True,
 ) -> None:
     """Start a task on the durable stack and follow it until it ends.
 
     Prints the status each time it changes, then the outcome and the final diff. Exits 0 when
     the agent finishes and 2 when the run fails. Ctrl-C stops the command and not the task.
     """
-    options = DurableOptions(path, issue_file, provider, script, window, context_mode, plan)
+    options = DurableOptions(
+        path, issue_file, provider, script, window, context_mode, plan, budgets
+    )
     try:
         code = asyncio.run(submit(options))
     except DURABLE_ERRORS as exc:
@@ -778,6 +790,8 @@ class DurableOptions:
     context_mode: ContextMode | None = None
     # Whether the planner writes a plan before the coder starts (LH-501).
     plan: bool = False
+    # Whether the task checks its budgets before every model call (LH-702).
+    budgets: bool = True
 
 
 async def open_client(settings: EnvSettings) -> Client:
@@ -858,13 +872,17 @@ async def submit(options: DurableOptions) -> int:
         tuning=tuning,
         context_mode=options.context_mode,
         plan=options.plan,
+        enforce_budgets=options.budgets,
     )
 
     who = "provider scripted" if script is not None else "provider of the worker"
     window = f", context window {options.window} tokens" if options.window is not None else ""
     mode = f", context mode {options.context_mode.value}" if options.context_mode else ""
+    unchecked = "" if options.budgets else ", budgets off"
     typer.echo(f"task {task_id}: {title}")
-    typer.echo(f"repo {spec.repo}, {who}{window}{mode}, task queue {settings.task_queue}")
+    typer.echo(
+        f"repo {spec.repo}, {who}{window}{mode}{unchecked}, task queue {settings.task_queue}"
+    )
     try:
         outcome = await follow(handle)
     except asyncio.CancelledError:

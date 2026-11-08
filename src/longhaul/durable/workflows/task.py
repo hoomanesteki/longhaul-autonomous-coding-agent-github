@@ -202,17 +202,19 @@ has no marker and replays as it ran: a stuck signal was only recorded, and `ask_
 a `paused` event and ended the task as stuck in phase PAUSED. Drop the patch with
 `workflow.deprecate_patch` once no run that began before this story is open.
 
-Budgets (LH-702). A task started with `enforce_budgets` (the poller starts every task so) checks
-its limits before each model turn, in `_afford`: a turn of the planner, of the coder and of the
-verifier alike. A task without the switch makes no check and ends at its turn limit with ERROR
-"turn limit", as every task did before.
+Budgets (LH-702). A task started with `enforce_budgets` (the poller, `longhaul run` and the eval
+runner start every task so) checks its limits before each model turn, in `_afford`: a turn of the
+planner, of the coder and of the verifier alike. A task without the switch makes no check and ends
+at its turn limit with ERROR "turn limit", as every task did before.
 
 1. The wall clock is judged here, from `workflow.now()`, `state.started_at` and the time the task
    spent in pauses (`state.paused_s`): a person who answers after three hours has not used three
    hours of the task. The wait for a decision on a plan (LH-502) counts as a pause. The other
    limits are judged by the `check_budget` activity, which reads the ledger. It is given the turn
    index, the top-ups, the running cost, the size of the last request and `workflow.now()`, so the
-   workflow reads no database and no clock of its own.
+   workflow reads no database and no clock of its own. The first request of a transcript has no
+   last request to measure, so the check is also given what that request is made of (the task,
+   the plan, the memory block and the review brief) and prices it from those.
 2. A limit that would be crossed pauses the task in `_budget_pause`. The phase becomes PAUSED,
    `post_budget` writes the comment under the key `budget:<n>` (a task of an issue), the label
    `longhaul:needs-human` goes on, and a `paused` event records the reason and the numbers. A
@@ -567,6 +569,11 @@ BUDGET_VIA = "budget"
 # `budget_added` with the dollars and turns that came in since the pause began (plan section 3.5).
 BUDGET_ADDED_EVENT = "budget_added"
 MIDNIGHT_VIA = "midnight"
+# Both counters of pauses start at 1, so the number of a pause is not enough to tell which
+# `resumed` event answers which `paused` event. The events of a budget pause say `kind` "budget"
+# and those of a pause for a hint say "hint", even when a budget top-up is what answers it.
+BUDGET_KIND = "budget"
+HINT_KIND = "hint"
 
 # The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
 PAUSE_PATCH = "lh-506-pause-for-hint"
@@ -1850,7 +1857,7 @@ class TaskWorkflow:
         for _ in range(verifier.MAX_TURNS):
             if self._out_of_turns():
                 return self._end(rules.turn_limit_outcome(), Phase.FAILED)
-            ended = await self._afford(Role.VERIFIER)
+            ended = await self._afford(Role.VERIFIER, review=brief)
             if ended is not None:
                 return ended
             index = state.turn_index
@@ -1960,10 +1967,17 @@ class TaskWorkflow:
         return None
 
     # ---------- the budgets ----------
-    async def _afford(self, role: Role, *, high_output_cap: bool = False) -> Outcome | None:
+    async def _afford(
+        self,
+        role: Role,
+        *,
+        high_output_cap: bool = False,
+        review: acts.ReviewBrief | None = None,
+    ) -> Outcome | None:
         """Check that the next model call fits the budgets, and wait while it does not (LH-702).
 
         `high_output_cap` is for the retry of a reply cut off at max_tokens, which may use more.
+        `review` is the brief of the verifier, which its first request carries.
 
         None means the call may go ahead, now or after the waiting. An outcome means the task ends
         here: nobody lifted a limit in time, or the next call can never fit the repo's day. A
@@ -1973,7 +1987,7 @@ class TaskWorkflow:
         if not self.state.enforce_budgets:
             return None
         while True:
-            stop = await self._budget_stop(role, high_output_cap)
+            stop = await self._budget_stop(role, high_output_cap, review)
             if stop is None:
                 return None
             ended = await self._budget_pause(stop)
@@ -1981,7 +1995,10 @@ class TaskWorkflow:
                 return ended
 
     async def _budget_stop(
-        self, role: Role, high_output_cap: bool = False
+        self,
+        role: Role,
+        high_output_cap: bool = False,
+        review: acts.ReviewBrief | None = None,
     ) -> budget.BudgetVerdict | None:
         """The limit that the next call would cross, or None when it fits."""
         state = self.state
@@ -2003,6 +2020,9 @@ class TaskWorkflow:
             return budget.BudgetVerdict(
                 ok=False, reason=budget.BudgetReason.WALL_CLOCK, numbers=numbers
             )
+        # Nothing has been measured for a transcript that has not started, so the activity prices
+        # what its first request is made of. Later checks price the size of the last request.
+        first = state.last_input_tokens == 0
         verdict = await self._call(
             acts.CHECK_BUDGET,
             acts.CheckBudgetInput(
@@ -2016,6 +2036,10 @@ class TaskWorkflow:
                 extra_turns=state.extra_turns,
                 spent_task_usd=state.cost_usd,
                 last_input_tokens=state.last_input_tokens,
+                spec=state.spec if first else None,
+                plan=state.plan if first else None,
+                memory_ref=state.memory_ref if first else None,
+                review=review if first else None,
                 now=now,
             ),
         )
@@ -2075,6 +2099,7 @@ class TaskWorkflow:
             return
         daily = reason is budget.BudgetReason.DAILY_REPO_USD
         payload: dict[str, Any] = {
+            "kind": BUDGET_KIND,
             "reason": reason.value,
             "pause": pause,
             "turn_index": state.turn_index,
@@ -2139,7 +2164,13 @@ class TaskWorkflow:
         reason = stop.reason.value if stop.reason is not None else None
         await self._note(
             RESUMED_EVENT,
-            {"pause": pause, "via": via, "reason": reason, "turn_index": state.turn_index},
+            {
+                "kind": BUDGET_KIND,
+                "pause": pause,
+                "via": via,
+                "reason": reason,
+                "turn_index": state.turn_index,
+            },
         )
         if via == BUDGET_VIA:
             added: dict[str, Any] = {
@@ -2186,6 +2217,7 @@ class TaskWorkflow:
         )
         state.cost_usd += asked.cost_usd
         payload: dict[str, Any] = {
+            "kind": HINT_KIND,
             "reason": signal.reason.value,
             "pause": pause,
             "question": asked.question,
@@ -2217,7 +2249,12 @@ class TaskWorkflow:
         """
         state = self.state
         via = self._answered(seen)
-        payload: dict[str, Any] = {"pause": pause, "via": via, "turn_index": state.turn_index}
+        payload: dict[str, Any] = {
+            "kind": HINT_KIND,
+            "pause": pause,
+            "via": via,
+            "turn_index": state.turn_index,
+        }
         if via == HINT_VIA:
             payload["by"] = state.hints[seen.hints].split(": ", 1)[0]
         state.stuck_count += 1
@@ -2295,7 +2332,7 @@ class TaskWorkflow:
         asked = False
         while True:
             if asked:
-                ended = await self._afford(role, high_output_cap=sampling.retried)
+                ended = await self._afford(role, high_output_cap=sampling.retried, review=review)
                 if ended is not None:
                     return ended
             asked = True

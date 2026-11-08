@@ -119,7 +119,13 @@ WALL_MARGIN_S = 300.0
 FAILURE_CHARS = 500
 
 # Plan section 8.4: the caps that every config shares. The dollar cap differs between the sets.
-CUSTOM_BUDGETS = Budgets(task_usd=2.0, task_turns=150, task_wall_minutes=120)
+# Section 8.4 caps each task and nothing more, but a task that enforces its budgets also checks
+# the day's limit of its repo, and every task and config of a run shares a few repo folders. The
+# day's limit is set out of reach so that it cannot pause a paid run half way through.
+NO_DAILY_CAP = 1_000_000.0
+CUSTOM_BUDGETS = Budgets(
+    task_usd=2.0, task_turns=150, task_wall_minutes=120, daily_repo_usd=NO_DAILY_CAP
+)
 SWEBENCH_BUDGETS = swebench_adapter.BUDGETS
 
 PAUSED_PHASES = frozenset({Phase.PAUSED, Phase.AWAITING_PLAN_APPROVAL})
@@ -772,6 +778,9 @@ async def execute_durable(ctx: RunContext, task: Task, started_at: datetime) -> 
                 task_queue=ctx.settings.task_queue,
                 script=script_ref,
                 context_mode=effective_context_mode(options),
+                # The caps of plan section 8.4 are in the spec, and only a task that enforces its
+                # budgets reads them. A paused task ends through the watcher below.
+                enforce_budgets=True,
             )
             live = TemporalTask(ctx.client, workflow_id)
             watched = await watch(

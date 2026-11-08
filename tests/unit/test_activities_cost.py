@@ -17,7 +17,7 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.contracts import Budgets, Role, Usage
+from longhaul.contracts import BlobRef, Budgets, Plan, PlanStep, RepoSettings, Role, TaskSpec, Usage
 from longhaul.cost.budget import BudgetNumbers, BudgetReason, BudgetVerdict
 from longhaul.cost.ledger import MemoryLedger
 from longhaul.cost.pricing import Pricing
@@ -73,6 +73,104 @@ async def test_a_task_with_room_left_is_ok_and_the_numbers_show_the_worst_case()
     assert verdict.ok and verdict.reason is None
     assert Decimal(str(verdict.numbers.projected_usd)) == WORST_CASE
     assert verdict.numbers.task_usd_limit == 1.0 and verdict.numbers.turns_limit == 10
+
+
+def a_spec(body: str = "Read the notes.") -> TaskSpec:
+    return TaskSpec(
+        task_id="lh-acme-calc-42",
+        repo="acme/calc",
+        issue_number=42,
+        title="read the notes",
+        body=body,
+        settings=RepoSettings(repo="acme/calc"),
+    )
+
+
+def a_ref(size: int) -> BlobRef:
+    return BlobRef(key="tasks/lh-acme-calc-42/blob", sha256="0" * 64, size=size)
+
+
+def a_review(diff_bytes: int = 40_000) -> acts.ReviewBrief:
+    run = acts.CheckRun(
+        command="pytest -q", call_id="c1", passed=True, exit_code=0, output_ref=a_ref(9_000)
+    )
+    diff = acts.CheckRun(
+        command="git diff", call_id="c2", passed=True, exit_code=0, output_ref=a_ref(diff_bytes)
+    )
+    return acts.ReviewBrief(checks=[run], diff=diff)
+
+
+def projected_of(verdict: BudgetVerdict) -> Decimal:
+    return Decimal(str(verdict.numbers.projected_usd))
+
+
+# One call with no input at all: 1,000 tokens out at 10 dollars per million.
+OUTPUT_ONLY = Decimal("0.010000")
+
+
+@pytest.mark.parametrize("role", [Role.PLANNER, Role.CODER, Role.VERIFIER])
+async def test_the_first_request_of_a_role_is_priced_with_its_prompt_and_not_as_output_only(
+    role: Role,
+) -> None:
+    # A transcript starts with last_input_tokens at 0. The request still holds the system prompt
+    # and the task, so the worst case is more than the reply alone.
+    verdict = await run(MemoryLedger(PRICES), ask(role=role, last_input_tokens=0, spec=a_spec()))
+    assert projected_of(verdict) > OUTPUT_ONLY
+
+
+async def test_a_long_task_statement_makes_the_first_request_dearer() -> None:
+    short = await run(MemoryLedger(PRICES), ask(last_input_tokens=0, spec=a_spec()))
+    long = await run(MemoryLedger(PRICES), ask(last_input_tokens=0, spec=a_spec("x " * 20_000)))
+    assert projected_of(long) - projected_of(short) > Decimal("0.02")
+
+
+async def test_the_memory_block_and_the_plan_count_in_the_first_request() -> None:
+    plain = await run(MemoryLedger(PRICES), ask(last_input_tokens=0, spec=a_spec()))
+    step = PlanStep(id="s1", description="Change add().", files=["calc.py"], done_when="tests pass")
+    plan = Plan(summary="Fix the sum.", steps=[step], acceptance_checks=["pytest -q"])
+    noted = await run(
+        MemoryLedger(PRICES),
+        ask(last_input_tokens=0, spec=a_spec(), memory_ref=a_ref(30_000), plan=plan),
+    )
+    assert projected_of(noted) - projected_of(plain) > Decimal("0.015")
+
+
+async def test_the_brief_of_a_review_counts_in_the_first_request_of_the_verifier() -> None:
+    bare = await run(
+        MemoryLedger(PRICES), ask(role=Role.VERIFIER, last_input_tokens=0, spec=a_spec())
+    )
+    briefed = await run(
+        MemoryLedger(PRICES),
+        ask(role=Role.VERIFIER, last_input_tokens=0, spec=a_spec(), review=a_review()),
+    )
+    # The checks and the diff are cut to the output caps before the model sees them, so the
+    # brief adds what the cut leaves and not the size of the blobs.
+    assert projected_of(briefed) > projected_of(bare)
+    assert projected_of(briefed) - projected_of(bare) < Decimal("0.02")
+
+
+async def test_a_request_that_follows_another_is_priced_from_the_last_one() -> None:
+    verdict = await run(
+        MemoryLedger(PRICES), ask(last_input_tokens=10_000, spec=a_spec("x " * 50_000))
+    )
+    assert projected_of(verdict) == WORST_CASE
+
+
+async def test_a_verifier_whose_first_request_does_not_fit_the_limit_is_stopped() -> None:
+    # 0.47 of 0.50 is spent, and the reply alone (0.01) fits. The task statement is 30,000 tokens
+    # and costs 0.06 more, so the call must not go ahead.
+    limits = Budgets(task_usd=0.5, task_turns=10, task_wall_minutes=240, daily_repo_usd=50.0)
+    base = ask(
+        role=Role.VERIFIER,
+        last_input_tokens=0,
+        limits=limits,
+        spent_task_usd=0.47,
+        review=a_review(),
+    )
+    assert (await run(MemoryLedger(PRICES), base.model_copy(update={"spec": None}))).ok
+    long = base.model_copy(update={"spec": a_spec("x " * 52_500)})
+    stopped = await run(MemoryLedger(PRICES), long)
+    assert stopped.reason is BudgetReason.TASK_USD
 
 
 async def test_a_retry_after_max_tokens_is_priced_at_the_higher_output_cap() -> None:

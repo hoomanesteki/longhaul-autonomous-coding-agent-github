@@ -60,7 +60,10 @@ What it is built from, and why each piece is what it is:
 * The budgets (LH-702) have two activities. Every worker registers `check_budget`, which the
   workflow calls before each model turn of a task that enforces them. It reads the sums of the
   worker's own ledger, and prices the next call with the model and the output cap of the role
-  from the same config as the model activities. With the GitHub token the worker also registers
+  from the same config as the model activities. For the first request of a transcript, which has
+  no earlier request to measure, it estimates the size from the prompt, the task, the plan, the
+  memory block and the review brief, with the tool list and token meter of the llm activity.
+  With the GitHub token the worker also registers
   `post_budget`, which tells the issue why a budget stopped the task, through the same ledger as
   the other writes.
 * The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers
@@ -390,7 +393,7 @@ def build_parts(
         meters=meters,
         templates=templates_path(settings),
     )
-    budgets = BudgetActivities(pricing, ledger, config_for)
+    budgets = BudgetActivities(pricing, ledger, config_for, tools_for=llm.tools_for, meters=meters)
     tools = ToolActivities(
         registry,
         sandboxes,

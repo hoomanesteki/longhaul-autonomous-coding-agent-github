@@ -2898,6 +2898,22 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 3. **Why not capture prompts in traces?** Prompts contain code and maybe secrets. Content capture is opt-in. Token counts and timings are enough for operations.
 4. **What is in the run report that a reviewer can't see in the diff?** How long it took, how much it cost, whether the Verifier sent it back, whether a person had to step in, and what the agent believes it learned.
 
+#### LH-791 · Budgets for every task and a report that pairs each pause
+- **Epic:** E11 · **Points:** 2 · **Branch:** `fix/lh-791-phase7-gate` · **Depends on:** LH-702, LH-705
+- **Story:** As an operator, I want every way of starting a task to check its budgets and the run report to pair each pause with its own resume, so that the Phase 7 gate holds for eval and local runs too.
+- **Build:**
+  - The eval runner and `longhaul run` start tasks with budgets enforced. `longhaul run --no-budgets` turns the check off, and the header says so.
+  - The paused and resumed events of every pause carry `kind` (`budget` or `hint`). The report pairs a resume with the newest open pause of its number and kind, so a hint pause answered by a top-up and a budget pause with the same number no longer collide.
+  - A daily-limit pause that ends at midnight reads "waited until midnight UTC".
+  - The first request of each role is priced from its system prompt, tools, first message, plan, memory block and review brief, not from zero input tokens.
+  - Integration checkpoint 7 starts Jaeger and the collector and uses the port variables.
+- **Acceptance criteria:**
+  - [ ] An eval task over its dollar cap stops on the budget.
+  - [ ] A hint pause answered by a budget top-up and a budget pause of the same number each show their own wait.
+  - [ ] The first verifier request of a task over its cap is stopped before it is sent.
+- **Tests:** `tests/integration/test_eval_runner.py`, `tests/integration/test_budgets.py`, `tests/unit/test_run_report.py`, `tests/unit/test_activities_cost.py`
+- **Files:** `eval/run.py`, `src/longhaul/cli.py`, `src/longhaul/durable/activities/cost.py`, `src/longhaul/durable/workflows/task.py`, `src/longhaul/reports/render.py`, `docs/runbook.md`, tests
+
 ---
 
 ## Phase 8: Console (tag v0.8.0)

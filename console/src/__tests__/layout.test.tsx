@@ -25,6 +25,19 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/** Answer /healthz with a new copy of the given reply (a body reads once) and the task list with an empty page. */
+function serve(health: () => Response) {
+  fetchStub.mockImplementation((input) =>
+    Promise.resolve(
+      String(input) === "/healthz"
+        ? health()
+        : String(input).startsWith("/api/tasks")
+          ? json({ items: [], next_cursor: null })
+          : json([]),
+    ),
+  );
+}
+
 beforeEach(() => {
   fetchStub.mockReset();
   vi.stubGlobal("fetch", fetchStub);
@@ -36,7 +49,7 @@ afterEach(() => {
 
 describe("layout", () => {
   it("has a nav with Tasks, Memory and Repos", async () => {
-    fetchStub.mockResolvedValue(json({ status: "ok" }));
+    serve(() => json({ status: "ok" }));
     renderAt("/tasks");
 
     const nav = screen.getByRole("navigation", { name: "Main" });
@@ -47,14 +60,14 @@ describe("layout", () => {
   });
 
   it("shows the API as healthy when /healthz answers", async () => {
-    fetchStub.mockResolvedValue(json({ status: "ok" }));
+    serve(() => json({ status: "ok" }));
     renderAt("/tasks");
 
     expect(await screen.findByText("API up")).toBeInTheDocument();
   });
 
   it("shows the API as down when /healthz fails", async () => {
-    fetchStub.mockResolvedValue(json({ detail: "database unavailable" }, 503));
+    serve(() => json({ detail: "database unavailable" }, 503));
     renderAt("/tasks");
 
     expect(await screen.findByText("API down")).toBeInTheDocument();
@@ -82,7 +95,7 @@ describe("layout", () => {
   });
 
   it("sends an unknown address to the tasks page", async () => {
-    fetchStub.mockResolvedValue(json({ status: "ok" }));
+    serve(() => json({ status: "ok" }));
     renderAt("/nowhere");
 
     expect(await screen.findByRole("heading", { name: "Tasks" })).toBeInTheDocument();

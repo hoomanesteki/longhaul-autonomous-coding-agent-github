@@ -106,6 +106,10 @@ function rowOf(title: string): HTMLElement {
   return screen.getByText(title).closest("tr") as HTMLElement;
 }
 
+async function findRow(title: string): Promise<HTMLElement> {
+  return (await screen.findByText(title)).closest("tr") as HTMLElement;
+}
+
 beforeEach(() => {
   fetchStub.mockReset();
   vi.stubGlobal("fetch", fetchStub);
@@ -121,7 +125,7 @@ describe("tasks page", () => {
     serve([CODING, DONE]);
     renderPage();
 
-    const row = rowOf(await screen.findByText("Rename the flag"));
+    const row = await findRow("Rename the flag");
     expect(within(row).getByText("acme/gadgets")).toBeInTheDocument();
     expect(within(row).getByRole("link", { name: "#3" })).toHaveAttribute(
       "href",
@@ -152,7 +156,7 @@ describe("tasks page", () => {
     serve([task({ id: "t-old", title: "An old task", created_at: hoursAgo })]);
     renderPage();
 
-    expect(await within(rowOf(await screen.findByText("An old task"))).findByText("3h")).toBeInTheDocument();
+    expect(within(await findRow("An old task")).getByText("3h")).toBeInTheDocument();
   });
 
   it("marks only paused and awaiting-approval tasks as needing you", async () => {
@@ -170,7 +174,7 @@ describe("tasks page", () => {
     serve([task({ id: "t-1", title: "Manual task", issue_number: null })]);
     renderPage();
 
-    const row = rowOf(await screen.findByText("Manual task"));
+    const row = await findRow("Manual task");
     expect(within(row).queryByRole("link", { name: /#/ })).not.toBeInTheDocument();
   });
 
@@ -230,7 +234,7 @@ describe("tasks page", () => {
     renderPage("/tasks?status=done&repo=acme%2Fgadgets");
 
     expect(await screen.findByText("Rename the flag")).toBeInTheDocument();
-    const url = taskCalls()[0];
+    const url = taskCalls()[0] as URL;
     expect(url.searchParams.get("status")).toBe("done");
     expect(url.searchParams.get("repo")).toBe("acme/gadgets");
     expect(screen.getByLabelText("Status")).toHaveValue("done");

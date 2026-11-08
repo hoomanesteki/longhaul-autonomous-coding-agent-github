@@ -3,18 +3,16 @@ import { useEffect, useMemo } from "react";
 import { Link, useParams } from "react-router-dom";
 
 import { ApiError, getTask, getTimeline } from "../api/client";
+import TaskActions from "../components/TaskActions";
 import Sparkline from "../components/timeline/Sparkline";
 import TaskSummary from "../components/timeline/TaskSummary";
 import Timeline from "../components/timeline/Timeline";
-import { issueUrl } from "../util/tasks";
+import { isEnded, issueUrl } from "../util/tasks";
 import { costSeries, groupTimeline } from "../util/timeline";
 
 const POLL_MS = 10_000;
 // The API's largest page. A timeline is read as a whole, so the fewer requests it takes the better.
 const TIMELINE_PAGE = 500;
-
-// Phases a task does not leave. A task in one of them is not polled any more.
-const ENDED = new Set(["done", "failed", "cancelled"]);
 
 /** One task: where it stands, its plan, and every turn, tool call and event in order. */
 export default function TaskPage() {
@@ -24,11 +22,11 @@ export default function TaskPage() {
     queryFn: () => getTask(taskId),
     refetchInterval: (query) => {
       const data = query.state.data;
-      return data !== undefined && ENDED.has(data.live?.phase ?? data.task.phase) ? false : POLL_MS;
+      return data !== undefined && isEnded(data.live?.phase ?? data.task.phase) ? false : POLL_MS;
     },
   });
   const ended =
-    detail.data !== undefined && ENDED.has(detail.data.live?.phase ?? detail.data.task.phase);
+    detail.data !== undefined && isEnded(detail.data.live?.phase ?? detail.data.task.phase);
 
   const timeline = useInfiniteQuery({
     queryKey: ["timeline", taskId],
@@ -86,6 +84,11 @@ export default function TaskPage() {
       </p>
 
       <TaskSummary detail={detail.data} />
+      <TaskActions
+        taskId={taskId}
+        phase={detail.data.live?.phase ?? task.phase}
+        workflow={detail.data.workflow}
+      />
 
       <div className="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2">
         <h2 className="text-sm font-semibold">Timeline</h2>

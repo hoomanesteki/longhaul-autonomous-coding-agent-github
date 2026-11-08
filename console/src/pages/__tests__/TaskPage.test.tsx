@@ -303,6 +303,56 @@ describe("task header", () => {
   });
 });
 
+describe("actions", () => {
+  it("offers the actions of the live phase and not of the row, which can lag", async () => {
+    serve({
+      detail: detail({
+        live: {
+          task_id: TASK_ID,
+          phase: "awaiting_plan_approval",
+          turn_index: 0,
+          cost_usd: 0.1,
+          last_checkpoint: null,
+          plan_version: 1,
+          paused_reason: null,
+        },
+      }),
+    });
+    renderPage();
+
+    const actions = await screen.findByRole("region", { name: "Actions" });
+    expect(within(actions).getByRole("button", { name: "Approve plan" })).toBeInTheDocument();
+    expect(within(actions).getByRole("button", { name: "Send hint" })).toBeInTheDocument();
+  });
+
+  it("fetches the task again after an action", async () => {
+    const user = userEvent.setup();
+    serve({ items: [] });
+    renderPage();
+    const actions = await screen.findByRole("region", { name: "Actions" });
+    const taskReads = () => urls().filter((url) => url.pathname === `/api/tasks/${TASK_ID}`).length;
+    const before = taskReads();
+    fetchStub.mockImplementationOnce(() =>
+      Promise.resolve(json({ task_id: TASK_ID, signal: "hint", by: "console" })),
+    );
+
+    await user.type(within(actions).getByLabelText("Hint"), "Look at vendor/.");
+    await user.click(within(actions).getByRole("button", { name: "Send hint" }));
+
+    await waitFor(() => expect(taskReads()).toBe(before + 1));
+    expect(await screen.findByRole("status")).toHaveTextContent("Hint sent.");
+  });
+
+  it("says that a task which has ended cannot be acted on", async () => {
+    const over = detail();
+    over.task.phase = "done";
+    serve({ detail: over });
+    renderPage();
+
+    expect(await screen.findByText("This task has ended. There is nothing to do.")).toBeInTheDocument();
+  });
+});
+
 describe("timeline", () => {
   it("shows each turn with its tool calls and what they did", async () => {
     serve({

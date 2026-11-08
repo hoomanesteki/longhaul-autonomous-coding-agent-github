@@ -715,6 +715,16 @@ async def test_actions_report_unreachable_temporal(api: Stack) -> None:
     assert response.status_code == 503
 
 
+async def test_cancel_action_takes_a_null_body_like_the_console_sends(api: Stack) -> None:
+    # The console sends the JSON text `null` when it has no reason to give. Reaching Temporal
+    # (and failing there, 503) means the body passed validation.
+    response = await api.client.post(
+        f"/api/tasks/{TASK}/cancel", content="null", headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code == 503
+
+
 # ---------- /api/memory ----------
 async def seed_memory(stack: Stack) -> dict[str, str]:
     store = PgMemoryStore(stack.sessions, HashEmbedder())

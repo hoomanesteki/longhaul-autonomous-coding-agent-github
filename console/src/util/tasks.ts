@@ -23,6 +23,14 @@ export function needsYou(task: Pick<TaskSummary, "phase">): string | null {
   return WAITING_FOR[task.phase] ?? null;
 }
 
+// Phases a task does not leave.
+const ENDED = new Set(["done", "failed", "cancelled"]);
+
+/** True when the task is over: it will not change again and nothing can steer it. */
+export function isEnded(phase: string): boolean {
+  return ENDED.has(phase);
+}
+
 /** Cents, except for a cost too small to show in cents, which would read as free. */
 export function formatCost(usd: number): string {
   if (usd > 0 && usd < 0.01) return "<$0.01";

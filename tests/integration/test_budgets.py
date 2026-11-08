@@ -21,7 +21,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -50,9 +50,12 @@ from longhaul.contracts import (
     RepoSettings,
     Role,
     Sandbox,
+    StopReason,
     TaskSpec,
+    TextBlock,
     Usage,
 )
+from longhaul.cost.budget import BudgetVerdict
 from longhaul.cost.ledger import LedgerEntry
 from longhaul.cost.ledger import MemoryLedger as CostLedger
 from longhaul.cost.pricing import Pricing
@@ -124,16 +127,52 @@ def write_script(tmp_path: Path, steps: list[dict[str, Any]]) -> Path:
 
 # ---------- the provider ----------
 class Probe(ScriptedProvider):
-    """A scripted provider that counts the model calls of the coder."""
+    """A scripted provider that counts the model calls of the coder.
 
-    def __init__(self, script: Path) -> None:
+    `first_replies` are answers for the first coder calls, before the script takes over. A
+    script is keyed on the request, and a retry or a continuation sends the same turn again, so
+    a test that needs a reply cut off at max_tokens or paused queues it here. `caps` is the
+    output cap of each coder call.
+    """
+
+    def __init__(self, script: Path, first_replies: list[LLMResponse] | None = None) -> None:
         super().__init__(script)
         self.calls = 0
+        self.caps: list[int] = []
+        self.first_replies = list(first_replies or [])
 
     async def complete(self, **kwargs: Any) -> LLMResponse:
         if parse_role_line(kwargs["system"]) == "coder":
             self.calls += 1
+            self.caps.append(kwargs["max_tokens"])
+            if self.first_replies:
+                return self.first_replies.pop(0)
         return await super().complete(**kwargs)
+
+
+def cut(stop: StopReason) -> LLMResponse:
+    """A coder reply that stops for `stop` with a little text, which the loop will not use."""
+    return LLMResponse(
+        content=[TextBlock(text="Looking at the notes first.")],
+        tool_calls=[],
+        stop_reason=stop,
+        usage=Usage(input_tokens=2_000, output_tokens=300),
+        model=SONNET,
+        latency_ms=1,
+    )
+
+
+class Recording(BudgetActivities):
+    """The check_budget activity, keeping what the workflow asked it."""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.seen: list[acts.CheckBudgetInput] = []
+
+    @activity.defn(name=acts.CHECK_BUDGET.name)
+    async def check_budget(self, inp: acts.CheckBudgetInput) -> BudgetVerdict:
+        self.seen.append(inp)
+        return await super().check_budget(inp)
 
 
 # ---------- a worker with a fake sandbox ----------
@@ -177,6 +216,7 @@ class World:
     costs: CostLedger
     fake: FakeGitHub | None = None
     number: int | None = None
+    checks: list[acts.CheckBudgetInput] = field(default_factory=list)
 
     def events(self, kind: str) -> list[dict[str, Any]]:
         return [e.payload for e in self.recorder.events if e.type == kind]
@@ -217,12 +257,13 @@ async def light(
     script: Path,
     *,
     tmp_path: Path | None = None,
+    first_replies: list[LLMResponse] | None = None,
 ) -> AsyncIterator[World]:
     """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue."""
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     costs = CostLedger(PRICES)
-    provider = Probe(script)
+    provider = Probe(script, first_replies)
     registry = default_registry(test_command="true", blobs=blobs)
 
     def config_for(role: Role) -> LoopConfig:
@@ -247,7 +288,7 @@ async def light(
         ledger=costs,
         templates=TEMPLATES,
     )
-    budgets = BudgetActivities(PRICES, costs, config_for)
+    budgets = Recording(PRICES, costs, config_for)
     boxes = Boxes()
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
     github: Github | None = None
@@ -286,7 +327,7 @@ async def light(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield World(queue, provider, recorder, costs, fake, number)
+            yield World(queue, provider, recorder, costs, fake, number, budgets.seen)
     finally:
         await boxes.destroy_all()
         if github is not None:
@@ -582,6 +623,84 @@ async def test_the_planner_is_held_to_the_budget_too(
     assert outcome.kind is OutcomeKind.PR_OPENED
     (resumed,) = world.events("resumed")
     assert resumed["via"] == "budget"
+
+
+# ---------- every model call, not only the first of a turn ----------
+async def test_a_turn_that_pauses_is_checked_again_before_it_goes_on(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    # The continued request ends with the text so far, as an assistant message, which the script
+    # counts as a turn of its own.
+    again = {"match": {"role": "coder", "turn_index": 1}, "respond": {"tool_calls": [FINISH]}}
+    script = write_script(tmp_path, [*reads_then_finish(0), again])
+    limits = Budgets(task_usd=50.0, task_turns=60, task_wall_minutes=240, daily_repo_usd=500.0)
+    async with light(env, script, first_replies=[cut("pause_turn")]) as world:
+        handle = await begin(env, world, world.spec(limits))
+        outcome = await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    names = timeline(history)
+    assert names == ["check_budget", "llm_turn", "check_budget", "llm_turn"]
+    assert_checked_before_every_turn(names)
+    assert [seen.high_output_cap for seen in world.checks] == [False, False]
+
+
+async def test_a_retry_after_max_tokens_is_priced_at_its_own_cap_and_can_be_held_back(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    # The first call fits, as it is priced at 1,000 output tokens. The retry may use 64,000,
+    # which is about 0.64 dollars on sonnet, and the task has 0.04 to spend.
+    script = write_script(tmp_path, reads_then_finish(0))
+    async with light(env, script, first_replies=[cut("max_tokens")]) as world:
+        handle = await begin(env, world, world.spec(SMALL_TASK))
+        await paused(world, handle)
+        assert world.provider.calls == 1, "the retry was not sent"
+        assert [seen.high_output_cap for seen in world.checks] == [False, True]
+        (asked,) = world.events("paused")
+        assert asked["reason"] == "task_usd"
+
+        await top_up(handle, usd=5.0)
+        outcome = await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert world.provider.caps == [1000, 64000]
+    assert_checked_before_every_turn(timeline(history))
+
+
+async def test_the_first_coder_turn_is_not_priced_with_the_planners_last_request(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [
+        {"match": {"role": "planner", "turn_index": 0}, "respond": {"tool_calls": [READ]}},
+        {
+            "match": {"role": "planner", "turn_index": 1},
+            "respond": {"tool_calls": [{"name": "submit_plan", "input": PLAN}]},
+        },
+        {
+            "match": {"role": "coder", "turn_index": 0},
+            "respond": {
+                "tool_calls": [{"name": "submit_for_review", "input": {"summary": SUMMARY}}]
+            },
+        },
+    ]
+    limits = Budgets(task_usd=50.0, task_turns=60, task_wall_minutes=240, daily_repo_usd=500.0)
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(
+            env.client,
+            world.spec(limits),
+            task_queue=world.queue,
+            plan=True,
+            enforce_budgets=True,
+        )
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    planner_checks = [seen for seen in world.checks if seen.role is Role.PLANNER]
+    (coder_check,) = [seen for seen in world.checks if seen.role is Role.CODER]
+    assert planner_checks[-1].last_input_tokens > 0, "the planner's second turn follows a request"
+    assert coder_check.last_input_tokens == 0, "the transcript of the coder starts empty"
 
 
 # ---------- the wall clock ----------

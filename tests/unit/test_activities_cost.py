@@ -75,6 +75,22 @@ async def test_a_task_with_room_left_is_ok_and_the_numbers_show_the_worst_case()
     assert verdict.numbers.task_usd_limit == 1.0 and verdict.numbers.turns_limit == 10
 
 
+async def test_a_retry_after_max_tokens_is_priced_at_the_higher_output_cap() -> None:
+    # 10,000 tokens in at 2 dollars per million is 0.02, and 5,000 out at 10 per million is 0.05.
+    ledger = MemoryLedger(PRICES)
+    verdict = await run(ledger, ask(high_output_cap=True))
+    assert Decimal(str(verdict.numbers.projected_usd)) == Decimal("0.070000")
+
+
+async def test_a_retry_that_does_not_fit_is_stopped_where_the_first_call_fit() -> None:
+    ledger = MemoryLedger(PRICES)
+    await spend(ledger, "lh-acme-calc-42", "acme/calc", 1)
+    limits = Budgets(task_usd=1.05, task_turns=10, task_wall_minutes=240, daily_repo_usd=50.0)
+    assert (await run(ledger, ask(limits=limits))).ok
+    stopped = await run(ledger, ask(limits=limits, high_output_cap=True))
+    assert stopped.reason is BudgetReason.TASK_USD
+
+
 async def test_the_task_total_comes_from_the_ledger() -> None:
     ledger = MemoryLedger(PRICES)
     await spend(ledger, "lh-acme-calc-42", "acme/calc", 1)  # 1.00 spent, 0.03 more is over 1.00

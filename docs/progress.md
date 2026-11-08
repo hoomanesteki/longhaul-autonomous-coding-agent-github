@@ -80,9 +80,9 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-501 | Planner role and plan schema | 5 | Done | merge | 2026-11-07 |
-| LH-502 | Human plan gate | 3 | Todo | | |
+| LH-502 | Human plan gate | 3 | Done | merge | 2026-11-08 |
 | LH-503 | Coder role with step tracking | 5 | Done | merge | 2026-11-07 |
-| LH-504 | Verifier role and send-back loop | 5 | Todo | | |
+| LH-504 | Verifier role and send-back loop | 5 | Done | merge | 2026-11-08 |
 | LH-505 | Stuck detector | 5 | Done | merge | 2026-11-07 |
 | LH-506 | Pause, ask and hint flow | 3 | Todo | | |
 | LH-507 | Final outcomes and stuck report | 3 | Todo | | |

@@ -396,9 +396,9 @@ def test_run_calc_durable(durable: Durable, tmp_path: Path) -> None:
     assert "Traceback" not in output, shown
     task_id = durable.task_id_of(run)
     assert "finished after 5 turns: Changed add()" in output, shown
-    # The run prints a status line when its poll sees a change, so a fast scripted run can go
-    # from preparing to done between two polls; the last line names the turns the coder took.
-    assert "status: done, 5 turns done" in output, shown
+    # No status line is checked: the run prints one only when its poll sees a change, and a fast
+    # scripted run can pass coding or done between two polls. The finish line above and the turn
+    # counter below show the coder took its five turns.
     assert_the_reference_fix(output, tmp_path)
     assert snapshot(CALC) == before, "the source folder was changed"
     assert leftovers(task_id) == ([], [])

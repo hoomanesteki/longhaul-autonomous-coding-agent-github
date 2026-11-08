@@ -25,9 +25,8 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.context.human_summary import SUMMARY_TOOL_NAME
 from temporalio import activity
-from temporalio.client import WorkflowHandle
+from temporalio.client import WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
@@ -36,6 +35,7 @@ from tests.fakes.fake_github import FakeGitHub
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.context.human_summary import SUMMARY_TOOL_NAME
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -643,3 +643,22 @@ async def test_the_history_of_a_pause_replays(env: WorkflowEnvironment, tmp_path
     )
     for history in (resumed, ended):
         await replayer.replay_workflow(history)
+
+
+@pytest.mark.parametrize("name", ["stuck_signal_recorded", "ask_human_ended"])
+async def test_histories_from_before_the_pause_replay(name: str) -> None:
+    """A run that began before this story keeps the behaviour it recorded (F13).
+
+    The two files were recorded with the code of the commit before LH-506. In the first, a stuck
+    signal was only noted and the task went on. In the second, `ask_human` noted the question and
+    ended the task as stuck. Neither has the marker of the pause, so the new code takes the old
+    way at the same places and makes the same commands.
+    """
+    path = ROOT / "tests" / "fixtures" / "histories" / f"{name}.json"
+    history = WorkflowHistory.from_json(f"replay-{name}", path.read_text(encoding="utf-8"))
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)

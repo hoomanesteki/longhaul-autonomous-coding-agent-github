@@ -10,8 +10,8 @@ goes:
 | paused for a person | `longhaul:needs-human` is added |
 | resumed | `longhaul:needs-human` is removed |
 
-Pause and resume arrive in Phases 5 and 7. Their helpers are here so that those stories only
-have to call them.
+The pause for a hint (LH-506) uses the last two rows and `stuck_comment`. The pause for a plan
+or a budget (Phases 5 and 7) will use the same helpers.
 
 The commands of LH-308 add two comments. `status_comment` is what a task posts when a
 maintainer asks `/longhaul status`, and `denied_comment` is the answer to a command from
@@ -47,6 +47,7 @@ __all__ = [
     "on_resume",
     "pickup_comment",
     "status_comment",
+    "stuck_comment",
 ]
 
 WORKING = "longhaul:working"
@@ -133,6 +134,22 @@ def on_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
 def on_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
     """The person answered. `pause` is the number that on_pause was given."""
     return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off", pause))]
+
+
+def stuck_comment(spec: TaskSpec, pause: int, body: str) -> CommentInput:
+    """The question that a paused task asks on its issue. `pause` counts the pauses from 1.
+
+    Each pause is a separate effect, so the key holds its number: `<task>:stuck:<n>`. The body is
+    rendered by the summarize_for_human activity (github/stuck_comment.py), and the workflow
+    passes it on as it is.
+    """
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=body,
+        idempotency_key=key_of(spec.task_id, "stuck", pause),
+    )
 
 
 def status_comment(spec: TaskSpec, status: TaskStatus, *, by: str, n: int) -> CommentInput:

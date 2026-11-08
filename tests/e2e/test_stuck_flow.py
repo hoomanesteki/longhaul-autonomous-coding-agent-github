@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -86,10 +86,10 @@ async def test_stuck_pause_hint_resume(stuck_stack: Stack) -> None:
         )
 
 
-async def wait_for_question(stack: Stack, issue: int, key: str) -> None:
+async def wait_for(stack: Stack, what: str, done: Callable[[], bool]) -> None:
     deadline = time.monotonic() + QUESTION_WAIT_S
-    while stack.fake.count_comments(stack.repo, issue, containing=key) == 0:
-        assert time.monotonic() < deadline, f"no question on the issue:\n{stack.worker_log()}"
+    while not done():
+        assert time.monotonic() < deadline, f"no {what} on the issue:\n{stack.worker_log()}"
         await asyncio.sleep(0.5)
 
 
@@ -120,7 +120,9 @@ async def stuck_to_pr(stack: Stack) -> None:
 
     # The loop triggers the rule, the task pauses and asks.
     key = f"<!-- longhaul:key={task_id}:stuck:1 -->"
-    await wait_for_question(stack, issue, key)
+    await wait_for(stack, "question", lambda: fake.count_comments(repo, issue, containing=key) > 0)
+    # The label follows the comment, so the status is read once both are there.
+    await wait_for(stack, "label", lambda: NEEDS_HUMAN in fake.label_names(repo, issue))
     handle = get_task(client, task_id)
     status = await handle.query(TaskWorkflow.status)
     assert status.phase is Phase.PAUSED, stack.worker_log()

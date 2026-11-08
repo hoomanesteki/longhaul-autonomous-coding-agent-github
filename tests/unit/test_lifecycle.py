@@ -218,3 +218,14 @@ def test_whatever_the_login_the_denial_key_is_a_valid_key(login: str) -> None:
 
     workflow_id, purpose, seq = key.split(":")
     assert effect_key(workflow_id, purpose, int(seq)) == key
+
+
+def test_each_pause_has_a_question_key_of_its_own() -> None:
+    first = lifecycle.stuck_comment(spec(), 1, "the question")
+    second = lifecycle.stuck_comment(spec(), 2, "the question")
+
+    assert (first.task_id, first.repo, first.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert first.body == "the question"
+    assert first.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 1)
+    assert second.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 2)
+    assert not has_marker(first.body), "the marker is added by post_comment"

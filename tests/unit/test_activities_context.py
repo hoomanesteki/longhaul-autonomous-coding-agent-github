@@ -572,10 +572,10 @@ def test_a_policy_that_keeps_no_turn_is_refused() -> None:
         ContextActivities(FakeProvider(), MemoryBlobStore(), TOOLS, config_for, policy)
 
 
-def test_the_activity_list_is_the_compact_activity() -> None:
+def test_the_activity_list_is_the_compact_and_the_question_activities() -> None:
     activities = ContextActivities(FakeProvider(), MemoryBlobStore(), TOOLS, config_for, POLICY)
 
-    assert [fn.__name__ for fn in activities.activities] == ["compact"]
+    assert [fn.__name__ for fn in activities.activities] == ["compact", "summarize_for_human"]
 
 
 # ---------- the modes (LH-406) ----------

@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.context.human_summary import SUMMARY_TOOL_NAME
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -19,6 +18,7 @@ from longhaul.agent.loop import LoopConfig
 from longhaul.agent.prompts import FIRST_USER_MESSAGE
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.context.human_summary import SUMMARY_TOOL_NAME
 from longhaul.contracts import (
     BlobRef,
     LLMResponse,

@@ -16,8 +16,9 @@ for them, and the workflow handles each call itself:
   transcript (ADR-0013), which llm_turn rewrites in place after an update.
 - `submit_for_review(summary)` ends the coding phase. Until the verifier (LH-504) exists it ends
   the task as `finish` does.
-- `ask_human(question)` is meant to pause the task for a person (LH-506). Until that flow exists
-  the workflow records the question and ends the task as stuck, with the question in the summary.
+- `ask_human(question)` pauses the task for a person (LH-506). The workflow asks the question on
+  the issue, waits for a hint, and puts the coder back to work with the answer in front of it.
+  With no answer in 24 hours the task ends as stuck, with the question in the summary.
 
 A call to `finish` in a task with a plan is still honoured, as `submit_for_review`. The coder is
 not offered it, but a worker or a history from before this story may still send it, and running a
@@ -330,7 +331,7 @@ def _question(arguments: Mapping[str, Any] | None) -> str | None:
 
 # ---------- how a run ends ----------
 def asked_outcome(question: str) -> Outcome:
-    """The end of a run whose coder asked a person. LH-506 replaces the end with a pause."""
+    """The end of a run whose coder asked a person, as it was before the pause (LH-506)."""
     return Outcome(
         kind=OutcomeKind.STUCK, summary=_cut(f"asked a person: {question}", MAX_SUMMARY_CHARS)
     )

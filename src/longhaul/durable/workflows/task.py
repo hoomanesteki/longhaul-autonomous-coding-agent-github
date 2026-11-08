@@ -80,9 +80,8 @@ and `ask_human` in place of `finish`, and reads the plan in the first message of
    DELIVERING. Until the verifier exists (LH-504) nothing stands between the two. A call to
    `finish` still ends such a task, for a worker or a history from before this story. The
    `build_pr_branch` activity gets the plan, and makes one commit for each done step.
-3. `ask_human` is where the pause of LH-506 will go. Until it exists, the workflow records a
-   `paused` event with the question and ends the task with outcome STUCK, in phase PAUSED, and a
-   summary that names the question. `_ask_human` is the one place to replace.
+3. `ask_human` pauses the task for a person, as a stuck signal does (see "The pause for a hint"
+   below).
 
 `status()` of a task with a plan answers with `acts.PlannedStatus`: the TaskStatus and the plan
 with the status of each step. TaskStatus is a contract and has no field for the plan. A client
@@ -98,12 +97,43 @@ turn to the detector of roles/stuck.py. The detector keeps its window in `state.
 it crosses a hand-over. Its facts come from two places: tool_exec returns a `CallSignal` with each
 result (acts.ToolExecResult), and the workflow adds what only it knows, the steps done and which
 calls failed. When a rule fires, the workflow records one `stuck` event with the reason and the
-evidence, and the task goes on. The pause and the question to a person are LH-506's, and `_watch`
-returns the signal for that flow to act on. The planner is not watched: its calls get no facts,
-and the detector is told the phase besides. The thresholds are the `stuck` section of the config,
-copied into roles/stuck.py because the workflow cannot read the config file, and a worker whose
-config differs stops at the start. Replay: the event is the one command this adds, and only on a
-turn where a rule fires, so a history in which none does replays as it was.
+evidence, and `_watch` returns the signal for the pause to act on. The planner is not watched:
+its calls get no facts, and the detector is told the phase besides. The thresholds are the
+`stuck` section of the config, copied into roles/stuck.py because the workflow cannot read the
+config file, and a worker whose config differs stops at the start. Replay: the event is the one
+command this adds, and only on a turn where a rule fires, so a history in which none does replays
+as it was.
+
+The pause for a hint (LH-506, ADR-0007). A stuck signal from `_watch`, or a good `ask_human` call,
+pauses the task in `_pause`:
+
+1. The phase becomes PAUSED. The workflow notes how many hints and budget top-ups it has by now,
+   before anything else is awaited, so that a signal that arrives while the question is written
+   counts as an answer to it. A hint that came earlier answered nothing yet.
+2. `summarize_for_human`, a call to the compactor model, writes what the agent is trying to do,
+   what it tried, its guess and one question, and renders them as the comment of
+   templates/stuck_comment.md.j2. Its cost is added to the task. A task of an issue then posts
+   the comment under the key `stuck:<n>` and adds `longhaul:needs-human`, through the side-effect
+   activities. A local task has no issue, so the comment goes into the `paused` event.
+3. The workflow waits for a `hint`, an `add_budget` or a `cancel`, up to `stuck.hint_wait_hours`
+   (acts.HINT_WAIT_HOURS, a copy of the config value like the detector's limits).
+
+A hint or a top-up resumes the task: the detector's window is emptied, `needs-human` is taken
+off, a `resumed` event is recorded, `state.stuck_count` goes up by one and the phase is CODING
+again. The hint is shown to the model on the next turn like any other (turns.show_hints), as
+"Hint from <user>: <text>" after the results of the turn that paused. `stuck_count` is the number
+of pauses that have ended, so the next pause is `stuck_count + 1`, which is the `n` of the key and
+survives a hand-over in CarryState. A task that is stuck after its third pause (stuck.MAX_PAUSES),
+and a task whose wait runs out, end with outcome STUCK in phase FAILED. A cancel during the wait
+takes the usual cancel path. The final comment and labels of those ends are LH-507's.
+
+Each hint is cut to agent/hints.MAX_HINT_BYTES when its signal arrives. The hints of a task stay
+in the state for its whole life, and every `llm_turn` takes all of them as input.
+
+Replay. The pause is behind `workflow.patched(PAUSE_PATCH)`. A history from before this story
+has no marker and replays as it ran: a stuck signal was only recorded, and `ask_human` recorded
+a `paused` event and ended the task as stuck in phase PAUSED. Drop the patch with
+`workflow.deprecate_patch` once no run that began before this story is open.
 
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
@@ -122,9 +152,10 @@ A task of an issue (LH-306) is one whose repo is owner/name and whose spec has a
 3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
    because GitHub refuses a pull request with no commit.
 
-Pause and resume (Phases 5 and 7) add and remove `longhaul:needs-human` through `_needs_human`
-and `_human_done`, which are here for them. Nothing calls them yet. The labels of a task that
-ends any other way (an error, a cancel) are left alone until LH-507.
+The pause for a hint adds and removes `longhaul:needs-human` through `_needs_human` and
+`_human_done`. The pause for a plan or a budget (Phases 5 and 7) will use them too. The labels of
+a task that ends any other way (an error, a cancel, a pause nobody answered) are left alone until
+LH-507.
 
 `/longhaul status` on the issue reaches the task as the signal `report_status` (LH-308). The
 handler posts a comment with the state of the task through the `post_comment` activity, so it is
@@ -149,9 +180,12 @@ can tell them apart without reading prose:
 The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
 ERROR "planner submitted no plan in 20 turns".
 
-Not here yet, each in its own story: the plan gate and the verifier phase (Phase 5), the pause
-for a question (LH-506), budget enforcement and pauses (Phase 7), clean-up and a final outcome
-for runs that end any way but a cancel (LH-507). An activity that fails for good, after its
+The pause for a hint adds two: STUCK with the reason, the evidence or the question, and "no hint in
+24 hours" or "3 hints did not unblock the task" (roles/stuck.py).
+
+Not here yet, each in its own story: the plan gate and the verifier phase (Phase 5), budget
+enforcement and pauses (Phase 7), clean-up and a final outcome for runs that end any way but a
+cancel (LH-507). An activity that fails for good, after its
 retries, fails the workflow with that error. A prompt over the context window is the exception,
 and it is handled as described next.
 
@@ -290,7 +324,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, FailureError
 # 30 ms per run and keeps one class object for each model, so an isinstance check against a
 # model that came from outside still works (ADR-0004, appendix section 1).
 with workflow.unsafe.imports_passed_through():
-    from longhaul.agent import rules
+    from longhaul.agent import hints, rules
     from longhaul.context.modes import ContextMode
     from longhaul.context.tokens import Decision
     from longhaul.contracts import (
@@ -301,6 +335,7 @@ with workflow.unsafe.imports_passed_through():
         Plan,
         ProviderErrorKind,
         Role,
+        StuckReason,
         StuckSignal,
         TaskStatus,
         ToolResult,
@@ -339,10 +374,17 @@ LOAD_MEMORY_PATCH = "lh-604-load-memory"
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
 
-# The event a question to a person records (plan section 3.5). LH-506 writes the same event when it
-# builds the pause.
+# The events of a pause (plan section 3.5). `paused` has the `reason` (a StuckReason value), the
+# `pause` number, the `question`, the `turn_index` and, for a local task, the `comment`. `resumed`
+# has the `pause` number, `via` ("hint" or "budget") and, for a hint, who gave it.
 PAUSED_EVENT = "paused"
-ASKED_REASON = "agent_asked"
+RESUMED_EVENT = "resumed"
+ASKED_REASON = StuckReason.AGENT_ASKED.value
+HINT_VIA = "hint"
+BUDGET_VIA = "budget"
+
+# The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
+PAUSE_PATCH = "lh-506-pause-for-hint"
 
 # The event a stuck detection records (plan section 3.5). The payload has the `reason`, which the
 # metrics count (telemetry/metrics.py), the `evidence` lines and the `turn_index`.
@@ -365,6 +407,15 @@ class _Ran:
     results: list[ToolResult]
     finish: str | None
     question: str | None = None
+
+
+@dataclass(frozen=True)
+class _Unanswered:
+    """What the task had when it paused, so that only a later signal counts as the answer."""
+
+    hints: int
+    usd: float
+    turns: int
 
 
 class _CancelRequested(Exception):
@@ -444,6 +495,8 @@ class TaskWorkflow:
         # The status comments posted so far, which a hand-over carries in the memo. None until
         # the first request of this run: only then is the memo read (see _next_status_number).
         self.status_posts: int | None = None
+        # Why the task waits for a person, for the status. None unless it is paused.
+        self.paused_reason: str | None = None
 
     # ---------- signals and the query ----------
     @workflow.signal
@@ -454,7 +507,9 @@ class TaskWorkflow:
 
     @workflow.signal
     def hint(self, by: str, text: str) -> None:
-        self.state.hints.append(f"{by}: {text}")
+        # Cut here, in the handler, because the hints stay in the state for the whole task and
+        # every llm_turn takes all of them as input (agent/hints.py).
+        self.state.hints.append(f"{hints.clip_author(by)}: {hints.clip_hint(text)}")
 
     @workflow.signal
     def add_budget(self, by: str, usd: float, turns: int) -> None:
@@ -516,6 +571,7 @@ class TaskWorkflow:
             last_checkpoint=state.head_sha,
             # CarryState counts from 0 for "no plan yet", TaskStatus says None.
             plan_version=state.plan_version or None,
+            paused_reason=self.paused_reason,
             outcome=self.outcome,
         )
         if state.plan is None:
@@ -945,9 +1001,15 @@ class TaskWorkflow:
         state.turn_index = index + 1
         if ran.finish is not None:
             return self._finish(rules.finished(ran.finish))
+        stuck_now: StuckSignal | None
         if ran.question is not None:
-            return await self._ask_human(ran.question)
-        await self._watch(index, calls, ran.results, finished)
+            stuck_now = StuckSignal(reason=StuckReason.AGENT_ASKED, evidence=[ran.question])
+        else:
+            stuck_now = await self._watch(index, calls, ran.results, finished)
+        if stuck_now is not None:
+            ended = await self._pause(stuck_now)
+            if ended is not None:
+                return ended
         await self._relieve(index, sampled.context_decision)
         return None
 
@@ -1024,7 +1086,7 @@ class TaskWorkflow:
         `results` are the results of every call of the turn, and `ran` the answers made as the
         calls ran. The ones tool_exec made carry the facts, and a step update's answer has none.
         The window is written back to the state before the event, so a hand-over right after it
-        carries the window. LH-506 acts on the signal that is returned.
+        carries the window. The signal that is returned is what `_pause` acts on.
         """
         state = self.state
         done = sum(1 for step in state.plan.steps if step.status == "done") if state.plan else 0
@@ -1046,22 +1108,113 @@ class TaskWorkflow:
             )
         return found
 
-    async def _ask_human(self, question: str) -> Outcome:
-        """The coder asked a person. LH-506 replaces this with the pause and the wait.
+    # ---------- the pause for a hint ----------
+    async def _pause(self, signal: StuckSignal) -> Outcome | None:
+        """Ask a person for help and wait. None when the task is unblocked and goes on.
 
-        It records the question and the phase it would pause in, PAUSED, and ends the task as
-        stuck with the question in the summary. The labels and the comment on the issue are the
-        pause flow's work, so a task of an issue keeps its working label here.
+        An outcome means the task ends here: it has had all its pauses, or nobody answered in
+        time. A cancel during the wait unwinds to the cancel path.
         """
+        state = self.state
+        if not workflow.patched(PAUSE_PATCH):
+            return await self._asked_before_the_pause(signal)
+        if state.stuck_count >= stuck.MAX_PAUSES:
+            return self._end(stuck.pauses_used_outcome(signal), Phase.FAILED)
+        pause = state.stuck_count + 1
+        wait = acts.hint_wait(self._tuning())
+        # Counted before the first await. A hint that arrives while the question is written is
+        # then an answer to it, and one that came before it answered nothing yet.
+        seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
+        state.phase = Phase.PAUSED
+        self.paused_reason = f"waiting for a hint after {signal.reason.value.replace('_', ' ')}"
+        await self._ask(signal, pause)
+        try:
+            await workflow.wait_condition(
+                lambda: self._answered(seen) is not None or self.cancel_request is not None,
+                timeout=wait,
+            )
+        except TimeoutError:
+            self._stop_if_cancelled()
+            return self._end(stuck.unanswered_outcome(signal, wait), Phase.FAILED)
+        self._stop_if_cancelled()
+        await self._resume(pause, seen)
+        return None
+
+    async def _asked_before_the_pause(self, signal: StuckSignal) -> Outcome | None:
+        """What a run did before the pause existed, for the histories that recorded it.
+
+        A stuck signal had only been recorded, and `ask_human` recorded the question and ended
+        the task as stuck in phase PAUSED.
+        """
+        if signal.reason is not StuckReason.AGENT_ASKED:
+            return None
+        question = signal.evidence[0]
         await self._note(
             PAUSED_EVENT,
-            {
-                "reason": ASKED_REASON,
-                "question": question,
-                "turn_index": self.state.turn_index,
-            },
+            {"reason": ASKED_REASON, "question": question, "turn_index": self.state.turn_index},
         )
         return self._end(coder.asked_outcome(question), Phase.PAUSED)
+
+    async def _ask(self, signal: StuckSignal, pause: int) -> None:
+        """Write the question and show it: on the issue, or in the event of a local task."""
+        state = self.state
+        spec = state.spec
+        asked = await self._call(
+            acts.SUMMARIZE_FOR_HUMAN,
+            acts.SummarizeInput(
+                task_id=spec.task_id,
+                turn_index=max(state.turn_index - 1, 0),
+                spec=spec,
+                transcript_ref=state.transcript_ref,
+                notes=state.notes,
+                reason=signal.reason,
+                evidence=signal.evidence,
+                pause=pause,
+                script_ref=self._script(),
+            ),
+        )
+        state.cost_usd += asked.cost_usd
+        payload: dict[str, Any] = {
+            "reason": signal.reason.value,
+            "pause": pause,
+            "question": asked.question,
+            "turn_index": state.turn_index,
+        }
+        if lifecycle.is_github_task(spec):
+            await self._call(acts.POST_COMMENT, lifecycle.stuck_comment(spec, pause, asked.comment))
+            await self._needs_human(pause)
+        else:
+            payload["comment"] = asked.comment
+        # The event comes last, so that whoever sees it can rely on the comment and the label.
+        await self._note(PAUSED_EVENT, payload)
+
+    def _answered(self, seen: _Unanswered) -> str | None:
+        """How the pause was answered since `seen`: by a hint, by a budget top-up, or not yet."""
+        state = self.state
+        if len(state.hints) > seen.hints:
+            return HINT_VIA
+        if state.extra_budget_usd > seen.usd or state.extra_turns > seen.turns:
+            return BUDGET_VIA
+        return None
+
+    async def _resume(self, pause: int, seen: _Unanswered) -> None:
+        """Go back to coding from a clean slate.
+
+        The hint is already in `state.hints`, and the next llm_turn shows it to the model. The
+        detector starts again from an empty window, so a pattern that goes on builds up from
+        nothing, and `stuck_count` counts the pause as spent.
+        """
+        state = self.state
+        via = self._answered(seen)
+        payload: dict[str, Any] = {"pause": pause, "via": via, "turn_index": state.turn_index}
+        if via == HINT_VIA:
+            payload["by"] = state.hints[seen.hints].split(": ", 1)[0]
+        state.stuck_count += 1
+        state.stuck_window = []
+        state.phase = Phase.CODING
+        self.paused_reason = None
+        await self._human_done(pause)
+        await self._note(RESUMED_EVENT, payload)
 
     async def _end_lost(
         self,
@@ -1456,5 +1609,6 @@ class TaskWorkflow:
 
     def _end(self, outcome: Outcome, phase: Phase) -> Outcome:
         self.state.phase = phase
+        self.paused_reason = None
         self.outcome = outcome
         return outcome

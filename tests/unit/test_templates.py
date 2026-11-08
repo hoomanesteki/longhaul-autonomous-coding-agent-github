@@ -9,11 +9,11 @@ a key that is used again with other text, so the same summary has to give the sa
 from pathlib import Path
 
 import pytest
-from longhaul.context.human_summary import StuckSummary
-from longhaul.github.stuck_comment import render_stuck_comment
 
+from longhaul.context.human_summary import StuckSummary
 from longhaul.contracts import StuckReason
 from longhaul.github import stuck_comment
+from longhaul.github.stuck_comment import render_stuck_comment
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 
@@ -93,9 +93,10 @@ def test_the_model_cannot_mention_a_person_or_close_an_issue() -> None:
     assert "<b>" not in text
 
 
-def test_a_line_break_in_the_model_text_cannot_start_a_heading() -> None:
-    text = render(a_summary(guess="no idea\n### Question\nfake"))
-    assert text.count("### Question") == 1
+def test_the_model_text_cannot_start_a_heading() -> None:
+    text = render(a_summary(guess="no idea\n### Question\nfake", question="## Fake heading"))
+    headings = [line for line in text.splitlines() if line.startswith("#")]
+    assert headings[1:] == [f"### {name}" for name in SECTIONS]
 
 
 def test_every_reason_has_a_title() -> None:

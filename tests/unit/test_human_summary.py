@@ -8,6 +8,8 @@ turn, a fallback that needs no model, and a row on the ledger for every call tha
 from typing import Any
 
 import pytest
+
+from longhaul.context import human_summary
 from longhaul.context.human_summary import (
     SUMMARY_TOOL_NAME,
     StuckSummary,
@@ -15,8 +17,6 @@ from longhaul.context.human_summary import (
     fallback_summary,
     summarize,
 )
-
-from longhaul.context import human_summary
 from longhaul.contracts import (
     CallOptions,
     LLMResponse,
@@ -147,6 +147,15 @@ async def test_another_provider_error_goes_up_for_the_retry_of_the_activity() ->
     with pytest.raises(ProviderError) as caught:
         await ask(provider)
     assert caught.value.kind is ProviderErrorKind.OVERLOADED
+
+
+async def test_a_call_that_failed_after_it_was_billed_is_still_on_the_ledger() -> None:
+    usage = Usage(input_tokens=300, output_tokens=0)
+    failed = ProviderError(ProviderErrorKind.OVERLOADED, "busy", usage=usage)
+    billed: list[Usage] = []
+    with pytest.raises(ProviderError):
+        await ask(FakeProvider(failed), billed)
+    assert billed == [usage]
 
 
 # ---------- the request ----------

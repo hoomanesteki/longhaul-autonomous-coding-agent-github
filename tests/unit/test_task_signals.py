@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from temporalio import workflow
 
+from longhaul.agent import hints
 from longhaul.contracts import (
     CarryState,
     Outcome,
@@ -81,6 +82,20 @@ def test_a_hint_is_stored_with_its_author(wf: TaskWorkflow, state: CarryState) -
     wf.hint("alice", "try pytest -x")
     wf.hint("bob", "mind the cache")
     assert state.hints == ["alice: try pytest -x", "bob: mind the cache"]
+
+
+def test_a_huge_hint_is_cut_when_it_arrives(wf: TaskWorkflow, state: CarryState) -> None:
+    # The hints stay in the state and go to every llm_turn, so each one has a size limit (LH-506).
+    wf.hint("alice", "x" * 300_000)
+    (stored,) = state.hints
+    assert stored.startswith("alice: " + "x" * 100)
+    assert stored.endswith(hints.CUT_NOTE)
+    assert len(stored.encode()) < 3_000
+
+
+def test_a_long_name_is_cut_too(wf: TaskWorkflow, state: CarryState) -> None:
+    wf.hint("n" * 500, "go on")
+    assert state.hints == [f"{'n' * hints.MAX_AUTHOR_CHARS}: go on"]
 
 
 def test_budget_top_ups_add_up(wf: TaskWorkflow, state: CarryState) -> None:

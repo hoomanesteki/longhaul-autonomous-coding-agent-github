@@ -439,6 +439,57 @@ SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = '
 
 The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
 
+### Budgets and top-ups
+
+A task has four limits (LH-702). They are the `budgets` of the repo in the config:
+
+```yaml
+budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
+```
+
+A task that the poller starts checks them before every model turn. The `check_budget` activity compares each limit with the worst case of the call that is about to be made: the input of the last request at the full input price, plus `loop.max_tokens_per_turn` of output at the output price, both for the model of the role (planner or coder). It is better to pause a little early than to find out after the bill. What the task spent comes from the `cost_ledger`, so a call that was billed and then retried counts twice. The checks run in this order, and the first one that fails names the pause:
+
+| Reason | The call is held back when | What the task waits for |
+|---|---|---|
+| `task_turns` | The turns done are equal to `task_turns` plus the turns that were added. | `/longhaul budget`, or `/longhaul cancel` |
+| `task_usd` | Spent plus the worst case of the next call is more than `task_usd` plus the dollars that were added. | `/longhaul budget`, or `/longhaul cancel` |
+| `wall_clock` | The task has worked more than `task_wall_minutes`. The workflow judges this one from its own clock. | `/longhaul budget`, or `/longhaul cancel` |
+| `daily_repo_usd` | What the repo spent since 00:00 UTC, plus the worst case of the next call, is more than `daily_repo_usd`. | Midnight UTC |
+
+The task sets the phase to `paused`, posts one comment under the key `<task id>:budget:<n>` and adds `longhaul:needs-human`. The comment gives the numbers and the exact commands:
+
+```text
+## Longhaul paused: task budget (pause 1)
+
+### Numbers
+### What happens next
+
+Reply with `/longhaul budget +2` to add $2, or `/longhaul cancel` to stop the task.
+```
+
+| Comment | What happens |
+|---|---|
+| `/longhaul budget +2` | Adds 2 dollars to the budget of this task, and the task goes on. |
+| `/longhaul budget +1 turns +25` | Adds 1 dollar and 25 turns. A top-up always has dollars, and a turns top-up carries one as well. |
+| `/longhaul cancel` | Ends the task as cancelled. |
+
+A top-up removes the label, records a `resumed` event (`via` is `budget`) and a `budget_added` event with the dollars and turns that came in, and the next check uses the new limits. A top-up that is too small pauses the task again, with its own comment (`budget:2`). A `/longhaul hint` does not answer a budget pause: the task waits for money. With no answer in 24 hours (`stuck.hint_wait_hours`) the task ends with outcome `budget_exhausted` in the phase `failed`, and the summary says which limit and how long it waited.
+
+Three limits behave in their own way:
+
+- **The wall clock** counts the time the task worked. The time it spent waiting for a hint, a top-up or midnight is left out, so a maintainer who answers after three hours has not used three hours of the task. `/longhaul budget` has no minutes, so a top-up of any amount after a wall-clock pause starts a new window of `task_wall_minutes`.
+- **The daily limit of the repo** is not lifted by a top-up. The task sleeps on a durable timer until 00:00 UTC and goes on by itself, with no signal and no label, and the comment says when. A worker restart does not lose the timer. `/longhaul cancel` still ends it. A call that is bigger than a whole day of the repo's budget would get the same answer tomorrow, so the task ends with `budget_exhausted` at once.
+- **A task that is not started by the poller** does not check budgets. `longhaul run` on a folder ends at its turn limit with the error "turn limit", as it did before.
+
+A task of a folder (`local:`) has no issue, so the numbers are in the `paused` event instead (`payload.numbers`, and `payload.resume_at` for the daily limit).
+
+```sql
+SELECT type, payload->>'reason' AS reason, payload->>'pause' AS pause, payload->'numbers' AS numbers, ts
+FROM events WHERE task_id = 'lh-acme-calc-42' AND type IN ('paused', 'resumed', 'budget_added') ORDER BY id;
+```
+
+The worker prices the next call with the model of the role, so every model in the config needs an entry in `config/pricing.yaml` (the worker already stops at the start when one is missing). The scripted and replay providers cost nothing, so a scripted task only stops at its turns and its clock.
+
 ### How a task ends
 
 Every task ends in exactly one outcome (LH-507): `pr_opened`, `stuck`, `budget_exhausted`, `cancelled` or `error`. Whatever the way, the workflow winds the task up in the same order:

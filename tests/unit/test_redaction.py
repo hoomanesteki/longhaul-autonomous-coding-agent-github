@@ -21,6 +21,11 @@ def github_token(length: int = 36) -> str:
     return "ghp_" + "a" * length
 
 
+def github_app_token(prefix: str, length: int = 36) -> str:
+    """Other GitHub tokens: installation (ghs), user (ghu), OAuth (gho) and refresh (ghr)."""
+    return prefix + "_" + "a" * length
+
+
 def fine_grained_token(length: int = 40) -> str:
     return "github_pat_" + ("11AB_" * 20)[:length]
 
@@ -46,6 +51,20 @@ PATTERN_CASES = [
         id="anthropic-key-with-hyphens",
     ),
     pytest.param(f"token {github_token()}.", f"token {REDACTED}.", id="github-token"),
+    # ADR-0012: the installation token of a GitHub App starts with ghs_, and the
+    # app and OAuth flows issue ghu_, gho_ and ghr_ tokens that can be just as powerful.
+    pytest.param(
+        f"token {github_app_token('ghs')}.", f"token {REDACTED}.", id="installation-token"
+    ),
+    pytest.param(f"token {github_app_token('ghu')}.", f"token {REDACTED}.", id="user-to-server"),
+    pytest.param(f"token {github_app_token('gho')}.", f"token {REDACTED}.", id="oauth-token"),
+    pytest.param(f"token {github_app_token('ghr')}.", f"token {REDACTED}.", id="refresh-token"),
+    pytest.param(github_app_token("ghs", 30), REDACTED, id="installation-token-at-its-shortest"),
+    pytest.param(
+        github_app_token("ghs", 29),
+        github_app_token("ghs", 29),
+        id="installation-token-one-short",
+    ),
     pytest.param(
         f'{{"pat": "{fine_grained_token()}"}}', f'{{"pat": "{REDACTED}"}}', id="github-pat"
     ),

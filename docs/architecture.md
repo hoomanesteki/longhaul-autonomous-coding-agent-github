@@ -146,7 +146,7 @@ Every log line that Python code in the worker writes is one JSON object on stder
 | Pattern | What it catches |
 |---|---|
 | `sk-[A-Za-z0-9_-]{20,}` | OpenAI and Anthropic keys. It must start a word, so `lh-acme-my-task-tracker-pro-edition-5` is left alone. A backslash and `n`, `r` or `t` before it counts as a line break, so a key in a repr, a `%r` argument or JSON text is caught. |
-| `ghp_[A-Za-z0-9]{30,}` | GitHub personal access tokens |
+| `gh[pousr]_[A-Za-z0-9]{30,}` | GitHub tokens: personal (`ghp_`), installation (`ghs_`, what a GitHub App worker holds), user (`ghu_`), OAuth (`gho_`) and refresh (`ghr_`) |
 | `github_pat_[A-Za-z0-9_]{30,}` | Fine-grained GitHub tokens |
 | `AKIA[0-9A-Z]{16}` | AWS access key ids |
 | `-----BEGIN [A-Z ]*PRIVATE KEY-----` | A PEM private key, from the header through its END line. A key that was cut off before its END line is redacted to the end of the text. |

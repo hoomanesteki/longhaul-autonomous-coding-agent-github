@@ -65,7 +65,9 @@ _PATTERNS: tuple[re.Pattern[str], ...] = (
         re.DOTALL,
     ),
     re.compile(_WORD_START + r"sk-[A-Za-z0-9_-]{20,}"),
-    re.compile(r"ghp_[A-Za-z0-9]{30,}"),
+    # ghp personal, ghs installation (what a GitHub App worker holds, ADR-0012), ghu user,
+    # gho OAuth and ghr refresh tokens all share one shape.
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{30,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{30,}"),
     re.compile(r"AKIA[0-9A-Z]{16}"),
 )
@@ -78,8 +80,9 @@ _LEADING_KEYS = ("timestamp", "level", "logger", "event")
 def redact(text: str) -> str:
     """Replace every secret in the text with "[redacted]".
 
-    The secrets are OpenAI and Anthropic style keys (`sk-`), GitHub tokens (`ghp_` and
-    `github_pat_`), AWS access key ids (`AKIA`) and PEM private keys, header through END line.
+    The secrets are OpenAI and Anthropic style keys (`sk-`), GitHub tokens (`ghp_`, `ghs_`,
+    `ghu_`, `gho_`, `ghr_` and `github_pat_`), AWS access key ids (`AKIA`) and PEM private keys,
+    header through END line.
     """
     for pattern in _PATTERNS:
         text = pattern.sub(REDACTED, text)

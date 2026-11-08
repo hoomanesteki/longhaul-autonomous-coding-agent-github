@@ -1673,6 +1673,13 @@
         "title": "ValidationError",
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "HTTPBearer": {
+        "description": "LONGHAUL_ADMIN_TOKEN",
+        "scheme": "bearer",
+        "type": "http"
+      }
     }
   },
   "info": {
@@ -1776,6 +1783,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1787,6 +1797,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "List Memory"
       }
     },
@@ -1816,6 +1831,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1827,6 +1845,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Approve"
       }
     },
@@ -1856,6 +1879,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1867,6 +1893,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Reject"
       }
     },
@@ -1888,8 +1919,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "The bearer token is missing or wrong."
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "List Repos"
       }
     },
@@ -1972,6 +2011,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -1983,6 +2025,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "List Tasks"
       }
     },
@@ -2012,6 +2059,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2023,6 +2073,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Get Task"
       }
     },
@@ -2052,6 +2107,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2063,6 +2121,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Approve Plan"
       }
     },
@@ -2102,6 +2165,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2113,6 +2179,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Budget"
       }
     },
@@ -2159,6 +2230,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2170,6 +2244,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Cancel"
       }
     },
@@ -2209,6 +2288,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2220,6 +2302,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Hint"
       }
     },
@@ -2259,6 +2346,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2270,6 +2360,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Reject Plan"
       }
     },
@@ -2327,6 +2422,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2338,6 +2436,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Get Timeline"
       }
     },
@@ -2404,6 +2507,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2415,6 +2521,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Get Tool Output"
       }
     },
@@ -2470,6 +2581,9 @@
             },
             "description": "Successful Response"
           },
+          "401": {
+            "description": "The bearer token is missing or wrong."
+          },
           "422": {
             "content": {
               "application/json": {
@@ -2481,6 +2595,11 @@
             "description": "Validation Error"
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Get Turn"
       }
     },
@@ -2515,8 +2634,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "401": {
+            "description": "The bearer token is missing or wrong."
           }
         },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
         "summary": "Prometheus"
       }
     }

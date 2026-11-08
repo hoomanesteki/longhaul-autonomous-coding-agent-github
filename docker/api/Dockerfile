@@ -39,8 +39,8 @@ ENV LONGHAUL_CONSOLE_DIR=/app/console
 ENV LONGHAUL_CONFIG=/app/config/longhaul.example.yaml
 
 # Inside the container the server must listen on every interface, or the published port would
-# reach nothing. docker-compose.yml publishes it on 127.0.0.1 only: the console has no login
-# until LH-807.
+# reach nothing. docker-compose.yml still publishes it on 127.0.0.1 only. Every /api route needs
+# LONGHAUL_ADMIN_TOKEN, and /metrics needs it too because the server is not bound to loopback.
 ENV LONGHAUL_API_HOST=0.0.0.0
 EXPOSE 8000
 

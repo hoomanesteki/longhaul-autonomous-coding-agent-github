@@ -16,13 +16,13 @@ from contextlib import asynccontextmanager
 
 import httpx2
 import pytest
-from longhaul.api.limits import ActionLimiter
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client
 from tests.integration import test_run_report as report_tests
 
 from longhaul.api.app import create_app
 from longhaul.api.deps import ApiContext
+from longhaul.api.limits import ActionLimiter
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.memory.embedder import HashEmbedder
 from longhaul.memory.store import PgMemoryStore

@@ -198,6 +198,8 @@ services:
       LONGHAUL_BLOB_BUCKET: longhaul
       LONGHAUL_BLOB_ACCESS_KEY: longhaul
       LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+      # The API does not start without a token. Set it in .env or the shell.
+      LONGHAUL_ADMIN_TOKEN: "${LONGHAUL_ADMIN_TOKEN:-}"
     ports:
       - "127.0.0.1:${LH_API_PORT:-8000}:8000"
     healthcheck:

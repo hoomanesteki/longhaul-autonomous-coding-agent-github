@@ -56,6 +56,7 @@ item, a missing database setting and a database that cannot be reached exit 2 wi
 
 import asyncio
 import getpass
+import os
 import re
 import signal
 import uuid
@@ -336,22 +337,34 @@ def api_command(
 
     It reads the database and the blob store and sends signals through Temporal, so it needs the
     stack from `make up` and the LONGHAUL_* settings of .env.example. It does not need a worker
-    to start, but the live status of a task and the actions do. The address defaults to this
-    machine only: the console has no login until LH-807.
+    to start, but the live status of a task and the actions do. Every `/api` route needs the
+    bearer token in LONGHAUL_ADMIN_TOKEN, and the server does not start without one. The address
+    defaults to this machine only, where /metrics is open as well.
     """
     # Imported here: the server pulls in FastAPI and the stores, which the other commands do not
     # need.
     import uvicorn
 
     settings = EnvSettings()
+    listen_host = host if host is not None else settings.api_host
     # The app builds its stores when it starts (create_app with no argument), so that a bad
-    # setting is reported by the server's start-up and not by an import.
-    uvicorn.run(
-        "longhaul.api.app:create_app",
-        factory=True,
-        host=host if host is not None else settings.api_host,
-        port=port if port is not None else settings.api_port,
-    )
+    # setting is reported by the server's start-up and not by an import. It also decides from
+    # LONGHAUL_API_HOST whether /metrics is open, so the --host option goes there as well. The
+    # server blocks until it stops, so the previous value comes back afterwards.
+    previous = os.environ.get("LONGHAUL_API_HOST")
+    os.environ["LONGHAUL_API_HOST"] = listen_host
+    try:
+        uvicorn.run(
+            "longhaul.api.app:create_app",
+            factory=True,
+            host=listen_host,
+            port=port if port is not None else settings.api_port,
+        )
+    finally:
+        if previous is None:
+            os.environ.pop("LONGHAUL_API_HOST", None)
+        else:
+            os.environ["LONGHAUL_API_HOST"] = previous
 
 
 @app.command("run")

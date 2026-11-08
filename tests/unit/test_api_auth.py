@@ -8,9 +8,9 @@ and what a deployment does when it has no token.
 from __future__ import annotations
 
 import pytest
-from longhaul.api.limits import ActionLimiter
 
 from longhaul.api.deps import is_loopback, open_context, token_matches
+from longhaul.api.limits import ActionLimiter
 from longhaul.settings import EnvSettings
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase8]

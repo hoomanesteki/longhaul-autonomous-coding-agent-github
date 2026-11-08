@@ -111,6 +111,12 @@ When a task ends, whichever way it ends, a worker with a memory store drafts the
 
 The notes are stored as `candidate` items with `source = task`. Their `source_ref` is the pull request number, or the task id when the task has no pull request. They reach no prompt until a person approves them or the pull request merges (ADR-0010).
 
+### Lessons after the review
+
+The poller settles the candidates on every tick. When the pull request of a task is merged, its candidates become `approved` with `approved_by` set to `merged_pr#<number>`, and the next task on the repo can read them. When the pull request is closed without a merge, the candidates become `rejected`: they stay in the table and never reach a prompt. A pull request that is still open decides nothing. Each decision is a `memory_promoted` or `memory_rejected` event on the task, and the poll's result counts them as `promoted` and `rejected`.
+
+A task that opened no pull request, such as a stuck one, keeps its candidates until a person decides. Find them with `memory list --status candidate` and decide with `memory approve ID` or `memory reject ID`. The poller never changes an item that a person has decided, even if a pull request is merged later.
+
 ```bash
 uv run longhaul memory list --repo acme/inventory --status candidate
 ```

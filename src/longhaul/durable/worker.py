@@ -163,6 +163,7 @@ from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_u
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.memory.embedder import make_embedder
+from longhaul.memory.promotion import Promoter
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
 from longhaul.roles import coder, planner, stuck, verifier
@@ -411,7 +412,13 @@ def build_parts(
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
-        github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue, ledger=effects
+        github,
+        SqlTaskStore(sessions),
+        cfg,
+        task_queue=settings.task_queue,
+        ledger=effects,
+        # Lessons are promoted only by a worker that keeps memory (LH-606).
+        promoter=None if memory is None else Promoter(memory, recorder),
     )
     delivery: list[Callable[..., Any]] = []
     if github is not None and remote is not None:

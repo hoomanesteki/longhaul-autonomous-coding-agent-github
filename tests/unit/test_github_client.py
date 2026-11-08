@@ -273,6 +273,13 @@ async def _check_pull_reads(fake: FakeGitHub, gh: GitHubClient) -> None:
     assert await gh.pr_merged(REPO, closed) is False
     with pytest.raises(GitHubFatal):  # issue 1 is an issue, not a pull request
         await gh.pr_merged(REPO, 1)
+    # pull_state tells a pull request that is still open from one that was closed unmerged.
+    waiting = fake.seed_pull(REPO, "longhaul-pr/4")
+    assert await gh.pull_state(REPO, waiting) == "open"
+    assert await gh.pull_state(REPO, number) == "merged"
+    assert await gh.pull_state(REPO, closed) == "closed"
+    with pytest.raises(GitHubFatal):
+        await gh.pull_state(REPO, 1)
 
 
 async def _check_permission_reads(fake: FakeGitHub, gh: GitHubClient) -> None:

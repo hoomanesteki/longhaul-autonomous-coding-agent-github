@@ -650,7 +650,9 @@ class PollResult(BaseModel):
     `repos` is the allowlisted repos it looked at, `issues` the open issues it saw with the label,
     `started` the tasks it started, and `known` the issues it left alone because their task
     already has a row or a workflow. `commands` is the comment commands (LH-308) that it carried
-    out: a signal sent to a task, or an attempt started by `/longhaul retry`.
+    out: a signal sent to a task, or an attempt started by `/longhaul retry`. `promoted` and
+    `rejected` count the lessons that the poll approved because their pull request merged and
+    turned down because it was closed (LH-606).
     """
 
     repos: int = Field(default=0, ge=0)
@@ -658,6 +660,8 @@ class PollResult(BaseModel):
     started: int = Field(default=0, ge=0)
     known: int = Field(default=0, ge=0)
     commands: int = Field(default=0, ge=0)
+    promoted: int = Field(default=0, ge=0)
+    rejected: int = Field(default=0, ge=0)
 
 
 class BuildPrBranchInput(BaseModel):

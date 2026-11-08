@@ -63,6 +63,10 @@ COMPACTION_EVENT = "compaction"
 # test keeps the two names equal.
 OUTCOME_EVENT = "outcome"
 
+# The type of the event that records the lessons a task stored (durable/acts.LESSONS_EVENT,
+# LH-605). Its payload names the pull request or task that the lessons are linked to.
+LESSONS_EVENT = "lessons"
+
 # The kind of the checkpoint that a step leaves when it is done (plan section 3.5).
 STEP_KIND = "step"
 
@@ -339,6 +343,27 @@ class SqlRecorder:
                 .order_by(Event.ts, Event.id)
             )
             return [EventRecord(row[0], row[1], dict(row[2])) for row in rows]
+
+    async def lessons_task(self, repo: str, source_ref: str) -> str | None:
+        """The task of `repo` whose `lessons` event names `source_ref`, or None.
+
+        The candidates of a task carry the number of its pull request and not its id (LH-605),
+        so the poller finds the task again through the event that the task recorded when it
+        stored them. The repo is needed because pull request numbers repeat from repo to repo.
+        """
+        stmt = (
+            select(Event.task_id)
+            .join(Task, Task.id == Event.task_id)
+            .where(
+                Task.repo == repo,
+                Event.type == LESSONS_EVENT,
+                Event.payload["source_ref"].astext == source_ref,
+            )
+            .order_by(Event.id.desc())
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            return (await session.execute(stmt)).scalar_one_or_none()
 
     async def record_request_fraction(self, task_id: str, fraction: float) -> None:
         # One statement, so two requests that finish together cannot lower the maximum.

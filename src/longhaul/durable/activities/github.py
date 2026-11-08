@@ -20,6 +20,11 @@ module only hands it the issues, and it starts the new attempts, because it owns
 spec. A new task gets a comment cursor in its row, at the newest comment its spec was built from,
 so nothing written before the label can act as a command.
 
+Lessons (LH-606). After the issues of a repo, the poll settles the candidate lessons of its tasks
+(memory/promotion.py): a merged pull request approves them and a closed one rejects them. A task
+that opened no pull request keeps its candidates until a person decides. This writes to Postgres
+only, so it needs no idempotency key, and a poll that runs again moves nothing twice.
+
 Every task the poller starts plans first (LH-501): the planner writes the plan, and the task
 posts it on the issue, before any code is written.
 
@@ -73,6 +78,7 @@ from longhaul.durable.client import start_task
 from longhaul.github.client import GitHubClient, GitHubError, GitHubFatal, GitHubRetryable
 from longhaul.github.intake import is_allowlisted, is_local, issue_to_spec, task_id_for
 from longhaul.github.side_effects import Ledger
+from longhaul.memory.promotion import Promoter
 from longhaul.settings import AppConfig, RepoEntry
 
 log = logging.getLogger(__name__)
@@ -88,6 +94,8 @@ class _Tally:
     started: int = 0
     known: int = 0
     commands: int = 0
+    promoted: int = 0
+    rejected: int = 0
     failures: list[tuple[str, Exception]] = field(default_factory=list)
 
     def result(self) -> acts.PollResult:
@@ -97,6 +105,8 @@ class _Tally:
             started=self.started,
             known=self.known,
             commands=self.commands,
+            promoted=self.promoted,
+            rejected=self.rejected,
         )
 
 
@@ -166,6 +176,8 @@ class PollerActivities:
     the worker starts, as the rest of the worker's settings are. `task_queue` is the queue that
     the tasks start on, which is the queue of the worker itself. `ledger` is the idempotency
     ledger of the replies to commands from people who may not steer (github/side_effects.py).
+    `promoter` settles the lessons of tasks whose pull request is decided (LH-606). It is None on
+    a worker that keeps no memory.
     """
 
     def __init__(
@@ -176,12 +188,14 @@ class PollerActivities:
         *,
         task_queue: str,
         ledger: Ledger,
+        promoter: Promoter | None = None,
     ) -> None:
         self._github = github
         self._store = store
         self._config = config
         self._task_queue = task_queue
         self._ledger = ledger
+        self._promoter = promoter
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -213,6 +227,7 @@ class PollerActivities:
             tally.repos += 1
             try:
                 await self._poll_repo(client, github, steering, entry, tally)
+                await self._settle_lessons(github, entry, tally)
             except (GitHubError, ValueError) as exc:
                 # ValueError is an issue that GitHub sent without a usable number or title.
                 # Waiting does not change it, so it counts as a failure for good.
@@ -223,12 +238,14 @@ class PollerActivities:
             raise _failed(tally.failures)
         log.info(
             "polled %d repos: %d labeled issues, %d tasks started, %d already known, "
-            "%d commands carried out",
+            "%d commands carried out, %d lessons promoted, %d rejected",
             tally.repos,
             tally.issues,
             tally.started,
             tally.known,
             tally.commands,
+            tally.promoted,
+            tally.rejected,
         )
         return tally.result()
 
@@ -268,6 +285,14 @@ class PollerActivities:
         steered = await steering.steer_repo(client, entry, issues)
         tally.commands += steered.commands
         tally.failures.extend(steered.failures)
+
+    async def _settle_lessons(self, github: GitHubClient, entry: RepoEntry, tally: _Tally) -> None:
+        """Approve the lessons of merged pull requests and reject those of closed ones."""
+        if self._promoter is None:
+            return
+        settled = await self._promoter.settle(github, entry.repo)
+        tally.promoted += settled.promoted
+        tally.rejected += settled.rejected
 
     async def _begin_attempt(
         self,

@@ -26,7 +26,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from longhaul.memory.promotion import Promoter
 from psycopg import sql
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
@@ -36,7 +35,7 @@ from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 from typer.testing import CliRunner
 
 from longhaul import cli
-from longhaul.contracts import MemoryItem
+from longhaul.contracts import MemoryItem, RepoSettings, TaskSpec
 from longhaul.db.models import Event, MemoryItemRow
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
@@ -46,6 +45,7 @@ from longhaul.durable.activities.github import PollerActivities
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger
 from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.promotion import Promoter
 from longhaul.memory.store import PgMemoryStore
 from longhaul.settings import AppConfig, EnvSettings, RepoEntry, get_settings, load_config
 
@@ -141,7 +141,9 @@ class World:
 
 
 def config() -> AppConfig:
-    return load_config(EXAMPLE).model_copy(update={"repos": [RepoEntry(repo=REPO)]})
+    return load_config(EXAMPLE).model_copy(
+        update={"repos": [RepoEntry(repo=REPO, allowlisted=True)]}
+    )
 
 
 @pytest.fixture
@@ -170,7 +172,16 @@ async def world(scratch: Scratch) -> AsyncIterator[World]:
 
 
 async def lessons_event(world: World, task_id: str, ref: str) -> None:
-    """The event that the workflow records when it stores the lessons of a task (LH-605)."""
+    """The row of a task and the event that it records when it stores its lessons (LH-605)."""
+    spec = TaskSpec(
+        task_id=task_id,
+        repo=REPO,
+        issue_number=7,
+        title="remove() hides a KeyError",
+        body="remove('x') raises KeyError",
+        settings=RepoSettings(repo=REPO),
+    )
+    await SqlTaskStore.from_engine(world.engine).record_pickup(spec)
     await world.recorder.record_event(task_id, acts.LESSONS_EVENT, {"source_ref": ref})
 
 

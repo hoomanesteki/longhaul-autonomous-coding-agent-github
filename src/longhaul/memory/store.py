@@ -8,6 +8,9 @@ ADR-0010 are kept here, at the one place that writes the table:
 * Longhaul approves its own findings from the default branch (the repo map and the verified
   commands) with `add_verified`, which accepts nothing else. Everything else is approved by a
   person or a merged pull request through `promote`, which always records who.
+* The poller approves and rejects with `promote_candidate` and `reject_candidate` (LH-606),
+  which move an item only while it is a candidate. A poll that runs twice, or a pull request that
+  merges after a person turned the item down, therefore changes nothing.
 * `search` returns approved items unless it is asked for the others (invariant I7), and counts
   each use of what it returns.
 * `get_verified` finds the approved item that Longhaul checked at one sha, which is how the repo
@@ -329,6 +332,26 @@ class PgMemoryStore:
         await self._decide(item_id, by, status="rejected", approved_by=None)
         log.info("memory item %s rejected by %s", item_id, by.strip())
 
+    async def promote_candidate(self, item_id: str, by: str) -> bool:
+        """Approve an item only if it is still a candidate. True when this call moved it.
+
+        The poller uses this form (LH-606), so that a poll that runs twice approves nothing
+        twice, and a pull request that merges after a person rejected the item cannot bring it
+        back. An item in any other state, or one that is gone, is left as it is.
+        """
+        return await self._decide(
+            item_id, by, status="approved", approved_by=by.strip(), only_from="candidate"
+        )
+
+    async def reject_candidate(self, item_id: str, by: str) -> bool:
+        """Turn an item down only if it is still a candidate. True when this call moved it."""
+        moved = await self._decide(
+            item_id, by, status="rejected", approved_by=None, only_from="candidate"
+        )
+        if moved:
+            log.info("memory item %s rejected by %s", item_id, by.strip())
+        return moved
+
     # ---------- the pieces ----------
     async def _embed(self, texts: list[str]) -> list[list[float]]:
         # The local model blocks while it runs, and the event loop must keep its heartbeats.
@@ -376,7 +399,21 @@ class PgMemoryStore:
             found = (await session.execute(stmt)).scalar_one_or_none()
         return None if found is None else str(found)
 
-    async def _decide(self, item_id: str, by: str, *, status: str, approved_by: str | None) -> None:
+    async def _decide(
+        self,
+        item_id: str,
+        by: str,
+        *,
+        status: str,
+        approved_by: str | None,
+        only_from: str | None = None,
+    ) -> bool:
+        """Set the status of an item, and say whether a row changed.
+
+        A person's decision (`only_from` unset) applies to any item and fails on an unknown id.
+        With `only_from`, the update takes the item only if it has that status, in the same
+        statement, so that two pollers cannot both move it.
+        """
         if not by.strip():
             raise ValueError("who decided? the name must not be blank")
         stmt = (
@@ -385,9 +422,13 @@ class PgMemoryStore:
             .values(status=status, approved_by=approved_by)
             .returning(MemoryItemRow.id)
         )
+        if only_from is not None:
+            stmt = stmt.where(MemoryItemRow.status == only_from)
         async with self._sessions.begin() as session:
-            if (await session.execute(stmt)).first() is None:
-                raise MemoryItemNotFoundError(f"no memory item {item_id!r}")
+            moved = (await session.execute(stmt)).first() is not None
+        if not moved and only_from is None:
+            raise MemoryItemNotFoundError(f"no memory item {item_id!r}")
+        return moved
 
 
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:

@@ -1079,6 +1079,9 @@ def status_line(current: TaskStatus | None) -> str:
         line += f", plan v{current.plan_version}"
     if current.last_checkpoint is not None:
         line += f", checkpoint {current.last_checkpoint[:7]}"
+    # A paused run blocks until someone answers, so the line says what it waits for.
+    if current.paused_reason:
+        line += f", {current.paused_reason}"
     return line
 
 

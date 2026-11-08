@@ -89,6 +89,7 @@ CALC = ROOT / "tests" / "fixtures" / "repos" / "calc"
 TEMPLATES = ROOT / "templates"
 IMAGE = "longhaul-sandbox:py312"
 PYTEST = "pytest -q"
+CHECK_ADD = "PYTHONPATH=src python -c 'from calc import add; assert add(2, 3) == 5'"
 MODULE = "src/calc/__init__.py"
 NEW_TEST_FILE = "tests/test_negative.py"
 CHANGELOG = "CHANGELOG.md"
@@ -625,8 +626,9 @@ class Real:
             issue_number=self.number,
             title="add() subtracts",
             body="`calc.add` subtracts its arguments instead of adding them.",
-            # No test command: the review runs it, and the image has no pytest to run it with.
-            settings=RepoSettings(repo=REPO, setup_command=""),
+            # The review runs this command, and the image has no pytest, so it checks the fix with
+            # plain python. A pull request is ready only when a command backed the verdict.
+            settings=RepoSettings(repo=REPO, test_command=CHECK_ADD, setup_command=""),
         )
 
     def bare(self, *args: str) -> str:

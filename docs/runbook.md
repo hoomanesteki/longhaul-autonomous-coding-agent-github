@@ -400,6 +400,12 @@ The limits are the `stuck` section of the config. The workflow cannot read the c
 
 `tool_exec` works out the facts that the rules need, because only the activity sees the whole text of a result (`durable/activities/signals.py`). The hash of a failed command covers the command, its exit code and the last 20 lines of stderr. When stderr names no error, the last 20 lines of stdout are added, because pytest prints its report there. Run times and memory addresses are taken out first, so the same failure on two runs hashes alike.
 
+```sql
+SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
+```
+
+The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+
 ### The pause and the hint
 
 A stuck signal, or a call to `ask_human`, pauses the task (LH-506). The workflow sets the phase to `paused` and asks the compactor model for a short question. Then it posts the question on the issue and adds the label `longhaul:needs-human`. A task of a folder (`local:`) has no issue, so the text goes into the `paused` event instead (`payload.comment`).
@@ -430,13 +436,6 @@ Each pause has its own comment key, `<task id>:stuck:<n>`, so a retry posts noth
 ```sql
 SELECT type, payload->>'reason' AS reason, payload->>'pause' AS pause, ts FROM events WHERE task_id = 'lh-acme-calc-42' AND type IN ('stuck', 'paused', 'resumed') ORDER BY id;
 ```
-
-
-```sql
-SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
-```
-
-The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
 
 ### Stopping a worker
 

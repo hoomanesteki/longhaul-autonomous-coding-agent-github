@@ -2505,7 +2505,7 @@ The review of LH-306 found the problems below before the Phase 3 gate. Each was 
     2. Post the comment (key `stuck:<n>`) and add `longhaul:needs-human`.
     3. Set phase `PAUSED` and wait for `hint`, `add_budget` or `cancel` with a timeout.
   - On `hint`:
-    1. Append a user message "Hint from @<user>: <text>".
+    1. Append a user message "Hint from @<user>: <text>". As built, the text has no `@` ("Hint from <user>: <text>"), the form that the hint tests since LH-308 and the console mirror ("Hint from console: ...") already use.
     2. Reset the detector window and remove the label.
     3. Record a `resumed` event. `stuck_count += 1`.
   - After 3 pauses, or on timeout, end with outcome `stuck`.

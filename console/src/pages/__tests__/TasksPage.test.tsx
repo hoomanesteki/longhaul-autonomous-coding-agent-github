@@ -248,10 +248,54 @@ describe("tasks page", () => {
     const before = taskCalls().length;
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(10_500);
+      await vi.advanceTimersByTimeAsync(9_000);
+    });
+    expect(taskCalls().length).toBe(before);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_500);
+    });
+    await waitFor(() => expect(taskCalls().length).toBe(before + 1));
+  });
+
+  it("keeps the ages current while the list does not change", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const fiveMinutes = 5 * 60 * 1000;
+    serve([task({ id: "lh-acme-widgets-20", title: "Old news", created_at: new Date(Date.now() - fiveMinutes).toISOString() })]);
+    renderPage();
+    const row = await findRow("Old news");
+    expect(within(row).getByText("5m")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1000);
     });
 
-    await waitFor(() => expect(taskCalls().length).toBeGreaterThan(before));
+    expect(within(rowOf("Old news")).getByText("2h")).toBeInTheDocument();
+  });
+
+  it("lets the filters shrink so a long repo name cannot widen the page", async () => {
+    const longRepo = "hoomanesteki/longhaul-autonomous-coding-agent-github";
+    serve([task({ id: "lh-long-1", repo: longRepo, title: "Long one" })]);
+    renderPage();
+    await screen.findByText("Long one");
+
+    const label = screen.getByLabelText("Repo").closest("label") as HTMLElement;
+    expect(label).toHaveClass("min-w-0", "max-w-full");
+    expect(screen.getByLabelText("Repo")).toHaveClass("w-full", "max-w-full");
+  });
+
+  it("warns that the needs-you toggle sees only the loaded tasks while more can be loaded", async () => {
+    fetchStub.mockImplementation((input) => {
+      const url = new URL(String(input), "http://console.test");
+      if (url.pathname === "/api/repos") return Promise.resolve(json(REPOS));
+      return Promise.resolve(json({ items: [CODING, PAUSED], next_cursor: "c2" }));
+    });
+    renderPage("/tasks?needs_you=1");
+
+    await screen.findByText("Speed up the build");
+    expect(
+      screen.getByText("Only the tasks loaded so far are checked. Load more to check the rest."),
+    ).toBeInTheDocument();
   });
 
   it("shows an empty state when there are no tasks", async () => {

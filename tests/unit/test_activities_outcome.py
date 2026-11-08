@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from longhaul.durable.activities.outcome import FinalCommentActivities
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
@@ -22,6 +21,7 @@ from longhaul.checkpoints.git_store import CheckpointError, RepoNotFoundError
 from longhaul.checkpoints.squash import FileStat
 from longhaul.contracts import Outcome, OutcomeKind, Plan, PlanStep
 from longhaul.durable import acts
+from longhaul.durable.activities.outcome import FinalCommentActivities
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, effect_key, marker
 

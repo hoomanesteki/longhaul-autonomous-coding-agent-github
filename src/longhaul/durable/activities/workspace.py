@@ -35,11 +35,14 @@ workflow calls it before a hand-over to a new run (Continue-As-New), so that a l
 mode F4) costs at most the work since the last hand-over. The blob is named after the head it
 holds, and a `checkpoints` row of kind `bundle` names the blob, so a restore can find the latest.
 
-cleanup removes everything of a task: its containers, its workspace volume and its bare repo. The
-workflow calls it when a task is cancelled. It finds the containers by the task label and not by
-`sandbox_id`, because a task cancelled during the preparation never learned the id. It is safe to
-run twice and for a task that has nothing left, since Temporal retries it and the task may have
-been cleaned by hand. A Docker or disk error fails the attempt, and Temporal tries again.
+cleanup removes the sandbox of a task: its containers and its workspace volume, and, unless the
+caller keeps it, its bare repo. The workflow calls it when a task ends, whatever the outcome
+(LH-507), and keeps the repo: the janitor (activities/janitor.py) removes it a week later, so a
+person can still read the checkpoints of a stuck or failed task. It finds the containers by the
+task label and not by `sandbox_id`, because a task that ended during the preparation never learned
+the id. It is safe to run twice and for a task that has nothing left, since Temporal retries it
+and the task may have been cleaned by hand. A Docker or disk error fails the attempt, and
+Temporal tries again.
 
 Two metrics follow these activities (LH-704). A task is active from the end of prepare_workspace,
 or from the first ensure_sandbox of a run that starts with a sandbox, and each rebuild counts in
@@ -509,7 +512,12 @@ class WorkspaceActivities:
         except ValueError as exc:
             raise not_retried(exc) from exc
         log.info("cleaning up task %s: %s", inp.task_id, inp.reason)
-        await self._clear(inp.task_id)
+        if inp.keep_repo:
+            # The end of a task (LH-507): the sandbox goes now and the janitor removes the repo
+            # a week later.
+            await self._sandboxes.cleanup_task(inp.task_id)
+        else:
+            await self._clear(inp.task_id)
 
     # ---------- what both need ----------
     async def _image_of(self, spec: TaskSpec) -> str | None:

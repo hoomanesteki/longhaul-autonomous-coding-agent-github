@@ -46,13 +46,30 @@ def test_the_trace_of_a_failed_activity_keeps_the_cause() -> None:
 
 
 def test_a_long_trace_is_cut_to_the_limit_and_keeps_its_end() -> None:
-    error = raised(RuntimeError("first line\n" + "x" * 50_000 + "\nthe root cause"))
+    error: BaseException | None = None
+    for n in range(200):
+        try:
+            raise RuntimeError(f"failure number {n}") from error
+        except RuntimeError as caught:
+            error = caught
+    assert error is not None
 
     trace = wind_up.error_trace(error)
 
     assert len(trace) <= acts.ERROR_TRACE_CHARS
     assert trace.startswith(wind_up.TRACE_CUT)
-    assert trace.rstrip().endswith("the root cause")
+    assert trace.rstrip().endswith("RuntimeError: failure number 199")
+
+
+def test_a_long_message_keeps_its_start() -> None:
+    # A provider error can echo the whole request. What went wrong is at the front.
+    error = raised(RuntimeError("push rejected: " + "x" * 50_000))
+
+    trace = wind_up.error_trace(error)
+
+    assert "push rejected: xxx" in trace
+    assert wind_up.MESSAGE_CUT in trace
+    assert len(trace) <= acts.ERROR_TRACE_CHARS
 
 
 def test_a_short_trace_is_kept_whole() -> None:

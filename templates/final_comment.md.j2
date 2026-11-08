@@ -1,0 +1,44 @@
+## {{ headline }}
+
+{{ summary }}
+{% if pr_url %}
+
+{{ pr_line }}: {{ pr_url }}
+{% endif %}
+{% if show_plan %}
+
+### What was done
+
+{% for step in done %}
+- [x] **{{ step.id }}**: {{ step.description }}
+{% else %}
+Nothing on the plan was finished.
+{% endfor %}
+
+### What is left
+
+{% for step in left %}
+- [ ] **{{ step.id }}**: {{ step.description }}
+{% else %}
+Every step of the plan is finished.
+{% endfor %}
+{% endif %}
+
+### Changes
+
+{{ changes }}
+{% if files %}
+
+{% for file in files %}
+- `{{ file.path }}`: {{ file.counts }}
+{% endfor %}
+{% if hidden %}
+- and {{ hidden }} more {{ "file" if hidden == 1 else "files" }}
+{% endif %}
+{% endif %}
+{% if next_step %}
+
+{{ next_step }}
+{% endif %}
+
+Ran {{ turns }}, spent {{ cost }}.

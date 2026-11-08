@@ -575,6 +575,14 @@ def test_text_at_every_limit_still_fits_the_16_kb_rule() -> None:
 # --- repo_settings rows -----------------------------------------------------------------------
 
 
+def test_a_field_only_the_worker_reads_stays_out_of_the_repo_rows() -> None:
+    # open_draft_on_stuck is not part of RepoSettings, which a task runs with and the row rebuilds.
+    (row,) = repo_rows(config_with(entry("hoomanesteki/lh-demo-calc", open_draft_on_stuck=True)))
+
+    assert "open_draft_on_stuck" not in row["settings"]
+    assert RepoSettings(repo=row["repo"], **row["settings"]).repo == "hoomanesteki/lh-demo-calc"
+
+
 def test_repo_rows_keep_the_flag_and_the_settings_apart_from_the_name() -> None:
     config = config_with(
         entry("hoomanesteki/lh-demo-textkit", allowlisted=False, test_command="pytest"),

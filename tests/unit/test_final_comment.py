@@ -9,11 +9,11 @@ same inputs have to give the same bytes.
 from pathlib import Path
 
 import pytest
-from longhaul.github.final_comment import render_final_comment
 
 from longhaul.checkpoints.squash import FileStat
 from longhaul.contracts import Outcome, OutcomeKind, Plan, PlanStep
 from longhaul.github import final_comment
+from longhaul.github.final_comment import render_final_comment
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 
@@ -190,10 +190,10 @@ def test_a_long_summary_is_cut() -> None:
 
 
 def test_a_long_plan_and_a_long_file_list_stay_short() -> None:
-    many = [FileStat(f"src/file_{n}.py", 1, 1) for n in range(60)]
+    many = [FileStat(f"src/file_{n}.py", 1, 1) for n in range(130)]
     text = render(outcome(OutcomeKind.STUCK, "x"), plan=a_plan(*["todo"] * 8), files=many)
-    assert "60 files changed" in text
-    assert "and 50 more files" in text
+    assert "130 files changed" in text
+    assert "and 30 more files" in text
     assert text.count("\n- `src/file_") == final_comment.MAX_FILES
 
 

@@ -191,7 +191,8 @@ again. The hint is shown to the model on the next turn like any other (turns.sho
 of pauses that have ended, so the next pause is `stuck_count + 1`, which is the `n` of the key and
 survives a hand-over in CarryState. A task that is stuck after its third pause (stuck.MAX_PAUSES),
 and a task whose wait runs out, end with outcome STUCK in phase FAILED. A cancel during the wait
-takes the usual cancel path. The final comment and labels of those ends are LH-507's.
+takes the usual cancel path. Those ends get the final comment and labels of every end (see "How a
+task ends" below).
 
 Each hint is cut to agent/hints.MAX_HINT_BYTES when its signal arrives. The hints of a task stay
 in the state for its whole life, and every `llm_turn` takes all of them as input.
@@ -222,7 +223,7 @@ A task of an issue (LH-306) is one whose repo is owner/name and whose spec has a
 The pause for a hint adds and removes `longhaul:needs-human` through `_needs_human` and
 `_human_done`, and the pause for a budget (Phase 7) will use them too. The plan gate asks for a
 person with helpers and keys of its own (`_ask_for_review`). The labels of a task that ends any
-other way (an error, a cancel, a pause nobody answered) are left alone until LH-507.
+other way are set when it ends (see "How a task ends" below).
 
 `/longhaul status` on the issue reaches the task as the signal `report_status` (LH-308). The
 handler posts a comment with the state of the task through the `post_comment` activity, so it is
@@ -239,7 +240,7 @@ can tell them apart without reading prose:
   PR_OPENED with the model's summary. A local task has no pull request and so no pr_url, which is
   the outcome the in-process loop returns too. The task of an issue has the URL of its pull
   request;
-- a `cancel` signal: CANCELLED, after a `cleanup` activity;
+- a `cancel` signal: CANCELLED;
 - `task_turns` plus the turns added by `add_budget` pass: ERROR "turn limit";
 - a tool call finds its sandbox gone more often than it may: ERROR "sandbox lost";
 - the other ends of agent/rules.py: "no tool calls", "output limit", "model declined (...)",
@@ -255,10 +256,50 @@ review: ..." for a task whose rounds ran out.
 The pause for a hint adds two: STUCK with the reason, the evidence or the question, and "no hint in
 24 hours" or "3 hints did not unblock the task" (roles/stuck.py).
 
-Not here yet, each in its own story: budget enforcement and pauses (Phase 7), clean-up and a final
-outcome for runs that end any way but a cancel (LH-507). An activity that fails for good, after
-its retries, fails the workflow with that error. A prompt over the context window is the
-exception, and it is handled as described next.
+Not here yet, in its own story: budget enforcement and pauses (Phase 7). An activity that fails
+for good, after its retries, ends the task with ERROR and then fails the workflow with that error
+(see "How a task ends" below). A prompt over the context window is the exception, and it is
+handled as described next.
+
+How a task ends (LH-507). Every task ends in exactly one Outcome, and `run()` winds it up the same
+way for every end, in `_wind_up`:
+
+1. The Outcome is set, with the phase (`_end`). `status()` shows it from here.
+2. The `cleanup` activity destroys the sandbox. This is first because it frees the most and needs
+   nothing from GitHub, which can be down for twenty minutes. A task that ended on its own keeps
+   its bare repo (`CleanupInput.keep_repo`), and the janitor (`clean_repos`, which PollerWorkflow
+   runs after each poll) removes it seven days after the `outcome` event. A cancel removes the
+   repo with the sandbox, as it always did, and its reason is the reason of the cancel.
+3. A task of an issue goes on. A stuck task whose repo asked for it (the memo key
+   acts.OPEN_DRAFT_MEMO_KEY, set by the poller from `open_draft_on_stuck`) builds the pull request
+   branch and opens a draft with its partial work, through the same two activities as a finished
+   task. A task whose work changes no file opens none, and a draft that fails is logged. The
+   URL becomes the `pr_url` of the outcome.
+4. `post_final` posts the one final comment under the key `final:1`: the pull request link, or
+   the report with what was done, what is left and the diff stats (github/final_comment.py).
+5. The final labels are set (lifecycle.on_end). A task that delivered has them already from
+   `_deliver`.
+6. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
+   of the above.
+
+Each step is best effort and runs outside `_call`, so a failed step is logged and the next one
+goes on, and a cancel that arrives during the wind-up changes nothing. The steps are idempotent:
+the comment, the labels and the pull request have keys, a cleanup of nothing is a no-op, and a
+replay makes the same commands from the history.
+
+An error ends the task too. An activity that failed for good (a FailureError) or a payload that
+was too large (acts.FAIL_THE_WORKFLOW) sets ERROR "workflow failed: <type>", and any other
+exception that escapes the run, a bug in the workflow, sets ERROR "unexpected error: <class>". The
+summary is the type and never the message, which can echo a request. The trace, cut to
+acts.ERROR_TRACE_CHARS, goes to the `events` table as an `error` event (wind_up.error_trace), and
+the wind-up runs. Then the workflow still fails, so Temporal shows it as failed and a client that
+waits for the result gets the error. A bug that used to fail the workflow task, and so to be
+retried for as long as the code stayed the same, now fails the workflow for good.
+
+Replay. All of it is behind `workflow.patched(OUTCOME_PATCH)`. A history from before this story
+has no marker and replays as it ran: a cancel cleaned up inside `_cancelled`, no other end cleaned
+up, and a failure noted the outcome and raised. Drop the patch with `workflow.deprecate_patch`
+once no run that began before this story is open.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -286,7 +327,7 @@ The end of a run is noted for the metrics (LH-704). Counting is I/O, so the work
 When run() ends, by any of the outcomes above or by an activity that failed for good, it calls
 the `record_event` local activity once with the type acts.OUTCOME_EVENT, and the worker counts the
 task as finished and no longer active. A hand-over to a new run (below) is not an end and makes no
-such call. The note is made after the cleanup of a cancel, outside `_call`, because `_call` stops
+such call. The note is made at the end of the wind-up, outside `_call`, because `_call` stops
 at once when a cancel was requested. It is a record for people, like the hand-over event: a
 failure to write it is logged and the outcome stands. A run that Temporal itself ends, by a
 terminate or a timeout, never gets to make it, and its task stays among the active ones until the
@@ -390,7 +431,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn, Protocol
 
 from temporalio import workflow
-from temporalio.exceptions import ActivityError, ApplicationError, FailureError
+from temporalio.exceptions import ActivityError, ApplicationError, FailureError, TemporalError
 
 # Contracts, acts and the turn rules are pure. Passing them through the sandbox saves about
 # 30 ms per run and keeps one class object for each model, so an isinstance check against a
@@ -413,7 +454,7 @@ with workflow.unsafe.imports_passed_through():
         ToolResult,
         VerifierVerdict,
     )
-    from longhaul.durable import acts
+    from longhaul.durable import acts, wind_up
     from longhaul.github import lifecycle
     from longhaul.roles import coder, planner, stuck, verifier
 
@@ -445,6 +486,14 @@ NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 LOAD_MEMORY_PATCH = "lh-604-load-memory"
 # The patch marker of the plan gate (LH-502, failure mode F13). See "The plan gate" above.
 PLAN_GATE_PATCH = "lh-502-plan-gate"
+# The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
+# ends" above.
+OUTCOME_PATCH = "lh-507-final-outcome"
+# What fails the workflow when it escapes run(): an activity or child that failed for good, and
+# the errors the workflow was told to fail on (acts.FAIL_THE_WORKFLOW).
+FAILS_THE_WORKFLOW: tuple[type[BaseException], ...] = (FailureError, *acts.FAIL_THE_WORKFLOW)
+# The type of the error that fails a workflow whose code raised something it did not expect.
+UNEXPECTED_ERROR = "UnexpectedError"
 
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
@@ -523,9 +572,9 @@ class _SandboxLost(Exception):
         self.call_id = call_id
 
 
-def _error_type(err: FailureError) -> str:
+def _error_type(err: BaseException) -> str:
     """The type of the error that failed the run: an application error's type, else its class."""
-    cause = err.cause or err
+    cause = (err.cause if isinstance(err, FailureError) else None) or err
     if isinstance(cause, ApplicationError) and cause.type:
         return cause.type
     return type(cause).__name__
@@ -678,15 +727,23 @@ class TaskWorkflow:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
             outcome = await self._finish_the_task()
-        except FailureError as err:
+        except FAILS_THE_WORKFLOW as err:
             # The workflow is about to fail. The task is over all the same, and its error type is
-            # all the note says: the message of a provider error can echo the request.
-            await self._note_outcome(
-                Outcome(kind=OutcomeKind.ERROR, summary=f"workflow failed: {_error_type(err)}")
-            )
+            # all the summary says: the message of a provider error can echo the request.
+            await self._end_with_error(err, unexpected=False)
             raise
-        await self._note_outcome(outcome)
-        return outcome
+        except TemporalError:
+            raise  # a non-determinism error or an eviction: the SDK handles these
+        except Exception as err:
+            # A bug in the workflow or in a helper it calls. Before LH-507 it failed the workflow
+            # task, which the server retries for as long as the code is the same.
+            if not workflow.patched(OUTCOME_PATCH):
+                raise
+            ended = await self._end_with_error(err, unexpected=True)
+            raise ApplicationError(
+                ended.summary, type=UNEXPECTED_ERROR, non_retryable=True
+            ) from err
+        return await self._wind_up(outcome)
 
     async def _finish_the_task(self) -> Outcome:
         try:
@@ -736,6 +793,188 @@ class TaskWorkflow:
         except FailureError as err:
             workflow.logger.warning(
                 "outcome of task %s not recorded: %s", state.spec.task_id, err.cause or err
+            )
+
+    # ---------- the end of a task ----------
+    async def _end_with_error(self, err: BaseException, *, unexpected: bool) -> Outcome:
+        """End the task with outcome ERROR for an exception, and wind it up. The caller raises.
+
+        The summary names the error type and nothing else. The trace goes to the `events` table.
+        """
+        label = "unexpected error" if unexpected else "workflow failed"
+        failed = Outcome(kind=OutcomeKind.ERROR, summary=f"{label}: {_error_type(err)}")
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._note_outcome(failed)
+            return failed
+        self._end(failed, Phase.FAILED)
+        await self._wind_note(
+            acts.ERROR_EVENT, {"type": _error_type(err), "trace": wind_up.error_trace(err)}
+        )
+        return await self._wind_up(failed)
+
+    async def _wind_up(self, outcome: Outcome) -> Outcome:
+        """Everything a task does when it ends, whatever way it ended (LH-507). Returns the outcome.
+
+        The order is the order of what costs the most when it is left behind. The sandbox goes
+        first, because GitHub can be down for twenty minutes and a container must not wait for it.
+        Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
+        for one, the final comment (which links that pull request), and the final labels. The
+        note for the metrics comes last, so it counts a task that has finished all of this.
+
+        Each step is best effort. An activity that fails for good is logged, and the next step
+        goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
+        cancel that arrives now is not acted on: the task is over. For that reason the steps do
+        not go through `_call`, which stops at once on a cancel.
+        """
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._note_outcome(outcome)
+            return outcome
+        state = self.state
+        await self._try("cleanup", self._wind_call(acts.CLEANUP, self._cleanup_input(outcome)))
+        if lifecycle.is_github_task(state.spec):
+            outcome = await self._open_draft(outcome)
+            await self._report(outcome)
+            await self._end_labels(outcome)
+        await self._note_outcome(outcome)
+        return outcome
+
+    def _cleanup_input(self, outcome: Outcome) -> acts.CleanupInput:
+        """What to destroy when the task ends, and whether its repo stays for the janitor.
+
+        A task that ended on its own keeps its bare repo for a week, so that a person can read
+        its checkpoints. A task that a person cancelled does not: they asked it to stop, and the
+        cancel has always removed the repo with the sandbox. Its reason is the cancel reason.
+        """
+        state = self.state
+        request = self.cancel_request
+        cancelled = outcome.kind is OutcomeKind.CANCELLED and request is not None
+        return acts.CleanupInput(
+            task_id=state.spec.task_id,
+            sandbox_id=state.sandbox_id,
+            reason=request.reason
+            if cancelled and request is not None
+            else wind_up.cleanup_reason(outcome.kind),
+            keep_repo=not cancelled,
+        )
+
+    async def _open_draft(self, outcome: Outcome) -> Outcome:
+        """Open a draft pull request with the partial work of a stuck task, if the repo asked.
+
+        The work is the same change a finished task delivers, so it goes through the same two
+        activities. A task whose work changes no file has nothing to open (the same error as in
+        `_deliver`), and a draft that cannot be opened is logged: the report goes out without it.
+        """
+        state = self.state
+        base_sha, issue = state.spec.base_sha, state.spec.issue_number
+        asked = bool(workflow.memo_value(acts.OPEN_DRAFT_MEMO_KEY, False, type_hint=bool))
+        if (
+            outcome.kind is not OutcomeKind.STUCK
+            or not asked
+            or state.head_sha is None
+            or base_sha is None
+            or issue is None
+        ):
+            return outcome
+        task_id, repo = state.spec.task_id, state.spec.repo
+        summary = wind_up.draft_summary(outcome)
+        try:
+            built = await self._wind_call(
+                acts.BUILD_PR_BRANCH,
+                acts.BuildPrBranchInput(
+                    task_id=task_id,
+                    repo=repo,
+                    summary=summary,
+                    base_sha=base_sha,
+                    head_sha=state.head_sha,
+                    plan=state.plan,
+                ),
+            )
+            url = await self._wind_call(
+                acts.DELIVER,
+                acts.DeliverInput(
+                    task_id=task_id,
+                    repo=repo,
+                    issue_number=issue,
+                    summary=summary,
+                    branch=built.branch,
+                    base_branch=built.base_branch,
+                    base_sha=built.base_sha,
+                    head_sha=built.head_sha,
+                    title=built.title,
+                ),
+            )
+        except ActivityError as err:
+            if not _has_nothing_to_deliver(err):
+                workflow.logger.warning(
+                    "no draft pull request for stuck task %s: %s", task_id, err.cause or err
+                )
+            return outcome
+        drafted = outcome.model_copy(update={"pr_url": url})
+        self.outcome = drafted
+        return drafted
+
+    async def _report(self, outcome: Outcome) -> None:
+        """Post the one final comment of a task of an issue."""
+        state = self.state
+        issue = state.spec.issue_number
+        if issue is None:  # is_github_task has checked
+            return
+        await self._try(
+            "final comment",
+            self._wind_call(
+                acts.POST_FINAL,
+                acts.PostFinalInput(
+                    task_id=state.spec.task_id,
+                    repo=state.spec.repo,
+                    number=issue,
+                    outcome=outcome,
+                    plan=state.plan,
+                    base_sha=state.spec.base_sha,
+                    head_sha=state.head_sha,
+                    turns=state.turn_index,
+                    cost_usd=state.cost_usd,
+                    draft=True,  # deliver opens drafts until a verifier has passed the work
+                ),
+            ),
+        )
+
+    async def _end_labels(self, outcome: Outcome) -> None:
+        opened = outcome.kind is OutcomeKind.STUCK and outcome.pr_url is not None
+        for step in lifecycle.on_end(self.state.spec, outcome.kind, pr_opened=opened):
+            await self._try(
+                "label",
+                self._wind_call(acts.ADD_LABEL if step.add else acts.REMOVE_LABEL, step.label),
+            )
+
+    async def _wind_note(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Record an event in the wind-up, which a cancel request does not interrupt."""
+        note = acts.RecordEventInput(
+            task_id=self.state.spec.task_id, type=event_type, payload=payload
+        )
+        await self._try(event_type, self._wind_call(acts.RECORD_EVENT, note))
+
+    async def _wind_call[In, Out](self, act: acts.Act[In, Out], arg: In) -> Out:
+        """Run an activity by name, outside the cancel handling of `_call`."""
+        if act.local:
+            local: Out = await workflow.execute_local_activity(
+                act.name, arg, result_type=act.result_type, **acts.local_options(act)
+            )
+            return local
+        remote: Out = await workflow.execute_activity(
+            act.name, arg, result_type=act.result_type, **acts.options(act, self._tuning())
+        )
+        return remote
+
+    async def _try(self, what: str, step: Awaitable[object]) -> None:
+        """Await one step of the wind-up. A step that fails for good is logged and skipped."""
+        try:
+            await step
+        except FailureError as err:
+            workflow.logger.warning(
+                "wind-up step %s of task %s failed: %s",
+                what,
+                self.state.spec.task_id,
+                err.cause or err,
             )
 
     async def _prepare(self) -> None:
@@ -1931,6 +2170,16 @@ class TaskWorkflow:
         request = self.cancel_request
         if request is None:
             raise ApplicationError("cancel path without a cancel request", non_retryable=True)
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._clean_up_after_cancel(request)
+        # The sandbox of a cancelled task is destroyed with that of every other end, in _wind_up.
+        outcome = Outcome(
+            kind=OutcomeKind.CANCELLED, summary=cancel_summary(request.by, request.reason)
+        )
+        return self._end(outcome, Phase.CANCELLED)
+
+    async def _clean_up_after_cancel(self, request: CancelRequest) -> None:
+        """What a cancel did before LH-507, for the histories that recorded it."""
         # Cleanup is not run through _call: a second cancel must not interrupt it.
         try:
             await workflow.execute_activity(
@@ -1948,10 +2197,6 @@ class TaskWorkflow:
             # running, so the failure is logged and the run still ends as cancelled. The cause
             # is what says why; the error itself only says that the activity failed.
             workflow.logger.warning("cleanup after a cancel failed: %s", err.cause or err)
-        outcome = Outcome(
-            kind=OutcomeKind.CANCELLED, summary=cancel_summary(request.by, request.reason)
-        )
-        return self._end(outcome, Phase.CANCELLED)
 
     # ---------- helpers ----------
     async def _call[In, Out](self, act: acts.Act[In, Out], arg: In) -> Out:

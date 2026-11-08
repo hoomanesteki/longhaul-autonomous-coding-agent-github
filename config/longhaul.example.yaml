@@ -8,6 +8,8 @@ repos:
     # The sandbox root filesystem is read-only, so packages go into a venv in the workspace.
     setup_command: "python -m venv .venv && .venv/bin/pip install -e '.[dev]'"
     test_command: "pytest -q"
+    # A task that ends stuck opens a draft pull request with its partial work. Off unless set.
+    open_draft_on_stuck: false
     budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
 models:                 # every id here needs an entry in the pricing file
   planner: "claude-sonnet-5-5"

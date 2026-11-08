@@ -29,13 +29,17 @@ went through leaves a second, identical line in the log (an event is a log line)
 stays right. Two real compactions differ in the tokens they started from, so they are two. A
 task with no row in `tasks`, as in a local run, is not an error: the update changes nothing, as
 it does for the cost ledger (cost/ledger.py).
+
+`ended_before` tells the janitor (LH-507) which tasks ended before a time. A task has ended when
+it has an `outcome` event, and the time of the end is the time of that event. It is not in the
+`Recorder` protocol either: only the janitor asks.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -53,6 +57,11 @@ from longhaul.db.models import Checkpoint, Event, PlanRow, Task, ToolCallRow, Tu
 COMPACTION_EVENT = "compaction"
 # The status of a plan that nobody has decided on yet (plan section 3.5).
 PROPOSED = "proposed"
+
+# The type of the event that the workflow records when a task ends (durable/acts.OUTCOME_EVENT,
+# LH-704). It dates the end of a task, which `ended_before` reads for the janitor (LH-507). A unit
+# test keeps the two names equal.
+OUTCOME_EVENT = "outcome"
 
 # The kind of the checkpoint that a step leaves when it is done (plan section 3.5).
 STEP_KIND = "step"
@@ -196,6 +205,8 @@ class MemoryRecorder:
         self.events: list[EventRecord] = []
         self.max_fractions: dict[str, float] = {}
         self.plans: dict[tuple[str, int], PlanRecord] = {}
+        # When each task ended, from its outcome event. A test may set a time directly.
+        self.ended: dict[str, datetime] = {}
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -217,6 +228,11 @@ class MemoryRecorder:
 
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         self.events.append(EventRecord(task_id, type, dict(payload)))
+        if type == OUTCOME_EVENT:
+            self.ended.setdefault(task_id, datetime.now(UTC))
+
+    async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
+        return {t for t in task_ids if t in self.ended and self.ended[t] < cutoff}
 
     async def record_plan(self, record: PlanRecord) -> None:
         key = (record.task_id, record.version)
@@ -317,6 +333,17 @@ class SqlRecorder:
                 await session.execute(
                     update(Task).where(Task.id == task_id).values(compactions=compactions)
                 )
+
+    async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
+        if not task_ids:
+            return set()
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(Event.task_id)
+                .where(Event.task_id.in_(task_ids), Event.type == OUTCOME_EVENT, Event.ts < cutoff)
+                .distinct()
+            )
+            return {row[0] for row in rows}
 
     async def record_request_fraction(self, task_id: str, fraction: float) -> None:
         # One statement, so two requests that finish together cannot lower the maximum.

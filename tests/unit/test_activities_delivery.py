@@ -571,7 +571,11 @@ def make_with_reports(reports: StoredReports) -> DeliveryActivities:
     )
 
 
-async def delivered_body(monkeypatch: pytest.MonkeyPatch, reports: StoredReports) -> str:
+async def delivered_body(
+    monkeypatch: pytest.MonkeyPatch,
+    reports: StoredReports,
+    inp: acts.DeliverInput | None = None,
+) -> str:
     patch_ready(monkeypatch)
     seen: list[Any] = []
 
@@ -580,7 +584,7 @@ async def delivered_body(monkeypatch: pytest.MonkeyPatch, reports: StoredReports
         return PR_URL
 
     monkeypatch.setattr(delivery, "create_pr", create)
-    await run(make_with_reports(reports).deliver, deliver_input())
+    await run(make_with_reports(reports).deliver, inp or deliver_input())
     return str(seen[0].body)
 
 
@@ -593,6 +597,19 @@ async def test_the_body_embeds_the_run_report_of_the_task(monkeypatch: pytest.Mo
     assert "| Turns | 8 |" in body
     assert body.rstrip().splitlines()[-1] == "Closes #42"
     assert reports.asked == [(TASK, "pr_opened")]
+
+
+async def test_the_draft_of_a_stuck_task_reports_it_as_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reports = StoredReports("### Overview\n\n| Outcome | stuck |\n")
+    inp = deliver_input().model_copy(update={"partial": True})
+
+    body = await delivered_body(monkeypatch, reports, inp)
+
+    assert "<summary>Run report</summary>" in body
+    assert body.rstrip().splitlines()[-1] == "Refs #42"
+    assert reports.asked == [(TASK, "stuck")]
 
 
 async def test_a_worker_with_no_reports_opens_the_pull_request_without_one(

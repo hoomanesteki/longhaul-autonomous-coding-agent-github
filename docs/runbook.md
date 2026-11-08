@@ -105,6 +105,20 @@ When the repo settings name no test command, the task statement names the first 
 
 `longhaul memory list --repo REPO --status approved` shows what a task can be given. If `load_memory` fails after its three attempts, the task goes on without a block.
 
+### Lessons from a finished task
+
+When a task ends, whichever way it ends, a worker with a memory store drafts the lessons of the task. The workflow calls `extract_lessons` after the final comment and the labels, so the issue does not wait for a model. The compactor model gets the plan with the status of each step, the last progress notes, the stuck and `paused` events and the issues the verifier found. It answers with at most five notes, each under 300 characters and typed `lesson`, `pitfall` or `convention`. Its prompt forbids advice that would suit any repo.
+
+The notes are stored as `candidate` items with `source = task`. Their `source_ref` is the pull request number, or the task id when the task has no pull request. They reach no prompt until a person approves them or the pull request merges (ADR-0010).
+
+```bash
+uv run longhaul memory list --repo acme/inventory --status candidate
+```
+
+Before they are stored, the worker cuts a note over 300 characters at a word and drops a note that is only generic advice, such as "write tests" or "read the code", unless it names a file, a command or a name of the repo. A reply that holds no usable note stores nothing and does not fail the task. A task with no plan, no notes and no stuck or verifier events makes no model call.
+
+Each call of the compactor is a row on the cost ledger, and the cost is added to the task. The workflow records a `lessons` event with the status, the `source_ref` and the notes, which the run report reads. If the activity fails after its three attempts, the workflow logs it and the task keeps the outcome it had.
+
 ## Run the agent on a local folder
 
 `longhaul run-local` copies a folder into a fresh Docker sandbox and lets the agent fix an issue in it. It needs no `make up`: no Temporal, no database. It is the quickest way to watch the agent work.

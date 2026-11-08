@@ -4,6 +4,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "../App";
+import { clearToken, setToken } from "../api/token";
 
 const fetchStub = vi.fn<typeof fetch>();
 
@@ -28,10 +29,13 @@ function json(body: unknown, status = 200): Response {
 beforeEach(() => {
   fetchStub.mockReset();
   vi.stubGlobal("fetch", fetchStub);
+  // The pages sit behind the login, so these tests start signed in.
+  setToken("test-token");
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  clearToken();
 });
 
 describe("layout", () => {

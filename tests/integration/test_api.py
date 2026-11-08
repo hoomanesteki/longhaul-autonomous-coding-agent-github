@@ -77,6 +77,10 @@ OPENAI_KEY = "sk-" + "a1B2c3D4" * 4
 GITHUB_TOKEN = "ghp_" + "Z9y8X7w6V5" * 4
 REDACTED = "[redacted]"
 HINT = "the tests import the copy in vendor/, edit that one"
+# The routes check a bearer token (LH-807). The tests here are about what the routes answer, so
+# the app is given a token and the client sends it; tests/integration/test_api_auth.py covers
+# the token itself.
+API_TOKEN = "admin-" + "t0K3n" * 6
 
 
 # ---------- the app ----------
@@ -112,9 +116,14 @@ async def serving(sessions: Sessions, temporal: Client | None = None) -> AsyncIt
         blobs=blobs,
         memory=PgMemoryStore(sessions, HashEmbedder()),
         temporal=connect,
+        admin_token=API_TOKEN,
     )
     transport = httpx2.ASGITransport(app=create_app(context))
-    async with httpx2.AsyncClient(transport=transport, base_url="http://api") as client:
+    async with httpx2.AsyncClient(
+        transport=transport,
+        base_url="http://api",
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
+    ) as client:
         yield Stack(client, sessions, blobs)
 
 

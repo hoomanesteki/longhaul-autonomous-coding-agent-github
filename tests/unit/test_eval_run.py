@@ -6,19 +6,41 @@ tests/integration/test_eval_runner.py.
 """
 
 import asyncio
+import contextlib
+import hashlib
+import re
+import shutil
+import subprocess
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from temporalio.service import RPCError, RPCStatusCode
 
-from eval import custom_tasks, results, run
+from eval import config_files, custom_tasks, results, run
+from eval.baselines import single_shot
 from eval.grade_custom import GradeResult
 from eval.results import TaskResult, Tokens
 from eval.run import RunOptions
 from longhaul.checkpoints.git_store import CheckpointError, check_task_id
-from longhaul.contracts import Outcome, OutcomeKind, Phase, TaskStatus
+from longhaul.context.modes import ContextMode
+from longhaul.contracts import (
+    LLMResponse,
+    Outcome,
+    OutcomeKind,
+    Phase,
+    ProviderError,
+    ProviderErrorKind,
+    TaskSpec,
+    TaskStatus,
+    TextBlock,
+    Usage,
+)
+from longhaul.cost.ledger import LedgerEntry
 from longhaul.settings import load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -79,19 +101,55 @@ def test_every_flag_of_the_plan_is_accepted(tmp_path: Path) -> None:
     assert (options.provider, options.script, options.results_dir) == ("scripted", script, tmp_path)
 
 
-def test_the_swebench_set_is_not_there_yet(capsys: pytest.CaptureFixture[str]) -> None:
-    err = refuses(capsys, ["--set", "swebench", "--config", "full", "--run-id", "try1"])
-    assert "swebench" in err
-    assert "LH-902" in err
+def test_the_swebench_set_is_accepted() -> None:
+    options = run.parse_args(["--set", "swebench", "--config", "full", "--run-id", "try1"])
+
+    assert options.task_set == "swebench"
+    assert options.config == "full"
 
 
 @pytest.mark.parametrize("config", ["naive", "single_shot"])
-def test_the_baseline_configs_are_not_there_yet(
-    capsys: pytest.CaptureFixture[str], config: str
+def test_the_baseline_configs_are_accepted(config: str) -> None:
+    options = run.parse_args(["--set", "custom", "--config", config, "--run-id", "try1"])
+    assert options.config == config
+
+
+def test_a_config_that_does_not_exist_is_a_usage_error(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    err = refuses(capsys, ["--set", "custom", "--config", config, "--run-id", "try1"])
-    assert config in err
-    assert "LH-903" in err
+    assert "--config" in refuses(capsys, ["--set", "custom", "--config", "fast", "--run-id", "t"])
+
+
+def test_the_seed_is_42_unless_the_run_says_otherwise() -> None:
+    # Plan section 8.2 draws the SWE-bench subset with seed 42, and a result file records it.
+    assert run.parse_args(BASE_ARGS).seed == 42
+    assert run.parse_args([*BASE_ARGS, "--seed", "7"]).seed == 7
+
+
+def test_the_run_set_and_the_mixed_models_switch_default_to_off() -> None:
+    options = run.parse_args(BASE_ARGS)
+    assert (options.run_set, options.allow_mixed_models) == (None, False)
+    options = run.parse_args([*BASE_ARGS, "--run-set", "headline", "--allow-mixed-models"])
+    assert (options.run_set, options.allow_mixed_models) == ("headline", True)
+
+
+@pytest.mark.parametrize("run_set", ["", "../x", "a b", "-x", "x" * 80])
+def test_a_run_set_must_be_a_safe_short_name(
+    capsys: pytest.CaptureFixture[str], run_set: str
+) -> None:
+    assert "run-set" in refuses(capsys, [*BASE_ARGS, "--run-set", run_set])
+
+
+@pytest.mark.parametrize("config", ["naive", "single_shot"])
+@pytest.mark.parametrize("flags", [["--context-mode", "full"], ["--memory", "on"]])
+def test_a_baseline_does_not_take_the_switches_of_an_ablation(
+    capsys: pytest.CaptureFixture[str], config: str, flags: list[str]
+) -> None:
+    # The config file is the definition of a baseline and its hash is stored with the result,
+    # so a flag may not quietly turn it into something else.
+    err = refuses(capsys, ["--set", "custom", "--config", config, "--run-id", "t", *flags])
+    assert flags[0] in err
+    assert "--config full" in err
 
 
 @pytest.mark.parametrize(
@@ -597,6 +655,8 @@ def test_the_progress_line_names_the_task_the_outcome_and_the_verdict() -> None:
         workflow_id="lh-eval-try1-calc-01",
         task_set="custom",
         config="full",
+        config_hash="a" * 64,
+        seed=42,
         model="m",
         git_sha="f" * 40,
         provider=None,
@@ -627,8 +687,11 @@ class Remover:
         self.removed.append(task_id)
 
 
-def run_context(tmp_path: Path, *extra: str) -> run.RunContext:
-    options = run.parse_args([*BASE_ARGS, "--results-dir", str(tmp_path), *extra])
+def run_context(
+    tmp_path: Path, *extra: str, config: str = "full", flags: list[str] | None = None
+) -> run.RunContext:
+    base = ["--set", "custom", "--config", config, "--run-id", "try1"]
+    options = run.parse_args([*base, "--results-dir", str(tmp_path), *extra, *(flags or [])])
     return SimpleNamespace(  # type: ignore[return-value]
         options=options,
         settings=SimpleNamespace(task_queue="q"),
@@ -640,6 +703,7 @@ def run_context(tmp_path: Path, *extra: str) -> run.RunContext:
         model="claude-sonnet-5-5",
         commit="f" * 40,
         folder=tmp_path,
+        driver=None,
     )
 
 
@@ -746,6 +810,8 @@ def result_for(task: custom_tasks.CustomTask) -> TaskResult:
         workflow_id=f"lh-eval-try1-{task.id}",
         task_set="custom",
         config="full",
+        config_hash=config_files.load("full").sha256,
+        seed=42,
         model="claude-sonnet-5-5",
         git_sha="f" * 40,
         provider=None,
@@ -793,6 +859,468 @@ async def test_one_task_that_fails_does_not_stop_the_others(
     assert (summary.attempted, summary.resolved, summary.ungraded) == (3, 2, 1)
 
 
+# ---------- the config of a run (LH-903) ----------
+def options_for(config: str, *flags: str) -> RunOptions:
+    return run.parse_args(["--set", "custom", "--config", config, "--run-id", "try1", *flags])
+
+
+def ctx_of(options: RunOptions) -> run.RunContext:
+    return SimpleNamespace(  # type: ignore[return-value]
+        options=options, model="claude-sonnet-5-5", commit="f" * 40
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "flags", "mode"),
+    [
+        ("full", [], ContextMode.FULL),
+        ("full", ["--context-mode", "no_compaction"], ContextMode.NO_COMPACTION),
+        ("naive", [], ContextMode.SLIDING),
+        ("single_shot", [], None),
+    ],
+)
+def test_the_context_mode_of_a_run_comes_from_the_config_and_a_flag_wins(
+    config: str, flags: list[str], mode: ContextMode | None
+) -> None:
+    assert run.effective_context_mode(options_for(config, *flags)) is mode
+
+
+@pytest.mark.parametrize(
+    ("config", "flags", "memory"),
+    [
+        ("full", [], "on"),
+        ("full", ["--memory", "off"], "off"),
+        ("naive", [], "off"),
+        ("single_shot", [], "off"),
+    ],
+)
+def test_the_memory_of_a_run_comes_from_the_config_and_a_flag_wins(
+    config: str, flags: list[str], memory: str
+) -> None:
+    assert run.effective_memory(options_for(config, *flags)) == memory
+
+
+@pytest.mark.parametrize("config", ["full", "naive", "single_shot"])
+def test_every_result_carries_the_hash_of_its_config_file_and_the_seed(config: str) -> None:
+    file = Path(__file__).resolve().parents[2] / "eval" / "configs" / f"{config}.yaml"
+
+    fields = run.identity(ctx_of(options_for(config, "--seed", "9")), first_task())
+
+    assert fields["config"] == config
+    assert fields["config_hash"] == hashlib.sha256(file.read_bytes()).hexdigest()
+    assert fields["seed"] == 9
+
+
+def test_the_identity_records_what_the_run_used_and_not_what_the_flags_left_out() -> None:
+    naive = run.identity(ctx_of(options_for("naive")), first_task())
+    assert (naive["memory"], naive["context_mode"]) == ("off", "sliding")
+    full = run.identity(ctx_of(options_for("full")), first_task())
+    assert (full["memory"], full["context_mode"]) == ("on", "full")
+    shot = run.identity(ctx_of(options_for("single_shot")), first_task())
+    assert (shot["memory"], shot["context_mode"]) == ("off", None)
+
+
+def test_the_identity_names_the_run_set() -> None:
+    fields = run.identity(ctx_of(options_for("full", "--run-set", "headline")), first_task())
+    assert fields["run_set"] == "headline"
+    assert run.identity(ctx_of(options_for("full")), first_task())["run_set"] is None
+
+
+def test_the_identity_records_whether_mixed_models_were_allowed() -> None:
+    # A run with no run set is compared with nothing by the runner, so the result file is what
+    # tells a later comparison whether a pair of models was meant.
+    plain = run.identity(ctx_of(options_for("full")), first_task())
+    assert plain["allow_mixed_models"] is False
+    mixed = run.identity(ctx_of(options_for("full", "--allow-mixed-models")), first_task())
+    assert mixed["allow_mixed_models"] is True
+
+
+async def test_a_durable_task_is_started_with_the_context_mode_of_its_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def start_task(*_args: object, **kwargs: Any) -> None:
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    async def upload_script(*_args: object, **_kwargs: object) -> str:
+        return "the-script-ref"
+
+    monkeypatch.setattr(run, "start_task", start_task)
+    monkeypatch.setattr(run, "upload_script", upload_script)
+    ledger_says(monkeypatch, 0.0, Tokens())
+
+    for config, flags, mode in [
+        ("naive", [], ContextMode.SLIDING),
+        ("full", [], ContextMode.FULL),
+        ("full", ["--context-mode", "none"], ContextMode.NONE),
+    ]:
+        ctx = run_context(tmp_path / f"{config}-{len(flags)}", config=config, flags=flags)
+        await run.run_one(ctx, first_task())
+        assert seen["context_mode"] is mode
+
+
+# ---------- one model across the configs of a run set (LH-903) ----------
+def write_earlier_run(folder: Path, run_id: str, model: str, run_set: str | None) -> None:
+    done = result_for(first_task()).model_copy(
+        update={"run_id": run_id, "model": model, "run_set": run_set}
+    )
+    results.write_result(folder / run_id, done)
+
+
+def set_options(tmp_path: Path, *flags: str) -> RunOptions:
+    return run.parse_args(
+        [*BASE_ARGS[:-1], "later", "--results-dir", str(tmp_path), "--run-set", "headline", *flags]
+    )
+
+
+def test_a_run_with_the_model_of_its_run_set_is_accepted(tmp_path: Path) -> None:
+    write_earlier_run(tmp_path, "full-1", "claude-sonnet-5-5", "headline")
+    run.check_run_set(set_options(tmp_path), "claude-sonnet-5-5")
+
+
+def test_a_run_with_another_model_than_its_run_set_is_refused_and_names_the_way_out(
+    tmp_path: Path,
+) -> None:
+    write_earlier_run(tmp_path, "full-1", "claude-sonnet-5-5", "headline")
+
+    with pytest.raises(ValueError) as caught:
+        run.check_run_set(set_options(tmp_path), "claude-haiku-5-5")
+
+    message = str(caught.value)
+    assert "full-1" in message
+    assert "claude-sonnet-5-5" in message
+    assert "claude-haiku-5-5" in message
+    assert "--allow-mixed-models" in message
+
+
+def test_mixed_models_are_allowed_when_the_run_says_so(tmp_path: Path) -> None:
+    write_earlier_run(tmp_path, "full-1", "claude-sonnet-5-5", "headline")
+    run.check_run_set(set_options(tmp_path, "--allow-mixed-models"), "claude-haiku-5-5")
+
+
+def test_a_run_set_of_another_name_is_not_compared(tmp_path: Path) -> None:
+    write_earlier_run(tmp_path, "full-1", "claude-sonnet-5-5", "ablation")
+    run.check_run_set(set_options(tmp_path), "claude-haiku-5-5")
+
+
+def test_a_run_with_no_run_set_is_compared_with_nothing(tmp_path: Path) -> None:
+    write_earlier_run(tmp_path, "full-1", "claude-sonnet-5-5", "headline")
+    options = run.parse_args([*BASE_ARGS[:-1], "later", "--results-dir", str(tmp_path)])
+    run.check_run_set(options, "claude-haiku-5-5")
+
+
+def test_the_first_run_of_a_run_set_finds_nothing_to_compare_with(tmp_path: Path) -> None:
+    run.check_run_set(set_options(tmp_path / "nowhere"), "claude-haiku-5-5")
+
+
+# ---------- the single-shot config on the runner (LH-903) ----------
+CALC_FIX = custom_tasks.reference_patch_path(first_task()).read_text(encoding="utf-8")
+
+
+class AnsweringProvider:
+    """A provider that answers the one call of a single-shot task from a list."""
+
+    name = "fake"
+
+    def __init__(self, *answers: str | ProviderError) -> None:
+        self.answers = list(answers)
+        self.calls: list[dict[str, Any]] = []
+
+    async def complete(self, **kwargs: Any) -> LLMResponse:
+        self.calls.append(kwargs)
+        answer = self.answers.pop(0)
+        if isinstance(answer, ProviderError):
+            raise answer
+        return LLMResponse(
+            content=[TextBlock(text=answer)],
+            tool_calls=[],
+            stop_reason="end_turn",
+            usage=Usage(input_tokens=900, output_tokens=60),
+            model=kwargs["model"],
+            latency_ms=5,
+        )
+
+    async def count_tokens(self, **kwargs: Any) -> int:
+        return 0
+
+
+class BookKeeper:
+    def __init__(self) -> None:
+        self.entries: list[LedgerEntry] = []
+
+    async def record(
+        self, task_id: str, repo: str, model: str, turn_index: int, attempt: int, usage: Usage
+    ) -> Decimal:
+        self.entries.append(
+            LedgerEntry(task_id, repo, model, turn_index, attempt, usage, Decimal("0.01"))
+        )
+        return Decimal("0.01")
+
+
+def single_shot_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider: AnsweringProvider,
+    grader: FakeGrader,
+) -> run.RunContext:
+    options = run.parse_args(
+        ["--set", "custom", "--config", "single_shot", "--run-id", "try1", "--limit", "1"]
+    )
+    maps: list[str] = []
+
+    async def repo_map_for(*_args: object) -> str:
+        maps.append("asked")
+        return "Python files of this repo (1 of 1 shown):\ncalc: add"
+
+    monkeypatch.setattr(run, "repo_map_for", repo_map_for)
+    monkeypatch.setattr(run, "RETRY_BASE_S", 0.0)
+    ledger_says(monkeypatch, 0.01, Tokens(input=900, output=60))
+    return SimpleNamespace(  # type: ignore[return-value]
+        options=options,
+        settings=SimpleNamespace(task_queue="q"),
+        client=None,
+        blobs=None,
+        store=Remover(),
+        sandboxes=Remover(),
+        sessions=None,
+        grader=grader,
+        model="claude-sonnet-5-5",
+        commit="f" * 40,
+        folder=tmp_path,
+        driver=None,
+        wall_limit_s=600.0,
+        provider_for=lambda _script: provider,
+        ledger=BookKeeper(),
+        cfg=CONFIG,
+    )
+
+
+async def test_a_single_shot_task_is_one_call_that_is_graded_and_booked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    grader = FakeGrader(GradeResult(True, "all tests passed (3 hidden, 4 repo)"))
+    ctx = single_shot_context(monkeypatch, tmp_path, provider, grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.config, result.outcome, result.resolved) == ("single_shot", "pr_opened", True)
+    assert result.turns == 1
+    assert result.workflow_id == "lh-eval-try1-calc-01"
+    assert result.config_hash == config_files.load("single_shot").sha256
+    # One call, no tools, and the retrieved files and the repo map in the prompt.
+    (call,) = provider.calls
+    assert call["tools"] == []
+    prompt = call["messages"][0].content[0].text
+    assert "Python files of this repo (1 of 1 shown):\ncalc: add" in prompt
+    assert "src/calc/__init__.py" in prompt
+    # The call is on the ledger like every other, under the id of the task.
+    (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]
+    assert (entry.task_id, entry.turn_index, entry.attempt) == ("lh-eval-try1-calc-01", 0, 1)
+    assert entry.usage == Usage(input_tokens=900, output_tokens=60)
+    assert entry.model == "claude-sonnet-5-5"
+    # The grader got the patch that was applied, and the patch is kept next to the result.
+    ((task_id, patch, _name),) = grader.graded
+    assert task_id == "calc-01"
+    assert "+    return a + b" in patch
+    assert (tmp_path / "calc-01.patch").read_text(encoding="utf-8") == patch
+    assert results.read_results(tmp_path) == [result]
+    # The sandbox of the repo map is removed.
+    assert ctx.sandboxes.removed == ["lh-eval-try1-calc-01"]  # type: ignore[attr-defined]
+
+
+class CopyDriver:
+    """A task set with a driver, as the SWE-bench set has: its own copy of the repo, its own cut
+    of the patch and a verdict that comes later."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.cut: list[str] = []
+        self.removed = False
+
+    @contextlib.asynccontextmanager
+    async def prepared(self, task: Any, workflow_id: str) -> AsyncIterator[TaskSpec]:
+        spec = run.build_spec(task, workflow_id)
+        repo = f"local:{self.folder}"
+        settings = spec.settings.model_copy(update={"repo": repo})
+        try:
+            yield spec.model_copy(update={"repo": repo, "settings": settings})
+        finally:
+            self.removed = True
+
+    def patch(self, task: Any, patch: str) -> str:
+        self.cut.append(patch)
+        return patch.replace("+    return a + b", "+    return b + a")
+
+    async def grade(self, task: Any, patch: str) -> tuple[bool | None, str]:
+        return None, "not graded yet"
+
+
+async def test_a_single_shot_task_of_a_set_with_a_driver_reads_its_copy_and_is_graded_later(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The SWE-bench set brings its own folder for each task, cuts the patch and grades the run
+    # afterwards. A single-shot task of such a set goes through the same three steps.
+    copy = tmp_path / "copy"
+    shutil.copytree(custom_tasks.REPOS_DIR / first_task().repo, copy)
+    driver = CopyDriver(copy)
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path / "results", provider, grader)
+    ctx.folder.mkdir()
+    ctx.driver = driver
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved, result.grading) == (
+        "pr_opened",
+        None,
+        "not graded yet",
+    )
+    assert grader.graded == []  # the custom grader is not the one of this set
+    # The call read the copy of the driver and was booked against it.
+    (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]
+    assert entry.repo == f"local:{copy}"
+    # The patch that is kept is the one the driver cut, and the copy is gone after the task.
+    (applied,) = driver.cut
+    assert "+    return a + b" in applied
+    kept = (ctx.folder / "calc-01.patch").read_text(encoding="utf-8")
+    assert "+    return b + a" in kept
+    assert driver.removed
+
+
+async def test_a_reply_without_a_diff_is_an_error_result_that_is_not_graded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path, AnsweringProvider("I give up."), grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved) == ("error", False)
+    assert "no diff" in result.outcome_summary
+    assert grader.graded == []
+    assert len(ctx.ledger.entries) == 1  # type: ignore[attr-defined]  # the call was paid for
+
+
+async def test_a_diff_that_does_not_apply_is_an_error_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bad = "--- a/src/calc/__init__.py\n+++ b/src/calc/__init__.py\n@@ -1 +1 @@\n-nope\n+nope2\n"
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path, AnsweringProvider(bad), grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved) == ("error", False)
+    assert "git apply" in result.outcome_summary
+    assert grader.graded == []
+
+
+async def test_a_busy_provider_is_asked_again_and_each_billed_call_is_booked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    busy = ProviderError(ProviderErrorKind.OVERLOADED, "busy", usage=Usage(input_tokens=5))
+    provider = AnsweringProvider(busy, f"```diff\n{CALC_FIX}```")
+    ctx = single_shot_context(
+        monkeypatch, tmp_path, provider, FakeGrader(GradeResult(True, "all tests passed"))
+    )
+
+    result = await run.run_one(ctx, first_task())
+
+    assert result.outcome == "pr_opened"
+    assert len(provider.calls) == 2
+    assert [e.attempt for e in ctx.ledger.entries] == [1, 2]  # type: ignore[attr-defined]
+
+
+async def test_a_provider_that_keeps_failing_ends_the_task_with_an_error_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    refusal = ProviderError(ProviderErrorKind.AUTH, "bad key")
+    provider = AnsweringProvider(refusal)
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path, provider, grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert (result.outcome, result.resolved) == ("error", False)
+    assert "bad key" in result.outcome_summary
+    assert len(provider.calls) == 1  # an error that asking again cannot change is not retried
+    assert grader.graded == []
+
+
+async def test_the_top_files_of_the_config_decide_how_many_files_are_in_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # top_files is part of the definition that the hash of the file stands for, so the runner has
+    # to use the value in the file and not a constant of its own.
+    real_load = config_files.load
+    shot = real_load("single_shot")
+    one = config_files.LoadedConfig(shot.config.model_copy(update={"top_files": 1}), shot.sha256)
+    monkeypatch.setattr(
+        config_files, "load", lambda name: one if name == "single_shot" else real_load(name)
+    )
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    ctx = single_shot_context(
+        monkeypatch, tmp_path, provider, FakeGrader(GradeResult(True, "all tests passed"))
+    )
+
+    await run.run_one(ctx, first_task())
+
+    (call,) = provider.calls
+    prompt = call["messages"][0].content[0].text
+    assert re.findall(r"^### (\S+)\n`{3,}\n", prompt, re.MULTILINE) == ["README.md"]
+
+
+async def test_the_default_config_puts_five_files_in_the_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    ctx = single_shot_context(
+        monkeypatch, tmp_path, provider, FakeGrader(GradeResult(True, "all tests passed"))
+    )
+
+    await run.run_one(ctx, first_task())
+
+    (call,) = provider.calls
+    prompt = call["messages"][0].content[0].text
+    assert len(re.findall(r"^### (\S+)\n`{3,}\n", prompt, re.MULTILINE)) == 5
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        subprocess.TimeoutExpired("git add", 60),
+        UnicodeDecodeError("utf-8", b"\xe9", 0, 1, "invalid continuation byte"),
+        RuntimeError("git init failed in the throwaway copy"),
+    ],
+    ids=["git-timeout", "undecodable-git-output", "git-failure"],
+)
+async def test_a_call_is_booked_even_when_applying_the_diff_fails_for_another_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, error: Exception
+) -> None:
+    # The call was billed when the provider answered. What happens to the reply afterwards, in a
+    # git command that times out or prints bytes that are not text, must not take its row off the
+    # ledger (invariant I6).
+    def apply_diff(_repo: Path, _diff: str) -> single_shot.AppliedPatch:
+        raise error
+
+    monkeypatch.setattr(single_shot, "apply_diff", apply_diff)
+    provider = AnsweringProvider(f"```diff\n{CALC_FIX}```")
+    grader = FakeGrader(GradeResult(True, "would pass"))
+    ctx = single_shot_context(monkeypatch, tmp_path, provider, grader)
+
+    result = await run.run_one(ctx, first_task())
+
+    assert result.outcome == "error"
+    assert grader.graded == []
+    (entry,) = ctx.ledger.entries  # type: ignore[attr-defined]
+    assert (entry.task_id, entry.turn_index, entry.attempt) == ("lh-eval-try1-calc-01", 0, 1)
+    assert entry.usage == Usage(input_tokens=900, output_tokens=60)
+
+
 def main_with_a_stub(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], *flags: str
 ) -> str:
@@ -820,3 +1348,62 @@ def test_a_run_with_the_defaults_has_nothing_to_note(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert main_with_a_stub(monkeypatch, capsys) == ""
+
+
+# ---------- the SWE-bench set (LH-902) ----------
+def test_the_swebench_tasks_are_the_first_instances_of_the_subset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from eval.swebench import adapter
+
+    asked: list[int | None] = []
+    found = [object(), object()]
+
+    def select_instances(limit: int | None) -> list[object]:
+        asked.append(limit)
+        return found
+
+    monkeypatch.setattr(adapter, "select_instances", select_instances)
+    options = run.parse_args(
+        ["--set", "swebench", "--config", "full", "--run-id", "try1", "--limit", "2"]
+    )
+
+    assert run.select_tasks(options) == found
+    assert asked == [2]
+
+
+def test_the_custom_set_still_comes_from_tasks_yaml() -> None:
+    options = run.parse_args(
+        ["--set", "custom", "--config", "full", "--run-id", "try1", "--limit", "2"]
+    )
+
+    assert [t.id for t in run.select_tasks(options)] == [
+        t.id for t in custom_tasks.load_tasks()[:2]
+    ]
+
+
+def test_the_swebench_set_has_its_own_dollar_cap_and_the_same_turn_and_time_caps() -> None:
+    # Plan section 8.4: task_usd 4 on SWE-bench and 2 on the custom set.
+    assert run.SWEBENCH_BUDGETS.task_usd == 4.0
+    assert run.CUSTOM_BUDGETS.task_usd == 2.0
+    assert run.SWEBENCH_BUDGETS.task_turns == run.CUSTOM_BUDGETS.task_turns == 150
+    assert run.SWEBENCH_BUDGETS.task_wall_minutes == run.CUSTOM_BUDGETS.task_wall_minutes == 120
+
+
+def test_a_swebench_run_ends_by_pointing_at_the_grader_and_does_not_count_resolved(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    done = result_for(first_task())
+
+    async def run_eval(_options: RunOptions, _settings: object) -> results.Summary:
+        return results.summarize([done], started_at=done.started_at, ended_at=done.ended_at)
+
+    monkeypatch.setattr(run, "run_eval", run_eval)
+    argv = ["--set", "swebench", "--config", "full", "--run-id", "try1"]
+
+    assert run.main([*argv, "--results-dir", str(tmp_path)]) == 0
+
+    out = capsys.readouterr().out
+    assert "not graded yet" in out
+    assert "resolved" not in out
+    assert f"eval/swebench/grade.sh {tmp_path / 'try1'}" in out

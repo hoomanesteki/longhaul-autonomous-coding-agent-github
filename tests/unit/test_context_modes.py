@@ -33,22 +33,25 @@ VALUES: dict[str, Any] = {
 
 
 @pytest.mark.parametrize(
-    ("mode", "elides", "compacts"),
+    ("mode", "elides", "compacts", "slides"),
     [
-        (ContextMode.FULL, True, True),
-        (ContextMode.NO_COMPACTION, True, False),
-        (ContextMode.NONE, False, False),
+        (ContextMode.FULL, True, True, False),
+        (ContextMode.NO_COMPACTION, True, False, False),
+        (ContextMode.NONE, False, False, False),
+        (ContextMode.SLIDING, False, False, True),
     ],
 )
 def test_each_mode_says_which_tiers_it_runs(
-    mode: ContextMode, elides: bool, compacts: bool
+    mode: ContextMode, elides: bool, compacts: bool, slides: bool
 ) -> None:
     assert mode.elides is elides
     assert mode.compacts is compacts
+    assert mode.slides is slides
 
 
 def test_the_modes_are_named_as_the_plan_names_them() -> None:
-    assert [mode.value for mode in ContextMode] == ["full", "no_compaction", "none"]
+    # `sliding` is the window of the naive baseline (plan section 8.3, LH-903).
+    assert [mode.value for mode in ContextMode] == ["full", "no_compaction", "none", "sliding"]
 
 
 def test_a_mode_is_its_name_for_a_command_line_and_a_yaml_file() -> None:

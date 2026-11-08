@@ -71,7 +71,10 @@ own mode, which travels in `LlmTurnInput.context_mode` and wins over the config
 (longhaul.context.modes). Tier 1 runs in `full` and `no_compaction`. The decision is always "ok"
 unless the mode is `full`, so a workflow that acts on the decision never compacts in the others.
 The guard in front of the call stays on in every mode: it is how a task in `none` ends, at the hard
-limit, with the outcome "context limit" and not with a provider error.
+limit, with the outcome "context limit" and not with a provider error. The mode `sliding` (LH-903,
+the naive baseline) answers the guard another way: before the request is measured against the limit,
+the oldest whole turns are dropped until it fits (context/sliding.py), and the cut view is what is
+sent and stored. The guard then refuses only a request that no cut can bring under the limit.
 
 The share of the window. A request that passes the guard is going out, and the activity notes what
 share of the window it takes (`Recorder.record_request_fraction`), so that `tasks.max_fraction`
@@ -92,6 +95,25 @@ workflow hands it to each call in `LlmTurnInput.window_tokens`. The call then us
 the config with that window and with the cap for one result cut to fit it
 (settings.Context.for_window), for the guard, for the room kept for results and for the decision.
 The other thresholds are shares of the window, so they follow it.
+
+The coder of a task with a plan (LH-503) is the one role with two forms. A plan in the input
+(`LlmTurnInput.plan`) makes the coder's prompt `build_planned_system_prompt`, its first message the
+one that points at the plan, and its tool list `planned_tools`, which has `update_step`,
+`submit_for_review` and `ask_human` in place of `finish`. A task has a plan from before the coder's
+transcript starts or not at all, so each of the three is the same for the life of the transcript.
+The plan is the fifth block of the first message (agent/prompts.py), and the activity brings that
+block up to date before every call from the plan the workflow holds, which is how a step update
+reaches the model. A worker with no `planned_tools` offers such a coder `tools`, as it did before.
+
+The verifier (LH-504) has a transcript of its own, and its first message is built here, from what
+the workflow gathered before the first turn. The workflow cannot write blobs, so it runs the
+pre-check and the `git_diff` through tool_exec, which stores their full output, and hands over
+`LlmTurnInput.review`: each command with how it ended and the ref of its output, and the plan. The
+first message is then the line that starts the review, the plan block, the pre-check block and the
+diff block (roles/verifier.py renders the last two). Each output is cut to a head, a tail and a
+handle, so a long test log or diff costs the window what any tool output does, and the verifier
+pages through the rest with `read_output`. This happens when the transcript starts only. A later
+turn of the review reads the transcript, which holds that message already.
 """
 
 from __future__ import annotations
@@ -109,7 +131,13 @@ from temporalio import activity
 
 from longhaul.agent import rules
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import build_system_prompt, first_user_message
+from longhaul.agent.prompts import (
+    build_planned_system_prompt,
+    build_system_prompt,
+    first_user_message,
+    render_plan,
+    with_plan,
+)
 from longhaul.agent.turns import (
     TranscriptError,
     append_assistant,
@@ -119,10 +147,12 @@ from longhaul.agent.turns import (
     validate_pairs,
 )
 from longhaul.blobs.base import BlobStoreBase, blob_key
+from longhaul.context import sliding
 from longhaul.context.evict import elide_old_outputs
 from longhaul.context.log import added_messages, append_to_log
 from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import ContextBudget, Decision, TokenMeter, count_request_chars
+from longhaul.context.truncate import shape_output
 from longhaul.contracts import (
     BlobRef,
     Block,
@@ -154,10 +184,12 @@ from longhaul.durable.activities.support import (
 )
 from longhaul.durable.payload_guard import json_size
 from longhaul.durable.scripts import TaskProviders
+from longhaul.roles import coder, verifier
 from longhaul.settings import Context
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import chat_span
 from longhaul.tools.control import is_control_tool
+from longhaul.tools.output import output_handle
 
 
 @dataclass(frozen=True)
@@ -185,6 +217,11 @@ def _budget(context: Context | None) -> ContextBudget | None:
     return ContextBudget(context.window_tokens, context.compact_at, context.hard_limit)
 
 
+def _answered_by_the_workflow(tool: str) -> bool:
+    """True for a call whose answer is a line from the workflow, so no output to reserve for."""
+    return is_control_tool(tool) or tool in coder.CONTROL_TOOLS or tool == verifier.SUBMIT_VERDICT
+
+
 def _options(cfg: LoopConfig) -> CallOptions | None:
     return CallOptions(effort=cfg.effort) if cfg.effort is not None else None
 
@@ -208,7 +245,8 @@ class LlmActivities:
     shares it, so both count with the ratio the replies taught.
 
     `role_tools` gives a role the tools it is offered when they are not `tools`. The planner has
-    its own (roles/planner.py).
+    its own (roles/planner.py). `planned_tools` is the list of the coder of a task with a plan
+    (roles/coder.py `tool_specs`).
     """
 
     def __init__(
@@ -223,6 +261,7 @@ class LlmActivities:
         context: Context | None = None,
         meters: Meters | None = None,
         role_tools: Mapping[Role, Sequence[ToolSpec]] | None = None,
+        planned_tools: Sequence[ToolSpec] | None = None,
     ) -> None:
         self._provider = provider
         self._scripts = TaskProviders(blobs)
@@ -230,6 +269,7 @@ class LlmActivities:
         self._recorder = recorder
         self._tools = list(tools)
         self._role_tools = {role: list(specs) for role, specs in (role_tools or {}).items()}
+        self._planned_tools = None if planned_tools is None else list(planned_tools)
         self._config_for = config_for
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
         self._context = context
@@ -241,8 +281,13 @@ class LlmActivities:
         """What to register on a worker."""
         return [self.llm_turn]
 
-    def tools_for(self, role: Role) -> list[ToolSpec]:
-        """The tools that `role` is offered with every call."""
+    def tools_for(self, role: Role, *, planned: bool = False) -> list[ToolSpec]:
+        """The tools that `role` is offered with every call.
+
+        `planned` is for the coder of a task that has a plan. No other role has a second list.
+        """
+        if planned and role is Role.CODER and self._planned_tools is not None:
+            return self._planned_tools
         return self._role_tools.get(role, self._tools)
 
     @activity.defn(name=acts.LLM_TURN.name)
@@ -269,14 +314,20 @@ class LlmActivities:
         inp = small(inp)
         cfg = self._config_for(inp.role)
         mode = self._mode(inp.context_mode)
-        tools = self.tools_for(inp.role)
+        planned = inp.role is Role.CODER and inp.plan is not None
+        tools = self.tools_for(inp.role, planned=planned)
         try:
             # The block is blob text that was written once for the task, so the system prompt is
             # the same bytes on every turn (D7). A task without one gets the prompt it always had.
-            system = build_system_prompt(
-                inp.role, inp.spec, await read_memory_block(self._blobs, inp.memory_ref)
+            memory_block = await read_memory_block(self._blobs, inp.memory_ref)
+            system = (
+                build_planned_system_prompt(inp.spec, memory_block)
+                if planned
+                else build_system_prompt(inp.role, inp.spec, memory_block)
             )
-            stored = await self._transcript(inp)
+            stored = await self._transcript(inp, planned=planned, cap=cfg.tool_output_max_tokens)
+            if planned and inp.plan is not None:
+                stored = with_plan(stored, inp.plan)  # a step update reaches the model here
             shown = show_hints(stored, inp.hints)
             transcript = self._evict(shown, mode)  # tier 1
             validate_pairs(transcript)  # a transcript the API would reject is not sent
@@ -284,10 +335,14 @@ class LlmActivities:
             raise not_retried(exc) from exc
         paused = await self._paused(inp.paused_ref)
         provider = await self._provider_for(inp)
-        # The text of a paused reply goes back as the last message, which the API continues.
-        request = [*transcript, Message(role="assistant", content=paused)] if paused else transcript
         meter = self._meters.for_task(inp.task_id)
-        projected = await self._preflight(provider, cfg, system, request, tools, meter)
+        measured: int | None = None
+        if mode.slides:
+            transcript, measured = await self._slide(
+                provider, cfg, system, transcript, paused, tools, meter
+            )
+        request = self._with_paused(transcript, paused)
+        projected = await self._preflight(provider, cfg, system, request, tools, meter, measured)
         await self._note_share(inp.task_id, projected)
         attempt = await self._recorder.next_attempt(inp.task_id, inp.turn_index)
         started = datetime.now(UTC)
@@ -324,10 +379,43 @@ class LlmActivities:
         return small(out)
 
     # ----- the request -----
-    async def _transcript(self, inp: acts.LlmTurnInput) -> list[Message]:
-        if inp.transcript_ref is None:
-            return append_user_text([], first_user_message(inp.role))
-        return await self._blobs.get_json(inp.transcript_ref, list[Message])
+    async def _transcript(
+        self, inp: acts.LlmTurnInput, *, planned: bool, cap: int
+    ) -> list[Message]:
+        if inp.transcript_ref is not None:
+            return await self._blobs.get_json(inp.transcript_ref, list[Message])
+        messages = append_user_text([], first_user_message(inp.role, planned=planned))
+        if inp.role is Role.VERIFIER:
+            for text in await self._review_blocks(inp, cap):
+                messages = append_user_text(messages, text)
+        return messages
+
+    async def _review_blocks(self, inp: acts.LlmTurnInput, cap: int) -> list[str]:
+        """The blocks after the first line of a review: the plan, the pre-check and the diff.
+
+        The text of each output is read from its blob and cut by the rule of any tool output
+        (context/truncate.py), with the handle `out_<call id>` that read_output resolves. The
+        pre-check gets a smaller share than the diff, because the start of a test log has the
+        first failure and its end has the counts.
+        """
+        blocks: list[str] = []
+        if inp.plan is not None:
+            blocks.append(render_plan(inp.plan))
+        if inp.review is not None:
+            shown = [
+                (run, await self._shaped(run, verifier.CHECK_OUTPUT_TOKENS))
+                for run in inp.review.checks
+            ]
+            blocks.append(verifier.render_precheck(shown))
+            if inp.review.diff is not None:
+                blocks.append(verifier.render_diff(await self._shaped(inp.review.diff, cap)))
+        return blocks
+
+    async def _shaped(self, run: acts.CheckRun, max_tokens: int) -> str:
+        if run.output_ref is None:
+            return ""
+        text = (await self._blobs.get(run.output_ref)).decode("utf-8", errors="replace")
+        return shape_output(text, max_tokens, output_handle(run.call_id))
 
     async def _paused(self, ref: BlobRef | None) -> list[Block]:
         if ref is None:
@@ -355,8 +443,16 @@ class LlmActivities:
         if self._budget is not None:
             await self._recorder.record_request_fraction(task_id, projected / self._budget.window)
 
+    @staticmethod
+    def _with_paused(transcript: list[Message], paused: list[Block]) -> list[Message]:
+        """The request: the view, then the text of a paused reply as the last message.
+
+        The API continues that message, so it goes at the end and is not part of the view.
+        """
+        return [*transcript, Message(role="assistant", content=paused)] if paused else transcript
+
     # ----- tier 2: the size of the request -----
-    async def _preflight(
+    async def _measure(
         self,
         provider: LLMProvider,
         cfg: LoopConfig,
@@ -365,11 +461,10 @@ class LlmActivities:
         tools: list[ToolSpec],
         meter: TokenMeter,
     ) -> int:
-        """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
+        """The projected tokens of the request, or 0 when there is no context policy.
 
-        A request at or over `hard_limit` of the window is not sent. The workflow handles this
-        as it does the provider's own answer (F6), by compacting and asking once more. Close to
-        the thresholds the estimate is replaced by the provider's exact count, if it gives one.
+        Close to the thresholds the estimate is replaced by the provider's exact count, if it
+        gives one.
         """
         budget = self._budget
         if budget is None:
@@ -377,6 +472,62 @@ class LlmActivities:
         tokens = meter.projected(system, request, tools)
         if budget.needs_exact_count(tokens):
             tokens = await self._exact_count(provider, cfg, system, request, tools) or tokens
+        return tokens
+
+    async def _slide(
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        transcript: list[Message],
+        paused: list[Block],
+        tools: list[ToolSpec],
+        meter: TokenMeter,
+    ) -> tuple[list[Message], int | None]:
+        """The sliding window (mode `sliding`): the newest turns that fit under the hard limit.
+
+        The request is measured as it will be sent, with the system prompt, the tools of the role
+        and the text of a paused reply, so what comes back passes the guard in `_preflight` unless
+        no cut can make it fit. A request that is under the limit is returned as it is. The
+        measure of the view that is returned goes with it, so that the guard does not ask the
+        provider for the same count a second time.
+        """
+        budget = self._budget
+        if budget is None:
+            return transcript, None
+
+        async def measure(view: list[Message]) -> int:
+            request = self._with_paused(view, paused)
+            return await self._measure(provider, cfg, system, request, tools, meter)
+
+        def over(tokens: int) -> bool:
+            return budget.decide(tokens) == "force"
+
+        return await sliding.fit(transcript, measure, over)
+
+    async def _preflight(
+        self,
+        provider: LLMProvider,
+        cfg: LoopConfig,
+        system: str,
+        request: list[Message],
+        tools: list[ToolSpec],
+        meter: TokenMeter,
+        measured: int | None = None,
+    ) -> int:
+        """The projected tokens of the request, or CONTEXT_TOO_LONG when it is over the limit.
+
+        A request at or over `hard_limit` of the window is not sent. The workflow handles this
+        as it does the provider's own answer (F6), by compacting and asking once more. `measured`
+        is the size of this very request when the caller has it already.
+        """
+        budget = self._budget
+        if budget is None:
+            return 0
+        if measured is not None:
+            tokens = measured
+        else:
+            tokens = await self._measure(provider, cfg, system, request, tools, meter)
         if budget.decide(tokens) == "force":
             limit = int(budget.window * budget.hard_limit)
             raise provider_failure(
@@ -436,7 +587,7 @@ class LlmActivities:
         if policy is None or budget is None or not mode.compacts:
             return "ok"
         upcoming = elide_old_outputs(view, policy.elide_tool_outputs_after_turns)
-        pending = sum(1 for call in calls if not is_control_tool(call.name))
+        pending = sum(1 for call in calls if not _answered_by_the_workflow(call.name))
         tokens = meter.projected(system, upcoming, tools)
         return budget.decide(tokens + pending * policy.tool_output_max_tokens)
 

@@ -35,15 +35,24 @@ workflow calls it before a hand-over to a new run (Continue-As-New), so that a l
 mode F4) costs at most the work since the last hand-over. The blob is named after the head it
 holds, and a `checkpoints` row of kind `bundle` names the blob, so a restore can find the latest.
 
-cleanup removes everything of a task: its containers, its workspace volume and its bare repo. The
-workflow calls it when a task is cancelled. It finds the containers by the task label and not by
-`sandbox_id`, because a task cancelled during the preparation never learned the id. It is safe to
-run twice and for a task that has nothing left, since Temporal retries it and the task may have
-been cleaned by hand. A Docker or disk error fails the attempt, and Temporal tries again.
+cleanup removes the sandbox of a task: its containers and its workspace volume, and, unless the
+caller keeps it, its bare repo. The workflow calls it when a task ends, whatever the outcome
+(LH-507), and keeps the repo: the janitor (activities/janitor.py) removes it a week later, so a
+person can still read the checkpoints of a stuck or failed task. It finds the containers by the
+task label and not by `sandbox_id`, because a task that ended during the preparation never learned
+the id. It is safe to run twice and for a task that has nothing left, since Temporal retries it
+and the task may have been cleaned by hand. A Docker or disk error fails the attempt, and
+Temporal tries again.
 
 Two metrics follow these activities (LH-704). A task is active from the end of prepare_workspace,
 or from the first ensure_sandbox of a run that starts with a sandbox, and each rebuild counts in
 longhaul_sandbox_recreated_total. The end of the task is counted by record_event.
+
+A local folder can ask for a sandbox image of its own with a file called .longhaulimage (see
+agent/workspace.py). The eval of SWE-bench uses it: each instance comes with an image that holds
+the environment its tests need. Both prepare_workspace and ensure_sandbox read it, so a sandbox
+that is made again runs in the same image. A folder that is gone when the sandbox is made again
+cannot be asked, and the image of the worker is used.
 
 The setup command is `spec.settings.setup_command`, or the default of `longhaul run-local` when
 there is none. The default is read from the pyproject.toml of the workspace, so a recovery sets
@@ -95,6 +104,7 @@ from longhaul.agent.workspace import (
     WorkspaceError,
     collect_source_files,
     pip_install_command,
+    read_image_file,
 )
 from longhaul.blobs.base import blob_key
 from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError, check_task_id
@@ -161,10 +171,11 @@ class WorkspaceMemory(CommandMemory, StructureMemory, Protocol):
 
 @dataclass(frozen=True)
 class LocalFolder:
-    """A folder to commit as the base of a task, and the files of it that go in."""
+    """A folder to commit as the base of a task, the files of it that go in, and its image."""
 
     path: Path
     files: list[SourceFile]
+    image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,7 +248,8 @@ class WorkspaceActivities:
             try:
                 await self._clear(task_id)
                 base_sha = await self._publish_base(task_id, source)
-                sandbox = await self._boot(task_id)
+                image = source.image if isinstance(source, LocalFolder) else None
+                sandbox = await self._boot(task_id, image)
                 await self._set_up(sandbox, spec)
                 await self._sandboxes.set_network(sandbox.id, False)
                 # The map comes first: it reads the workspace as the base commit has it, before
@@ -282,7 +294,8 @@ class WorkspaceActivities:
             raise WorkspaceError(
                 f"{repo!r}: a local repo needs an absolute path, as in {LOCAL_PREFIX}/abs/path"
             )
-        return LocalFolder(path, await asyncio.to_thread(collect_source_files, path))
+        files = await asyncio.to_thread(collect_source_files, path)
+        return LocalFolder(path, files, await asyncio.to_thread(read_image_file, path))
 
     async def _github_base(self, repo: str) -> GitHubBase:
         remote = self._remote(repo)
@@ -476,8 +489,12 @@ class WorkspaceActivities:
         # this activity made and did not get to report. Exactly one container may be live.
         await self._sandboxes.remove_containers(task_id)
         try:
-            sandbox = await self._boot(task_id)
-            await self._store.restore(sandbox, inp.head_sha)
+            image = await self._image_of(inp.spec)
+            sandbox = await self._boot(task_id, image)
+            # An image brings its own environment, built when the image was made, and the task has
+            # no setup command that could build it again. A volume that survived holds the only
+            # copy of what git ignores there, such as compiled extensions, so a restore keeps it.
+            await self._store.restore(sandbox, inp.head_sha, keep_ignored=image is not None)
             await self._set_up(sandbox, inp.spec)
             await self._sandboxes.set_network(sandbox.id, False)
         except BaseException:
@@ -495,14 +512,35 @@ class WorkspaceActivities:
         except ValueError as exc:
             raise not_retried(exc) from exc
         log.info("cleaning up task %s: %s", inp.task_id, inp.reason)
-        await self._clear(inp.task_id)
+        if inp.keep_repo:
+            # The end of a task (LH-507): the sandbox goes now and the janitor removes the repo
+            # a week later.
+            await self._sandboxes.cleanup_task(inp.task_id)
+        else:
+            await self._clear(inp.task_id)
 
     # ---------- what both need ----------
-    async def _boot(self, task_id: str) -> Sandbox:
-        """A container with the network on and the repo at /ckpt, and a workspace cloned from it."""
+    async def _image_of(self, spec: TaskSpec) -> str | None:
+        """The image a local folder asks for, or None when it asks for none or is gone.
+
+        A bad image file was refused when the task was prepared, so it can only be missing now.
+        """
+        if not is_local(spec.repo):
+            return None
+        folder = Path(spec.repo[len(LOCAL_PREFIX) :])
+        try:
+            return await asyncio.to_thread(read_image_file, folder)
+        except WorkspaceError as exc:
+            raise not_retried(exc) from exc
+
+    async def _boot(self, task_id: str, image: str | None = None) -> Sandbox:
+        """A container with the network on and the repo at /ckpt, and a workspace cloned from it.
+
+        `image` is the one the task's folder asked for. Without it the image of the worker is used.
+        """
         sandbox = await self._sandboxes.create(
             task_id,
-            self._image,
+            image or self._image,
             self._limits,
             network=True,
             mounts=self._store.mounts(task_id),

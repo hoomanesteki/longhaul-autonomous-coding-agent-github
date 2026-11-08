@@ -25,6 +25,8 @@ What it is built from, and why each piece is what it is:
   local folders only and still recovers the sandbox of a GitHub task. LONGHAUL_GITHUB_API_URL and
   LONGHAUL_GITHUB_WEB_URL point it at a GitHub Enterprise server, or at a FakeGitHub and a folder
   of bare repos in the end-to-end test of LH-308. Unset, they mean api.github.com and github.com.
+  LONGHAUL_GITHUB_CLONE_BASE names a folder or server for clones only and wins over the web URL;
+  the chaos suite of LH-904 uses it.
 * Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
   that is all a worker leaves behind, and it says where the kill landed.
 * With the token the worker also registers the GitHub writes (post_comment, add_label,
@@ -47,7 +49,30 @@ What it is built from, and why each piece is what it is:
   `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
   Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
   workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
-  another number stops before it takes a task.
+  another number stops before it takes a task. The stuck detector (LH-505) is the same: the
+  workflow keeps a copy of the four limits in `stuck`, and `tool_exec` returns the facts it reads.
+  The plan gate (LH-502) records who decided a plan through `decide_plan`, which every worker
+  registers with `store_plan`. Its wait, and the wait of the pause for a hint (LH-506), are the
+  workflow's own copy of `stuck.hint_wait_hours`, so a worker whose config holds another number
+  stops before it takes a task for the same reason. `summarize_for_human`, which writes the
+  question for a person, is an activity of the compactor and renders its comment from the
+  templates folder.
+* The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers
+  `post_final`, which reads the diff stats from the checkpoint store and posts the final comment
+  through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
+  that PollerWorkflow runs after each poll: it removes the bare repos under LONGHAUL_CKPT_DIR of
+  tasks that ended more than seven days ago. A worker sweeps the repos on its own disk.
+* The run report (LH-705) is `write_run_report`, which every worker registers: it reads the tables
+  and writes one blob. `deliver` makes the same report for the body of the pull request, so the
+  templates folder must hold run_report.md.j2 as well.
+* The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
+  `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
+  without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
+  the step updates, and every worker registers it.
+* The verifier (LH-504) has a tool list of its own as well: the read tools, `git_diff` and
+  `run_tests`, and `submit_verdict` (roles/verifier.py). It runs on tools that every worker has,
+  so it needs no activity of its own. The workflow keeps its own copy of `loop.max_verify_rounds`,
+  so a worker whose config holds another number stops before it takes a task.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
   own queue. It also carries out the slash commands in the comments of the task issues (LH-308),
   and posts the one reply to a command from someone who may not steer, through the same
@@ -84,6 +109,7 @@ the wait is short and bounded.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import signal
 from collections.abc import Callable, Sequence
@@ -111,9 +137,16 @@ from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
+from longhaul.durable.activities.janitor import JanitorActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.memory import MemoryActivities
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
+from longhaul.durable.activities.outcome import FinalCommentActivities, StoreDiffs
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
+from longhaul.durable.activities.report import ReportActivities, RunReports, sql_reader
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -123,13 +156,13 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
-from longhaul.github.remote import GitHubRemote, clone_url_under
+from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_url
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.memory.embedder import make_embedder
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner, stuck, verifier
 from longhaul.sandbox.docker_manager import DockerSandboxManager
 from longhaul.settings import (
     AppConfig,
@@ -203,11 +236,14 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
     return get_provider(settings)
 
 
-def _github_remote(settings: EnvSettings, github: GitHubClient, auth: PatAuth) -> GitHubRemote:
-    """The remote of the worker: github.com, or the server that LONGHAUL_GITHUB_WEB_URL names."""
-    if settings.github_web_url is None:
-        return GitHubRemote(github, auth)
-    return GitHubRemote(github, auth, clone_url=clone_url_under(settings.github_web_url))
+def clone_url_for(settings: EnvSettings) -> Callable[[str], str]:
+    """Where repos are cloned from: github.com, or the base the settings name.
+
+    LONGHAUL_GITHUB_CLONE_BASE (LH-904) names a folder or server for clones only, and wins over
+    LONGHAUL_GITHUB_WEB_URL (LH-308), the web address of a GitHub Enterprise server.
+    """
+    base = settings.github_clone_base or settings.github_web_url
+    return github_clone_url if base is None else clone_url_under(base)
 
 
 def build_memory(cfg: Memory, sessions: async_sessionmaker[AsyncSession]) -> PgMemoryStore | None:
@@ -229,6 +265,38 @@ def build_memory(cfg: Memory, sessions: async_sessionmaker[AsyncSession]) -> PgM
     return PgMemoryStore(sessions, embedder)
 
 
+def _check_stuck_limits(cfg: AppConfig) -> None:
+    """Refuse a config whose `stuck` limits the workflow's detector does not use.
+
+    The detector runs in the workflow, which cannot read the config file and keeps its own copy
+    of the numbers (stuck.DEFAULT_LIMITS). Like the planner's turn limit, a different number
+    would be accepted and then ignored on every task.
+    """
+    have = stuck.limits_of(cfg.stuck)
+    for field in dataclasses.fields(stuck.Limits):
+        got, want = getattr(have, field.name), getattr(stuck.DEFAULT_LIMITS, field.name)
+        if got != want:
+            raise ValueError(
+                f"stuck.{field.name} is {got}, but the stuck detector of the workflow uses "
+                f"{want} and cannot be told otherwise. Set it to {want}"
+            )
+
+
+def _check_hint_wait(cfg: AppConfig) -> None:
+    """Refuse a config whose `stuck.hint_wait_hours` the workflow does not use.
+
+    The plan gate (LH-502) and the pause for a hint (LH-506) run in the workflow, which cannot
+    read the config file and waits for acts.HINT_WAIT_HOURS. Like the stuck limits, a different
+    number would be accepted and then ignored on every task.
+    """
+    if cfg.stuck.hint_wait_hours != acts.HINT_WAIT_HOURS:
+        raise ValueError(
+            f"stuck.hint_wait_hours is {cfg.stuck.hint_wait_hours}, but the workflow waits "
+            f"{acts.HINT_WAIT_HOURS} hours for a person and cannot be told otherwise. "
+            f"Set it to {acts.HINT_WAIT_HOURS}"
+        )
+
+
 def build_parts(
     settings: EnvSettings, cfg: AppConfig, sandboxes: DockerSandboxManager
 ) -> WorkerParts:
@@ -244,6 +312,15 @@ def build_parts(
             f"loop.planner_max_turns is {cfg.loop.planner_max_turns}, but the workflow gives the "
             f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
             f"Set it to {acts.PLANNER_MAX_TURNS}"
+        )
+    _check_stuck_limits(cfg)
+    _check_hint_wait(cfg)
+    if cfg.loop.max_verify_rounds != acts.MAX_VERIFY_ROUNDS:
+        # The same reason as the planner's limit above.
+        raise ValueError(
+            f"loop.max_verify_rounds is {cfg.loop.max_verify_rounds}, but the workflow ends the "
+            f"task after {acts.MAX_VERIFY_ROUNDS} failed reviews and cannot be told otherwise. "
+            f"Set it to {acts.MAX_VERIFY_ROUNDS}"
         )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
@@ -278,7 +355,11 @@ def build_parts(
         ledger=ledger,
         context=cfg.context,
         meters=meters,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
+        planned_tools=coder.tool_specs(registry.specs()),
     )
     compactor = ContextActivities(
         provider,
@@ -288,6 +369,7 @@ def build_parts(
         cfg.context,
         ledger=ledger,
         meters=meters,
+        templates=templates_path(settings),
     )
     tools = ToolActivities(
         registry,
@@ -304,7 +386,7 @@ def build_parts(
     if settings.github_token is not None:
         auth = PatAuth(settings.github_token)
         github = GitHubClient(settings.github_api_url or GITHUB_API_URL, auth)
-        remote = _github_remote(settings, github, auth)
+        remote = GitHubRemote(github, auth, clone_url=clone_url_for(settings))
     workspace = WorkspaceActivities(
         sandboxes,
         store,
@@ -318,6 +400,10 @@ def build_parts(
     notes = MemoryActivities(memory, blobs)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
+    steps = StepActivities(recorder)
+    janitor = JanitorActivities(store, recorder)
+    run_reports = RunReports(sql_reader(sessions), blobs, templates=templates_path(settings))
+    reports = ReportActivities(run_reports)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
@@ -336,8 +422,12 @@ def build_parts(
                 blobs,
                 author=settings.git_author,
                 templates=templates_path(settings),
+                reports=run_reports,
             ).activities,
             *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
+            *FinalCommentActivities(
+                github, effects, StoreDiffs(store), templates=templates_path(settings)
+            ).activities,
         ]
     return WorkerParts(
         activities=[
@@ -348,6 +438,9 @@ def build_parts(
             *notes.activities,
             *events.activities,
             *plans.activities,
+            *steps.activities,
+            *janitor.activities,
+            *reports.activities,
             *poller.activities,
             *delivery,
         ],

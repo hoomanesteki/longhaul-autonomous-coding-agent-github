@@ -32,7 +32,7 @@ from longhaul.memory.embedder import HashEmbedder, LocalEmbedder
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.settings import AppConfig, EnvSettings, Memory, load_config
 from longhaul.telemetry import metrics
 
@@ -223,6 +223,25 @@ def test_a_planner_turn_limit_the_workflow_cannot_follow_stops_the_worker(tmp_pa
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
+def test_stuck_limits_the_workflow_cannot_follow_stop_the_worker(tmp_path: Path) -> None:
+    # Same reason as the planner limit: the detector in the workflow has its own copy of the four
+    # numbers, so a different one in the file would be read, accepted and ignored.
+    stuck = CONFIG.stuck.model_copy(update={"repeated_failure_count": 2})
+    config = CONFIG.model_copy(update={"stuck": stuck})
+    with pytest.raises(ValueError, match=r"stuck\.repeated_failure_count.*2.*3"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
+def test_a_hint_wait_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The plan gate (LH-502) and the pause for a hint (LH-506) wait as long as the workflow's own
+    # copy of stuck.hint_wait_hours says, so a different number in the file would be read,
+    # accepted and ignored.
+    stuck = CONFIG.stuck.model_copy(update={"hint_wait_hours": 48})
+    config = CONFIG.model_copy(update={"stuck": stuck})
+    with pytest.raises(ValueError, match=r"stuck\.hint_wait_hours.*48.*24"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.blobs, S3BlobStore)
@@ -296,10 +315,60 @@ async def test_a_worker_with_a_github_token_can_prepare_github_repos(tmp_path: P
     assert parts.github is not None and parts.github._http.is_closed
 
 
+async def test_a_worker_talks_to_the_github_it_is_told_about(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            github_api_url="http://127.0.0.1:8099",
+            github_clone_base=str(tmp_path / "remotes"),
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "http://127.0.0.1:8099"
+        remote = _workspace_of(parts)._github
+        assert remote.clone_url("acme/calc") == f"{tmp_path / 'remotes'}/acme/calc.git"
+    finally:
+        await parts.close()
+
+
+async def test_a_worker_with_no_endpoints_set_talks_to_github_com(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "https://api.github.com"
+        assert _workspace_of(parts)._github.clone_url("acme/calc") == (
+            "https://github.com/acme/calc.git"
+        )
+    finally:
+        await parts.close()
+
+
 def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert _workspace_of(parts)._github is None
     assert parts.github is None
+
+
+async def test_the_delivery_activity_of_a_worker_has_the_report_source(tmp_path: Path) -> None:
+    # Without it every pull request goes out with no run report, and no other test would notice.
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        (deliver,) = [fn for fn in parts.activities if getattr(fn, "__name__", "") == "deliver"]
+        assert deliver.__self__._reports is not None
+    finally:
+        await parts.close()
 
 
 # ---------- one GitHub client (LH-305 and LH-307) ----------
@@ -528,6 +597,13 @@ def test_a_worker_stores_plans_with_the_recorder_of_the_rest(tmp_path: Path) -> 
     assert store._records is activity_object(parts, "llm_turn")._recorder
 
 
+def test_every_worker_registers_the_plan_decision(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    decide = activity_object(parts, "decide_plan")
+    assert decide is activity_object(parts, "store_plan")
+    assert decide._records is activity_object(parts, "llm_turn")._recorder
+
+
 async def test_a_worker_with_a_token_posts_plans_through_the_ledger_of_the_writes(
     tmp_path: Path,
 ) -> None:
@@ -614,6 +690,19 @@ async def test_the_api_and_the_clone_address_follow_the_settings(tmp_path: Path)
         )
     finally:
         await parts.close()
+
+
+def test_a_clone_base_wins_over_the_web_url(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        github_web_url="https://git.example.com",
+        github_clone_base=str(tmp_path / "remotes"),
+    )
+
+    assert worker.clone_url_for(settings)("acme/calc") == f"{tmp_path / 'remotes'}/acme/calc.git"
+    assert worker.clone_url_for(make_settings(tmp_path))("acme/calc") == (
+        "https://github.com/acme/calc.git"
+    )
 
 
 # ---------- memory (LH-604) ----------
@@ -795,3 +884,49 @@ async def test_a_memory_database_that_cannot_be_reached_stops_the_worker_with_a_
             await parts.check_memory()
     finally:
         await parts.close()
+
+
+# ---------- the coder with a plan (LH-503) ----------
+@pytest.mark.phase5
+def test_a_coder_with_a_plan_gets_the_step_tools_and_one_without_keeps_finish(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+
+    plain = [tool.name for tool in llm.tools_for(Role.CODER)]
+    planned = [tool.name for tool in llm.tools_for(Role.CODER, planned=True)]
+
+    assert "finish" in plain
+    assert not set(coder.CONTROL_TOOLS) & set(plain)
+    assert planned == [*(name for name in plain if name != "finish"), *coder.CONTROL_TOOLS]
+    # The flag is for the coder only: the planner has one list.
+    assert llm.tools_for(Role.PLANNER, planned=True) == llm.tools_for(Role.PLANNER)
+
+
+@pytest.mark.phase5
+def test_a_worker_records_steps_with_the_recorder_of_the_rest(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    recording = activity_object(parts, "record_step")
+    assert recording._records is activity_object(parts, "llm_turn")._recorder
+
+
+# ---------- the verifier (LH-504) ----------
+def test_the_verifier_gets_its_own_tools_on_every_worker(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+
+    offered = [tool.name for tool in llm.tools_for(Role.VERIFIER)]
+    assert offered == [*verifier.TOOLS, "submit_verdict"]
+    assert not {"edit_file", "write_file", "run_command", "finish"} & set(offered)
+    # The flag is for the coder only: the verifier has one list.
+    assert llm.tools_for(Role.VERIFIER, planned=True) == llm.tools_for(Role.VERIFIER)
+
+
+def test_a_verify_round_limit_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The workflow keeps its own copy of the limit, so a different number in the file would be
+    # read, accepted and ignored. Stopping at the start says so while the operator is looking.
+    loop = CONFIG.loop.model_copy(update={"max_verify_rounds": 5})
+    config = CONFIG.model_copy(update={"loop": loop})
+    with pytest.raises(ValueError, match=r"loop\.max_verify_rounds.*5.*3"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]

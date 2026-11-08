@@ -214,3 +214,76 @@ async def test_store_plan_writes_to_postgres(migrated: Scratch, recorder: SqlRec
         acts.StorePlanInput(task_id=TASK, version=1, plan=PLAN),
     )
     assert migrated.rows("SELECT task_id, version FROM plans") == [(TASK, 1)]
+
+
+# ---------- the decision on a plan (LH-502) ----------
+async def test_an_approval_sets_the_status_who_decided_and_when(
+    migrated: Scratch, recorder: SqlRecorder
+) -> None:
+    await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
+    await recorder.record_plan_decision(TASK, 1, approved=True, decided_by="alice")
+
+    ((status, decided_by, decided),) = migrated.rows(
+        "SELECT status, decided_by, decided_at IS NOT NULL FROM plans"
+    )
+    assert (status, decided_by, decided) == ("approved", "alice", True)
+
+
+async def test_a_rejection_sets_the_status_who_decided_and_when(
+    migrated: Scratch, recorder: SqlRecorder
+) -> None:
+    await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
+    await recorder.record_plan_decision(TASK, 1, approved=False, decided_by="bob")
+
+    ((status, decided_by, decided),) = migrated.rows(
+        "SELECT status, decided_by, decided_at IS NOT NULL FROM plans"
+    )
+    assert (status, decided_by, decided) == ("rejected", "bob", True)
+
+
+async def test_a_decision_changes_only_the_version_it_names(
+    migrated: Scratch, recorder: SqlRecorder
+) -> None:
+    await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
+    await recorder.record_plan(PlanRecord(TASK, 2, PLAN))
+    await recorder.record_plan(PlanRecord("lh-acme-calc-43", 1, PLAN))
+    await recorder.record_plan_decision(TASK, 1, approved=False, decided_by="bob")
+
+    rows = migrated.rows("SELECT task_id, version, status FROM plans ORDER BY task_id, version")
+    assert rows == [
+        (TASK, 1, "rejected"),
+        (TASK, 2, "proposed"),
+        ("lh-acme-calc-43", 1, "proposed"),
+    ]
+
+
+async def test_the_first_decision_stands_and_keeps_its_time(
+    migrated: Scratch, recorder: SqlRecorder
+) -> None:
+    # decide_plan runs again after a crash. The rerun must not move the time or the author.
+    await recorder.record_plan(PlanRecord(TASK, 1, PLAN))
+    await recorder.record_plan_decision(TASK, 1, approved=False, decided_by="bob")
+    first = migrated.rows("SELECT decided_at FROM plans")
+    await recorder.record_plan_decision(TASK, 1, approved=True, decided_by="alice")
+
+    assert migrated.rows("SELECT status, decided_by FROM plans") == [("rejected", "bob")]
+    assert migrated.rows("SELECT decided_at FROM plans") == first
+
+
+async def test_a_decision_on_a_plan_that_was_never_stored_writes_no_row(
+    migrated: Scratch, recorder: SqlRecorder
+) -> None:
+    await recorder.record_plan_decision(TASK, 1, approved=True, decided_by="alice")
+    assert migrated.rows("SELECT count(*) FROM plans") == [(0,)]
+
+
+async def test_decide_plan_writes_to_postgres(migrated: Scratch, recorder: SqlRecorder) -> None:
+    activities = PlanActivities(recorder)
+    await ActivityEnvironment().run(
+        activities.store_plan, acts.StorePlanInput(task_id=TASK, version=1, plan=PLAN)
+    )
+    await ActivityEnvironment().run(
+        activities.decide_plan,
+        acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice"),
+    )
+    assert migrated.rows("SELECT status, decided_by FROM plans") == [("approved", "alice")]

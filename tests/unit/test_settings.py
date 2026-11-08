@@ -211,6 +211,18 @@ def test_the_planner_needs_at_least_one_turn(tmp_path: Path, turns: int) -> None
     assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "planner_max_turns")]
 
 
+@pytest.mark.parametrize("rounds", [0, -1])
+def test_the_verifier_needs_at_least_one_round(tmp_path: Path, rounds: int) -> None:
+    data = _example_data()
+    data["loop"]["max_verify_rounds"] = rounds
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "max_verify_rounds")]
+
+
 def test_the_retry_cap_may_equal_the_normal_cap(tmp_path: Path) -> None:
     data = _example_data()
     data["loop"]["max_tokens_retry"] = data["loop"]["max_tokens_per_turn"]
@@ -864,3 +876,38 @@ def test_an_embedder_that_does_not_exist_is_refused_and_the_error_names_the_sett
 
     assert [error["loc"] for error in excinfo.value.errors()] == [("memory", "embedder")]
     assert "hash" in str(excinfo.value)
+
+
+# ---------- LH-904: a GitHub other than github.com ----------
+def test_the_github_endpoints_are_unset_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LONGHAUL_GITHUB_API_URL", raising=False)
+    monkeypatch.delenv("LONGHAUL_GITHUB_CLONE_BASE", raising=False)
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url is None
+    assert settings.github_clone_base is None
+
+
+def test_the_github_endpoints_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "http://127.0.0.1:8099")
+    monkeypatch.setenv("LONGHAUL_GITHUB_CLONE_BASE", "/tmp/remotes")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url == "http://127.0.0.1:8099"
+    assert settings.github_clone_base == "/tmp/remotes"
+
+
+def test_blank_github_endpoints_count_as_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "")
+    monkeypatch.setenv("LONGHAUL_GITHUB_CLONE_BASE", "")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+
+    assert settings.github_api_url is None
+    assert settings.github_clone_base is None
+
+
+def test_env_example_lists_the_github_endpoints() -> None:
+    example = _env_example()
+
+    assert example["LONGHAUL_GITHUB_API_URL"] == ""
+    assert example["LONGHAUL_GITHUB_CLONE_BASE"] == ""

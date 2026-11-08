@@ -2,30 +2,42 @@
 
 One run writes `eval/results/<run_id>/<task_id>.json` for each task and a `summary.json`. Every
 number in the README comes from these files, so a file says which run, config, model and commit
-it belongs to. A result file is written once. The grader fills `resolved` before it is written.
+it belongs to. A result file is written once. The grader fills `resolved` before it is written,
+except in the SWE-bench set, where the official harness grades the whole run afterwards and
+`set_verdict` puts its answers into the files.
 
 The fields that later phases fill (compactions, verify rounds, stuck reasons) start at honest
 zeros and empty lists. A zero here means "not measured yet" until the phase that counts them has
 landed, and the summary does not report them.
+
+Which definition produced a number (LH-903). Every file holds the sha256 of the config file it ran
+with (eval/configs/<config>.yaml) and the seed of the run, so a result can be traced to the exact
+settings of its config. Runs that are meant to be compared share a `run_set`, and the runner
+refuses to mix models inside one (`models_in_run_set`).
 """
 
 from __future__ import annotations
 
+import os
 import re
 import statistics
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, ValidationError
 
 SUMMARY_FILE = "summary.json"
 _TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 TaskSet = Literal["custom", "swebench"]
 Config = Literal["full", "naive", "single_shot"]
+CONFIG_NAMES: tuple[str, ...] = get_args(Config)
 Switch = Literal["on", "off"]
-ContextMode = Literal["full", "no_compaction", "none"]
+ContextMode = Literal["full", "no_compaction", "none", "sliding"]
+# The sha256 of a config file, in lowercase hex.
+CONFIG_HASH = r"^[0-9a-f]{64}$"
 
 
 class Tokens(BaseModel):
@@ -56,6 +68,14 @@ class TaskResult(BaseModel):
     workflow_id: str
     task_set: TaskSet
     config: Config
+    # The sha256 of eval/configs/<config>.yaml as it was when the run started, and the seed.
+    config_hash: str = Field(pattern=CONFIG_HASH)
+    seed: int
+    # The name the operator gave to the runs that are compared with each other, if any.
+    run_set: str | None = None
+    # The run was started with --allow-mixed-models. The runner compares models only inside a
+    # run set, so this is what tells a later comparison that a pair on two models was meant.
+    allow_mixed_models: bool = False
     model: str
     git_sha: str
     # Where the answers came from. `scripted` is true when a script played them: such a run is
@@ -98,6 +118,10 @@ class Summary(BaseModel):
     run_id: str
     task_set: TaskSet
     config: Config
+    config_hash: str = Field(pattern=CONFIG_HASH)
+    seed: int
+    run_set: str | None = None
+    allow_mixed_models: bool = False
     model: str
     provider: str | None
     scripted: bool
@@ -136,6 +160,24 @@ def write_result(folder: Path, result: TaskResult) -> Path:
     return path
 
 
+def set_verdict(folder: Path, task_id: str, *, resolved: bool | None, grading: str) -> TaskResult:
+    """Change `resolved` and `grading` of a result that was written without a verdict.
+
+    The SWE-bench harness grades a whole run after it, so its verdicts reach the files later.
+    Nothing else in the file changes. The new file replaces the old one in one step, so a reader
+    never sees half of it.
+    """
+    path = folder / f"{check_task_id(task_id)}.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"no result for task {task_id} in {folder}")
+    current = TaskResult.model_validate_json(path.read_text(encoding="utf-8"))
+    changed = current.model_copy(update={"resolved": resolved, "grading": grading})
+    scratch = path.with_name(path.name + ".tmp")
+    scratch.write_text(changed.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    os.replace(scratch, path)
+    return changed
+
+
 def read_results(folder: Path) -> list[TaskResult]:
     """Every result in `folder`, ordered by task id. The summary file is not a result."""
     paths = sorted(p for p in folder.glob("*.json") if p.name != SUMMARY_FILE)
@@ -143,8 +185,59 @@ def read_results(folder: Path) -> list[TaskResult]:
     return sorted(found, key=lambda r: r.task_id)
 
 
+def models_in_run_set(results_dir: Path, run_set: str) -> dict[str, str]:
+    """The model of each run in `results_dir` that belongs to `run_set`, by run id.
+
+    A run is a folder of result files. Its first result file says which run set and model it had,
+    and a run in progress has results as soon as its first task is done. A folder that holds no
+    readable result, such as an empty one or the output of another tool, is not a run and is
+    skipped.
+    """
+    if not results_dir.is_dir():
+        return {}
+    found: dict[str, str] = {}
+    for folder in sorted(p for p in results_dir.iterdir() if p.is_dir()):
+        for path in sorted(folder.glob("*.json")):
+            if path.name == SUMMARY_FILE:
+                continue
+            try:
+                first = TaskResult.model_validate_json(path.read_text(encoding="utf-8"))
+            except (OSError, ValidationError):
+                continue
+            if first.run_set == run_set:
+                found[folder.name] = first.model
+            break
+    return found
+
+
+def check_comparable(runs: Sequence[Summary]) -> None:
+    """Refuse to put runs on more than one model side by side, unless a run allowed it.
+
+    The runner checks the models of a run set when a run starts, and only for runs that name a
+    set. A report that pairs two runs calls this, so a pair that nobody put in a set is held to
+    the same rule (plan section 8.4). `--allow-mixed-models` on any of the runs says that the
+    operator meant it.
+    """
+    models = {run.run_id: run.model for run in runs}
+    if len(set(models.values())) > 1 and not any(run.allow_mixed_models for run in runs):
+        named = ", ".join(f"{run_id} used {model}" for run_id, model in sorted(models.items()))
+        raise ValueError(
+            f"these runs are on more than one model ({named}), and none of them was started "
+            "with --allow-mixed-models. A comparison needs one model (plan section 8.4)"
+        )
+
+
 def _check_one_run(results: list[TaskResult]) -> None:
-    for field in ("run_id", "task_set", "config", "model", "provider", "scripted"):
+    fields = (
+        "run_id",
+        "task_set",
+        "config",
+        "config_hash",
+        "seed",
+        "run_set",
+        "allow_mixed_models",
+    )
+    for field in (*fields, "model", "provider", "scripted"):
         values = {str(getattr(r, field)) for r in results}
         if len(values) != 1:
             raise ValueError(
@@ -169,6 +262,10 @@ def summarize(results: list[TaskResult], *, started_at: datetime, ended_at: date
         run_id=first.run_id,
         task_set=first.task_set,
         config=first.config,
+        config_hash=first.config_hash,
+        seed=first.seed,
+        run_set=first.run_set,
+        allow_mixed_models=first.allow_mixed_models,
         model=first.model,
         provider=first.provider,
         scripted=first.scripted,

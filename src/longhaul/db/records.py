@@ -3,17 +3,23 @@
 `Recorder` is the small interface the activities use, so a unit test can run them without
 Postgres. `SqlRecorder` writes the `turns`, `tool_calls`, `checkpoints`, `events` and `plans`
 tables and `MemoryRecorder` keeps the same rows in memory. Both also read back the last call of a
-tool (`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306). It is not in
-the `Recorder` protocol: only the delivery activities read rows, and they name what they need.
+tool (`last_tool_call`), which `deliver` uses to say how a task was tested (LH-306), and the step
+checkpoints of a task (`step_checkpoints`), which `build_pr_branch` turns into one commit for each
+step (LH-503). Neither is in the `Recorder` protocol: only the delivery activities read rows, and
+they name what they need.
 tests/integration/test_records.py runs the cases of tests/unit/test_records.py against both.
 
 Temporal runs an activity again after a crash or a timeout, and the second run writes what the
 first run may already have written. A turn, a tool call and a checkpoint are therefore written
 once, however often they are recorded: the first two as upserts on their key, the checkpoint by
-looking for the same sha first, because its table has no natural key. An event is a log line.
+looking for the same sha, kind and step first, because its table has no natural key. The step is
+part of it because a step that is done with no new work has the sha of the step before it
+(LH-503), and each of the two still has its own row. An event is a log line.
 The same event twice means that the thing happened twice, so it is written every time. A plan is
 an upsert on its task and version, and it only ever rewrites the plan itself: the status and the
-decision of a row that someone has already decided on are left as they are.
+decision of a row that someone has already decided on are left as they are. The decision itself
+(`record_plan_decision`, LH-502) is written once: it only changes a row that is still proposed,
+so the first answer stands and its time does not move when the activity runs again.
 
 Two of the totals in `tasks` come from here (LH-406). `record_request_fraction` keeps the largest
 share of the window that a request took, as a maximum, so it cannot count a request twice. A
@@ -23,13 +29,17 @@ went through leaves a second, identical line in the log (an event is a log line)
 stays right. Two real compactions differ in the tokens they started from, so they are two. A
 task with no row in `tasks`, as in a local run, is not an error: the update changes nothing, as
 it does for the cost ledger (cost/ledger.py).
+
+`ended_before` tells the janitor (LH-507) which tasks ended before a time. A task has ended when
+it has an `outcome` event, and the time of the end is the time of that event. It is not in the
+`Recorder` protocol either: only the janitor asks.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -45,6 +55,16 @@ from longhaul.db.models import Checkpoint, Event, PlanRow, Task, ToolCallRow, Tu
 # The workflow cannot import this module, so each side has the name, and a unit test keeps the two
 # equal.
 COMPACTION_EVENT = "compaction"
+# The status of a plan that nobody has decided on yet (plan section 3.5).
+PROPOSED = "proposed"
+
+# The type of the event that the workflow records when a task ends (durable/acts.OUTCOME_EVENT,
+# LH-704). It dates the end of a task, which `ended_before` reads for the janitor (LH-507). A unit
+# test keeps the two names equal.
+OUTCOME_EVENT = "outcome"
+
+# The kind of the checkpoint that a step leaves when it is done (plan section 3.5).
+STEP_KIND = "step"
 
 
 @dataclass(frozen=True)
@@ -97,7 +117,8 @@ class CheckpointRecord:
     """One saved workspace state: a commit in the task's bare repo (ADR-0006).
 
     `kind` is one of tool, step, compaction and bundle. tool_exec writes `tool` after each
-    commit. `bundle_ref` is set for a bundle only.
+    commit, and record_step writes `step` for a step that is done (LH-503), with its `step_id`.
+    `bundle_ref` is set for a bundle only.
     """
 
     task_id: str
@@ -121,13 +142,15 @@ class EventRecord:
 class PlanRecord:
     """One version of the plan of a task, as store_plan writes it (LH-501).
 
-    A plan starts as `proposed`. Approving and rejecting it is the plan gate (LH-502).
+    A plan starts as `proposed`. A person approves or rejects it at the plan gate (LH-502), and
+    the row then holds the status and the login of whoever decided.
     """
 
     task_id: str
     version: int
     plan: Plan
-    status: str = "proposed"
+    status: str = PROPOSED
+    decided_by: str | None = None
 
 
 class Recorder(Protocol):
@@ -162,6 +185,15 @@ class Recorder(Protocol):
         """Save a version of the plan. Saving the same version again rewrites only its plan."""
         ...
 
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        """Mark a proposed version `approved` or `rejected`, with who decided and when.
+
+        A version that is already decided, or was never stored, is left as it is.
+        """
+        ...
+
 
 class MemoryRecorder:
     """The rows in memory, for tests. Public, so that a test can read what was written."""
@@ -173,6 +205,8 @@ class MemoryRecorder:
         self.events: list[EventRecord] = []
         self.max_fractions: dict[str, float] = {}
         self.plans: dict[tuple[str, int], PlanRecord] = {}
+        # When each task ended, from its outcome event. A test may set a time directly.
+        self.ended: dict[str, datetime] = {}
 
     async def next_attempt(self, task_id: str, turn_index: int) -> int:
         taken = [
@@ -194,12 +228,29 @@ class MemoryRecorder:
 
     async def record_event(self, task_id: str, type: str, payload: Mapping[str, Any]) -> None:
         self.events.append(EventRecord(task_id, type, dict(payload)))
+        if type == OUTCOME_EVENT:
+            self.ended.setdefault(task_id, datetime.now(UTC))
+
+    async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
+        return {t for t in task_ids if t in self.ended and self.ended[t] < cutoff}
 
     async def record_plan(self, record: PlanRecord) -> None:
         key = (record.task_id, record.version)
         kept = self.plans.get(key)
         # A row that has a status already keeps it, as the SQL upsert does.
         self.plans[key] = record if kept is None else replace(kept, plan=record.plan)
+
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+        return [c for c in self.checkpoints if c.task_id == task_id and c.kind == STEP_KIND]
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        kept = self.plans.get((task_id, version))
+        if kept is None or kept.status != PROPOSED:
+            return
+        status = "approved" if approved else "rejected"
+        self.plans[(task_id, version)] = replace(kept, status=status, decided_by=decided_by)
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None:
         found = [c for c in self.tool_calls.values() if (c.task_id, c.name) == (task_id, name)]
@@ -213,7 +264,7 @@ class MemoryRecorder:
 
 
 def _same_checkpoint(a: CheckpointRecord, b: CheckpointRecord) -> bool:
-    return (a.task_id, a.sha, a.kind) == (b.task_id, b.sha, b.kind)
+    return (a.task_id, a.sha, a.kind, a.step_id) == (b.task_id, b.sha, b.kind, b.step_id)
 
 
 _TURN_KEY = ("task_id", "turn_index", "attempt")
@@ -257,6 +308,8 @@ class SqlRecorder:
             Checkpoint.task_id == record.task_id,
             Checkpoint.sha == record.sha,
             Checkpoint.kind == record.kind,
+            # IS NOT DISTINCT FROM: a tool checkpoint has no step, and NULL = NULL is not true.
+            Checkpoint.step_id.is_not_distinct_from(record.step_id),
         )
         async with self._sessions.begin() as session:
             # No unique key to upsert on, so look first. Two attempts of one activity do not
@@ -281,6 +334,17 @@ class SqlRecorder:
                     update(Task).where(Task.id == task_id).values(compactions=compactions)
                 )
 
+    async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
+        if not task_ids:
+            return set()
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(Event.task_id)
+                .where(Event.task_id.in_(task_ids), Event.type == OUTCOME_EVENT, Event.ts < cutoff)
+                .distinct()
+            )
+            return {row[0] for row in rows}
+
     async def record_request_fraction(self, task_id: str, fraction: float) -> None:
         # One statement, so two requests that finish together cannot lower the maximum.
         stmt = (
@@ -303,6 +367,45 @@ class SqlRecorder:
         # plan that has been approved in the meantime stays approved.
         stmt = stmt.on_conflict_do_update(
             index_elements=["task_id", "version"], set_={"plan": stmt.excluded.plan}
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(stmt)
+
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+        """The checkpoints of the done steps of a task, in the order they were saved."""
+        stmt = (
+            select(Checkpoint)
+            .where(Checkpoint.task_id == task_id, Checkpoint.kind == STEP_KIND)
+            .order_by(Checkpoint.id)
+        )
+        async with self._sessions() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [
+            CheckpointRecord(
+                task_id=row.task_id,
+                sha=row.sha,
+                kind=row.kind,
+                turn_index=row.turn_index,
+                step_id=row.step_id,
+            )
+            for row in rows
+        ]
+
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
+        # Only a proposed row changes, in one statement, so a rerun finds the answer already
+        # there and leaves the author and the time of the first one.
+        stmt = (
+            update(PlanRow)
+            .where(
+                PlanRow.task_id == task_id, PlanRow.version == version, PlanRow.status == PROPOSED
+            )
+            .values(
+                status="approved" if approved else "rejected",
+                decided_by=decided_by,
+                decided_at=func.now(),
+            )
         )
         async with self._sessions.begin() as session:
             await session.execute(stmt)

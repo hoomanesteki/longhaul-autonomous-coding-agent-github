@@ -29,6 +29,10 @@ COMMAND_TIMEOUT_HINT = "Run something narrower, or raise timeout_s (max {max_s})
 TESTS_TIMEOUT_HINT = "Run one file or test id with target, or look for a hanging test."
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# The labels that render_exit and render_timeout put above each stream, one to a line.
+STDOUT_LABEL = "stdout:"
+STDERR_LABEL = "stderr:"
+_STREAM_LABELS = re.compile(rf"^({STDOUT_LABEL}|{STDERR_LABEL})$", re.MULTILINE)
 # The words pytest prints after a count in its closing line.
 _KINDS = (
     "failed",
@@ -87,11 +91,28 @@ def _summary_of(res: ExecResult) -> str | None:
 
 def _stream_sections(res: ExecResult) -> list[str]:
     sections: list[str] = []
-    for label, text in (("stdout", res.stdout), ("stderr", res.stderr)):
+    for label, text in ((STDOUT_LABEL, res.stdout), (STDERR_LABEL, res.stderr)):
         body = text.rstrip("\n")
         if body:
-            sections += [f"{label}:", body]
+            sections += [label, body]
     return sections
+
+
+def split_streams(output: str) -> tuple[str, str]:
+    """The stdout and the stderr of a result that render_exit or render_timeout made.
+
+    A stream that printed nothing comes back as "". The text is the stream's own, without the
+    newline that ends it. It is the inverse of `_stream_sections`, for code that needs one
+    stream and has only the rendered text, such as the stuck detector (LH-505). A line of the
+    output that is exactly "stdout:" or "stderr:" is read as a label, which can misplace the
+    text after it. The loss is a different hash for one failure, and nothing else.
+    """
+    found = {"stdout": "", "stderr": ""}
+    marks = list(_STREAM_LABELS.finditer(output))
+    for i, mark in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(output)
+        found[mark.group(1).rstrip(":")] = output[mark.end() + 1 : end].rstrip("\n")
+    return found["stdout"], found["stderr"]
 
 
 def render_exit(res: ExecResult, summary: str | None = None) -> str:

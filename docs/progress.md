@@ -80,12 +80,13 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-501 | Planner role and plan schema | 5 | Done | merge | 2026-11-07 |
-| LH-502 | Human plan gate | 3 | Todo | | |
-| LH-503 | Coder role with step tracking | 5 | Todo | | |
-| LH-504 | Verifier role and send-back loop | 5 | Todo | | |
-| LH-505 | Stuck detector | 5 | Todo | | |
-| LH-506 | Pause, ask and hint flow | 3 | Todo | | |
-| LH-507 | Final outcomes and stuck report | 3 | Todo | | |
+| LH-502 | Human plan gate | 3 | Done | merge | 2026-11-08 |
+| LH-503 | Coder role with step tracking | 5 | Done | merge | 2026-11-07 |
+| LH-504 | Verifier role and send-back loop | 5 | Done | merge | 2026-11-08 |
+| LH-505 | Stuck detector | 5 | Done | merge | 2026-11-07 |
+| LH-506 | Pause, ask and hint flow | 3 | Done | merge | 2026-11-08 |
+| LH-507 | Final outcomes and stuck report | 3 | Done | merge | 2026-11-08 |
+| LH-591 | Stuck evidence names the command, and the demo repo | 1 | Done | merge | 2026-11-08 |
 
 ## Phase 6: Memory (tag v0.6.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -105,7 +106,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-702 | Budget enforcement and top-ups | 5 | Todo | | |
 | LH-703 | OpenTelemetry traces | 5 | Done | merge | 2026-11-04 |
 | LH-704 | Prometheus metrics and Grafana dashboard | 3 | Done | merge | 2026-11-04 |
-| LH-705 | Run report | 3 | Todo | | |
+| LH-705 | Run report | 3 | Done | merge | 2026-11-08 |
 | LH-706 | Structured logs and redaction | 2 | Done | merge | 2026-11-04 |
 
 ## Phase 8: Console (tag v0.8.0)
@@ -124,9 +125,9 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-901 | Eval task sets and runner | 5 | Done | merge | 2026-11-07 |
-| LH-902 | SWE-bench Verified adapter and grading | 8 | Todo | | |
-| LH-903 | Baselines: single-shot and naive loop | 5 | Todo | | |
-| LH-904 | Full chaos suite | 5 | Todo | | |
+| LH-902 | SWE-bench Verified adapter and grading | 8 | Done | merge | 2026-11-07 |
+| LH-903 | Baselines: single-shot and naive loop | 5 | Done | merge | 2026-11-07 |
+| LH-904 | Full chaos suite | 5 | Done | merge | 2026-11-08 |
 | LH-905 | Results report | 3 | Todo | | |
 | LH-906 | Security hardening pass | 3 | Todo | | |
 | LH-907 | Docs, README and demo | 3 | Todo | | |

@@ -1,8 +1,8 @@
-"""store_plan and post_plan: how a plan is kept and told to the issue (LH-501).
+"""store_plan, decide_plan and post_plan: how a plan is kept, decided and told to the issue.
 
-Both run inside temporalio's ActivityEnvironment. store_plan writes to the memory recorder.
-post_plan posts to a FakeGitHub through the idempotent write of github/side_effects.py, so the
-tests also show the key, the marker and what a retry does.
+All three run inside temporalio's ActivityEnvironment (LH-501, LH-502). store_plan and decide_plan
+write to the memory recorder. post_plan posts to a FakeGitHub through the idempotent write of
+github/side_effects.py, so the tests also show the key, the marker and what a retry does.
 """
 
 from __future__ import annotations
@@ -17,9 +17,13 @@ from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.contracts import Plan, PlanStep
-from longhaul.db.records import MemoryRecorder, PlanRecord
+from longhaul.db.records import CheckpointRecord, EventRecord, MemoryRecorder, PlanRecord
 from longhaul.durable import acts
-from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, effect_key, marker
 
@@ -39,8 +43,30 @@ PLAN = Plan(
 )
 
 
+SHA = "a" * 40
+
+
+def step_input(status: str = "done", **fields: Any) -> acts.RecordStepInput:
+    values: dict[str, Any] = {
+        "task_id": TASK,
+        "step_id": "s1",
+        "status": status,
+        "note": "the tests of add() pass",
+        "head_sha": SHA,
+        "turn_index": 6,
+    }
+    return acts.RecordStepInput(**{**values, **fields})
+
+
 class Broken(MemoryRecorder):
     async def record_plan(self, record: PlanRecord) -> None:
+        raise ConnectionError("the database is down")
+
+
+class BrokenDecision(MemoryRecorder):
+    async def record_plan_decision(
+        self, task_id: str, version: int, *, approved: bool, decided_by: str
+    ) -> None:
         raise ConnectionError("the database is down")
 
 
@@ -68,11 +94,59 @@ async def test_a_database_that_is_down_is_left_to_the_retry_policy() -> None:
         await ActivityEnvironment().run(PlanActivities(Broken()).store_plan, inp)
 
 
-def test_the_store_activity_is_the_one_the_workflow_calls() -> None:
+def test_the_store_activities_are_the_ones_the_workflow_calls() -> None:
     activities = PlanActivities(MemoryRecorder())
     assert [fn.__temporal_activity_definition.name for fn in activities.activities] == [  # type: ignore[attr-defined]
-        acts.STORE_PLAN.name
+        acts.STORE_PLAN.name,
+        acts.DECIDE_PLAN.name,
     ]
+
+
+# ---------- decide_plan (LH-502) ----------
+async def stored() -> MemoryRecorder:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).store_plan,
+        acts.StorePlanInput(task_id=TASK, version=1, plan=PLAN),
+    )
+    return recorder
+
+
+async def test_decide_plan_records_an_approval_with_who_approved() -> None:
+    recorder = await stored()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).decide_plan,
+        acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice"),
+    )
+    assert recorder.plans[(TASK, 1)] == PlanRecord(
+        TASK, 1, PLAN, status="approved", decided_by="alice"
+    )
+
+
+async def test_decide_plan_records_a_rejection_with_who_rejected() -> None:
+    recorder = await stored()
+    await ActivityEnvironment().run(
+        PlanActivities(recorder).decide_plan,
+        acts.DecidePlanInput(task_id=TASK, version=1, approved=False, by="bob"),
+    )
+    assert recorder.plans[(TASK, 1)].status == "rejected"
+    assert recorder.plans[(TASK, 1)].decided_by == "bob"
+
+
+async def test_decide_plan_twice_leaves_the_first_decision() -> None:
+    recorder = await stored()
+    activities = PlanActivities(recorder)
+    first = acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice")
+    await ActivityEnvironment().run(activities.decide_plan, first)
+    await ActivityEnvironment().run(activities.decide_plan, first)
+    assert recorder.plans[(TASK, 1)].decided_by == "alice"
+    assert len(recorder.plans) == 1
+
+
+async def test_decide_plan_leaves_a_database_that_is_down_to_the_retry_policy() -> None:
+    inp = acts.DecidePlanInput(task_id=TASK, version=1, approved=True, by="alice")
+    with pytest.raises(ConnectionError):
+        await ActivityEnvironment().run(PlanActivities(BrokenDecision()).decide_plan, inp)
 
 
 # ---------- post_plan ----------
@@ -191,4 +265,68 @@ def test_the_comment_activity_is_the_one_the_workflow_calls(client: GitHubClient
     activities = comments(client, MemoryLedger())
     assert [fn.__temporal_activity_definition.name for fn in activities.activities] == [
         acts.POST_PLAN.name
+    ]
+
+
+# ---------- record_step (LH-503) ----------
+async def test_a_step_that_is_done_gets_a_step_checkpoint_at_the_head() -> None:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(StepActivities(recorder).record_step, step_input("done"))
+
+    assert recorder.checkpoints == [CheckpointRecord(TASK, SHA, "step", turn_index=6, step_id="s1")]
+
+
+@pytest.mark.parametrize("status", ["todo", "doing", "skipped"])
+async def test_a_step_that_is_not_done_gets_no_checkpoint(status: str) -> None:
+    recorder = MemoryRecorder()
+    await ActivityEnvironment().run(StepActivities(recorder).record_step, step_input(status))
+    assert recorder.checkpoints == []
+
+
+async def test_every_update_is_an_event_with_the_note() -> None:
+    recorder = MemoryRecorder()
+    activities = StepActivities(recorder)
+    await ActivityEnvironment().run(activities.record_step, step_input("doing", note=""))
+    await ActivityEnvironment().run(activities.record_step, step_input("done"))
+
+    assert recorder.events == [
+        EventRecord(
+            TASK,
+            "step_updated",
+            {"step_id": "s1", "status": "doing", "note": "", "head_sha": SHA, "turn_index": 6},
+        ),
+        EventRecord(
+            TASK,
+            "step_updated",
+            {
+                "step_id": "s1",
+                "status": "done",
+                "note": "the tests of add() pass",
+                "head_sha": SHA,
+                "turn_index": 6,
+            },
+        ),
+    ]
+
+
+async def test_recording_a_step_again_leaves_one_checkpoint() -> None:
+    recorder = MemoryRecorder()
+    activities = StepActivities(recorder)
+    for _ in range(2):
+        await ActivityEnvironment().run(activities.record_step, step_input("done"))
+    assert len(recorder.checkpoints) == 1
+
+
+async def test_two_steps_done_at_one_sha_each_get_a_checkpoint() -> None:
+    recorder = MemoryRecorder()
+    activities = StepActivities(recorder)
+    await ActivityEnvironment().run(activities.record_step, step_input("done", step_id="s1"))
+    await ActivityEnvironment().run(activities.record_step, step_input("done", step_id="s2"))
+    assert [c.step_id for c in recorder.checkpoints] == ["s1", "s2"]
+
+
+def test_the_step_activity_is_the_one_the_workflow_calls() -> None:
+    activities = StepActivities(MemoryRecorder())
+    assert [fn.__temporal_activity_definition.name for fn in activities.activities] == [  # type: ignore[attr-defined]
+        acts.RECORD_STEP.name
     ]

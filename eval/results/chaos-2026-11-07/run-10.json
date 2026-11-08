@@ -1,0 +1,42 @@
+{
+  "run": 10,
+  "task_id": "calc-02",
+  "workflow_id": "lh-chaos-calc-02-76869db3",
+  "seed": 7010,
+  "kills_planned": [
+    "temporal"
+  ],
+  "kills": [
+    {
+      "type": "temporal",
+      "landed": true,
+      "place": "tool_exec",
+      "struck_at": "2026-11-07T19:37:22.586444Z",
+      "resume_latency_s": 2.034399
+    }
+  ],
+  "completed": true,
+  "outcome": "pr_opened",
+  "diff_equals_reference": true,
+  "problems": [],
+  "ledger_rows": 5,
+  "extra_ledger_rows": 0,
+  "cost_usd": 0.020216,
+  "extra_cost_usd": 0.0,
+  "resume_latency_s": [
+    2.034399
+  ],
+  "side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "expected_side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "duplicate_side_effects": 0,
+  "missing_side_effects": 0,
+  "wall_time_s": 31.5
+}

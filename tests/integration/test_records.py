@@ -386,6 +386,42 @@ async def test_checkpoints_of_other_shas_kinds_and_tasks_are_all_kept(
     assert scratch.query("SELECT count(*) FROM checkpoints") == [(4,)]
 
 
+@pytest.mark.phase5
+async def test_two_steps_done_at_the_same_sha_are_two_rows_and_a_repeat_is_not_a_third(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    # LH-503: a step marked done with no new work has the sha of the step before it.
+    for step_id in ("s1", "s2", "s2"):
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id="lh-a-1", sha=SHA, kind="step", turn_index=4, step_id=step_id)
+        )
+    assert scratch.query("SELECT step_id FROM checkpoints ORDER BY id") == [("s1",), ("s2",)]
+
+
+@pytest.mark.phase5
+async def test_the_step_checkpoints_of_a_task_come_back_in_the_order_they_were_saved(
+    recorder: SqlRecorder,
+) -> None:
+    saved = [
+        ("lh-a-1", "a" * 40, "tool", None),
+        ("lh-a-1", "b" * 40, "step", "s2"),
+        ("lh-a-1", "c" * 40, "step", "s1"),
+        ("lh-b-2", "d" * 40, "step", "s1"),
+    ]
+    for task, sha, kind, step_id in saved:
+        await recorder.record_checkpoint(
+            CheckpointRecord(task_id=task, sha=sha, kind=kind, turn_index=2, step_id=step_id)
+        )
+
+    found = await recorder.step_checkpoints("lh-a-1")
+
+    assert [(c.step_id, c.sha[0], c.kind, c.turn_index) for c in found] == [
+        ("s2", "b", "step", 2),
+        ("s1", "c", "step", 2),
+    ]
+    assert await recorder.step_checkpoints("lh-none") == []
+
+
 async def test_a_kind_outside_the_plan_is_refused(recorder: SqlRecorder) -> None:
     with pytest.raises(IntegrityError, match="ck_checkpoints_kind"):
         await recorder.record_checkpoint(
@@ -474,3 +510,29 @@ async def test_a_call_comes_back_with_every_field_it_was_written_with(
     await recorder.record_tool_call(written)
 
     assert await recorder.last_tool_call("lh-acme-calc-42", "run_tests") == written
+
+
+# ---------- the end of a task, for the janitor (LH-507) ----------
+def date_events(scratch: Scratch, task_id: str, kind: str, moment: datetime) -> None:
+    with psycopg.connect(scratch.url) as conn:
+        conn.execute(
+            "UPDATE events SET ts = %s WHERE task_id = %s AND type = %s", (moment, task_id, kind)
+        )
+
+
+async def test_the_outcome_event_dates_the_end_of_a_task(
+    scratch: Scratch, recorder: SqlRecorder
+) -> None:
+    for task_id in ("lh-old-1", "lh-new-2", "lh-running-3"):
+        await recorder.record_event(task_id, "stuck", {})  # any other event is not an end
+    await recorder.record_event("lh-old-1", "outcome", {"kind": "stuck"})
+    await recorder.record_event("lh-new-2", "outcome", {"kind": "error"})
+    date_events(scratch, "lh-old-1", "outcome", T0)
+    date_events(scratch, "lh-running-3", "stuck", T0)
+
+    ids = ["lh-old-1", "lh-new-2", "lh-running-3", "lh-unknown-4"]
+    assert await recorder.ended_before(ids, T1) == {"lh-old-1"}
+    assert await recorder.ended_before(ids, datetime.now(UTC)) == {"lh-old-1", "lh-new-2"}
+    assert await recorder.ended_before([], datetime.now(UTC)) == set()
+    # Only the ids asked about come back.
+    assert await recorder.ended_before(["lh-new-2"], T1) == set()

@@ -2,8 +2,10 @@
 # For a task that plans first, as every task of the poller does (LH-501). The planner and the
 # coder have a transcript each, so each counts its turns from 0, and every step names its role.
 # The planner reads the layout and the module and submits a plan of two steps. The coder then
-# makes the same edit as calc_fix.yaml, and its finish also waits for a passing test run
-# ("3 passed" is the whole calc suite).
+# makes the same edit as calc_fix.yaml. A coder with a plan is offered `update_step` and
+# `submit_for_review` in place of `finish` (LH-503), so once a test run passes ("3 passed" is the
+# whole calc suite) it marks both steps done and submits. The work is then reviewed (LH-504): the
+# pre-check runs the repo's test command, and the verifier, in a transcript of its own, passes it.
 steps:
   - match: {role: planner, turn_index: 0}
     respond:
@@ -59,5 +61,19 @@ steps:
       last_tool_result_contains: "3 passed"
     respond:
       tool_calls:
-        - name: finish
+        - name: update_step
+          input: {step_id: s1, status: done, note: "add() returns a + b."}
+        - name: update_step
+          input: {step_id: s2, status: done, note: "3 passed."}
+        - name: submit_for_review
           input: {summary: "Changed add() to return a + b. All tests pass."}
+  - match: {role: verifier, turn_index: 0}
+    respond:
+      text: "The operator is fixed and the suite passes."
+      tool_calls:
+        - name: submit_verdict
+          input:
+            passed: true
+            tests_run: "pytest -q"
+            tests_summary: "3 passed"
+            issues: []

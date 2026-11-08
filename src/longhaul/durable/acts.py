@@ -44,6 +44,24 @@ of the `plans` table, so it is sized like `append_results` and every worker regi
 GitHub write with the policy of `post_comment`, and it sits in `GITHUB` with them. The template is
 read inside the activity, so the workflow, which may not read files, passes the plan itself.
 
+The coder with a plan (LH-503) adds one more, `record_step`. It writes the event of a step update
+and, for a step that is done, the `step` checkpoint at the head of the work. Like `store_plan` it
+is a database write of a row or two, sized like `append_results`, and every worker registers it.
+The plan gate (LH-502) adds `decide_plan`, which records who approved or rejected a version of the
+plan on its row of the `plans` table. It is one row update, so it is sized like `store_plan` and
+every worker registers it.
+
+The pause for a person (LH-506) adds `summarize_for_human`. It is a compactor model call and a
+template, so it has the numbers of `compact`: 10 minutes, 5 attempts, the backoff and the
+non-retryable error kinds of a model call, and a heartbeat timeout. It writes no row but the ledger
+rows of its calls. The comment itself is posted by `post_comment`, so every worker registers the
+first and only a worker with a token the second.
+
+The run report (LH-705) adds `write_run_report`, which is in the table. It reads the tables of the
+task and writes one blob, so every worker registers it. The workflow does not call it yet:
+`deliver` makes the report for the body of the pull request, and a later wind-up can call the
+activity to keep a final copy.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -79,18 +97,22 @@ from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
     CarryState,
+    Outcome,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
     Role,
     StopDetails,
     StopReason,
+    StuckReason,
     TaskSpec,
+    TaskStatus,
     ToolResult,
     Usage,
 )
 from longhaul.durable.payload_guard import PayloadTooLargeError
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
+from longhaul.roles.stuck import CallSignal
 
 # The `finish` control tool ends a task. The workflow runs nothing for it: rules.run_calls reads
 # its summary. A unit test keeps the name equal to longhaul.tools.control.FINISH.
@@ -133,6 +155,18 @@ FORCED_KEEP_RECENT_TURNS = 2
 # file, so the number is copied from `loop.planner_max_turns`. A unit test keeps the two equal.
 PLANNER_MAX_TURNS = 20
 
+# The hours a task waits for a person before it gives up, the same number as
+# `stuck.hint_wait_hours` of the config. The plan gate (LH-502) waits this long for an approval,
+# and a paused task (LH-506) this long for a hint, a budget top-up or a cancel before it ends as
+# stuck. The workflow cannot read the config file, so the number is copied here, a unit test keeps
+# the two equal, and a worker whose config holds another number stops before it takes a task
+# (durable/worker.py).
+HINT_WAIT_HOURS = 24
+
+# The failed reviews after which a task ends as stuck (LH-504). The workflow cannot read the config
+# file, so the number is copied from `loop.max_verify_rounds`. A unit test keeps the two equal.
+MAX_VERIFY_ROUNDS = 3
+
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
 # The workflow memo key that switches planning on for a task (LH-501). A task started with
@@ -165,6 +199,26 @@ OUTCOME_SUMMARY_CHARS = 500
 # after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
 # contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
 STATUS_MEMO_KEY = "status_posts"
+# The workflow memo key that has a stuck task open a draft pull request with its partial work
+# (LH-507, the repo setting `open_draft_on_stuck`). The poller sets it from the repo entry of the
+# config when it starts the task, because the workflow cannot read the config and RepoSettings is
+# a contract that this story does not change. A task started without it opens no such draft.
+OPEN_DRAFT_MEMO_KEY = "open_draft_on_stuck"
+
+# How a task ends (LH-507). The purpose part of the idempotency key of the final comment, which
+# is `<task>:final:1`: a task ends once, so there is one such comment.
+FINAL_COMMENT = "final"
+# The `type` of the record_event call that keeps the trace of an exception that ended a task. The
+# payload holds the error `type` and the `trace`, cut to ERROR_TRACE_CHARS. The cut leaves the
+# event far under the 16 KB that CONTRIBUTING.md rule 5 allows across an activity boundary even
+# when every character is four bytes of JSON.
+ERROR_EVENT = "error"
+ERROR_TRACE_CHARS = 3000
+# How long the bare repo of a task that has ended is kept. The checkpoints in it are how a person
+# looks at what a stuck or failed task did, and the janitor (clean_repos) deletes the repo after
+# this long. A repo whose task has no outcome belongs to a task that is still running and is
+# never deleted.
+REPO_RETENTION = timedelta(days=7)
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -190,8 +244,9 @@ POLLER_CONFIG = "PollerConfigError"
 # runs it starts are named "<schedule id>-run" and a time.
 POLLER_SCHEDULE_ID = "longhaul-poller"
 # The longest one run of PollerWorkflow may last. All attempts of poll_once at their longest
-# come to 3 x 180 s and two waits of 5 s and 10 s, which is under 10 minutes. A run that lasts
-# longer has lost its worker, and the Schedule skips ticks for as long as a run is open.
+# come to 3 x 180 s and two waits of 5 s and 10 s, which is under 10 minutes, and the sweep of
+# the janitor after it (clean_repos) adds at most 2 x 120 s and a wait. A run that lasts longer
+# has lost its worker, and the Schedule skips ticks for as long as a run is open.
 POLLER_RUN_TIMEOUT = timedelta(minutes=15)
 # What the Schedule does about ticks it missed while the server was away: it catches up on those
 # of the last two minutes and drops the rest. A poll is a full scan, so one poll after an outage
@@ -294,6 +349,30 @@ class ToolCallSummary(BaseModel):
         return self
 
 
+class CheckRun(BaseModel):
+    """One command of the pre-check, or the diff, as the verifier's first message is built from it.
+
+    `command` is the label of the command, cut to a line. `passed` and `exit_code` are what the
+    workflow saw: a command passes when it finished with exit code 0, and `exit_code` is None for
+    one that did not finish. `output_ref` is the full text that tool_exec stored, which llm_turn
+    reads and cuts, so that a long test log never travels through the history. `call_id` names the
+    handle the verifier can page the rest with.
+    """
+
+    command: str
+    call_id: str
+    passed: bool
+    exit_code: int | None = None
+    output_ref: BlobRef | None = None
+
+
+class ReviewBrief(BaseModel):
+    """What the verifier is shown besides the plan: the pre-check, then the diff (LH-504)."""
+
+    checks: list[CheckRun] = Field(default_factory=list)
+    diff: CheckRun | None = None
+
+
 class LlmTurnInput(BaseModel):
     task_id: str
     turn_index: int
@@ -303,17 +382,20 @@ class LlmTurnInput(BaseModel):
     transcript_ref: BlobRef | None  # None before the first turn
     # The notes reach the model in the first message of the view, where compaction put them
     # (context/compact.py apply), so the system prompt does not change with them (D7). This field
-    # is the workflow's copy, which it hands back to the compact activity. The plan reaches the
-    # model in Phase 5.
+    # is the workflow's copy, which it hands back to the compact activity.
     notes: ProgressNotes | None = None
+    # The plan with the status of each step, as the workflow holds it. A coder with a plan reads it
+    # in the first message of its transcript, which llm_turn brings up to date before each call
+    # (LH-503). It also decides the coder's prompt and tool list, so it is set for the whole
+    # transcript or for none of it. The other roles ignore it.
     plan: Plan | None = None
     # The memory block that load_memory wrote for the task (LH-604): text in the blob store that
     # ends the system prompt. It is the same ref on every turn of the task, in every run, so the
     # prompt is the same bytes. None means the task has no block.
     memory_ref: BlobRef | None = None
     # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
-    # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
-    # LH-506 builds on this.
+    # the ones that are not in the transcript yet (turns.show_hints). A hint is cut to
+    # agent/hints.MAX_HINT_BYTES when it arrives.
     hints: list[str] = Field(default_factory=list)
     # D8: the one retry of a turn that stopped on max_tokens runs at the higher cap. The
     # activity maps this to the number in the config, which the workflow cannot read.
@@ -328,6 +410,10 @@ class LlmTurnInput(BaseModel):
     # The context mode this run asked for, from the memo (CONTEXT_MODE_MEMO_KEY). None means the
     # run did not ask, and the config of the worker decides.
     context_mode: ContextMode | None = None
+    # What the verifier reads in its first message besides the plan (LH-504). The activity builds
+    # that message once, when the transcript starts, so the later turns of a review ignore it. The
+    # other roles ignore it always.
+    review: ReviewBrief | None = None
 
 
 class LlmTurnOutput(BaseModel):
@@ -373,6 +459,18 @@ class ToolExecInput(BaseModel):
     # The context window of the run (Tuning.window_tokens). A tool pages its output to the cap for
     # one result, and that cap shrinks with a small window (context.tokens.result_cap).
     window_tokens: int | None = Field(default=None, ge=1)
+
+
+class ToolExecResult(ToolResult):
+    """What tool_exec returns: the ToolResult, and the facts the stuck detector reads (LH-505).
+
+    `signal` is None for a call that has none to give, such as a read, and for every call of the
+    planning phase, which the detector does not watch. The facts are small by design (see
+    roles/stuck.py), so they add a few hundred bytes to the history at most. A result stored
+    before this field existed reads back as one without facts.
+    """
+
+    signal: CallSignal | None = None
 
 
 class ToolResultSummary(BaseModel):
@@ -454,12 +552,61 @@ class CompactOutput(BaseModel):
     cost_usd: float = Field(default=0.0, ge=0)
 
 
+# What the question for a person came to. The three are human_summary.SummaryStatus, and a test
+# keeps them equal.
+SummaryStatus = Literal["ok", "repaired", "fallback"]
+
+
+class SummarizeInput(BaseModel):
+    """What summarize_for_human needs to write the question for a person (LH-506).
+
+    `transcript_ref` is the view of the coder's transcript, None before the first turn has
+    stored one. `reason` and `evidence` are those of the StuckSignal; for AGENT_ASKED the one line
+    of evidence is the question the coder asked. `pause` is the number of this pause, counted from
+    1, and goes into the title of the comment. `turn_index` is the turn that ended in the signal,
+    for the ledger rows.
+    """
+
+    task_id: str
+    turn_index: int
+    spec: TaskSpec
+    transcript_ref: BlobRef | None
+    notes: ProgressNotes | None = None
+    reason: StuckReason
+    evidence: list[str] = Field(default_factory=list)
+    pause: int = Field(ge=1)
+    # The script of the task, as in LlmTurnInput. The compactor is scripted in a scripted run.
+    script_ref: BlobRef | None = None
+
+
+class SummarizeOutput(BaseModel):
+    """The comment to show a person, and the question in it.
+
+    `comment` is the whole text for the issue, under 250 words. A local task has no issue, so the
+    workflow records it in the `paused` event. `cost_usd` is what the compactor's calls cost on
+    the ledger.
+    """
+
+    comment: str
+    question: str
+    status: SummaryStatus
+    cost_usd: float = Field(default=0.0, ge=0)
+
+
 class CleanupInput(BaseModel):
+    """What cleanup needs: the task, and whether its bare repo stays.
+
+    A task that has ended on its own keeps its repo for REPO_RETENTION, so it sends
+    `keep_repo=True` and the janitor deletes the repo later. The default removes it, which is what
+    a workflow from before LH-507 asked for and what a cancel still asks for.
+    """
+
     task_id: str
     # None when the workflow stopped before it learned the id. The activity then finds the
     # task's containers by their task label.
     sandbox_id: str | None
     reason: str
+    keep_repo: bool = False
 
 
 class RecordEventInput(BaseModel):
@@ -504,6 +651,10 @@ class BuildPrBranchInput(BaseModel):
     which the workflow keeps. The activity does not read it from the checkpoint repo, where the
     sandbox could move the `base` tag. `head_sha` is the latest checkpoint the workflow knows.
     The work of the whole task is the change from the base to the head.
+
+    `plan` is the plan with the status of each step, for a task that has one (LH-503). The
+    activity makes one commit for each done step from it and from the step checkpoints, and a task
+    without a plan gets the single commit it always did.
     """
 
     task_id: str
@@ -511,6 +662,7 @@ class BuildPrBranchInput(BaseModel):
     summary: str
     base_sha: str
     head_sha: str
+    plan: Plan | None = None
 
 
 class PrBranchOutput(BaseModel):
@@ -550,6 +702,47 @@ class PostPlanInput(BaseModel):
     plan: Plan
 
 
+class RecordStepInput(BaseModel):
+    """What record_step needs: one step update, and the head of the work it was made at.
+
+    A step that is `done` gets a `step` checkpoint at `head_sha`. Every update, the others
+    included, is an event with its note.
+    """
+
+    task_id: str
+    step_id: str
+    status: Literal["todo", "doing", "done", "skipped"]
+    note: str = ""
+    head_sha: str
+    turn_index: int = Field(ge=0)
+
+
+class PlannedStatus(TaskStatus):
+    """What status() returns for a task that has a plan: the status, and the plan with its steps.
+
+    TaskStatus is a contract and has no field for the plan, so this is the same model with one
+    more. A client that wants the plan asks for the query by name with the type:
+    `handle.query("status", result_type=PlannedStatus)`. The SDK takes the result type from the
+    method only when the query is asked for by method, so that form reads a TaskStatus, because
+    the extra field is ignored. A task without a plan answers with a plain TaskStatus.
+    """
+
+    plan: Plan | None = None
+
+
+class DecidePlanInput(BaseModel):
+    """What decide_plan needs: a version of the plan, and the decision a person made on it.
+
+    `by` is the login that sent the signal. Deciding the same version again changes nothing,
+    so a retry of the activity cannot turn a rejection into an approval.
+    """
+
+    task_id: str
+    version: int = Field(ge=1)
+    approved: bool
+    by: str
+
+
 class DeliverInput(BaseModel):
     """What deliver needs: the branch to push, and the facts for the title and the body."""
 
@@ -562,6 +755,55 @@ class DeliverInput(BaseModel):
     base_sha: str
     head_sha: str
     title: str
+    # The counts the verifier gave when it passed the work (LH-504), or None for work that no
+    # verifier passed. A pull request is ready for review exactly when this is set, and its body
+    # says "Verified: <this>". It is part of the input, so a retry builds the same request.
+    verified_tests: str | None = None
+    # True for the draft of a task that stopped before it finished (LH-507). The body then refers
+    # to the issue and does not close it. Part of the input, so a retry builds the same body.
+    partial: bool = False
+
+
+class PostFinalInput(BaseModel):
+    """What post_final needs: how the task ended, and what the report says about the work.
+
+    The activity renders the comment from this and from the diff stats it reads itself. It builds
+    the key from the task id, so a retry and a run after a Continue-As-New send the same one.
+    `base_sha` and `head_sha` are the ends of the work, and either is None for a task that never
+    made a checkpoint. `draft` says whether the pull request of the outcome, if there is one, is
+    still a draft. The verifier (Phase 5) is what makes it ready.
+    """
+
+    task_id: str
+    repo: str
+    number: int  # the issue
+    outcome: Outcome
+    plan: Plan | None = None
+    base_sha: str | None = None
+    head_sha: str | None = None
+    turns: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0)
+    draft: bool = True
+
+
+class JanitorResult(BaseModel):
+    """What one sweep of the janitor did: the task ids whose repos it removed, how many repos it
+    left, and how many it could not remove."""
+
+    removed: list[str] = Field(default_factory=list)
+    kept: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
+
+
+class RunReportInput(BaseModel):
+    """What write_run_report needs: the task, and how to call its end if the rows do not say.
+
+    `outcome` is an OutcomeKind value. A task that has already recorded its outcome ignores it.
+    The activity returns the BlobRef of the report, never the text (CONTRIBUTING.md rule 5).
+    """
+
+    task_id: str
+    outcome: str | None = None
 
 
 # ---------- activities ----------
@@ -635,7 +877,7 @@ LLM_TURN = Act(
 TOOL_EXEC = Act(
     "tool_exec",
     ToolExecInput,
-    ToolResult,
+    ToolExecResult,
     start_to_close=timedelta(seconds=TOOL_TIMEOUT_S + 60),
     heartbeat=timedelta(seconds=15),
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
@@ -707,6 +949,26 @@ COMPACT = Act(
     start_to_close=timedelta(minutes=10),
     # Section 3.7 gives no heartbeat. It is a model call like llm_turn, so a cancel has to reach
     # it and a killed worker has to be noticed in half a minute.
+    heartbeat=timedelta(seconds=30),
+    retry=RetryPolicy(
+        initial_interval=timedelta(seconds=2),
+        backoff_coefficient=2.0,
+        maximum_interval=timedelta(seconds=120),
+        maximum_attempts=5,
+        non_retryable_error_types=[
+            ProviderErrorKind.INVALID_REQUEST.value,
+            ProviderErrorKind.AUTH.value,
+            ProviderErrorKind.CONTEXT_TOO_LONG.value,
+            _OVERSIZED,
+        ],
+    ),
+)
+
+SUMMARIZE_FOR_HUMAN = Act(
+    "summarize_for_human",
+    SummarizeInput,
+    SummarizeOutput,
+    start_to_close=timedelta(minutes=10),
     heartbeat=timedelta(seconds=30),
     retry=RetryPolicy(
         initial_interval=timedelta(seconds=2),
@@ -805,6 +1067,58 @@ STORE_PLAN = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+RECORD_STEP = Act(
+    "record_step",
+    RecordStepInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
+DECIDE_PLAN = Act(
+    "decide_plan",
+    DecidePlanInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
+# The report on the issue when a task ends (LH-507). It is a post_comment whose body the activity
+# renders from the diff stats and a template, so it has the policy of post_comment and sits in
+# GITHUB with the other writes.
+POST_FINAL = Act(
+    "post_final",
+    PostFinalInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+# The janitor (LH-507). PollerWorkflow calls it after each poll, so the poller schedule is its
+# clock. It lists the bare repos on the disk of the worker, asks the database which of their
+# tasks ended more than REPO_RETENTION ago and removes those repos. A sweep that fails is run
+# again by the next tick, so it gets two attempts of two minutes, which keeps a poll and a sweep
+# at their longest inside POLLER_RUN_TIMEOUT.
+CLEAN_REPOS = Act(
+    "clean_repos",
+    NoneType,
+    JanitorResult,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=2, non_retryable_error_types=[_OVERSIZED]),
+)
+
+# The run report (LH-705). It reads the tables of the task and writes one blob, so it has the
+# numbers of section 3.7 (2 minutes, 3 attempts) and no heartbeat, and it needs no GitHub token.
+# `deliver` builds the same report inside its own activity to put it in the body of the pull
+# request, and `longhaul report` builds it without any activity at all.
+WRITE_RUN_REPORT = Act(
+    "write_run_report",
+    RunReportInput,
+    BlobRef,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -817,7 +1131,12 @@ ALL: tuple[Act[Any, Any], ...] = (
     RECORD_EVENT,
     POLL_ONCE,
     COMPACT,
+    SUMMARIZE_FOR_HUMAN,
     STORE_PLAN,
+    RECORD_STEP,
+    DECIDE_PLAN,
+    CLEAN_REPOS,
+    WRITE_RUN_REPORT,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -829,6 +1148,7 @@ GITHUB: tuple[Act[Any, Any], ...] = (
     BUILD_PR_BRANCH,
     DELIVER,
     POST_PLAN,
+    POST_FINAL,
 )
 
 
@@ -866,6 +1186,9 @@ class Tuning(BaseModel):
     # and append_results), and settings.Context.for_window says what it changes. The long-task
     # test needs a window that 62 turns fill, and the config's holds a task of hundreds of them.
     window_tokens: int | None = Field(default=None, ge=1)
+    # How long a paused task waits for a hint, in seconds, in place of HINT_WAIT_HOURS. The test
+    # server skips a 24 hour timer, but a test against a real server cannot wait for one.
+    hint_wait_s: float | None = Field(default=None, gt=0)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:
@@ -921,6 +1244,17 @@ def status_grace(tuning: Tuning | None = None) -> timedelta:
     if tuning is not None and tuning.status_grace_s is not None:
         return timedelta(seconds=tuning.status_grace_s)
     return STATUS_GRACE
+
+
+def hint_wait(tuning: Tuning | None = None) -> timedelta:
+    """How long a task waits for a person: the run's tuning, or HINT_WAIT_HOURS.
+
+    The plan gate passes no tuning and always waits HINT_WAIT_HOURS. A pause for a hint passes the
+    run's, so that a test against a real server can wait less.
+    """
+    if tuning is not None and tuning.hint_wait_s is not None:
+        return timedelta(seconds=tuning.hint_wait_s)
+    return timedelta(hours=HINT_WAIT_HOURS)
 
 
 def hand_off_due(turn_index: int, tuning: Tuning | None = None, *, suggested: bool = False) -> bool:

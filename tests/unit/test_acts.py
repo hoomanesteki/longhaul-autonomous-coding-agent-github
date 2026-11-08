@@ -19,6 +19,9 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Outcome,
+    OutcomeKind,
+    Phase,
     Plan,
     PlanStep,
     ProgressNotes,
@@ -26,7 +29,9 @@ from longhaul.contracts import (
     RepoSettings,
     Role,
     StopDetails,
+    StuckReason,
     TaskSpec,
+    TaskStatus,
     ToolResult,
     Usage,
 )
@@ -35,6 +40,7 @@ from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, 
 from longhaul.github import side_effects
 from longhaul.github.client import GitHubFatal, GitHubRetryable
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
+from longhaul.roles.stuck import CallSignal
 from longhaul.settings import load_config
 from longhaul.tools.control import FINISH
 
@@ -68,16 +74,21 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     assert sorted(names) == [
         "append_results",
         "bundle_checkpoint",
+        "clean_repos",
         "cleanup",
         "compact",
+        "decide_plan",
         "ensure_sandbox",
         "llm_turn",
         "load_memory",
         "poll_once",
         "prepare_workspace",
         "record_event",
+        "record_step",
         "store_plan",
+        "summarize_for_human",
         "tool_exec",
+        "write_run_report",
     ]
     assert len(set(names)) == len(names)
 
@@ -88,7 +99,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.PREPARE_WORKSPACE, TaskSpec, acts.PrepareWorkspaceOutput),
         (acts.ENSURE_SANDBOX, acts.EnsureSandboxInput, str),
         (acts.LLM_TURN, acts.LlmTurnInput, acts.LlmTurnOutput),
-        (acts.TOOL_EXEC, acts.ToolExecInput, ToolResult),
+        (acts.TOOL_EXEC, acts.ToolExecInput, acts.ToolExecResult),
         (acts.APPEND_RESULTS, acts.AppendResultsInput, BlobRef),
         (acts.CLEANUP, acts.CleanupInput, NoneType),
         (acts.BUNDLE_CHECKPOINT, acts.BundleCheckpointInput, BlobRef),
@@ -96,7 +107,11 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
+        (acts.DECIDE_PLAN, acts.DecidePlanInput, NoneType),
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
+        (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
+        (acts.CLEAN_REPOS, NoneType, acts.JanitorResult),
+        (acts.WRITE_RUN_REPORT, acts.RunReportInput, BlobRef),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -136,8 +151,14 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
         # Not in the table. A plan is one row, so it is sized like append_results.
         pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
+        # Not in the table. A decision updates one row, so it is sized like store_plan (LH-502).
+        pytest.param(acts.DECIDE_PLAN, 2 * 60, None, 3, id="decide_plan"),
         # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
         pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
+        # Not in the table. A step update is one event and at most one checkpoint row.
+        pytest.param(acts.RECORD_STEP, 2 * 60, None, 3, id="record_step"),
+        # Section 3.7: 2 minutes and 3 attempts. A few queries and one blob write.
+        pytest.param(acts.WRITE_RUN_REPORT, 2 * 60, None, 3, id="write_run_report"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -804,6 +825,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         "create_pr",
         "deliver",
         "post_comment",
+        "post_final",
         "post_plan",
         "remove_label",
     ]
@@ -850,6 +872,8 @@ def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
         pytest.param(acts.DELIVER, 10 * 60, 60, 5, id="deliver"),
         # The plan comment is a post_comment whose body the activity renders.
         pytest.param(acts.POST_PLAN, 2 * 60, None, 10, id="post_plan"),
+        # The final comment is a post_comment whose body the activity renders (LH-507).
+        pytest.param(acts.POST_FINAL, 2 * 60, None, 10, id="post_final"),
     ],
 )
 def test_github_timeouts_and_attempts_match_section_3_7(
@@ -861,7 +885,15 @@ def test_github_timeouts_and_attempts_match_section_3_7(
 
 
 @pytest.mark.parametrize(
-    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR, acts.POST_PLAN]
+    "act",
+    [
+        acts.POST_COMMENT,
+        acts.ADD_LABEL,
+        acts.REMOVE_LABEL,
+        acts.CREATE_PR,
+        acts.POST_PLAN,
+        acts.POST_FINAL,
+    ],
 )
 def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
     assert act.retry.maximum_interval == timedelta(minutes=5)
@@ -917,6 +949,19 @@ GITHUB_SAMPLES: list[BaseModel] = [
     ),
     CommentInput(task_id="lh-x", repo="acme/calc", number=42, body="hi", idempotency_key="k:a:1"),
     LabelInput(task_id="lh-x", repo="acme/calc", number=42, label="l", idempotency_key="k:a:1"),
+    acts.PostFinalInput(
+        task_id="lh-x",
+        repo="acme/calc",
+        number=42,
+        outcome=Outcome(kind=OutcomeKind.STUCK, summary="no hint in 24 hours"),
+        plan=Plan(summary="s", steps=[], acceptance_checks=["pytest -q"]),
+        base_sha="b" * 40,
+        head_sha=SHA,
+        turns=9,
+        cost_usd=0.5,
+    ),
+    acts.CleanupInput(task_id="lh-x", sandbox_id="sbx-1", reason="stuck", keep_repo=True),
+    acts.JanitorResult(removed=["lh-old-1"], kept=2, failed=0),
 ]
 
 
@@ -956,6 +1001,7 @@ def test_a_tool_call_is_not_read_only_unless_the_workflow_says_so() -> None:
 def test_the_plan_activities_are_registered_where_their_inputs_need_a_token() -> None:
     # Storing a plan needs the database only. Posting it needs a GitHub token.
     assert acts.STORE_PLAN in acts.ALL
+    assert acts.RECORD_STEP in acts.ALL and acts.RECORD_STEP not in acts.GITHUB
     assert acts.POST_PLAN in acts.GITHUB
     assert acts.STORE_PLAN not in acts.GITHUB and acts.POST_PLAN not in acts.ALL
 
@@ -977,6 +1023,12 @@ PLAN = Plan(
 PLAN_SAMPLES: list[BaseModel] = [
     acts.StorePlanInput(task_id="lh-x", version=1, plan=PLAN),
     acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=1, plan=PLAN),
+    acts.RecordStepInput(
+        task_id="lh-x", step_id="s1", status="done", note="ok", head_sha=SHA, turn_index=4
+    ),
+    acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="s", base_sha=SHA, head_sha=SHA, plan=PLAN
+    ),
     acts.ToolExecInput(
         task_id="lh-x",
         turn_index=2,
@@ -1053,3 +1105,250 @@ def test_the_model_turn_and_the_compaction_see_the_same_memory_block() -> None:
     )
     assert compact.memory_ref is None
     assert acts.CompactInput(**{**compact.model_dump(), "memory_ref": REF}).memory_ref == REF
+
+
+# ---------- the coder with a plan (LH-503) ----------
+@pytest.mark.phase5
+def test_a_step_update_names_one_of_the_statuses_of_the_plan() -> None:
+    with pytest.raises(ValidationError):
+        acts.RecordStepInput(
+            task_id="lh-x", step_id="s1", status="finished", head_sha=SHA, turn_index=1
+        )
+
+
+@pytest.mark.phase5
+def test_the_delivery_of_a_task_without_a_plan_asks_for_one_commit() -> None:
+    inp = acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="s", base_sha=SHA, head_sha=SHA
+    )
+    assert inp.plan is None
+
+
+@pytest.mark.phase5
+def test_status_is_a_task_status_that_also_carries_the_plan() -> None:
+    plain = TaskStatus(
+        task_id="lh-x",
+        phase=Phase.CODING,
+        turn_index=1,
+        cost_usd=0.0,
+        last_checkpoint=None,
+        plan_version=1,
+    )
+    planned = acts.PlannedStatus(**plain.model_dump(), plan=PLAN)
+
+    assert isinstance(planned, TaskStatus)
+    assert planned.plan == PLAN
+    assert acts.PlannedStatus(**plain.model_dump()).plan is None
+
+
+@pytest.mark.phase5
+def test_a_client_reads_the_plan_when_it_asks_for_it_and_the_status_when_it_does_not() -> None:
+    converter = pydantic_data_converter.payload_converter
+    plain = TaskStatus(
+        task_id="lh-x",
+        phase=Phase.CODING,
+        turn_index=1,
+        cost_usd=0.0,
+        last_checkpoint=SHA,
+        plan_version=1,
+    )
+    planned = acts.PlannedStatus(**plain.model_dump(), plan=PLAN)
+    payloads = converter.to_payloads([planned])
+
+    assert converter.from_payloads(payloads, [acts.PlannedStatus]) == [planned]
+    assert converter.from_payloads(payloads, [TaskStatus]) == [plain]
+
+
+# ---------- what tool_exec says to the stuck detector (LH-505) ----------
+def test_a_tool_exec_result_is_a_tool_result_with_one_more_field() -> None:
+    result = acts.ToolExecResult(call_id="c1", ok=True, output="o")
+    assert isinstance(result, ToolResult)
+    assert result.signal is None
+    fact = CallSignal(tests_passed=3, edited_regions=[("a.py", 1, 2)])
+    back = pydantic_data_converter.payload_converter.from_payload(
+        pydantic_data_converter.payload_converter.to_payload(
+            result.model_copy(update={"signal": fact})
+        ),
+        acts.ToolExecResult,
+    )
+    assert back.signal == fact
+
+
+def test_a_plain_tool_result_reads_as_one_without_facts() -> None:
+    # A history from before the detector, and the stubs of the workflow tests, return a ToolResult.
+    plain = ToolResult(call_id="c1", ok=True, output="o")
+    converter = pydantic_data_converter.payload_converter
+    back = converter.from_payload(converter.to_payload(plain), acts.ToolExecResult)
+    assert back.signal is None and back.output == "o"
+
+
+# ---------- LH-502: the plan gate ----------
+@pytest.mark.phase5
+def test_the_plan_wait_follows_the_configured_hint_wait() -> None:
+    # Same reason as the tool timeout: the workflow cannot read the config file, so it keeps a
+    # copy of stuck.hint_wait_hours. The plan gate and the pause for a hint (LH-506) both use it.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.stuck.hint_wait_hours == acts.HINT_WAIT_HOURS == 24
+
+
+@pytest.mark.phase5
+def test_the_plan_wait_is_a_duration_in_hours() -> None:
+    assert acts.hint_wait() == timedelta(hours=24)
+
+
+@pytest.mark.phase5
+def test_the_decision_is_registered_where_its_input_needs_only_the_database() -> None:
+    # Recording who decided a plan needs the database and no GitHub token.
+    assert acts.DECIDE_PLAN in acts.ALL
+    assert acts.DECIDE_PLAN not in acts.GITHUB
+
+
+@pytest.mark.phase5
+def test_a_decision_names_a_plan_version_from_one() -> None:
+    with pytest.raises(ValidationError):
+        acts.DecidePlanInput(task_id="lh-x", version=0, approved=True, by="alice")
+    inp = acts.DecidePlanInput(task_id="lh-x", version=2, approved=False, by="alice")
+    assert acts.DecidePlanInput.model_validate_json(inp.model_dump_json()) == inp
+    assert_small(inp)
+
+
+@pytest.mark.phase5
+def test_a_decision_does_not_retry_an_oversized_payload() -> None:
+    assert PayloadTooLargeError.__name__ in (acts.DECIDE_PLAN.retry.non_retryable_error_types or [])
+
+
+# ---------- LH-504: the verifier ----------
+def test_the_verify_round_limit_follows_the_configured_one() -> None:
+    # Same reason as the planner's turn limit: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.loop.max_verify_rounds == acts.MAX_VERIFY_ROUNDS == 3
+
+
+def test_a_review_brief_is_small_and_names_its_outputs_by_ref() -> None:
+    ref = BlobRef(
+        key="tasks/lh-x/turns/0003/tool-verify1-tests-output.txt", sha256="0" * 64, size=9
+    )
+    brief = acts.ReviewBrief(
+        checks=[
+            acts.CheckRun(
+                command="pytest -q",
+                call_id="verify1-tests",
+                passed=False,
+                exit_code=1,
+                output_ref=ref,
+            )
+        ],
+        diff=acts.CheckRun(command="git_diff", call_id="verify1-diff", passed=True, output_ref=ref),
+    )
+    converter = pydantic_data_converter.payload_converter
+    (payload,) = converter.to_payloads([brief])
+    assert converter.from_payloads([payload], [acts.ReviewBrief]) == [brief]
+    assert len(payload.data) < 1_000
+
+
+def test_a_model_turn_has_no_review_unless_the_workflow_gives_one() -> None:
+    inp = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.VERIFIER, spec=SPEC, transcript_ref=None
+    )
+    assert inp.review is None
+
+
+def test_a_delivery_is_not_verified_unless_the_workflow_says_so() -> None:
+    inp = acts.DeliverInput(
+        task_id="lh-x",
+        repo="acme/calc",
+        issue_number=42,
+        summary="s",
+        branch="longhaul-pr/42",
+        base_branch="main",
+        base_sha=SHA,
+        head_sha=SHA,
+        title="fix(calc): fix it",
+    )
+    assert inp.verified_tests is None
+    assert inp.model_copy(update={"verified_tests": "3 passed"}).verified_tests == "3 passed"
+
+
+# ---------- LH-506: the pause for a hint ----------
+def test_a_pause_waits_a_day_for_a_hint_unless_the_run_says_less() -> None:
+    assert acts.hint_wait() == timedelta(hours=24)
+    assert acts.hint_wait(acts.Tuning()) == timedelta(hours=24)
+    assert acts.hint_wait(acts.Tuning(hint_wait_s=90)) == timedelta(seconds=90)
+
+
+def test_summarize_for_human_is_an_activity_of_every_worker() -> None:
+    # It is a model call and a template, with no GitHub write: the comment is posted by
+    # post_comment, which only a worker with a token registers.
+    assert acts.SUMMARIZE_FOR_HUMAN in acts.ALL
+    assert acts.SUMMARIZE_FOR_HUMAN not in acts.GITHUB
+    assert acts.SUMMARIZE_FOR_HUMAN.heartbeat is not None
+
+
+def test_a_summarize_input_needs_a_pause_number_from_one() -> None:
+    with pytest.raises(ValidationError):
+        acts.SummarizeInput(
+            task_id="lh-x",
+            turn_index=1,
+            spec=TaskSpec(
+                task_id="lh-x", repo="acme/calc", settings=RepoSettings(repo="acme/calc")
+            ),
+            transcript_ref=None,
+            reason=StuckReason.NO_PROGRESS,
+            evidence=[],
+            pause=0,
+        )
+
+
+# ---------- LH-507: how a task ends ----------
+def test_the_janitor_runs_on_every_worker_and_the_final_comment_needs_a_token() -> None:
+    # Sweeping repos needs the database and the disk. Posting the report needs GitHub.
+    assert acts.CLEAN_REPOS in acts.ALL and acts.CLEAN_REPOS not in acts.GITHUB
+    assert acts.POST_FINAL in acts.GITHUB and acts.POST_FINAL not in acts.ALL
+
+
+def test_a_bare_repo_is_kept_for_seven_days_after_its_task_ends() -> None:
+    assert timedelta(days=7) == acts.REPO_RETENTION
+
+
+def test_cleanup_removes_the_repo_unless_the_caller_keeps_it() -> None:
+    # A workflow from before LH-507 sent no flag, and its cleanup removed the repo too.
+    assert acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="r").keep_repo is False
+
+
+def test_the_final_comment_has_one_key_for_the_whole_task() -> None:
+    assert acts.FINAL_COMMENT == "final"
+
+
+def test_the_error_trace_is_cut_far_below_the_payload_guard() -> None:
+    assert 0 < acts.ERROR_TRACE_CHARS * 4 < 16_000
+
+
+def test_the_draft_on_stuck_switch_rides_in_the_memo_beside_the_others() -> None:
+    keys = {
+        acts.OPEN_DRAFT_MEMO_KEY,
+        acts.PLAN_MEMO_KEY,
+        acts.SCRIPT_MEMO_KEY,
+        acts.TUNING_MEMO_KEY,
+        acts.CONTEXT_MODE_MEMO_KEY,
+        acts.STATUS_MEMO_KEY,
+    }
+    assert len(keys) == 6
+
+
+def test_a_poll_and_a_sweep_at_their_longest_fit_in_one_run_of_the_poller() -> None:
+    poll = acts.POLL_ONCE.start_to_close * acts.POLL_ONCE.retry.maximum_attempts
+    sweep = acts.CLEAN_REPOS.start_to_close * acts.CLEAN_REPOS.retry.maximum_attempts
+    waits = timedelta(seconds=5 + 10 + 5)
+    assert poll + sweep + waits < acts.POLLER_RUN_TIMEOUT
+
+
+# ---------- LH-705: the run report ----------
+def test_the_run_report_is_written_on_every_worker_because_it_needs_no_token() -> None:
+    # It reads the database and the blob store, and the CLI prints the same text.
+    assert acts.WRITE_RUN_REPORT in acts.ALL and acts.WRITE_RUN_REPORT not in acts.GITHUB
+
+
+def test_the_run_report_input_is_a_task_id_and_an_optional_outcome() -> None:
+    inp = acts.RunReportInput(task_id="lh-x")
+
+    assert (inp.task_id, inp.outcome) == ("lh-x", None)

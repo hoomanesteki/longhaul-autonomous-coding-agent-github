@@ -1,0 +1,37 @@
+# Fixes the stand-in instance of tests/integration/test_swebench_runner.py: add() subtracts.
+# It also edits the test file that the instance's test patch touches, so the runner has a change
+# to cut out of the patch before it goes to the harness.
+steps:
+  - respond:
+      text: "Looking at the repo layout."
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: calc/__init__.py}}
+  - respond:
+      text: "add() subtracts. Replacing the line."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: calc/__init__.py
+            old_str: "    return a - b"
+            new_str: "    return a + b"
+  - respond:
+      text: "A second test for the fix."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: tests/test_calc.py
+            old_str: "def test_add():"
+            new_str: "def test_add_zero():\n    assert add(0, 0) == 0\n\n\ndef test_add():"
+  - respond:
+      tool_calls:
+        - {name: run_tests, input: {}}
+  - match:
+      turn_index: 5
+      last_tool_result_contains: "2 passed"
+    respond:
+      tool_calls:
+        - name: finish
+          input: {summary: "Changed add() to return a + b. All tests pass."}

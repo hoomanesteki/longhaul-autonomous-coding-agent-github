@@ -1,0 +1,18 @@
+# The one answer of the single-shot baseline for eval task calc-02: divide() drops the fraction.
+# The counts in the hunk header are wrong on purpose, as a model's often are. git apply --recount
+# reads the hunk itself, so the diff still applies.
+steps:
+  - respond:
+      text: |
+        divide() uses floor division. This diff switches it to true division.
+
+        ```diff
+        --- a/src/calc/__init__.py
+        +++ b/src/calc/__init__.py
+        @@ -13,9 +13,9 @@
+
+         def divide(a: float, b: float) -> float:
+             """Return a divided by b. Dividing by zero raises ZeroDivisionError."""
+        -    return a // b
+        +    return a / b
+        ```

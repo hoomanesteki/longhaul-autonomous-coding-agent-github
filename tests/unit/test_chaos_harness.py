@@ -6,6 +6,7 @@ real process and a log file that grows on a timer, at the pace of the reference 
 twice that pace.
 """
 
+import asyncio
 import contextlib
 import subprocess
 import sys
@@ -504,3 +505,216 @@ def test_a_json_log_line_reads_as_the_plain_form() -> None:
 def test_a_line_that_is_not_json_is_kept() -> None:
     line = "2026-11-04T19:42:01Z WARN temporal_sdk_core: something\n"
     assert harness.plain_line(line) == line
+
+
+# ---------- LH-904: kills of more kinds than the worker ----------
+def kill_once(stack: Stack, kill: Kill, worker: Worker) -> harness.KillPoint | None:
+    """One kill of a run that nobody ends early."""
+    return stack._kill_one(kill, worker, "lh-t-1", time.monotonic(), threading.Event())
+
+
+class StrikingStack(Stack):
+    """A stack whose strike of any kind other than the worker is a note in a list.
+
+    The real strikes (a sandbox, Temporal, Postgres) need Docker. What the harness has to get
+    right is who is struck, in what order, and what is written down about it.
+    """
+
+    def __init__(self, root: Path, *, hits: bool = True) -> None:
+        super().__init__(root, "postgresql://unused")
+        self.struck: list[tuple[str, str]] = []
+        self.hits = hits
+
+    def strike(self, kind: str, worker: Worker, task_id: str) -> bool:
+        if kind == harness.WORKER:
+            return super().strike(kind, worker, task_id)
+        self.struck.append((kind, task_id))
+        return self.hits
+
+
+def test_a_kill_is_a_kill_of_the_worker_unless_it_says_otherwise() -> None:
+    assert Kill(after=ANY_STARTED).kind == harness.WORKER
+
+
+def test_plan_kills_gives_each_kill_the_kind_it_was_given() -> None:
+    kinds = ("sandbox", "temporal", "postgres")
+    plan = plan_kills(4, 3, REFERENCE, kinds=kinds)
+    assert [kill.kind for kill in plan] == list(kinds)
+
+
+def test_plan_kills_without_kinds_kills_the_worker() -> None:
+    assert {kill.kind for kill in plan_kills(4, 3, REFERENCE)} == {harness.WORKER}
+
+
+def test_the_kinds_do_not_change_when_or_where_a_kill_lands() -> None:
+    # A seed is a plan of times. The kind is a second decision, so naming it moves nothing.
+    plain = plan_kills(11, 3, REFERENCE)
+    named = plan_kills(11, 3, REFERENCE, kinds=("postgres", "worker", "sandbox"))
+    assert [(k.after, k.nth, k.delay_s) for k in plain] == [
+        (k.after, k.nth, k.delay_s) for k in named
+    ]
+
+
+def test_a_plan_needs_one_kind_for_each_kill() -> None:
+    with pytest.raises(ValueError, match="kinds"):
+        plan_kills(1, 3, REFERENCE, kinds=("worker", "sandbox"))
+
+
+def test_the_window_can_reach_the_last_activity() -> None:
+    # The delivery of the pull request is the last part of a run, and the story audits what a
+    # kill there does to the writes on GitHub, so a full chaos plan can aim at all of it.
+    last = {plan_kills(s, 1, REFERENCE, window_share=1.0)[0].nth for s in range(1, 600)}
+    assert max(last) == len(REFERENCE)
+    assert min(last) == FIRST_TURN_NTH
+
+
+def test_a_later_kill_counts_the_lines_that_come_after_it_starts_to_wait() -> None:
+    _, second = plan_kills(3, 2, REFERENCE)
+    assert second.fresh and second.after is ANY_ENDED
+    first, _ = plan_kills(3, 2, REFERENCE)
+    assert not first.fresh
+
+
+def test_a_fresh_kill_waits_for_a_line_that_is_new(tmp_path: Path) -> None:
+    # Three activities have ended already. A kill of a worker that stays up must not take them
+    # for the activity it is waiting for.
+    old = [(0.0, timed(BEGAN, "tool_exec", "ended", f", turn {n}, edit_file")) for n in range(3)]
+    new = [(0.6, timed(BEGAN, "tool_exec", "ended", ", turn 4, edit_file"))]
+    kill = Kill(after=ANY_ENDED, fresh=True, kind="sandbox")
+    with worker_logging(tmp_path, old + new) as (worker, _):
+        stack = StrikingStack(tmp_path / "stack")
+        while len(ANY_ENDED.findall(worker.text())) < len(old):
+            time.sleep(0.01)  # the kill starts to wait after the old lines are in the log
+        began = time.monotonic()
+        point = stack._kill_one(kill, worker, "lh-t-1", began, threading.Event())
+        waited = time.monotonic() - began
+        assert point is not None
+        assert waited >= 0.5, "the kill took an old line for the one it was waiting for"
+
+
+def test_a_strike_of_another_kind_leaves_the_worker_running(tmp_path: Path) -> None:
+    events = [(0.0, timed(BEGAN, "tool_exec", "started", ", turn 2, run_command"))]
+    with worker_logging(tmp_path, events) as (worker, _):
+        stack = StrikingStack(tmp_path / "stack")
+        point = kill_once(stack, Kill(after=ANY_STARTED, kind="sandbox"), worker)
+        assert worker.proc.poll() is None, "a sandbox kill ended the worker"
+
+    assert stack.struck == [("sandbox", "lh-t-1")]
+    assert point is not None
+    assert (point.via, point.kind, point.hit) == ("sandbox", "tool_exec", True)
+    assert point.struck_at is not None and point.struck_at.tzinfo is not None
+
+
+def test_a_strike_that_hits_nothing_is_written_down_as_a_miss(tmp_path: Path) -> None:
+    events = [(0.0, timed(BEGAN, "llm_turn", "started", ", turn 2"))]
+    with worker_logging(tmp_path, events) as (worker, _):
+        stack = StrikingStack(tmp_path / "stack", hits=False)
+        point = kill_once(stack, Kill(after=ANY_STARTED, kind="sandbox"), worker)
+
+    assert point is not None and point.hit is False
+
+
+def test_a_kill_of_the_worker_is_written_down_with_the_time_it_happened(tmp_path: Path) -> None:
+    events = [(0.0, timed(BEGAN, "tool_exec", "started", ", turn 2, run_command"))]
+    with worker_logging(tmp_path, events) as (worker, _):
+        stack = StrikingStack(tmp_path / "stack")
+        point = kill_once(stack, Kill(after=ANY_STARTED), worker)
+        assert worker.proc.poll() is not None
+
+    assert point is not None
+    assert (point.via, point.hit) == (harness.WORKER, True)
+    assert point.struck_at is not None
+
+
+def test_a_stack_cannot_strike_a_kind_it_does_not_know(tmp_path: Path) -> None:
+    stack = Stack(tmp_path, "postgresql://unused")
+    with pytest.raises(ValueError, match="tape"):
+        stack.strike("tape", Worker(subprocess.Popen(["true"]), tmp_path / "w.log"), "lh-t-1")
+
+
+def test_only_a_killed_worker_is_started_again(tmp_path: Path) -> None:
+    started: list[int] = []
+
+    class Counting(StrikingStack):
+        def start_worker(self) -> Worker:
+            started.append(1)
+            return Worker(subprocess.Popen(["true"]), tmp_path / "w.log")
+
+    events = [(0.0, timed(BEGAN, "tool_exec", "started", ", turn 2, run_command"))]
+    with worker_logging(tmp_path, events) as (worker, _):
+        stack = Counting(tmp_path / "stack")
+        stack.workers.append(worker)
+        kills = [Kill(after=ANY_STARTED, kind="sandbox"), Kill(after=ANY_STARTED, kind="postgres")]
+        points = stack._kill_all(kills, "lh-t-1", time.monotonic(), threading.Event())
+
+    assert [p.via for p in points] == ["sandbox", "postgres"]
+    assert started == []
+
+
+# ---------- calls to a Temporal that restarts ----------
+def rpc_error(code: object) -> Exception:
+    from temporalio.service import RPCError
+
+    return RPCError("the server said so", code, b"")  # type: ignore[arg-type]
+
+
+def test_a_call_is_made_again_while_the_server_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from temporalio.service import RPCStatusCode
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(harness.asyncio, "sleep", no_sleep)
+    calls: list[int] = []
+
+    async def call() -> str:
+        calls.append(1)
+        if len(calls) < 3:
+            raise rpc_error(RPCStatusCode.UNAVAILABLE)
+        return "answer"
+
+    assert asyncio.run(harness.Stack.through_restarts(call)) == "answer"
+    assert len(calls) == 3
+
+
+def test_a_call_that_cannot_succeed_is_not_made_again() -> None:
+    from temporalio.service import RPCError, RPCStatusCode
+
+    calls: list[int] = []
+
+    async def call() -> str:
+        calls.append(1)
+        raise rpc_error(RPCStatusCode.NOT_FOUND)
+
+    async def bounded() -> str:
+        # A loop that never ends must fail this test and not hang the suite.
+        return await asyncio.wait_for(harness.Stack.through_restarts(call), timeout=3)
+
+    with pytest.raises(RPCError):
+        asyncio.run(bounded())
+    assert calls == [1]
+
+
+def test_the_status_read_after_a_run_gives_up_when_no_worker_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from temporalio.service import RPCStatusCode
+
+    async def never_answers(*_: object, **__: object) -> None:
+        raise rpc_error(RPCStatusCode.DEADLINE_EXCEEDED)
+
+    async def no_sleep(_: float) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(harness, "read_status", never_answers)
+    monkeypatch.setattr(harness, "get_task", lambda *_: None)
+    monkeypatch.setattr(harness, "STATUS_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(harness, "RETRY_PAUSE_S", 0.01)
+
+    async def read() -> None:
+        await harness.Stack.final_status(object(), "lh-t-1")  # type: ignore[arg-type]
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(asyncio.wait_for(read(), timeout=10))

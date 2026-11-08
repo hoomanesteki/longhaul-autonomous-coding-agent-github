@@ -33,7 +33,7 @@ WORKDIR /app
 #
 # The dependencies first, so a change to the source does not install them again.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project --extra memory
+RUN uv sync --locked --no-dev --no-group eval --no-install-project --extra memory
 
 # The model is part of the image: a worker then starts with no network, and every container of
 # a build embeds with the same file, which the hub could otherwise replace between two builds.
@@ -45,7 +45,7 @@ RUN python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-smal
 COPY src ./src
 COPY config ./config
 COPY templates ./templates
-RUN uv sync --locked --no-dev --no-editable --extra memory
+RUN uv sync --locked --no-dev --no-group eval --no-editable --extra memory
 
 # The settings come from LONGHAUL_* variables (see .env.example). The config file is the example
 # one unless LONGHAUL_CONFIG names another.

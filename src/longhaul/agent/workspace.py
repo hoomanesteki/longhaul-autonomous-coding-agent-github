@@ -14,6 +14,9 @@ What is not copied:
 * Whatever the source folder's .longhaulignore lists, in .gitignore syntax. The fixture repos
   use it to keep REFERENCE.patch and ISSUE.md away from the model. The ignore file is not
   copied either, because it names what it hides.
+* The image file, .longhaulimage. It names the sandbox image that the task runs in, for a worker
+  that is given a folder whose repo needs an environment of its own (the SWE-bench eval, whose
+  instances come with their images). Only prepare_workspace reads it, and it stays on the host.
 * Symlinks and special files. The sandbox's file API cannot create links, and a link that
   leaves the folder would hand the sandbox whatever it points at.
 """
@@ -35,6 +38,7 @@ from longhaul.contracts import ExecResult, Sandbox, SandboxLimits, SandboxManage
 log = logging.getLogger(__name__)
 
 IGNORE_FILE = ".longhaulignore"
+IMAGE_FILE = ".longhaulimage"
 BASE_TAG = "base"
 
 GIT_TIMEOUT_S = 120
@@ -48,6 +52,9 @@ DEFAULT_TEST_COMMAND = "python -m pytest -q"
 OUTPUT_TAIL_LINES = 40
 OUTPUT_TAIL_CHARS = 4_000
 MAX_LISTED = 10
+
+# One docker image reference. The first character is not "-", so a name never reads as an option.
+_IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}")
 
 # Skipped whatever the ignore file says: a negation there cannot bring these back.
 BUILTIN_PATTERNS = """\
@@ -298,7 +305,7 @@ def collect_source_files(source_dir: Path, ignore_file: str = IGNORE_FILE) -> li
 
     def skipped(rel: str, *, is_dir: bool) -> bool:
         return (
-            rel == own_name
+            rel in (own_name, IMAGE_FILE)
             or BUILTIN_RULES.ignores(rel, is_dir=is_dir)
             or user_rules.ignores(rel, is_dir=is_dir)
         )
@@ -336,6 +343,27 @@ def collect_source_files(source_dir: Path, ignore_file: str = IGNORE_FILE) -> li
             f"no files to copy from {source_dir}: it is empty, or every file is skipped"
         )
     return sorted(files, key=lambda f: f.path)
+
+
+def read_image_file(source_dir: Path) -> str | None:
+    """The sandbox image that `source_dir` asks for in its image file, or None for no request.
+
+    The file holds one image name. A file that holds anything else raises WorkspaceError: a
+    name that docker could read as an option, or two names, is a mistake of the one who wrote
+    the file, and running the task in the default image instead would hide it.
+    """
+    try:
+        text = (source_dir / IMAGE_FILE).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise WorkspaceError(f"cannot read {IMAGE_FILE}: {exc}") from exc
+    names = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(names) != 1:
+        raise WorkspaceError(f"{IMAGE_FILE} must hold one image name, and it holds {len(names)}")
+    if not _IMAGE_NAME.fullmatch(names[0]):
+        raise WorkspaceError(f"{IMAGE_FILE}: {names[0][:80]!r} is not an image name")
+    return names[0]
 
 
 def _report_not_copied(paths: list[str]) -> None:

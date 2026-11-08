@@ -62,11 +62,14 @@ class EnvSettings(BaseSettings):
     github_app_id: int | None = None
     github_app_key_path: Path | None = None
     # Where GitHub is. Unset means api.github.com and github.com. A GitHub Enterprise server sets
-    # both, and the end-to-end test of LH-308 points them at a FakeGitHub and a folder of bare
-    # repos. The web URL is the base of `<base>/<owner>/<name>.git`, which is what the host clones
-    # from and pushes to.
+    # the API and web URLs, and the end-to-end test of LH-308 points them at a FakeGitHub and a
+    # folder of bare repos. The web URL is the base of `<base>/<owner>/<name>.git`, which is what
+    # the host clones from and pushes to. The clone base (LH-904) names a folder or server for
+    # clones only and wins over the web URL; the chaos suite points a worker at a FakeGitHub it
+    # serves on this machine, so it can count what a run wrote.
     github_api_url: str | None = None
     github_web_url: str | None = None
+    github_clone_base: str | None = None
     admin_token: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
     # Script file for the scripted provider; the provider factory reads it (LH-197).
@@ -133,6 +136,17 @@ class RepoEntry(RepoSettings):
 
     budgets: BudgetsEntry = Field(default_factory=BudgetsEntry)
     allowlisted: bool = False
+    # A task of this repo that ends stuck opens a draft pull request with the work it has (LH-507,
+    # decision D4). Off by default: a draft nobody asked for is noise on a busy repo. The flag is
+    # a worker setting and not part of RepoSettings, which is a contract. The poller hands it to
+    # the task when it starts it (durable/acts.OPEN_DRAFT_MEMO_KEY).
+    open_draft_on_stuck: bool = False
+
+
+# The fields of a RepoEntry that RepoSettings, the contract a task runs with, does not have. They
+# are read from the config by the worker when it starts a task, so the `repo_settings` rows and
+# the TaskSpec leave them out.
+WORKER_ONLY_FIELDS = frozenset({"open_draft_on_stuck"})
 
 
 class Poller(StrictModel):
@@ -174,8 +188,9 @@ class Context(StrictModel):
     elide_tool_outputs_after_turns: int
     tool_output_max_tokens: int
     # Which of the two tiers run (LH-406). `full` is what the product does, and the default keeps
-    # every config written before the mode existed on that behavior. A run can name its own mode
-    # (`longhaul run --context-mode`), and that wins over this one.
+    # every config written before the mode existed on that behavior. `sliding` runs neither tier
+    # and drops the oldest turns at the hard limit, as the naive baseline does (LH-903). A run can
+    # name its own mode (`longhaul run --context-mode`), and that wins over this one.
     mode: ContextMode = ContextMode.FULL
 
     def for_window(self, window_tokens: int | None) -> Self:
@@ -198,7 +213,9 @@ class Context(StrictModel):
 
 
 class Loop(StrictModel):
-    max_verify_rounds: int
+    # The failed reviews after which a task ends as stuck. The workflow keeps a copy of the number
+    # in acts.MAX_VERIFY_ROUNDS, because it cannot read this file, and a unit test keeps them equal.
+    max_verify_rounds: int = Field(ge=1)
     continue_as_new_every_turns: int
     max_tokens_per_turn: int
     # The cap for the one retry of a turn that stopped on max_tokens.

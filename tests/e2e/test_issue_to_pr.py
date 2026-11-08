@@ -11,8 +11,9 @@ The workspace setup builds a venv and installs pytest and calc from PyPI, so the
 outbound network.
 
 The poller runs once, as the Schedule would start it. The test then follows the task to its end
-and checks what the issue shows: one "Picked up" comment, one comment with the plan, one draft
-pull request, and the label `longhaul:pr-open` where `longhaul:working` was.
+and checks what the issue shows: one "Picked up" comment, one comment with the plan, one final
+comment with the link to the pull request, one pull request that a verifier passed and is ready
+for review, and the label `longhaul:pr-open` where `longhaul:working` was.
 
 Nothing here touches what other work on the machine uses. The test has its own task queue, its
 own scratch database (migrated to head, then dropped), its own checkpoint folder, and a repo with
@@ -165,6 +166,8 @@ class Stack:
     server: RunningServer
     repo: str
     queue: str = field(default_factory=lambda: f"lh-e2e-pr-{uuid.uuid4().hex[:8]}")
+    # The script the worker plays. tests/e2e/test_stuck_flow.py runs the same stack with another.
+    script: Path = SCRIPT
     processes: list[subprocess.Popen[str]] = field(default_factory=list)
     task_ids: list[str] = field(default_factory=list)
 
@@ -180,7 +183,11 @@ class Stack:
     def write_config(self) -> None:
         """The example config with the one repo of this test in the allowlist."""
         config = yaml.safe_load(CONFIG.read_text(encoding="utf-8"))
-        config["repos"] = [{**config["repos"][0], "repo": self.repo}]
+        # The example repo holds every plan for a person. This test has none to answer, and the
+        # gate has its own tests (tests/integration/test_plan_gate.py).
+        config["repos"] = [
+            {**config["repos"][0], "repo": self.repo, "plan_approval_required": False}
+        ]
         # The local embedder needs the memory extra and a model download (LH-604). The hash one
         # needs neither, and the worker still keeps its memory.
         config["memory"]["embedder"] = "hash"
@@ -210,7 +217,7 @@ class Stack:
             LONGHAUL_CKPT_DIR=str(self.tmp_path / "ckpt"),
             LONGHAUL_CONFIG=str(self.config_file),
             LONGHAUL_PROVIDER="scripted",
-            LONGHAUL_SCRIPT=str(SCRIPT),
+            LONGHAUL_SCRIPT=str(self.script),
             LONGHAUL_GITHUB_TOKEN=TOKEN,
             LONGHAUL_GITHUB_API_URL=self.server.url,
             LONGHAUL_GITHUB_WEB_URL=str(self.remotes),
@@ -350,22 +357,31 @@ async def label_to_pr(stack: Stack) -> None:
     assert outcome.kind is OutcomeKind.PR_OPENED, shown
     assert outcome.pr_url, shown
 
-    # Exactly one pull request: a draft that closes the issue, from the branch of the task.
+    # Exactly one pull request that closes the issue, from the branch of the task. The verifier
+    # passed the work and the pre-check ran the test command, so it is ready for review (LH-504).
     (pull,) = fake.pulls(repo)
     assert pull["html_url"] == outcome.pr_url
-    assert pull["draft"] is True
+    assert pull["draft"] is False
+    assert "Verified: 3 passed" in pull["body"], pull["body"]
     assert pull["head"]["ref"] == f"longhaul-pr/{issue}"
     assert f"Closes #{issue}" in pull["body"], pull["body"]
     assert "3 passed" in pull["body"], pull["body"]
+    # The run report from the tables is in the body (LH-705).
+    assert "<summary>Run report</summary>" in pull["body"], pull["body"]
+    assert "### Overview" in pull["body"], pull["body"]
     assert set(fake.branches(repo)) == {"main", f"longhaul-pr/{issue}"}, "main was not pushed to"
 
-    # The issue shows one "Picked up" comment, then the plan once, and nothing else from us.
+    # The issue shows one "Picked up" comment, the plan once, and the final comment with the link
+    # to the pull request (LH-507), and nothing else from us.
     comments = fake.comment_bodies(repo, issue)
-    assert len(comments) == 2, comments
+    assert len(comments) == 3, comments
     assert comments[0].startswith("Picked up"), comments[0]
     assert task_id in comments[0]
     assert "## Plan, version 1" in comments[1], comments[1]
     assert f"<!-- longhaul:key={task_id}:plan_comment:1 -->" in comments[1], comments[1]
+    assert comments[2].startswith("## Longhaul opened a pull request\n"), comments[2]
+    assert str(outcome.pr_url) in comments[2], comments[2]
+    assert f"<!-- longhaul:key={task_id}:final:1 -->" in comments[2], comments[2]
 
     # `longhaul:working` came and went, and the pull request label stayed.
     assert sorted(fake.label_names(repo, issue)) == [LABEL, "longhaul:pr-open"]
@@ -383,7 +399,7 @@ async def label_to_pr(stack: Stack) -> None:
     )
     assert again == acts.PollResult(repos=1, issues=1, started=0, known=1), shown
     assert fake.count_pulls(repo) == 1
-    assert fake.count_comments(repo, issue) == 2
+    assert fake.count_comments(repo, issue) == 3
 
     with psycopg.connect(stack.database) as conn:
         rows = conn.execute("SELECT id, repo, issue_number FROM tasks").fetchall()

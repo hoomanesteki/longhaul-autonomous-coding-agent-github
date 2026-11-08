@@ -104,11 +104,12 @@ def test_builder_takes_no_notes_or_plan() -> None:
     assert not re.search(r"^## (Plan|Notes|Progress)", prompt, re.MULTILINE)
 
 
-@pytest.mark.parametrize("role", [Role.VERIFIER, Role.COMPACTOR])
+@pytest.mark.parametrize("role", [Role.COMPACTOR])
 def test_a_role_without_rules_is_refused(role: Role) -> None:
-    # Their prompts belong to the stories that build those roles. Guessing at one here would
-    # hand the scripted provider and the model a role nobody designed. The planner got its
-    # prompt in LH-501, and tests/unit/test_roles.py covers it.
+    # The compactor builds its own request and has no prompt here. Guessing at one would hand
+    # the scripted provider and the model a role nobody designed. The planner got its prompt in
+    # LH-501 and the verifier in LH-504; tests/unit/test_roles.py and test_verifier_role.py
+    # cover them.
     with pytest.raises(ValueError, match=role.value):
         build_system_prompt(role, make_spec())
 

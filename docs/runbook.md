@@ -157,6 +157,7 @@ docs/private/**
 - The file is not copied, because it names what it hides. A bad pattern, or an ignore file that cannot be read, stops the run before any sandbox exists.
 - Always skipped, whatever the file says: `.git`, `.venv`, `__pycache__`, `*.pyc`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `*.egg-info`, `.DS_Store`, and `.env` and `.env.*` files (but not `.env.example`, `.env.sample` and `.env.template`). A secret in `/workspace` is as readable to the model as one in its environment.
 - Links and special files are skipped with a warning. The executable bit is kept.
+- A file called `.longhaulimage` is not copied either. It holds the name of one Docker image, and a task that goes through `longhaul worker` (the durable stack, for example from `eval/run.py`) runs in that image instead of `sandbox.image`. The SWE-bench eval writes it, because each instance needs its own environment. `longhaul run-local` does not read it. A file that holds more than one name, or a name that starts with `-`, stops the task before any sandbox exists.
 
 The three fixture repos list `REFERENCE.patch` and `ISSUE.md`, so a real model never sees the reference fix.
 
@@ -207,6 +208,7 @@ The worker stops at its start with a message that names `uv sync --extra memory`
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
 | `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
 | `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow, the compactions and the largest request of the task (`context: 5 compactions, max_fraction 0.59`) and, once it ended, the outcome. |
+| `longhaul report TASK_ID` | Prints the run report of the task as markdown (see "The run report"). It reads the database only, so it works while the task runs, after it ended, and for a task of `longhaul run`. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
 
 ### What `run` does
@@ -231,7 +233,7 @@ A task that runs for many turns keeps two records of its transcript (ADR-0013). 
 | `compact_at` | 0.60 | At this share of the window the older turns are folded into progress notes by the compactor model. |
 | `hard_limit` | 0.85 | A request projected above this share is not sent. The view is compacted down to the last two turns and the turn is asked once more. |
 | `keep_recent_turns` | 6 | The turns a compaction leaves as they are. |
-| `mode` | full | Which tiers run: `full`, `no_compaction` or `none`. See the next section. |
+| `mode` | full | Which tiers run: `full`, `no_compaction`, `none` or `sliding`. See the next section. |
 
 Each compaction writes a `compaction` event with the tokens before and after, and each call of the compactor model has its own row in `cost_ledger`:
 
@@ -252,20 +254,40 @@ uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtu
 
 ### Pull requests and labels
 
-A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a draft pull request:
+A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a pull request. The pull request is ready for review when a verifier passed the work and at least one command of the pre-check backed it (see "The verifier and the send-back loop"), and a draft when not:
 
 | When | What the issue shows |
 |---|---|
 | The task starts | A "Picked up" comment, and the label `longhaul:working` |
-| The agent calls `finish` | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and a draft pull request is opened |
+| The agent calls `finish`, or the work of a coder with a plan passes its review | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and the pull request is opened, as a draft after `finish` and ready for review after a review |
 | The pull request is open | `longhaul:working` is removed and `longhaul:pr-open` is added |
 | A pause for a person (Phases 5 and 7) | `longhaul:needs-human` is added, and removed when the task resumes |
+| The task ends without a pull request | `longhaul:working` is removed. A stuck or failed task gets `longhaul:needs-human`, and a cancelled one gets neither (see "How a task ends") |
 
 The pull request branch has one commit on top of the base commit, whatever number of checkpoints the agent made. Its tree is the tree of the last checkpoint, so its diff is the diff of the scratch branch. The commit is titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`, and its author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
 
-The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
+The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call, and a line `Verified: <counts>` when a verifier passed the work) and `Closes #<n>` (`Refs #<n>` for the draft of partial work, see "How a task ends"). The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
 
-Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
+A worker talks to github.com unless it is told otherwise. `LONGHAUL_GITHUB_API_URL` names another REST API, and `LONGHAUL_GITHUB_CLONE_BASE` names the folder or server that repos are cloned from and pushed to, as `<base>/<owner>/<name>.git`. It wins over `LONGHAUL_GITHUB_WEB_URL`, which does the same for the web address of a GitHub Enterprise server. The full chaos suite sets the API address and the clone base to point a worker at a FakeGitHub on this machine (see "The full chaos suite"). The token is only sent with git requests to github.com, so a clone base never receives it.
+
+Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
+
+### The run report
+
+A pull request carries a report of how the agent got there, inside a collapsed `<details>` block called "Run report", above the `Closes #<n>` line (`Refs #<n>` on the draft of a stuck task, whose report gives the outcome as stuck). `longhaul report TASK_ID` prints the same text. It has six sections:
+
+| Section | What it shows |
+|---|---|
+| Overview | The issue, the outcome, the wall time, the turns by role, the cost, the tokens and the cache ratio. |
+| Timeline | Planning, the wait for approval, coding, pauses, compactions, recoveries (a sandbox that was rebuilt, a hand-over to a new run) and the verifier rounds, in the order they happened. At most 60 entries. A longer timeline keeps its first and last entries, so that the end of the run is always there, and a row says how many entries were left out of the middle. |
+| Tool usage | Calls, errors and time for each tool, busiest first, and a total. |
+| Plan | The version in force, who decided on it, and the status each step ended in. |
+| Interventions | Who did what and when: plan decisions, hints, budget top-ups, answers to a pause and cancels. |
+| Candidate lessons | The items that lesson extraction drafted, from the newest `lessons` event. A task whose lessons are not drafted yet shows none. |
+
+The report is built from the database (`turns`, `tool_calls`, `events`, `plans`, `cost_ledger`, and `tasks` when the task has a row), never from the workflow. The cost, the tokens and the cache ratio are sums over the cost ledger, so they include the compactor and the calls that were retried. The turns are counted from `turns` by role and turn index. A task with no `tasks` row is reported from the other tables and shows as "local task". A task with no rows at all exits `longhaul report` with `no task <id> in the database`.
+
+`deliver` stores the report as a blob (`tasks/<task>/report/run-report.md`) the first time it builds it, and a retried attempt reads that copy, so the body of the pull request is the same bytes every time. The body stays under 60,000 characters: the report is cut at the end of a line, with a note, to the room that the rest of the body leaves. The activity `write_run_report` builds a fresh copy of the report and replaces the blob. Text that people or the model wrote has its mentions and issue references broken up, as in the rest of the body, and any key that matches the log redaction patterns shows as `[redacted]`.
 
 ### The prompt cache
 
@@ -289,8 +311,11 @@ The evaluation compares runs with the tiers on and off (plan section 8), so `con
 | `full` | on | on | one forced compaction, then the turn is asked again |
 | `no_compaction` | on | off | the run ends with `error` and the summary `context limit` |
 | `none` | off | off | the run ends with `error` and the summary `context limit` |
+| `sliding` | off | off | the oldest whole turns are dropped until the request fits |
 
-The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In the two modes without compaction nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+The guard in front of the model call stays on in every mode, so a request above `hard_limit` is never sent. In `no_compaction` and `none` nothing can relieve it, and the run ends there. It is a normal end: the workflow completes with that outcome, the transcript and the log are kept, and nothing is retried.
+
+`sliding` is the window of the naive baseline (see "The baselines" below). Before `llm_turn` measures a request it cuts the oldest turns from the view until the request is under `hard_limit`. A turn is an assistant message with the user message that answers its tool calls, and a cut never separates a call from its result. The first message stays, and a line `[longhaul:turn_offset=N]` in it keeps the turn count, as it does after a compaction. Nothing is summarized, so what leaves the window is gone from the view; the log keeps it. The run ends with `context limit` only when no cut helps, for example when one tool result is larger than the window. Each turn that slides changes the start of the request, so the prompt cache is read only as far as the first message.
 
 `context.mode` in the config is the default of a worker. A single run can ask for its own, and that wins:
 
@@ -352,7 +377,210 @@ The planner has 20 turns to submit. That number is `acts.PLANNER_MAX_TURNS`, and
 | `planner submitted no plan in 20 turns` | The planner used all its turns reading and running commands. |
 | `no tool calls` | Two replies in a row had no tool call. The first one gets a nudge to call `submit_plan`. |
 
-The turns of the planner count against `task_turns` like any other. The coder does not read the plan yet (LH-503).
+The turns of the planner count against `task_turns` like any other.
+
+### The coder and the steps of the plan
+
+A coder that has a plan works it one step at a time (LH-503). It reads the plan in the first message of its transcript, after the line that starts the work, with the status of each step: `todo`, `doing`, `done` or `skipped`. It is offered three tools in place of `finish`:
+
+| Tool | What it does |
+|---|---|
+| `update_step(step_id, status, note)` | Sets the status of one step. A step that is `done` gets a checkpoint. A step id or a status the plan does not have is answered with an error and changes nothing. |
+| `submit_for_review(summary)` | Ends the coding and starts the review (see "The verifier and the send-back loop"). A task of an issue goes on to open the pull request once the work passes. |
+| `ask_human(question)` | Asks a person. The task pauses as it does for a stuck signal (see "The pause and the hint" below) and goes back to coding when someone answers. |
+
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, without a review and with a draft pull request, for a worker or a history from before the verifier. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
+
+An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
+
+| Where | What shows the steps |
+|---|---|
+| `status()` of the workflow | The plan with the status of each step. `TaskStatus` has no field for it, so ask for the query by name with the type: `handle.query("status", result_type=acts.PlannedStatus)`. A plain `TaskStatus` read still works. |
+| Postgres, `events` | One `step_updated` event for each update, with the step, the status, the note and the head of the work. |
+| Postgres, `checkpoints` | One row of kind `step` for each step marked `done`, with its `step_id`. |
+| The pull request | One commit for each done step, in the order the steps were finished, titled from the step's description (`fix(calc): change the operator in add()`). The work after the last step is a last commit titled from the summary. A step with no change of its own makes no commit, and together the commits are the change of the scratch branch to the byte. |
+
+```sql
+SELECT step_id, sha, turn_index FROM checkpoints WHERE task_id = 'lh-acme-calc-42' AND kind = 'step' ORDER BY id;
+```
+
+### The stuck detector
+
+The workflow watches the coder for four ways of going in circles (LH-505). It shows each coder turn that does not end the run to the detector in `roles/stuck.py`, and records one `stuck` event when a rule fires, and then pauses the task for a hint. The planner is never watched.
+
+| Reason | Fires when | Default |
+|---|---|---|
+| `repeated_failure` | The same command failed the same way this many times. Turns with no failing command do not break the streak. | 3 |
+| `tool_errors` | The last this many tool calls all failed. A turn with one good call ends the run. | 5 |
+| `edit_churn` | One region of a file was edited this many times in the last 10 turns and the number of passing tests did not move. Two edits are the same region when they share half or more of the lines of the longer one, so a new file followed by fixes in other places of it is not churn. | 4 |
+| `no_progress` | In this many turns no test run passed more tests than any run before it, and no plan step was finished. The first test count counts as a gain, and so do the steps done when the window starts. | 15 |
+
+When a turn matches more than one rule, the first row that fits is the one recorded. A signal that fires empties the detector's window, so a pattern that goes on is reported again only after it has built up again from nothing. Because the window does not say how many steps were done before it started, `no_progress` can come one turn late after a signal, and never early. The window holds the last 30 turns in `CarryState.stuck_window`, which crosses a hand-over to a new run, and it serializes to under 8 KB, whatever the characters of the file names, since a path is cut to 48 bytes of JSON.
+
+The limits are the `stuck` section of the config. The workflow cannot read the config file and keeps a copy (`roles/stuck.py`, `DEFAULT_LIMITS`), so a worker whose `stuck.no_progress_turns`, `repeated_failure_count`, `churn_edits` or `consecutive_tool_errors` differs from it stops at the start and names the setting. So does a worker whose `stuck.hint_wait_hours` is not 24 (`acts.HINT_WAIT_HOURS`), since the pause below and the plan gate wait for that long.
+
+`tool_exec` works out the facts that the rules need, because only the activity sees the whole text of a result (`durable/activities/signals.py`). The hash of a failed command covers the command, its exit code and the last 20 lines of stderr. When stderr names no error, the last 20 lines of stdout are added, because pytest prints its report there. Run times and memory addresses are taken out first, so the same failure on two runs hashes alike.
+
+```sql
+SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
+```
+
+The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+
+### The pause and the hint
+
+A stuck signal, or a call to `ask_human`, pauses the task (LH-506). The workflow sets the phase to `paused` and asks the compactor model for a short question. Then it posts the question on the issue and adds the label `longhaul:needs-human`. A task of a folder (`local:`) has no issue, so the text goes into the `paused` event instead (`payload.comment`).
+
+The comment has four parts and fits in 250 words. It ends with the commands that answer it:
+
+```text
+## Longhaul needs a hint: repeated failure (pause 1)
+
+### What I'm trying to do
+### What I tried
+### My current guess
+### Question
+```
+
+Answer it with a comment from someone who has write access:
+
+| Comment | What happens |
+|---|---|
+| `/longhaul hint <text>` | The text goes to the coder as "Hint from <user>: <text>" on its next turn. A hint is cut to 2,000 bytes, with a note that says so. |
+| `/longhaul budget +$2` | Also unblocks the task, because a top-up may be what it needed. |
+| `/longhaul cancel` | Ends the task as cancelled. |
+
+A hint or a top-up removes the label, records a `resumed` event, empties the detector's window and puts the task back in `coding`. The task waits 24 hours. With no answer it ends as `stuck` in the phase `failed`, and the summary says how long it waited. A task pauses at most three times: a fourth signal ends it as `stuck` and says that three hints did not unblock it. Those ends post the final comment and set the final labels like every other end (see "How a task ends").
+
+Each pause has its own comment key, `<task id>:stuck:<n>`, so a retry posts nothing twice. The compactor's calls for the question are on the cost ledger like any others, one row for each call, under the turn that was stuck.
+
+```sql
+SELECT type, payload->>'reason' AS reason, payload->>'pause' AS pause, ts FROM events WHERE task_id = 'lh-acme-calc-42' AND type IN ('stuck', 'paused', 'resumed') ORDER BY id;
+```
+
+### The plan gate
+
+A repo can ask for a person to read the plan before any code is written (LH-502). Set `plan_approval_required: true` for the repo in the config. A task that plans on such a repo holds its plan after the planner submits it:
+
+| Step | What happens |
+|---|---|
+| The plan is stored and posted | As above. The phase becomes `awaiting_plan_approval`. |
+| The issue asks for a person | The label `longhaul:needs-human` goes on, and a comment says how to answer. A task on a local folder has no issue and asks nobody. |
+| `/longhaul approve` | The `plans` row for that version becomes `approved` with `decided_by` and `decided_at`, the label comes off, and the coder starts. |
+| `/longhaul reject <feedback>` | The row becomes `rejected`, the label comes off, and the planner revises its plan in the transcript it already has. The feedback reaches it as a message from you. The new version is stored, posted and put to the same wait. |
+| No answer for 24 hours | The task ends as `stuck` with the summary `plan not approved: no decision in 24 hours`. The row stays `proposed` and the label stays on, because a person is still needed. |
+
+The planner writes at most three versions. A third rejection ends the task as `stuck` with the summary `plan not approved`. Each version has its own 20 planner turns and its own repair turn, and every turn counts against `task_turns`.
+
+The wait is `stuck.hint_wait_hours` of the config, 24 hours. The workflow keeps its own copy (`acts.HINT_WAIT_HOURS`), so a worker whose config holds another number stops at the start and names the setting.
+
+Things to know:
+
+- **An answer can come early.** An approval or a rejection sent while the planner is still working is kept and used when the plan is ready, without waiting. It applies to one version: a decision is used once.
+- **A late answer does nothing.** After the coder has started, `/longhaul approve` and `/longhaul reject` find no plan to decide on.
+- **A cancel works at any time**, also during the wait.
+- **The gate is not repeated after a hand-over.** A task that has a plan does not plan again, so it does not ask again either.
+
+```sql
+SELECT version, status, decided_by, decided_at FROM plans WHERE task_id = 'lh-acme-calc-42' ORDER BY version;
+```
+
+### The verifier and the send-back loop
+
+A task with a plan does not trust `submit_for_review` (LH-504). The phase becomes `verifying`, and the work is checked in two halves. It passes only when both say so.
+
+| Half | What it does |
+|---|---|
+| The pre-check | Runs the test command of the repo, then every acceptance check of the plan that is a command, then `git_diff`. All of it is read-only: a file that a command writes is put back. A command that exits with a code other than 0, or does not finish, fails the review, whatever the verifier says. A repo with no test command and a plan with no command in its checks runs none, and the verdict decides alone. |
+| The verdict | A verifier with a fresh transcript gets the plan, the pre-check and the diff, reads the code with `list_dir`, `read_file`, `search`, `git_diff`, `run_tests` and `read_output`, and ends with `submit_verdict`: `passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. It has 15 turns for a round. |
+
+An acceptance check is a command when it starts with `$ ` or is a command in backticks and nothing else. The planner is told the mark. A check without it is read by the verifier and not run, so a sentence is never run as a command.
+
+| Result | What follows |
+|---|---|
+| The work passes | The task goes on as it did after `finish`. A task of an issue opens the pull request ready for review, with `Verified: <tests_summary>` in the body. When the pre-check ran no command, the counts are the verifier's word only, so the pull request is a draft and has no `Verified:` line. |
+| The work fails | The round is counted, the coder gets the user message `Review failed: <issues>. Fix step <send_back_step>.` at the end of its own transcript, and the phase is `coding` again. |
+| The work fails the third time | The task ends as `stuck` in the phase `failed`, with the reason and the last issues in the summary. A task of an issue has no pull request and keeps its labels (LH-507). |
+
+The number of failed reviews is `loop.max_verify_rounds`, and it must equal `acts.MAX_VERIFY_ROUNDS` (3): a worker whose config holds another number stops at the start and names the setting. The count is part of the state that crosses a hand-over to a new run.
+
+| Where | What shows the review |
+|---|---|
+| `status()`, `longhaul status` | The phase `verifying` while the pre-check and the verifier run. |
+| Postgres, `events` | One `verdict` event for each round, with `passed`, `model_passed`, `precheck_passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. `passed` is the result, and the other two show which half failed. |
+| Postgres, `tool_calls` | The commands of the pre-check, with the ids `<task id>-verify<round>-tests`, `<task id>-verify<round>-check<n>` and `<task id>-verify<round>-diff`. The task id is part of the id because the table keys its rows by it. |
+| The pull request | Ready for review, with a `Verified:` line, after a pass. |
+
+```sql
+SELECT payload->>'round' AS round, payload->>'passed' AS passed, payload->>'model_passed' AS model, payload->>'precheck_passed' AS precheck, payload->'issues' AS issues
+FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'verdict' ORDER BY id;
+```
+
+These ends of the review are fixed, so a caller can tell them apart without reading prose:
+
+| Outcome | Meaning |
+|---|---|
+| `stuck`: `the work failed review 3 times; last review: <issues>` | Three reviews in a row failed. The coder was sent back after the first two, and the third ended the task. |
+| `error`: `verifier submitted an invalid verdict twice: <problems>` | The repair turn did not fix the verdict. This is not a failed round. |
+| `error`: `verifier submitted no verdict in 15 turns` | The verifier used all its turns reading. |
+| `error`: `turn limit` | The turns of the review count against `task_turns`, and the message that sends the coder back takes one too. A coder that submits with no turn left gets no review, and no command of the pre-check runs. |
+
+### How a task ends
+
+Every task ends in exactly one outcome (LH-507): `pr_opened`, `stuck`, `budget_exhausted`, `cancelled` or `error`. Whatever the way, the workflow winds the task up in the same order:
+
+| Step | What happens |
+|---|---|
+| 1 | The outcome is set. `status()` shows it, and the `outcome` event is recorded last, after the other steps, so it counts a task that has finished them. |
+| 2 | The sandbox is destroyed: the containers and the workspace volume. This comes first because GitHub can be down for twenty minutes and a container must not wait for it. |
+| 3 | A stuck task whose repo sets `open_draft_on_stuck: true` opens a draft pull request with its partial work, if the work changes a file. |
+| 4 | A task of an issue posts one final comment, under the key `<task id>:final:1`. |
+| 5 | The final labels are set. |
+
+The final comment is the pull request link for a task that delivered. For any other end it is a report: the reason, what was done and what is left (from the plan), the diff stats, and what to do next. A stuck report looks like this:
+
+```markdown
+## Longhaul is stuck and has stopped
+
+stuck, repeated failure; no hint in 24 hours
+
+### What was done
+
+- [x] **s1**: Fix the lookup
+
+### What is left
+
+- [ ] **s2**: Test it
+
+### Changes
+
+1 file changed, 3 additions, 1 deletion
+
+- `inv.py`: +3 -1
+
+Comment `/longhaul retry` to start a new attempt, or take over from the checkpoints.
+
+Ran 12 turns, spent $0.43.
+```
+
+| Outcome | Labels at the end |
+|---|---|
+| `pr_opened` | `longhaul:pr-open` (set when the pull request opened) |
+| `stuck`, `budget_exhausted` | `longhaul:needs-human`, and `longhaul:pr-open` if a draft of the partial work was opened |
+| `error` | `longhaul:needs-human` |
+| `cancelled` | none: `longhaul:needs-human` is removed too if the task was paused |
+
+`open_draft_on_stuck` is a setting of the repo entry in the config and is off by default. The poller hands it to the task when it starts it. A stuck task has no verified work, so the pull request is a draft. Its body says that it holds partial work and ends with `Refs #<n>` and not `Closes #<n>`, so merging it to keep some of the changes does not close an issue that the task did not finish.
+
+Each step is best effort. A step that fails after its retries is logged and the next one still runs, so one failure leaves the outcome as it is. The steps run again safely: the comment, the labels and the pull request have idempotency keys, and a cleanup of a sandbox that is gone changes nothing.
+
+An exception that nobody expected becomes the outcome `error`. The summary names the error type, for example `unexpected error: KeyError` or `workflow failed: CheckpointError`, and nothing else, because the message of a provider error can echo the request. The trace, cut to 3,000 characters and run through the log redaction, is the payload of an `error` event. The workflow still fails after the wind-up, so Temporal shows it as failed:
+
+```sql
+SELECT ts, payload->>'type', payload->>'trace' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'error';
+```
+
+The bare repo of a task that ended on its own is kept for seven days, so that you can read its checkpoints. A cancel removes it as it always did: with the sandbox for a local task, and right after the final comment for a task of an issue, because that comment reads the diff stats from the repo. The janitor deletes the rest: `PollerWorkflow` runs the activity `clean_repos` after each poll, so the poller schedule is its clock, and it removes the repos under `LONGHAUL_CKPT_DIR` of tasks whose `outcome` event is more than seven days old. A repo whose task has no `outcome` event is never touched, because the task may be waiting for a hint. A task that Temporal ended from outside (a terminate) records no outcome, so its repo stays until you remove it. A worker sweeps the repos on its own disk, and a failed sweep is logged and tried again on the next tick.
 
 ### Stopping a worker
 
@@ -441,7 +669,7 @@ Rules that keep a command from doing something nobody meant:
 
 Each poll now reads the new comments of every open labeled issue that has a task, which is one more GitHub call for each such issue, and one more for each author of a command that the poll has not asked about yet.
 
-The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one draft pull request and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner and for the coder. It needs `make up` and `make sandbox-image`, and takes about two minutes.
+The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one pull request that is ready for review and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner, the coder and the verifier, and the review passes the work. It needs `make up` and `make sandbox-image`, and takes about two minutes.
 
 ## Kill the worker on purpose
 
@@ -460,7 +688,8 @@ The task is `tests/fixtures/scripts/inventory_fix.yaml`: eleven turns, with read
 | Marker | Runs | Kills per run | Model | Where it runs |
 |---|---|---|---|---|
 | `chaos_lite` | 5 | 1 | scripted | `make gate`, and the `chaos-lite` CI job at night and by hand |
-| `chaos` without `chaos_lite` | 20 | 1 to 3 | replay | on request, in Phase 9 |
+| `chaos` without `chaos_lite` | 20 | 1 to 3 | replay | on request, in Phase 9. The worker is the only thing killed. |
+| `eval/chaos/chaos.py` | 20 | 1 to 3 | replay | on request, in Phase 9. Four kinds of kill, a private Temporal and Postgres, and a count of the writes to GitHub. See "The full chaos suite". |
 
 ```bash
 uv run pytest -m chaos_lite                    # 6 to 9 minutes
@@ -484,9 +713,45 @@ Each of the first three asserts the kill point from the last activity line in th
 
 **The mutation check.** The test must fail when the recovery code is gone. To see it, comment out `await self._checkpoints.restore(sandbox, pre_sha)` in `ToolActivities._start_from` (`src/longhaul/durable/activities/tools.py`) and run `uv run pytest tests/chaos/test_kill_worker.py::test_kill_during_tool_exec_resumes`. The retried command appends its line to the half done tree of the first attempt, `CHANGES.txt` ends up with the line twice, and the test fails on the diff. Put the line back afterwards. The result of this check belongs in the gate report.
 
+## The full chaos suite
+
+`eval/chaos/chaos.py` puts a number behind "survives crashes": 20 runs of four recorded custom tasks, each killed one to three times, with a count of what each run left behind. It is the Phase 9 suite (LH-904). `eval/chaos/README.md` has the details, and this section has what an operator needs.
+
+```bash
+make up && make sandbox-image
+uv run python eval/chaos/chaos.py --runs 20 --seed 7     # about an hour
+uv run python eval/chaos/chaos.py --runs 2 --seed 7      # the short version
+```
+
+**It leaves the services of `make up` alone.** The suite restarts Temporal and Postgres on purpose, and other work on the machine uses the ones of `make up`. So it starts a second compose project from the same `docker-compose.yml`, named `longhaul-chaos-<8 hex>`, with other host ports that it picks free, and with the volumes that compose gives that project. The Temporal dev server runs with `--db-filename` on a volume, as it does in the main file, so a restart keeps the workflows. At the end the suite removes the containers, volumes and network of its project, found by the compose label. It does not run `docker compose down`, and `eval/chaos/services.py` refuses any project name without the prefix. MinIO is shared, and each run removes its own blobs. If a suite is killed, remove `longhaul-chaos-*` containers and volumes by hand.
+
+**The kills.** Each kill is one of four kinds, drawn from the seed:
+
+| Kind | What it does | What has to hold |
+|---|---|---|
+| `worker` | SIGKILL to the worker, then a new worker | the activity runs again from its `pre_sha` |
+| `sandbox` | `docker kill` of the container of the task | the sandbox is made again at the head commit |
+| `temporal` | restart of the Temporal container | the workflow goes on from the saved history |
+| `postgres` | restart of the Postgres container | the activities that failed on the database run again |
+
+When a kill lands follows the progress of a run that was not killed (the harness's `plan_kills`), and it may land in the delivery of the pull request, which is where a repeated write would show. With seed 7 each kind is hit at least four times, and `tests/unit/test_chaos_plan.py::test_kill_type_coverage` asserts it.
+
+**What it records.** `eval/results/chaos-<date>/summary.json` and one `run-NN.json` for each run:
+
+| Field | Meaning |
+|---|---|
+| `completed`, `diff_equals_reference` | the task ended with a pull request, and its diff is the diff of the same task without a kill |
+| `extra_ledger_rows`, `extra_cost_usd` | model calls billed again after a kill, and what they cost, against the run without a kill |
+| `resume_latency_s` | for each kill, the time from the end of the kill to the start of the next activity, from the timestamps in Temporal's history. The clock of the Docker VM is compared with this machine's first (`clock_offset_s`) |
+| `side_effects`, `expected_side_effects`, `duplicate_side_effects`, `missing_side_effects` | comments, label changes and pull requests found on the FakeGitHub of the run, against the 1, 3 and 1 that a task writes |
+
+If the private Temporal stops answering (its SQLite connection can be left interrupted on a busy machine), a watchdog restarts it after 60 seconds, and `temporal_heals` in the summary counts those restarts. The writes are counted from the state of FakeGitHub and not from the `side_effects` table, because that table is where a retry decides whether a write already happened. The heartbeat timeout of these runs is 20 seconds, so the latency of a killed worker is mostly that. The exit code says that the suite ran. Whether the runs survived is in the summary, and a run that did not has a `run-NN.log` with the worker logs.
+
+**The recordings** in `eval/chaos/recordings/<task id>/` are scripted runs, because no key was available when they were made. `uv run python eval/chaos/chaos.py --record --provider anthropic` records a real model into the same folders and replaces them. See "Record and replay model calls" for how a recording is matched.
+
 ## Record and replay model calls
 
-The full chaos suite must not depend on what a model says, so it plays a recording. A recording is a folder with one JSON file per model call: the request, the reply, and the turn. Two settings control it:
+The replayed chaos runs must not depend on what a model says, so they play a recording. A recording is a folder with one JSON file per model call: the request, the reply, and the turn. Two settings control it:
 
 | Setting | Meaning |
 |---|---|
@@ -507,7 +772,7 @@ LONGHAUL_RECORD=1 LONGHAUL_RECORDINGS_DIR=eval/chaos/recordings/inventory \
   --issue-file tests/fixtures/repos/inventory/ISSUE.md
 ```
 
-Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The full chaos suite plays this folder when it holds recordings. Until then it records a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and plays that.
+Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The replay tests of `tests/chaos/test_kill_worker.py` play this folder when it holds recordings. Until then they record a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and play that. The four tasks of `eval/chaos/chaos.py` have folders of their own, recorded with `chaos.py --record` (see "The full chaos suite").
 
 ## Metrics and the dashboard
 
@@ -570,14 +835,17 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 
 | Flag | Meaning |
 |---|---|
-| `--set custom` | The 15 custom tasks. `swebench` is accepted and refused until LH-902. |
-| `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
+| `--set custom\|swebench` | `custom` is the 15 custom tasks. `swebench` is the 40 instances of `eval/swebench/subset.txt`, and `--limit` takes the first N of them (see "The SWE-bench set"). |
+| `--config full\|naive\|single_shot` | A file in `eval/configs`. `full` is the product, and `naive` and `single_shot` are the baselines (see "The baselines"). The sha256 of the file is stored in every result. Every config runs on both sets. |
 | `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
 | `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
 | `--concurrency K` | How many tasks run at once. The default is 1. |
 | `--model ID` | Checked against the coder model in the worker's config, and recorded. |
-| `--memory on\|off`, `--context-mode full\|no_compaction\|none` | Recorded in each result file. The worker reads memory and context settings from its own config, so start it with the settings you mean to measure. |
-| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. Every other `--provider` is only recorded: the worker answers with its own provider. |
+| `--context-mode full\|no_compaction\|none\|sliding` | Only with `--config full`, for an ablation. It takes the place of the context mode in the config file, travels with each task and is recorded. |
+| `--memory on\|off` | Only with `--config full`. Recorded in each result file. The worker reads its memory settings from its own config, so start it with the settings you mean to measure. |
+| `--run-set NAME`, `--allow-mixed-models` | Runs that share a run set are compared with each other, so they must use one model. The runner stops a run whose model differs from the earlier runs of its set, unless `--allow-mixed-models` is passed. A run with no run set is compared with nothing at start time, so every result file records `allow_mixed_models`, and a report that pairs two runs calls `results.check_comparable`, which refuses two models unless a run allowed it. |
+| `--seed N` | Recorded in each result file. The default is 42, the seed of the SWE-bench subset. Nothing in the custom runner draws random numbers yet. |
+| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. For the durable configs every other `--provider` is only recorded, because the worker answers with its own provider. For `single_shot` the runner makes the call itself, so `--provider` chooses who answers. |
 | `--results-dir`, `--pause-timeout-s` | Where results go (default `eval/results`), and how long a pause lasts before the runner ends the task (default 60). |
 
 ### What a run does
@@ -588,9 +856,39 @@ The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE
 4. Reads the patch from the checkpoint repo and grades it. A task counts as resolved when the agent finished (outcome `pr_opened`) and the grader passed the patch. A task that ended any other way is not graded and is not resolved.
 5. Writes `<task id>.json` and `<task id>.patch`, removes the sandbox and the checkpoint repo of the task, and at the end writes `summary.json`.
 
+A `single_shot` task takes a different path through steps 2 to 4. There is no workflow: the runner builds the repo map in a sandbox, makes the one call, books it on the cost ledger under the id `lh-eval-<run id>-<task id>` and applies the diff in a throwaway copy of the repo. The patch it hands to the grader is `git diff` of that copy. Outcome `pr_opened` means that a patch was applied. A reply with no diff, a diff that neither tool applies and a reply that was cut off at max tokens end as `error` and are not graded.
+
 When the runner itself fails on a task, for example a lost connection or a database error, that task gets a result with outcome `error` and `resolved` null, and the other tasks go on. The summary counts it as attempted and not graded. Ctrl-C ends the whole run: the tasks that are running are terminated, no summary is written, and the run id cannot be used again.
 
-A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout, the hash of the config file, the seed, the run set and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+
+### The baselines
+
+The headline numbers compare `full` with two simpler setups on the same model and tasks (plan section 8.3). Each is defined by a file in `eval/configs`, and the runner stores the sha256 of that file in every result. A comment in the file changes the hash, so change a config in a commit of its own.
+
+| Config | What it is |
+|---|---|
+| `full` | The product: planner, verifier, memory and stuck detector on, and both context tiers. |
+| `naive` | The same durable stack, tools, model, turn limit and cost limit. Planner, verifier, memory and stuck detector are off. The context mode is `sliding`: when a request would pass the hard limit, the oldest whole turns are dropped. |
+| `single_shot` | No loop and no tools. The five files closest to the issue by BM25, plus the repo map, in one prompt; one call asks for a unified diff. |
+
+For the naive config the runner can apply the context mode only: it travels with each task in the workflow memo. The planner, the verifier, memory and the stuck detector are not per-run switches yet. The file records them as off, the worker's own config decides what runs, and a part that the stack does not have yet is not there. When a story adds one of those switches, it makes the runner pass the config's value on.
+
+The single-shot baseline works in three steps (`eval/baselines/single_shot.py`):
+
+1. Retrieve. BM25 (`rank_bm25`) between the issue and the text of each file the agent would see, with camelCase and snake_case names split into words. Files with equal scores come in path order. The top five go into the prompt whole (a file over 30,000 characters is cut and says so), after the repo map.
+2. Ask. One call through the provider protocol with no tools and the larger output cap of the loop (`max_tokens_retry`), because the reply is a whole diff. A provider error that asking again can fix is retried up to three times, and each billed call is a ledger row.
+3. Apply. The reply is searched for the diff, which may sit in a code fence between prose. Every path in it is checked first: no absolute path, no `..`, nothing in `.git`. The check reads the `---` and `+++` lines, the `diff --git` and rename lines, and also the `Index:` lines and context diff headers, because `patch` takes file names from those too and the `patch` of macOS follows a `..` in them. Then `git apply --recount` runs on a throwaway copy of the repo, one file at a time, and when git refuses, `patch -p1 -u --fuzz=2` runs on a fresh copy. It is given only the `---` and `+++` headers and the hunks of the diff, so a line it would read a name from, and any ed command, never reaches it. A reply cut off at max tokens is not applied. The number of files in step 1 is `top_files` in `eval/configs/single_shot.yaml`.
+
+Compare the three on one model by giving the runs a run set. The model comes from the config of the worker, so the runs of a set share it unless the worker was started with another config:
+
+```bash
+uv run python eval/run.py --set custom --config full --run-set headline --run-id headline-full
+uv run python eval/run.py --set custom --config naive --run-set headline --run-id headline-naive
+uv run python eval/run.py --set custom --config single_shot --run-set headline --run-id headline-single-shot
+```
+
+A dry run of the single-shot config plays `tests/fixtures/scripts/eval_single_shot` (one script per task, each with the one answer) in place of `tests/fixtures/scripts/eval`.
 
 ### The custom task set
 
@@ -616,6 +914,22 @@ uv run python eval/grade_custom.py calc-01 --patch eval/custom/reference/calc-01
 
 A failed setup raises an error and does not mark the patch as wrong, because the setup does not depend on the patch.
 
+### The SWE-bench set
+
+`--set swebench` runs the frozen subset of SWE-bench Verified (40 instances: 15 easy, 20 medium, 5 hard, seed 42) and has the official harness grade the patches. The runner works as for the custom set, with three differences:
+
+* Each task runs in an image made from the instance's own image, with its repo and conda environment, and the dollar cap is 4 (plan section 8.4). The runner builds the image and copies the repo to a temporary folder. The folder names the image in a file `.longhaulimage`, which the worker reads when it prepares the sandbox (`agent/workspace.py`, `read_image_file`) and when it makes a new one after a crash.
+* The result files say `not graded yet`. The runner also writes `predictions.jsonl`, with the test files of each instance cut out of the agent's diff.
+* `eval/swebench/grade.sh eval/results/<run id>` runs `python -m swebench.harness.run_evaluation` and puts `resolved` into the result file of each task that finished and into the summary. A task that ended any other way keeps the verdict the runner gave it.
+
+```bash
+uv sync --extra eval                    # swebench and datasets, which CI does not install
+uv run python eval/run.py --set swebench --config full --limit 3 --run-id swe-smoke-1
+eval/swebench/grade.sh eval/results/swe-smoke-1
+```
+
+The harness pulls the instance images (several GB each, built for x86_64) and wants about 120 GB of free disk for a full run, so run it on the eval VM. `eval/swebench/README.md` has the notes of the spike on the `swebench` package, the exact smoke command with the agent, how to check the grader with the reference patches, and the known limits.
+
 `make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
 
 ## CI
@@ -628,7 +942,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
-| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a draft pull request (see "Steer a task from its issue") |
+| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a pull request a verifier passed (see "Steer a task from its issue") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |

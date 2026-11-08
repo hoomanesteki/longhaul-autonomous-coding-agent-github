@@ -48,8 +48,9 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
+from longhaul.durable.activities.signals import command_label
 from longhaul.durable.activities.tools import (
-    PLANNING_NOTE,
+    READ_ONLY_NOTE,
     SHELL_TOOLS,
     NoCheckpoints,
     ToolActivities,
@@ -298,6 +299,82 @@ async def test_the_null_checkpoint_store_stores_nothing(sandbox: FakeSandbox) ->
     assert await store.commit(sandbox, "lh: edit_file turn 0 call toolu_1", parent=SHA) is None
     assert await store.restore(sandbox, SHA) is None
     assert await store.is_at(sandbox, SHA)  # nothing to restore, so it never asks for a restore
+
+
+# ---------- facts for the stuck detector (LH-505) ----------
+async def test_an_edit_leaves_the_region_it_changed_in_the_result(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(
+        exec_input("edit_file", path=MODULE, old_str="    return a - b", new_str="    return a + b")
+    )
+
+    assert isinstance(result, acts.ToolExecResult)
+    assert result.signal is not None
+    assert result.signal.edited_regions == [(MODULE, 6, 6)]
+
+
+async def test_a_failing_test_run_leaves_its_count_and_its_failure(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    first = await rig.exec(exec_input("run_tests"))
+    again = await rig.exec(exec_input("run_tests", "toolu_2"))
+
+    fact = first.signal
+    assert fact is not None
+    assert fact.tests_passed == 2
+    assert fact.failed_cmd_hash is not None
+    assert fact.failed_error == "AssertionError at tests/test_calc.py:5"
+    assert fact.failed_command is not None and "-m pytest -q" in fact.failed_command
+    # The same run again, with another run time, is the same failure.
+    assert again.signal is not None
+    assert again.signal.failed_cmd_hash == fact.failed_cmd_hash
+
+
+def test_the_label_of_a_command_names_the_program_and_not_its_path() -> None:
+    deep = "/" + "/".join(["very-long-folder-name"] * 6) + "/.venv/bin/python -m pytest -q"
+    assert command_label(deep) == "python -m pytest -q"
+    assert command_label("pytest -q tests/test_inv.py") == "pytest -q tests/test_inv.py"
+    assert command_label("make test") == "make test"
+
+
+async def test_a_run_that_passes_leaves_a_count_and_no_failure(sandbox: FakeSandbox) -> None:
+    await sandbox.write_file(
+        MODULE, b"def add(a, b):\n    return a + b\n\n\ndef multiply(a, b):\n    return a * b\n"
+    )
+    rig = Rig(sandbox, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    result = await rig.exec(exec_input("run_tests"))
+
+    assert result.signal is not None
+    assert result.signal.tests_passed == 3
+    assert result.signal.failed_cmd_hash is None
+
+
+async def test_a_call_that_changes_and_runs_nothing_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    result = await Rig(sandbox).exec(exec_input("read_file", path=MODULE))
+    assert result.ok and result.signal is None
+
+
+async def test_a_call_the_model_got_wrong_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(
+        exec_input("edit_file", path=MODULE, old_str="no such text", new_str="x")
+    )
+    assert not result.ok and result.signal is None
+
+
+async def test_a_call_of_the_planning_phase_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    # The detector never watches the planner, so the activity does not work out facts for it.
+    inp = exec_input("run_command", command="echo KeyError >&2; exit 1")
+    result = await Rig(sandbox).exec(inp.model_copy(update={"read_only": True}))
+    assert result.exit_code == 1 and result.signal is None
+
+
+async def test_the_facts_are_small_next_to_the_output(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    code = "import sys; print('E' * 50000, file=sys.stderr); sys.exit(1)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    result = await rig.exec(exec_input("run_command", command=command))
+    assert result.signal is not None
+    assert len(result.signal.model_dump_json()) < 600
 
 
 # ---------- checkpoints (LH-206) ----------
@@ -1407,8 +1484,20 @@ async def test_the_planner_is_told_that_its_changes_were_undone(repo: Repo) -> N
 
     assert result.output_ref is not None
     stored = (await rig.blobs.get(result.output_ref)).decode()
-    assert stored.endswith(PLANNING_NOTE)
-    assert PLANNING_NOTE.isascii()
+    assert stored.endswith(READ_ONLY_NOTE)
+    assert READ_ONLY_NOTE.isascii()
+
+
+async def test_the_note_of_an_undone_call_does_not_name_the_planning_phase(repo: Repo) -> None:
+    """The verifier's calls are read-only too, and its output must not talk about planning."""
+    rig = repo.rig()
+    result = await rig.exec(planning("run_command", repo.base_sha, command="echo x > note.txt"))
+
+    assert result.output_ref is not None
+    stored = (await rig.blobs.get(result.output_ref)).decode()
+    note = stored.splitlines()[-1]
+    assert note.startswith("[read-only: ") and note.endswith("was undone]")
+    assert "planning" not in stored.lower()
 
 
 async def test_a_command_of_the_planning_phase_that_edits_a_tracked_file_is_undone(
@@ -1453,7 +1542,7 @@ async def test_a_call_of_the_planning_phase_that_only_reads_restores_nothing(rep
 
     assert result.ok and result.post_sha is None
     assert spy.restores == [] and spy.commits == []
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output
 
 
 async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(repo: Repo) -> None:
@@ -1464,7 +1553,7 @@ async def test_files_that_git_ignores_are_not_a_change_of_the_planning_phase(rep
 
     assert result.ok and result.post_sha is None
     assert spy.restores == []
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output
 
 
 async def test_a_reset_of_the_planning_phase_keeps_what_the_setup_built(repo: Repo) -> None:
@@ -1506,4 +1595,4 @@ async def test_a_call_of_the_coding_phase_is_still_saved(repo: Repo) -> None:
         exec_input("run_command", pre_sha=repo.base_sha, command="echo built > out.txt")
     )
     assert result.post_sha is not None
-    assert PLANNING_NOTE not in result.output
+    assert READ_ONLY_NOTE not in result.output

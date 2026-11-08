@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from jinja2 import TemplateNotFound, TemplateSyntaxError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
@@ -19,7 +20,8 @@ from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import CheckpointError, RepoNotFoundError
 from longhaul.checkpoints.push import ForbiddenBranchError
 from longhaul.checkpoints.squash import FileStat, NothingToDeliverError, PrBranch
-from longhaul.db.records import MemoryRecorder, ToolCallRecord
+from longhaul.contracts import Plan, PlanStep
+from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities import delivery
 from longhaul.durable.activities.delivery import DeliveryActivities
@@ -153,6 +155,93 @@ async def test_the_branch_is_built_from_the_title_the_summary_gives(
     assert seen["base_sha"] == BASE, "the base is the one the workflow handed over"
 
 
+def three_steps(*statuses: str) -> Plan:
+    steps = [
+        PlanStep(
+            id=f"s{n}",
+            description=f"Change file {n}",
+            done_when="the tests pass",
+            status=status,  # type: ignore[arg-type]
+        )
+        for n, status in enumerate(statuses, start=1)
+    ]
+    return Plan(summary="plan", steps=steps, acceptance_checks=["pytest -q"])
+
+
+async def groups_built_for(
+    recorder: MemoryRecorder, plan: Plan | None, monkeypatch: pytest.MonkeyPatch
+) -> list[tuple[str, str]]:
+    seen: dict[str, Any] = {}
+
+    async def build(task_id: str, groups: Any, **kwargs: Any) -> PrBranch:
+        seen["groups"] = groups
+        return PrBranch("longhaul-pr/42", SHA, BASE)
+
+    monkeypatch.setattr(delivery, "build_pr_branch", build)
+    inp = build_input().model_copy(update={"plan": plan})
+    await run(make(recorder=recorder).build_pr_branch, inp)
+    return [tuple(g) for g in seen["groups"]]
+
+
+@pytest.mark.phase5
+async def test_a_task_with_a_plan_gets_one_group_for_each_done_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = MemoryRecorder()
+    for n, sha in enumerate(["1" * 40, "2" * 40], start=1):
+        await recorder.record_checkpoint(
+            CheckpointRecord(TASK, sha, "step", turn_index=n, step_id=f"s{n}")
+        )
+
+    groups = await groups_built_for(recorder, three_steps("done", "done", "todo"), monkeypatch)
+
+    assert groups == [
+        ("fix(calc): change file 1", "1" * 40),
+        ("fix(calc): change file 2", "2" * 40),
+        ("fix(calc): fix add()", SHA),
+    ]
+
+
+@pytest.mark.phase5
+async def test_the_tool_checkpoints_of_a_task_are_not_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_checkpoint(CheckpointRecord(TASK, "1" * 40, "tool", turn_index=1))
+
+    groups = await groups_built_for(recorder, three_steps("done", "todo"), monkeypatch)
+
+    assert groups == [("fix(calc): fix add()", SHA)]
+
+
+@pytest.mark.phase5
+async def test_a_task_without_a_plan_never_reads_the_step_checkpoints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoSteps(MemoryRecorder):
+        async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]:
+            raise AssertionError("a task without a plan has no steps to read")
+
+    groups = await groups_built_for(NoSteps(), None, monkeypatch)
+
+    assert groups == [("fix(calc): fix add()", SHA)]
+
+
+@pytest.mark.phase5
+async def test_the_title_of_the_pull_request_is_still_the_summary_with_a_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def build(task_id: str, groups: Any, **kwargs: Any) -> PrBranch:
+        return PrBranch("longhaul-pr/42", SHA, BASE)
+
+    monkeypatch.setattr(delivery, "build_pr_branch", build)
+    inp = build_input().model_copy(update={"plan": three_steps("done", "done")})
+
+    out = await run(make().build_pr_branch, inp)
+
+    assert out.title == "fix(calc): fix add()"
+
+
 async def test_a_task_that_changed_nothing_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(delivery, "build_pr_branch", raising(NothingToDeliverError("no change")))
 
@@ -258,6 +347,72 @@ async def test_the_pull_request_is_a_draft_into_the_default_branch_under_a_stabl
     assert request.title == "fix(calc): fix add()"
     assert request.idempotency_key == f"{TASK}:pr:1"
     assert "Closes #42" in request.body
+
+
+async def test_a_pull_request_whose_work_was_verified_is_ready_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"verified_tests": "41 passed"})
+
+    await run(make().deliver, inp)
+
+    (request,) = seen
+    assert request.draft is False
+    assert "Verified: 41 passed" in request.body
+    assert request.body.rstrip().endswith("Closes #42")
+    assert request.idempotency_key == f"{TASK}:pr:1"
+
+
+async def test_a_pull_request_of_partial_work_refers_to_the_issue_and_stays_a_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Merging it must not close an issue that the task did not finish.
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"partial": True})
+
+    await run(make().deliver, inp)
+
+    (request,) = seen
+    assert request.draft is True
+    assert request.body.rstrip().endswith("Refs #42")
+    assert "Closes" not in request.body
+
+
+async def test_the_body_of_a_verified_pull_request_is_the_same_on_a_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # create_pr refuses a reused key with other text, and a retried deliver builds the body again.
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"verified_tests": "41 passed"})
+    activities = make()
+
+    await run(activities.deliver, inp)
+    await run(activities.deliver, inp)
+
+    assert seen[0] == seen[1]
+    assert seen[0].body.encode() == seen[1].body.encode()
 
 
 async def test_a_push_to_a_protected_name_is_recorded_and_not_retried(
@@ -385,3 +540,108 @@ async def test_a_test_call_with_no_output_reference_has_no_summary_line(
     request = await last_request(monkeypatch, recorder=recorder)
 
     assert "no pytest summary line" in request.body
+
+
+# ---------- the run report in the body (LH-705) ----------
+class StoredReports:
+    """The part of RunReports that deliver uses, with a fixed text."""
+
+    def __init__(self, text: str | Exception) -> None:
+        self.text = text
+        self.asked: list[tuple[str, str | None]] = []
+
+    async def stored_or_new(self, task_id: str, *, outcome: str | None = None) -> str:
+        self.asked.append((task_id, outcome))
+        if isinstance(self.text, Exception):
+            raise self.text
+        return self.text
+
+
+def make_with_reports(reports: StoredReports) -> DeliveryActivities:
+    return DeliveryActivities(
+        None,  # type: ignore[arg-type]
+        FakeRemote(),  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        MemoryLedger(),
+        MemoryRecorder(),
+        MemoryBlobStore(),
+        author=AUTHOR,
+        templates=ROOT / "templates",
+        reports=reports,
+    )
+
+
+async def delivered_body(
+    monkeypatch: pytest.MonkeyPatch,
+    reports: StoredReports,
+    inp: acts.DeliverInput | None = None,
+) -> str:
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    await run(make_with_reports(reports).deliver, inp or deliver_input())
+    return str(seen[0].body)
+
+
+async def test_the_body_embeds_the_run_report_of_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    reports = StoredReports("### Overview\n\n| Turns | 8 |\n")
+
+    body = await delivered_body(monkeypatch, reports)
+
+    assert "<summary>Run report</summary>" in body
+    assert "| Turns | 8 |" in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"
+    assert reports.asked == [(TASK, "pr_opened")]
+
+
+async def test_the_draft_of_a_stuck_task_reports_it_as_stuck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reports = StoredReports("### Overview\n\n| Outcome | stuck |\n")
+    inp = deliver_input().model_copy(update={"partial": True})
+
+    body = await delivered_body(monkeypatch, reports, inp)
+
+    assert "<summary>Run report</summary>" in body
+    assert body.rstrip().splitlines()[-1] == "Refs #42"
+    assert reports.asked == [(TASK, "stuck")]
+
+
+async def test_a_worker_with_no_reports_opens_the_pull_request_without_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = await last_request(monkeypatch)
+
+    assert "<details>" not in request.body
+
+
+async def test_a_report_that_cannot_be_read_is_left_to_the_retry_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_ready(monkeypatch)
+    reports = StoredReports(ConnectionError("the database is down"))
+
+    with pytest.raises(ConnectionError):
+        await run(make_with_reports(reports).deliver, deliver_input())
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ValueError("a plan row is invalid"),
+        TemplateNotFound("run_report.md.j2"),
+        TemplateSyntaxError("unexpected end of template", 1),
+    ],
+)
+async def test_a_report_that_cannot_be_built_does_not_stop_the_pull_request(
+    monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    body = await delivered_body(monkeypatch, StoredReports(fault))
+
+    assert "<details>" not in body
+    assert body.rstrip().splitlines()[-1] == "Closes #42"

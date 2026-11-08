@@ -1,12 +1,12 @@
 """TaskWorkflow: the one durable owner of a task.
 
 It holds the task's CarryState, answers `status()`, takes the signals that steer a task, and
-drives the phases through activities: PREPARING, PLANNING when the task asks for it, a CODING loop,
-then DONE. The task of an issue goes through DELIVERING before DONE (see "A task of an issue"
-below). All I/O happens in activities, which this module calls by name through
-longhaul.durable.acts. It imports no I/O library (invariant I1, checked by
-tests/unit/test_invariants.py), reads time only through workflow.now() (it needs none yet), and
-uses no random numbers.
+drives the phases through activities: PREPARING, PLANNING when the task asks for it, a CODING loop
+that goes through VERIFYING when the task has a plan, then DONE. The task of an issue goes through
+DELIVERING before DONE (see "A task of an issue" below). All I/O happens in activities, which this
+module calls by name through longhaul.durable.acts. It imports no I/O library (invariant I1,
+checked by tests/unit/test_invariants.py), reads time only through workflow.now() (it needs none
+yet), and uses no random numbers.
 
 The CODING loop applies the same turn rules as the in-process loop. The decisions are in
 longhaul.agent.rules, which both call, so they cannot drift (tests/integration/test_parity.py
@@ -64,6 +64,144 @@ coding.
 A run that starts with a plan, because an earlier run made it and handed over, does not plan
 again.
 
+The plan gate (LH-502). A repo whose settings have `plan_approval_required` holds the plan after
+step 3 until a person has answered, and a repo without it goes on to CODING as before. The gate
+applies to a task that plans: a task without the plan switch has no plan to hold.
+
+1. Phase AWAITING_PLAN_APPROVAL. A task of an issue adds `longhaul:needs-human` and comments how
+   to answer (github/lifecycle.py, keys with the version of the plan), and the workflow waits for
+   `approve_plan`, `reject_plan`, a cancel, or acts.HINT_WAIT_HOURS (24, the config's
+   `stuck.hint_wait_hours`). A task on a folder waits the same way and asks nobody.
+2. `approve_plan` ends the wait. The `decide_plan` activity records the status and the login in
+   the `plans` table (the workflow does not write to the database), the label comes off, and the
+   coder starts from this version.
+3. `reject_plan(by, feedback)` records the rejection and takes the label off, then sends the
+   planner back for the next version. The feedback reaches the planner as a hint from the
+   person, so it is a user message in the planner's own transcript, which the planner keeps: the
+   revision starts from what it had read. It goes in `self.revision_hints` and not in
+   `state.hints`, so the coder, which has a transcript of its own, never sees it. The new version
+   is stored and posted like the first, and put to the same wait. Each version has its own
+   allowance of acts.PLANNER_MAX_TURNS planner turns and one repair turn (F14). The planner is
+   asked for at most planner.MAX_PLAN_VERSIONS (3) versions. The third rejection ends the task
+   as STUCK "plan not approved", and so does a wait that runs out, as STUCK "plan not approved:
+   no decision in 24 hours". On the timeout the label stays, because a person is still needed.
+4. A decision that arrives before the wait is not lost. The signal handlers keep the last
+   decision in `self.plan_decision`, and the gate takes it when it asks for one, without waiting.
+   That covers an approval sent while the planner works, and one sent while it revises. Such a
+   decision is taken as it is: the issue gets no request for a decision and no label goes on or
+   off. The gate sets `state.plan_approved` when it takes the decision, and the handlers do not.
+   The gate clears the decision when it takes it, so a decision applies to one version, and an
+   approval or a rejection that arrives after the coder started finds nobody to read it. Two
+   decisions that arrive in the same workflow task are one: the later one counts. The poller sends
+   a command a second time only after a crash between the signal and its cursor, and a repeated
+   rejection then costs one more revision.
+5. Replay (F13). The gate is behind `workflow.patched(PLAN_GATE_PATCH)`, asked only when the
+   repo's setting is on, so a history without the gate has no marker and a history from before
+   this story replays without it. The marker is in every history that passes the gate. Drop the
+   patch with `workflow.deprecate_patch` once no run that began before this story is open. The
+   wait and the revision loop issue the same commands in the same order on every replay: the
+   decision is read from the state that the signals changed, never from a clock or a lookup.
+
+The coder with a plan (LH-503). A task that has a plan codes differently, and a task that has none
+codes as it always did. The coder of a planned task is offered `update_step`, `submit_for_review`
+and `ask_human` in place of `finish`, and reads the plan in the first message of its transcript
+(roles/coder.py, agent/prompts.py). The workflow handles those three calls itself, as it does
+`finish`:
+
+1. `update_step` goes to the `record_step` activity, which writes the event and, for a step that is
+   done, a `step` checkpoint at `state.head_sha`. Only then does the new status go into
+   `state.plan`, so `status()` never shows a step as done before its checkpoint is saved. The
+   next `llm_turn` gets the plan in its input and brings the first message up to date. A call
+   that names a step the plan does not have, or a status it does not know, is answered as an
+   error and changes nothing.
+2. `submit_for_review` ends the coding and starts the review (see "The verifying phase" below). A
+   call to `finish` still ends such a task the way it did before the verifier, without a review,
+   for a worker or a history from before that story. The `build_pr_branch` activity gets the
+   plan, and makes one commit for each done step.
+3. `ask_human` pauses the task for a person, as a stuck signal does (see "The pause for a hint"
+   below).
+
+`status()` of a task with a plan answers with `acts.PlannedStatus`: the TaskStatus and the plan
+with the status of each step. TaskStatus is a contract and has no field for the plan. A client
+that wants the plan asks by name: `handle.query("status", result_type=acts.PlannedStatus)`.
+
+The verifying phase (LH-504, ADR-0007). A task that has a plan does not trust `submit_for_review`.
+The phase becomes VERIFYING and the work is checked in two halves, and it passes only when both
+say so (roles/verifier.py):
+
+1. The pre-check. `tool_exec` runs the test command of the repo and every acceptance check of the
+   plan that is a command, then `git_diff`, all marked read-only, so a file that a command writes
+   is put back. A command that failed fails the review, whatever the verifier says.
+2. The verdict. A verifier with a fresh transcript, a tool list and a prompt of its own gets the
+   plan, the pre-check and the diff in its first message, and ends by calling `submit_verdict`
+   with a `VerifierVerdict`. The workflow judges the call itself, as it does `submit_plan`: an
+   invalid verdict gets one repair turn (F14), and a second one ends the task with ERROR
+   "verifier submitted an invalid verdict twice: ...". A verifier that uses its turns without a
+   verdict ends it with ERROR "verifier submitted no verdict in 15 turns". Neither is a pass.
+
+A review that passes ends the coding as `finish` did: a task of an issue goes on to DELIVERING,
+and the pull request is opened ready for review, with "Verified: <tests_summary>" in its body. A
+review whose pre-check ran no command (no test command for the repo, none in the plan) can still
+pass on the verdict alone, but then the counts are the model's word, so the pull request is a draft
+and does not say "Verified". A review that fails adds a round to `state.verify_rounds`, which
+crosses hand-overs. Below acts.MAX_VERIFY_ROUNDS the coder is sent back: a `verdict` event records
+the round, the coder's transcript and notes (set aside while the verifier had the view) are put
+back, and a user message "Review failed: <issues>. Fix step <id>." goes at the end of that
+transcript. The phase is CODING again. At acts.MAX_VERIFY_ROUNDS the task ends as STUCK, in phase
+FAILED, with the reason and the last review's issues in the summary.
+
+Replay. The new activity calls are on the paths a plan opens: `record_step` runs only when the
+coder of a planned task calls `update_step`, and the extra input of `build_pr_branch` is the plan.
+The review adds `tool_exec` calls for the pre-check and the diff, and the verifier's own turns, and
+makes them only after a `submit_for_review`. A task without a plan makes the commands it made
+before, in the same order, and so does a planned task that ends on `finish`, so those histories
+replay as they were. A planned task that submitted for review before this story replays
+differently, which matters only for a deployment that has such a history in flight (F13).
+
+The stuck detector (LH-505). After each coder turn that does not end the run, `_watch` shows the
+turn to the detector of roles/stuck.py. The detector keeps its window in `state.stuck_window`, so
+it crosses a hand-over. Its facts come from two places: tool_exec returns a `CallSignal` with each
+result (acts.ToolExecResult), and the workflow adds what only it knows, the steps done and which
+calls failed. When a rule fires, the workflow records one `stuck` event with the reason and the
+evidence, and `_watch` returns the signal for the pause to act on. The planner is not watched:
+its calls get no facts, and the detector is told the phase besides. The thresholds are the
+`stuck` section of the config, copied into roles/stuck.py because the workflow cannot read the
+config file, and a worker whose config differs stops at the start. Replay: the event is the one
+command this adds, and only on a turn where a rule fires, so a history in which none does replays
+as it was.
+
+The pause for a hint (LH-506, ADR-0007). A stuck signal from `_watch`, or a good `ask_human` call,
+pauses the task in `_pause`:
+
+1. The phase becomes PAUSED. The workflow notes how many hints and budget top-ups it has by now,
+   before anything else is awaited, so that a signal that arrives while the question is written
+   counts as an answer to it. A hint that came earlier answered nothing yet.
+2. `summarize_for_human`, a call to the compactor model, writes what the agent is trying to do,
+   what it tried, its guess and one question, and renders them as the comment of
+   templates/stuck_comment.md.j2. Its cost is added to the task. A task of an issue then posts
+   the comment under the key `stuck:<n>` and adds `longhaul:needs-human`, through the side-effect
+   activities. A local task has no issue, so the comment goes into the `paused` event.
+3. The workflow waits for a `hint`, an `add_budget` or a `cancel`, up to `stuck.hint_wait_hours`
+   (acts.HINT_WAIT_HOURS, a copy of the config value like the detector's limits).
+
+A hint or a top-up resumes the task: the detector's window is emptied, `needs-human` is taken
+off, a `resumed` event is recorded, `state.stuck_count` goes up by one and the phase is CODING
+again. The hint is shown to the model on the next turn like any other (turns.show_hints), as
+"Hint from <user>: <text>" after the results of the turn that paused. `stuck_count` is the number
+of pauses that have ended, so the next pause is `stuck_count + 1`, which is the `n` of the key and
+survives a hand-over in CarryState. A task that is stuck after its third pause (stuck.MAX_PAUSES),
+and a task whose wait runs out, end with outcome STUCK in phase FAILED. A cancel during the wait
+takes the usual cancel path. Those ends get the final comment and labels of every end (see "How a
+task ends" below).
+
+Each hint is cut to agent/hints.MAX_HINT_BYTES when its signal arrives. The hints of a task stay
+in the state for its whole life, and every `llm_turn` takes all of them as input.
+
+Replay. The pause is behind `workflow.patched(PAUSE_PATCH)`. A history from before this story
+has no marker and replays as it ran: a stuck signal was only recorded, and `ask_human` recorded
+a `paused` event and ended the task as stuck in phase PAUSED. Drop the patch with
+`workflow.deprecate_patch` once no run that began before this story is open.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -72,18 +210,20 @@ A task of an issue (LH-306) is one whose repo is owner/name and whose spec has a
    with a sandbox id, because an earlier run prepared it and handed over, has been picked up
    already and does not repeat it. The keys would make a repeat harmless, but each one costs an
    activity and a place in the history.
-2. When the model calls `finish`, the phase becomes DELIVERING and the task is not over. The
-   `build_pr_branch` activity makes the pull request branch on the base the workspace was
-   prepared at (kept in `state.spec.base_sha`, because the `base` tag in the checkpoint repo is
-   the agent's to move), and `deliver` pushes it and opens a draft pull request. The task then
-   swaps the label (`longhaul:working` out, `longhaul:pr-open` in) and ends with PR_OPENED
-   carrying the URL. `status()` shows no outcome until then.
+2. When the model calls `finish`, or the work passes its review, the phase becomes DELIVERING and
+   the task is not over. The `build_pr_branch` activity makes the pull request branch on the base
+   the workspace was prepared at (kept in `state.spec.base_sha`, because the `base` tag in the
+   checkpoint repo is the agent's to move), and `deliver` pushes it and opens the pull request:
+   ready for review when a verifier passed the work and a command backed it, else a draft. The
+   task then swaps the label (`longhaul:working` out, `longhaul:pr-open` in) and ends with
+   PR_OPENED carrying the URL. `status()` shows no outcome until then.
 3. A task whose work changes no file ends with ERROR "nothing to deliver: no file changed",
    because GitHub refuses a pull request with no commit.
 
-Pause and resume (Phases 5 and 7) add and remove `longhaul:needs-human` through `_needs_human`
-and `_human_done`, which are here for them. Nothing calls them yet. The labels of a task that
-ends any other way (an error, a cancel) are left alone until LH-507.
+The pause for a hint adds and removes `longhaul:needs-human` through `_needs_human` and
+`_human_done`, and the pause for a budget (Phase 7) will use them too. The plan gate asks for a
+person with helpers and keys of its own (`_ask_for_review`). The labels of a task that ends any
+other way are set when it ends (see "How a task ends" below).
 
 `/longhaul status` on the issue reaches the task as the signal `report_status` (LH-308). The
 handler posts a comment with the state of the task through the `post_comment` activity, so it is
@@ -96,23 +236,72 @@ does not fail the task, and a cancel does not wait for it, not in a turn and not
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
-- the model calls `finish` with a summary: PR_OPENED with the model's summary. A local task has
-  no pull request and so no pr_url, which is the outcome the in-process loop returns too. The
-  task of an issue has the URL of its pull request;
-- a `cancel` signal: CANCELLED, after a `cleanup` activity;
+- the model calls `finish` with a summary, or the work of a coder with a plan passes its review:
+  PR_OPENED with the model's summary. A local task has no pull request and so no pr_url, which is
+  the outcome the in-process loop returns too. The task of an issue has the URL of its pull
+  request;
+- a `cancel` signal: CANCELLED;
 - `task_turns` plus the turns added by `add_budget` pass: ERROR "turn limit";
 - a tool call finds its sandbox gone more often than it may: ERROR "sandbox lost";
 - the other ends of agent/rules.py: "no tool calls", "output limit", "model declined (...)",
   "context limit", "pause limit" and "unexpected stop reason: ...".
 
 The planner adds two ends of its own: ERROR "planner submitted an invalid plan twice: ..." and
-ERROR "planner submitted no plan in 20 turns".
+ERROR "planner submitted no plan in 20 turns". The plan gate adds two more, both STUCK: "plan not
+approved" after the third rejection and "plan not approved: no decision in 24 hours" after a wait
+that ran out. The verifier adds three: ERROR "verifier submitted an invalid verdict twice: ...",
+ERROR "verifier submitted no verdict in 15 turns", and STUCK "the work failed review 3 times; last
+review: ..." for a task whose rounds ran out.
 
-Not here yet, each in its own story: the plan gate, the coder's use of the plan and the verifier
-phase (Phase 5), budget enforcement and pauses (Phase 7), clean-up and a final outcome for runs
-that end any way but a cancel (LH-507). An activity that fails for good, after its retries, fails
-the workflow with that error. A prompt over the context window is the exception, and it is
+The pause for a hint adds two: STUCK with the reason, the evidence or the question, and "no hint in
+24 hours" or "3 hints did not unblock the task" (roles/stuck.py).
+
+Not here yet, in its own story: budget enforcement and pauses (Phase 7). An activity that fails
+for good, after its retries, ends the task with ERROR and then fails the workflow with that error
+(see "How a task ends" below). A prompt over the context window is the exception, and it is
 handled as described next.
+
+How a task ends (LH-507). Every task ends in exactly one Outcome, and `run()` winds it up the same
+way for every end, in `_wind_up`:
+
+1. The Outcome is set, with the phase (`_end`). `status()` shows it from here.
+2. The `cleanup` activity destroys the sandbox. This is first because it frees the most and needs
+   nothing from GitHub, which can be down for twenty minutes. A task that ended on its own keeps
+   its bare repo (`CleanupInput.keep_repo`), and the janitor (`clean_repos`, which PollerWorkflow
+   runs after each poll) removes it seven days after the `outcome` event. A cancel removes the
+   repo as it always did. For a task of an issue that happens at the end of the wind-up, with a
+   second `cleanup`, because the final comment reads the diff from the repo. The reason of both
+   is the reason of the cancel.
+3. A task of an issue goes on. A stuck task whose repo asked for it (the memo key
+   acts.OPEN_DRAFT_MEMO_KEY, set by the poller from `open_draft_on_stuck`) builds the pull request
+   branch and opens a draft with its partial work, through the same two activities as a finished
+   task. A task whose work changes no file opens none, and a draft that fails is logged. The
+   URL becomes the `pr_url` of the outcome.
+4. `post_final` posts the one final comment under the key `final:1`: the pull request link, or
+   the report with what was done, what is left and the diff stats (github/final_comment.py).
+5. The final labels are set (lifecycle.on_end). A task that delivered has them already from
+   `_deliver`.
+6. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
+   of the above.
+
+Each step is best effort and runs outside `_call`, so a failed step is logged and the next one
+goes on, and a cancel that arrives during the wind-up changes nothing. The steps are idempotent:
+the comment, the labels and the pull request have keys, a cleanup of nothing is a no-op, and a
+replay makes the same commands from the history.
+
+An error ends the task too. An activity that failed for good (a FailureError) or a payload that
+was too large (acts.FAIL_THE_WORKFLOW) sets ERROR "workflow failed: <type>", and any other
+exception that escapes the run, a bug in the workflow, sets ERROR "unexpected error: <class>". The
+summary is the type and never the message, which can echo a request. The trace, cut to
+acts.ERROR_TRACE_CHARS, goes to the `events` table as an `error` event (wind_up.error_trace), and
+the wind-up runs. Then the workflow still fails, so Temporal shows it as failed and a client that
+waits for the result gets the error. A bug that used to fail the workflow task, and so to be
+retried for as long as the code stayed the same, now fails the workflow for good.
+
+Replay. All of it is behind `workflow.patched(OUTCOME_PATCH)`. A history from before this story
+has no marker and replays as it ran: a cancel cleaned up inside `_cancelled`, no other end cleaned
+up, and a failure noted the outcome and raised. Drop the patch with `workflow.deprecate_patch`
+once no run that began before this story is open.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -140,7 +329,7 @@ The end of a run is noted for the metrics (LH-704). Counting is I/O, so the work
 When run() ends, by any of the outcomes above or by an activity that failed for good, it calls
 the `record_event` local activity once with the type acts.OUTCOME_EVENT, and the worker counts the
 task as finished and no longer active. A hand-over to a new run (below) is not an end and makes no
-such call. The note is made after the cleanup of a cancel, outside `_call`, because `_call` stops
+such call. The note is made at the end of the wind-up, outside `_call`, because `_call` stops
 at once when a cancel was requested. It is a record for people, like the hand-over event: a
 failure to write it is logged and the outcome stands. A run that Temporal itself ends, by a
 terminate or a timeout, never gets to make it, and its task stays among the active ones until the
@@ -148,8 +337,10 @@ worker restarts.
 
 The context modes (LH-406). `context.mode` of the worker's config, or the mode a run asks for with
 `longhaul run --context-mode`, switches the tiers off for an ablation: `no_compaction` keeps tier 1
-and `none` has neither (longhaul.context.modes). The workflow cannot read the config, so a run's
-own mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
+and `none` has neither (longhaul.context.modes). `sliding`, the window of the naive baseline
+(LH-903), has neither tier either, and the workflow never sees it as a refusal: `llm_turn` cuts the
+oldest turns before it measures the request. The workflow cannot read the config, so a run's own
+mode comes from the memo (acts.CONTEXT_MODE_MEMO_KEY). The workflow hands it to every `llm_turn`
 and `compact`, which resolve it against the config, and it skips the `compact` call itself when the
 memo says the mode has no compaction. When the memo is empty the config decides, and the workflow
 asks as it always did: `compact` answers "unchanged" in a mode without compaction, and
@@ -227,8 +418,9 @@ What does not cross, and why that is fine:
 - The count of turns without a tool call (`self.idle`) is not in CarryState, which this story may
   not change. After a hand-over that follows a nudge, the model gets one more nudge before the run
   ends with "no tool calls".
-- `plan_decision` is not carried. The plan gate (Phase 5) waits and reads the decision inside one
-  run, before any hand-over, and CarryState keeps `plan_approved`.
+- `plan_decision` and `revision_hints` are not carried. The plan gate waits, reads the decision and
+  revises inside one run, before any hand-over: a run hands over only between coder turns. The
+  approval that remains is `plan_approved` in CarryState.
 - `outcome` is never set at a hand-over, because a run that has an outcome ends.
 """
 
@@ -236,17 +428,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from temporalio import workflow
-from temporalio.exceptions import ActivityError, ApplicationError, FailureError
+from temporalio.exceptions import ActivityError, ApplicationError, FailureError, TemporalError
 
 # Contracts, acts and the turn rules are pure. Passing them through the sandbox saves about
 # 30 ms per run and keeps one class object for each model, so an isinstance check against a
 # model that came from outside still works (ADR-0004, appendix section 1).
 with workflow.unsafe.imports_passed_through():
-    from longhaul.agent import rules
+    from longhaul.agent import hints, rules
     from longhaul.context.modes import ContextMode
     from longhaul.context.tokens import Decision
     from longhaul.contracts import (
@@ -257,12 +450,15 @@ with workflow.unsafe.imports_passed_through():
         Plan,
         ProviderErrorKind,
         Role,
+        StuckReason,
+        StuckSignal,
         TaskStatus,
         ToolResult,
+        VerifierVerdict,
     )
-    from longhaul.durable import acts
+    from longhaul.durable import acts, wind_up
     from longhaul.github import lifecycle
-    from longhaul.roles import planner
+    from longhaul.roles import coder, planner, stuck, verifier
 
 
 @dataclass(frozen=True)
@@ -290,14 +486,74 @@ NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 
 # The patch marker of the load_memory call (LH-604, failure mode F13). See "Memory" above.
 LOAD_MEMORY_PATCH = "lh-604-load-memory"
+# The patch marker of the plan gate (LH-502, failure mode F13). See "The plan gate" above.
+PLAN_GATE_PATCH = "lh-502-plan-gate"
+# The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
+# ends" above.
+OUTCOME_PATCH = "lh-507-final-outcome"
+# What fails the workflow when it escapes run(): an activity or child that failed for good, and
+# the errors the workflow was told to fail on (acts.FAIL_THE_WORKFLOW).
+FAILS_THE_WORKFLOW: tuple[type[BaseException], ...] = (FailureError, *acts.FAIL_THE_WORKFLOW)
+# The type of the error that fails a workflow whose code raised something it did not expect.
+UNEXPECTED_ERROR = "UnexpectedError"
 
 # The event a compaction records (plan section 3.5).
 COMPACTION_EVENT = "compaction"
+
+# The events of a pause (plan section 3.5). `paused` has the `reason` (a StuckReason value), the
+# `pause` number, the `question`, the `turn_index` and, for a local task, the `comment`. `resumed`
+# has the `pause` number, `via` ("hint" or "budget") and, for a hint, who gave it.
+PAUSED_EVENT = "paused"
+RESUMED_EVENT = "resumed"
+ASKED_REASON = StuckReason.AGENT_ASKED.value
+HINT_VIA = "hint"
+BUDGET_VIA = "budget"
+
+# The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
+PAUSE_PATCH = "lh-506-pause-for-hint"
+
+# The event a stuck detection records (plan section 3.5). The payload has the `reason`, which the
+# metrics count (telemetry/metrics.py), the `evidence` lines and the `turn_index`.
+STUCK_EVENT = "stuck"
+
+# The event that a review records (plan section 3.5), one for each round.
+VERDICT_EVENT = "verdict"
 
 # The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
 CONTINUE_AS_NEW_EVENT = "continue_as_new"
 HAND_OVER_TURNS = "turns"  # the turn count reached the interval
 HAND_OVER_HISTORY = "history"  # the server suggested it, because the history grew
+
+
+@dataclass(frozen=True)
+class _Ran:
+    """What the calls of a coder turn came to, for a task with a plan or without.
+
+    `finish` is the summary of a good `finish` or `submit_for_review`, and `question` the text of
+    a good `ask_human`. Either ends the turn. `review` is true when the summary came with
+    `submit_for_review`, so that the work is verified before it is delivered.
+    """
+
+    results: list[ToolResult]
+    finish: str | None
+    question: str | None = None
+    review: bool = False
+
+
+class _Answered(Protocol):
+    """What the calls of a read-only turn came to, as far as the transcript is concerned."""
+
+    @property
+    def results(self) -> list[ToolResult]: ...
+
+
+@dataclass(frozen=True)
+class _Unanswered:
+    """What the task had when it paused, so that only a later signal counts as the answer."""
+
+    hints: int
+    usd: float
+    turns: int
 
 
 class _CancelRequested(Exception):
@@ -318,9 +574,9 @@ class _SandboxLost(Exception):
         self.call_id = call_id
 
 
-def _error_type(err: FailureError) -> str:
+def _error_type(err: BaseException) -> str:
     """The type of the error that failed the run: an application error's type, else its class."""
-    cause = err.cause or err
+    cause = (err.cause if isinstance(err, FailureError) else None) or err
     if isinstance(cause, ApplicationError) and cause.type:
         return cause.type
     return type(cause).__name__
@@ -372,11 +628,20 @@ class TaskWorkflow:
         self.state = state
         self.outcome: Outcome | None = None
         self.cancel_request: CancelRequest | None = None
+        # The last decision a person sent about the plan, until the gate takes it (LH-502).
         self.plan_decision: PlanDecision | None = None
+        # What the planner is told about rejected versions of its plan. Not carried: planning
+        # ends before any hand-over.
+        self.revision_hints: list[str] = []
         self.idle = 0  # turns in a row that ended without a tool call
         # The status comments posted so far, which a hand-over carries in the memo. None until
         # the first request of this run: only then is the memo read (see _next_status_number).
         self.status_posts: int | None = None
+        # The counts a verifier gave when it passed the work, for the pull request. Delivery
+        # follows the review in the same run, so a hand-over never has to carry it.
+        self.verified_tests: str | None = None
+        # Why the task waits for a person, for the status. None unless it is paused.
+        self.paused_reason: str | None = None
 
     # ---------- signals and the query ----------
     @workflow.signal
@@ -387,7 +652,9 @@ class TaskWorkflow:
 
     @workflow.signal
     def hint(self, by: str, text: str) -> None:
-        self.state.hints.append(f"{by}: {text}")
+        # Cut here, in the handler, because the hints stay in the state for the whole task and
+        # every llm_turn takes all of them as input (agent/hints.py).
+        self.state.hints.append(f"{hints.clip_author(by)}: {hints.clip_hint(text)}")
 
     @workflow.signal
     def add_budget(self, by: str, usd: float, turns: int) -> None:
@@ -398,12 +665,12 @@ class TaskWorkflow:
 
     @workflow.signal
     def approve_plan(self, by: str) -> None:
-        self.state.plan_approved = True
+        # state.plan_approved is the gate's to set (_review): a late answer, after the coder has
+        # started, must not change what the hand-overs carry.
         self.plan_decision = PlanDecision(approved=True, by=by)
 
     @workflow.signal
     def reject_plan(self, by: str, feedback: str) -> None:
-        self.state.plan_approved = False
         self.plan_decision = PlanDecision(approved=False, by=by, feedback=feedback)
 
     # A task that ends while its status comment is still being posted does not wait for it: the
@@ -441,7 +708,7 @@ class TaskWorkflow:
 
     def _snapshot(self) -> TaskStatus:
         state = self.state
-        return TaskStatus(
+        status = TaskStatus(
             task_id=state.spec.task_id,
             phase=state.phase,
             turn_index=state.turn_index,
@@ -449,8 +716,12 @@ class TaskWorkflow:
             last_checkpoint=state.head_sha,
             # CarryState counts from 0 for "no plan yet", TaskStatus says None.
             plan_version=state.plan_version or None,
+            paused_reason=self.paused_reason,
             outcome=self.outcome,
         )
+        if state.plan is None:
+            return status
+        return acts.PlannedStatus(**status.model_dump(), plan=state.plan)
 
     # ---------- the run ----------
     @workflow.run
@@ -458,15 +729,23 @@ class TaskWorkflow:
         # The input is already in self.state. The SDK needs the two signatures to match.
         try:
             outcome = await self._finish_the_task()
-        except FailureError as err:
+        except FAILS_THE_WORKFLOW as err:
             # The workflow is about to fail. The task is over all the same, and its error type is
-            # all the note says: the message of a provider error can echo the request.
-            await self._note_outcome(
-                Outcome(kind=OutcomeKind.ERROR, summary=f"workflow failed: {_error_type(err)}")
-            )
+            # all the summary says: the message of a provider error can echo the request.
+            await self._end_with_error(err, unexpected=False)
             raise
-        await self._note_outcome(outcome)
-        return outcome
+        except TemporalError:
+            raise  # a non-determinism error or an eviction: the SDK handles these
+        except Exception as err:
+            # A bug in the workflow or in a helper it calls. Before LH-507 it failed the workflow
+            # task, which the server retries for as long as the code is the same.
+            if not workflow.patched(OUTCOME_PATCH):
+                raise
+            ended = await self._end_with_error(err, unexpected=True)
+            raise ApplicationError(
+                ended.summary, type=UNEXPECTED_ERROR, non_retryable=True
+            ) from err
+        return await self._wind_up(outcome)
 
     async def _finish_the_task(self) -> Outcome:
         try:
@@ -516,6 +795,229 @@ class TaskWorkflow:
         except FailureError as err:
             workflow.logger.warning(
                 "outcome of task %s not recorded: %s", state.spec.task_id, err.cause or err
+            )
+
+    # ---------- the end of a task ----------
+    async def _end_with_error(self, err: BaseException, *, unexpected: bool) -> Outcome:
+        """End the task with outcome ERROR for an exception, and wind it up. The caller raises.
+
+        The summary names the error type and nothing else. The trace goes to the `events` table.
+        """
+        label = "unexpected error" if unexpected else "workflow failed"
+        failed = Outcome(kind=OutcomeKind.ERROR, summary=f"{label}: {_error_type(err)}")
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._note_outcome(failed)
+            return failed
+        self._end(failed, Phase.FAILED)
+        await self._wind_note(
+            acts.ERROR_EVENT, {"type": _error_type(err), "trace": wind_up.error_trace(err)}
+        )
+        return await self._wind_up(failed)
+
+    async def _wind_up(self, outcome: Outcome) -> Outcome:
+        """Everything a task does when it ends, whatever way it ended (LH-507). Returns the outcome.
+
+        The order is the order of what costs the most when it is left behind. The sandbox goes
+        first, because GitHub can be down for twenty minutes and a container must not wait for it.
+        Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
+        for one, the final comment (which links that pull request), and the final labels. The
+        repo of a cancelled task goes after them, since the comment reads its diff. The note for
+        the metrics comes last, so it counts a task that has finished all of this.
+
+        Each step is best effort. An activity that fails for good is logged, and the next step
+        goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
+        cancel that arrives now is not acted on: the task is over. For that reason the steps do
+        not go through `_call`, which stops at once on a cancel.
+        """
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._note_outcome(outcome)
+            return outcome
+        state = self.state
+        await self._try(
+            "cleanup",
+            self._wind_call(
+                acts.CLEANUP,
+                self._cleanup_input(outcome, keep_repo=self._repo_outlives_the_sandbox(outcome)),
+            ),
+        )
+        if lifecycle.is_github_task(state.spec):
+            outcome = await self._open_draft(outcome)
+            await self._report(outcome)
+            await self._end_labels(outcome)
+        await self._remove_repo(outcome)
+        await self._note_outcome(outcome)
+        return outcome
+
+    def _cancelled_by_a_person(self, outcome: Outcome) -> bool:
+        return outcome.kind is OutcomeKind.CANCELLED and self.cancel_request is not None
+
+    def _cleanup_input(self, outcome: Outcome, *, keep_repo: bool) -> acts.CleanupInput:
+        """What to destroy when the task ends, and whether its repo stays.
+
+        A task that ended on its own keeps its bare repo for a week, so that a person can read
+        its checkpoints, and the janitor removes it. A task that a person cancelled has its repo
+        removed, as a cancel always did, and its reason is the cancel reason.
+        """
+        request = self.cancel_request
+        cancelled = self._cancelled_by_a_person(outcome)
+        return acts.CleanupInput(
+            task_id=self.state.spec.task_id,
+            sandbox_id=self.state.sandbox_id,
+            reason=request.reason
+            if cancelled and request is not None
+            else wind_up.cleanup_reason(outcome.kind),
+            keep_repo=keep_repo,
+        )
+
+    def _repo_outlives_the_sandbox(self, outcome: Outcome) -> bool:
+        """Whether the first cleanup leaves the repo, because the final comment reads its diff.
+
+        A task of an issue posts a report that needs the repo, so the sandbox goes first and the
+        repo of a cancelled one goes after the report (`_remove_repo`). A local task has no
+        report, and one cleanup removes both.
+        """
+        return not self._cancelled_by_a_person(outcome) or lifecycle.is_github_task(self.state.spec)
+
+    async def _remove_repo(self, outcome: Outcome) -> None:
+        """Remove the bare repo of a task that a person cancelled, now that its report is out.
+
+        They asked it to stop, so the repo does not wait a week for the janitor. The second
+        cleanup finds no sandbox and removes the repo and the rest of what the task left.
+        """
+        if self._cancelled_by_a_person(outcome) and lifecycle.is_github_task(self.state.spec):
+            await self._try(
+                "repo cleanup",
+                self._wind_call(acts.CLEANUP, self._cleanup_input(outcome, keep_repo=False)),
+            )
+
+    async def _open_draft(self, outcome: Outcome) -> Outcome:
+        """Open a draft pull request with the partial work of a stuck task, if the repo asked.
+
+        The work is the same change a finished task delivers, so it goes through the same two
+        activities. A task whose work changes no file has nothing to open (the same error as in
+        `_deliver`), and a draft that cannot be opened is logged: the report goes out without it.
+        """
+        state = self.state
+        base_sha, issue = state.spec.base_sha, state.spec.issue_number
+        asked = bool(workflow.memo_value(acts.OPEN_DRAFT_MEMO_KEY, False, type_hint=bool))
+        if (
+            outcome.kind is not OutcomeKind.STUCK
+            or not asked
+            or state.head_sha is None
+            or base_sha is None
+            or issue is None
+        ):
+            return outcome
+        task_id, repo = state.spec.task_id, state.spec.repo
+        summary = wind_up.draft_summary(outcome)
+        try:
+            built = await self._wind_call(
+                acts.BUILD_PR_BRANCH,
+                acts.BuildPrBranchInput(
+                    task_id=task_id,
+                    repo=repo,
+                    summary=summary,
+                    base_sha=base_sha,
+                    head_sha=state.head_sha,
+                    plan=state.plan,
+                ),
+            )
+            url = await self._wind_call(
+                acts.DELIVER,
+                acts.DeliverInput(
+                    task_id=task_id,
+                    repo=repo,
+                    issue_number=issue,
+                    summary=summary,
+                    branch=built.branch,
+                    base_branch=built.base_branch,
+                    base_sha=built.base_sha,
+                    head_sha=built.head_sha,
+                    title=built.title,
+                    partial=True,
+                ),
+            )
+        except ActivityError as err:
+            if not _has_nothing_to_deliver(err):
+                workflow.logger.warning(
+                    "no draft pull request for stuck task %s: %s", task_id, err.cause or err
+                )
+            return outcome
+        drafted = outcome.model_copy(update={"pr_url": url})
+        self.outcome = drafted
+        return drafted
+
+    async def _report(self, outcome: Outcome) -> None:
+        """Post the one final comment of a task of an issue."""
+        state = self.state
+        issue = state.spec.issue_number
+        if issue is None:  # is_github_task has checked
+            return
+        await self._try(
+            "final comment",
+            self._wind_call(
+                acts.POST_FINAL,
+                acts.PostFinalInput(
+                    task_id=state.spec.task_id,
+                    repo=state.spec.repo,
+                    number=issue,
+                    outcome=outcome,
+                    plan=state.plan,
+                    base_sha=state.spec.base_sha,
+                    head_sha=state.head_sha,
+                    turns=state.turn_index,
+                    cost_usd=state.cost_usd,
+                    draft=not self._verified(outcome),
+                ),
+            ),
+        )
+
+    def _verified(self, outcome: Outcome) -> bool:
+        """Whether the pull request of the outcome is ready for review and not a draft.
+
+        `deliver` opens a ready pull request exactly when `verified_tests` is set, and only the
+        delivery of a finished task passes it. The draft of a stuck task holds partial work and is
+        always a draft.
+        """
+        return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
+
+    async def _end_labels(self, outcome: Outcome) -> None:
+        opened = outcome.kind is OutcomeKind.STUCK and outcome.pr_url is not None
+        for step in lifecycle.on_end(self.state.spec, outcome.kind, pr_opened=opened):
+            await self._try(
+                "label",
+                self._wind_call(acts.ADD_LABEL if step.add else acts.REMOVE_LABEL, step.label),
+            )
+
+    async def _wind_note(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Record an event in the wind-up, which a cancel request does not interrupt."""
+        note = acts.RecordEventInput(
+            task_id=self.state.spec.task_id, type=event_type, payload=payload
+        )
+        await self._try(event_type, self._wind_call(acts.RECORD_EVENT, note))
+
+    async def _wind_call[In, Out](self, act: acts.Act[In, Out], arg: In) -> Out:
+        """Run an activity by name, outside the cancel handling of `_call`."""
+        if act.local:
+            local: Out = await workflow.execute_local_activity(
+                act.name, arg, result_type=act.result_type, **acts.local_options(act)
+            )
+            return local
+        remote: Out = await workflow.execute_activity(
+            act.name, arg, result_type=act.result_type, **acts.options(act, self._tuning())
+        )
+        return remote
+
+    async def _try(self, what: str, step: Awaitable[object]) -> None:
+        """Await one step of the wind-up. A step that fails for good is logged and skipped."""
+        try:
+            await step
+        except FailureError as err:
+            workflow.logger.warning(
+                "wind-up step %s of task %s failed: %s",
+                what,
+                self.state.spec.task_id,
+                err.cause or err,
             )
 
     async def _prepare(self) -> None:
@@ -599,11 +1101,40 @@ class TaskWorkflow:
         return bool(workflow.memo_value(acts.PLAN_MEMO_KEY, False, type_hint=bool))
 
     async def _plan(self) -> Outcome | None:
-        """Run the planner until it submits a plan. Returns None once the plan is in place.
+        """Plan until the coder can start. Returns None then, or the outcome that ends the task.
+
+        The planner writes a version of the plan. On a repo with the plan gate a person decides
+        on it, and a rejection sends the planner back for the next version, in its own
+        transcript, until the version is approved or the gate ends the task (see "The plan gate"
+        in the module docstring). Without the gate the first version is the one the coder gets.
+        """
+        while True:
+            ended = await self._write_plan()
+            if ended is not None:
+                return ended
+            if not self._gated():
+                break
+            version = self.state.plan_version
+            decision = await self._review(version)
+            if isinstance(decision, Outcome):
+                return decision
+            if decision.approved:
+                break
+            if version >= planner.MAX_PLAN_VERSIONS:
+                return self._end(planner.not_approved_outcome(), Phase.FAILED)
+            self.revision_hints.append(
+                f"{decision.by}: {planner.revision_request(version, decision.feedback)}"
+            )
+        self._start_coding()
+        return None
+
+    async def _write_plan(self) -> Outcome | None:
+        """Run the planner until it submits a plan. Returns None once the plan is stored.
 
         An outcome means the task ends here: the planner failed its repair turn, used up its
         turns, ran out of the task's turn budget, or was stopped by one of the ends that the coder
-        shares (a refusal, a full window, a lost sandbox).
+        shares (a refusal, a full window, a lost sandbox). Each call is a version of its own,
+        with its own turns and its own repair turn.
         """
         state = self.state
         state.phase = Phase.PLANNING
@@ -621,7 +1152,9 @@ class TaskWorkflow:
             if not calls:
                 verdict = rules.idle_turn(idle)
                 idle = verdict.count
-                ended = await self._planner_idle(index, sampled, verdict)
+                ended = await self._idle_read_only(
+                    index, sampled, verdict, Role.PLANNER, planner.NUDGE
+                )
                 if ended is not None:
                     return ended
                 continue
@@ -652,6 +1185,25 @@ class TaskWorkflow:
         whether the planning goes on or ends here. A sandbox that is lost for good ends the run,
         and the outcome is returned.
         """
+        return await self._read_only_calls(
+            index, reply, calls, lambda run: planner.run_calls(calls, run, failures)
+        )
+
+    async def _read_only_calls[R: _Answered](
+        self,
+        index: int,
+        reply: acts.LlmTurnOutput,
+        calls: list[acts.ToolCallSummary],
+        judge: Callable[[Callable[[acts.ToolCallSummary], Awaitable[ToolResult]]], Awaitable[R]],
+    ) -> R | Outcome:
+        """Run the calls of a turn of a role that cannot change the tree, and answer them all.
+
+        `judge` is the role's run_calls with its collaborators bound. It is given the function that
+        makes one tool call, read-only, and decides which calls run and what the control tool
+        came to. Every call is answered in the transcript, the control call included, so that the
+        stored transcript is paired whether the phase goes on or ends here. A sandbox that is lost
+        for good ends the run, and the outcome is returned.
+        """
         state = self.state
         finished: list[ToolResult] = []  # kept for the transcript if a call loses the sandbox
 
@@ -661,7 +1213,7 @@ class TaskWorkflow:
             return result
 
         try:
-            ran = await planner.run_calls(calls, run, failures)
+            ran = await judge(run)
         except _SandboxLost as lost:
             return await self._end_lost(index, reply.transcript_ref, calls, finished, lost)
         state.transcript_ref = await self._call(
@@ -677,10 +1229,13 @@ class TaskWorkflow:
         state.turn_index = index + 1
         return ran
 
-    async def _planner_idle(
-        self, index: int, reply: acts.LlmTurnOutput, verdict: rules.Idle
+    async def _idle_read_only(
+        self, index: int, reply: acts.LlmTurnOutput, verdict: rules.Idle, role: Role, nudge: str
     ) -> Outcome | None:
-        """A planner reply with no tool calls. The first gets a nudge, and a second ends the run."""
+        """A reply of the planner or the verifier with no tool calls.
+
+        The first gets a nudge, and a second ends the run.
+        """
         state = self.state
         if verdict.outcome is not None:
             state.turn_index = index + 1
@@ -692,12 +1247,12 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=reply.transcript_ref,
                 results=[],
-                user_text=planner.NUDGE,
+                user_text=nudge,
                 window_tokens=self._window(),
             ),
         )
         state.turn_index = index + 1
-        await self._relieve(index, reply.context_decision, Role.PLANNER)
+        await self._relieve(index, reply.context_decision, role)
         return None
 
     async def _accept(self, plan: Plan) -> None:
@@ -705,7 +1260,8 @@ class TaskWorkflow:
 
         The plan is written to the `plans` table and, for a task of an issue, posted on the issue,
         before it is in `state`: `status()` shows a plan version only once the plan is stored and
-        out. The coder starts a transcript of its own, with no notes of the planner's.
+        out. The planner's transcript stays in the state, because a person may reject the plan
+        and the planner then revises it from what it has read. `_start_coding` drops it.
         """
         state = self.state
         version = state.plan_version + 1
@@ -723,8 +1279,85 @@ class TaskWorkflow:
             )
         state.plan = plan
         state.plan_version = version
-        state.transcript_ref = None
-        state.notes = None
+
+    def _start_coding(self) -> None:
+        """The plan is final. The coder starts a transcript of its own, with no planner notes."""
+        self.state.transcript_ref = None
+        self.state.notes = None
+
+    # ---------- the plan gate ----------
+    def _gated(self) -> bool:
+        """True when a person has to approve the plan before the coder starts (LH-502)."""
+        if not self.state.spec.settings.plan_approval_required:
+            return False
+        # A history from before the gate has no marker for it and replays without it (F13). The
+        # call is made only when the setting is on, so no other history gets a marker.
+        return workflow.patched(PLAN_GATE_PATCH)
+
+    async def _review(self, version: int) -> PlanDecision | Outcome:
+        """Hold version `version` of the plan for a person. Returns the decision, or the outcome.
+
+        The outcome is the end of a wait that ran out. A cancel unwinds to the cancel path. The
+        decision is recorded by an activity before the label comes off, and the label comes off
+        for a rejection too: the person has answered, and the planner is at work on the next
+        version. The label stays when the wait runs out, because a person is still needed.
+
+        A decision that arrived while the planner was at work is taken as it is: nobody is asked,
+        so no request is left on the issue and no label goes on or off.
+        """
+        state = self.state
+        state.phase = Phase.AWAITING_PLAN_APPROVAL
+        asked = self.plan_decision is None
+        if asked:
+            await self._ask_for_review(version)
+        decision = await self._decision()
+        if decision is None:
+            return self._end(planner.undecided_outcome(acts.HINT_WAIT_HOURS), Phase.FAILED)
+        await self._call(
+            acts.DECIDE_PLAN,
+            acts.DecidePlanInput(
+                task_id=state.spec.task_id,
+                version=version,
+                approved=decision.approved,
+                by=decision.by,
+            ),
+        )
+        state.plan_approved = decision.approved
+        if asked and lifecycle.is_github_task(state.spec):
+            await self._label(lifecycle.on_plan_decided(state.spec, version))
+        return decision
+
+    async def _ask_for_review(self, version: int) -> None:
+        """Put the needs-human label on the issue and say how to answer. A local task has none."""
+        spec = self.state.spec
+        if not lifecycle.is_github_task(spec):
+            return
+        await self._label(lifecycle.on_plan_review(spec, version))
+        await self._call(
+            acts.POST_COMMENT,
+            lifecycle.plan_review_comment(spec, version, hours=acts.HINT_WAIT_HOURS),
+        )
+
+    async def _decision(self) -> PlanDecision | None:
+        """Take the decision a person sent, waiting for it if none has arrived yet.
+
+        None means the wait ran out. A decision that is already there is taken without a timer, so
+        an approval sent during planning costs the history nothing. The decision is cleared when
+        it is taken: it applies to one version.
+        """
+        self._stop_if_cancelled()
+        if self.plan_decision is None:
+            try:
+                await workflow.wait_condition(
+                    lambda: self.plan_decision is not None or self.cancel_request is not None,
+                    timeout=acts.hint_wait(),
+                )
+            except TimeoutError:
+                self._stop_if_cancelled()
+                return None
+            self._stop_if_cancelled()
+        decision, self.plan_decision = self.plan_decision, None
+        return decision
 
     # ---------- the coding phase ----------
     async def _code(self) -> Outcome:
@@ -849,15 +1482,14 @@ class TaskWorkflow:
             return await self._idle_turn(index, sampled)
 
         self.idle = 0
-        finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
+        # Kept for the transcript if a later call loses the sandbox, and for the stuck detector.
+        finished: list[ToolResult] = []
 
         async def run(call: acts.ToolCallSummary) -> ToolResult:
-            result = await self._run_tool(index, call)
-            finished.append(result)
-            return result
+            return await self._run_tool(index, call)
 
         try:
-            ran = await rules.run_calls(calls, run)
+            ran = await self._run_calls(index, calls, run, finished)
         except _SandboxLost as lost:
             return await self._end_lost(index, sampled.transcript_ref, calls, finished, lost)
         # The transcript lives in the blob store, so an activity answers the calls. It answers
@@ -875,16 +1507,411 @@ class TaskWorkflow:
         )
         state.turn_index = index + 1
         if ran.finish is not None:
-            return self._finish(rules.finished(ran.finish))
+            if not ran.review:
+                return self._finish(rules.finished(ran.finish))
+            ended = await self._verify(ran.finish)
+            if ended is None:  # sent back: the coder goes on, as after any other turn
+                await self._relieve(index, sampled.context_decision)
+            return ended
+        stuck_now: StuckSignal | None
+        if ran.question is not None:
+            stuck_now = StuckSignal(reason=StuckReason.AGENT_ASKED, evidence=[ran.question])
+        else:
+            stuck_now = await self._watch(index, calls, ran.results, finished)
+        if stuck_now is not None:
+            ended = await self._pause(stuck_now)
+            if ended is not None:
+                return ended
         await self._relieve(index, sampled.context_decision)
         return None
+
+    async def _run_calls(
+        self,
+        index: int,
+        calls: list[acts.ToolCallSummary],
+        run: Callable[[acts.ToolCallSummary], Awaitable[ToolResult]],
+        finished: list[ToolResult],
+    ) -> _Ran:
+        """Run the calls of a coder turn by the rules of its kind: with a plan, or without.
+
+        `finished` collects the answer of every call as it is made, so that a sandbox lost for good
+        in the middle of the turn (`_end_lost`) still has the answers of the calls before it. For a
+        task with a plan that includes a step update, which has already changed the plan.
+        """
+        if self.state.plan is None:
+
+            async def kept(call: acts.ToolCallSummary) -> ToolResult:
+                result = await run(call)
+                finished.append(result)
+                return result
+
+            plain = await rules.run_calls(calls, kept)
+            return _Ran(plain.results, plain.finish)
+
+        async def update(change: coder.StepUpdate) -> None:
+            await self._update_step(index, change)
+
+        planned = await coder.run_calls(calls, run, update, self._plan_now, answered=finished)
+        return _Ran(planned.results, planned.submitted, planned.question, planned.review)
+
+    def _plan_now(self) -> Plan:
+        plan = self.state.plan
+        if plan is None:
+            raise ApplicationError("the task has no plan to update", non_retryable=True)
+        return plan
+
+    async def _update_step(self, index: int, change: coder.StepUpdate) -> None:
+        """Record one step update, and then put the new status in the plan.
+
+        The record comes first, so that `status()` and the next prompt never show a step as done
+        before the checkpoint of its work is saved. A retry of the activity writes the same rows.
+        """
+        state = self.state
+        plan = self._plan_now()
+        if state.head_sha is None:
+            # prepare_workspace sets it before the first turn. Asking again changes nothing.
+            raise ApplicationError(
+                "a step cannot be recorded: the run has no checkpoint", non_retryable=True
+            )
+        await self._call(
+            acts.RECORD_STEP,
+            acts.RecordStepInput(
+                task_id=state.spec.task_id,
+                step_id=change.step_id,
+                status=change.status,
+                note=change.note,
+                head_sha=state.head_sha,
+                turn_index=index,
+            ),
+        )
+        state.plan = coder.with_status(plan, change)
+
+    async def _watch(
+        self,
+        index: int,
+        calls: list[acts.ToolCallSummary],
+        results: list[ToolResult],
+        ran: Sequence[ToolResult],
+    ) -> StuckSignal | None:
+        """Show the turn to the stuck detector, and record a signal that it gives (LH-505).
+
+        `results` are the results of every call of the turn, and `ran` the answers made as the
+        calls ran. The ones tool_exec made carry the facts, and a step update's answer has none.
+        The window is written back to the state before the event, so a hand-over right after it
+        carries the window. The signal that is returned is what `_pause` acts on.
+        """
+        state = self.state
+        done = sum(1 for step in state.plan.steps if step.status == "done") if state.plan else 0
+        facts = [
+            r.signal for r in ran if isinstance(r, acts.ToolExecResult) and r.signal is not None
+        ]
+        signal, notes = stuck.read_turn(index, done, facts, results, {c.id: c.name for c in calls})
+        detector = stuck.StuckDetector(stuck.DEFAULT_LIMITS, state.stuck_window)
+        found = detector.observe(signal, notes, phase=state.phase)
+        state.stuck_window = detector.window
+        if found is not None:
+            await self._note(
+                STUCK_EVENT,
+                {
+                    "reason": found.reason.value,
+                    "evidence": found.evidence,
+                    "turn_index": index,
+                },
+            )
+        return found
+
+    # ---------- the verifying phase ----------
+    async def _verify(self, summary: str) -> Outcome | None:
+        """Check the work the coder submitted. Returns None when the coder is sent back to fix it.
+
+        Phase VERIFYING. The pre-check and the diff come first (`_gather`), then a verifier with a
+        transcript of its own reads them and gives a verdict (`_run_verifier`). The work passes only
+        when every command of the pre-check passed and the verdict passes (verifier.judge_review).
+        A pass ends the coding like `finish` did, with the counts of the verdict kept for the
+        pull request. A fail counts a round, and the coder is sent back with the issues, until the
+        rounds run out and the task ends as stuck with the last review as its evidence.
+
+        The coder's transcript and notes are set aside for the review and put back at the end,
+        whatever the end is, because the state has one transcript and the verifier needs a fresh
+        one.
+        """
+        state = self.state
+        plan = self._plan_now()
+        if self._out_of_turns():
+            # The verifier needs a turn, so no command of the pre-check could be used. Each one can
+            # take minutes, and the task ends the same way once the review has started.
+            return self._end(rules.turn_limit_outcome(), Phase.FAILED)
+        state.phase = Phase.VERIFYING
+        number = state.verify_rounds + 1
+        coder_view = (state.transcript_ref, state.notes)
+        try:
+            brief = await self._gather(number, plan)
+            if isinstance(brief, Outcome):
+                return brief
+            got = await self._run_verifier(plan, brief)
+        finally:
+            state.transcript_ref, state.notes = coder_view
+        if isinstance(got, Outcome):
+            return got
+        review = verifier.judge_review(brief.checks, got)
+        await self._note(
+            VERDICT_EVENT,
+            {**verifier.verdict_event(number, review), "turn_index": state.turn_index},
+        )
+        if review.passed:
+            # With no command in the pre-check the counts are the model's word only. The work may
+            # pass, but the pull request stays a draft and does not say it was verified.
+            self.verified_tests = review.tests_summary if brief.checks else None
+            return self._finish(rules.finished(summary))
+        state.verify_rounds += 1
+        if state.verify_rounds >= acts.MAX_VERIFY_ROUNDS:
+            return self._end(verifier.stuck_outcome(state.verify_rounds, review), Phase.FAILED)
+        await self._send_back(review)
+        return None
+
+    async def _gather(self, number: int, plan: Plan) -> acts.ReviewBrief | Outcome:
+        """Run the pre-check and take the diff, all read-only, before the verifier reads anything.
+
+        The commands are the test command of the repo and the acceptance commands of the plan
+        (verifier.precheck_commands), one after another, so a command that changes a file cannot
+        change what the next one sees: the tree is put back after each. They belong to no model
+        turn, so they carry the index of the verifier's first turn, which only says where their
+        output blobs are kept. A sandbox that is lost for good ends the run.
+        """
+        state = self.state
+        index = state.turn_index
+        checks: list[acts.CheckRun] = []
+        try:
+            for command in verifier.precheck_commands(
+                plan, state.spec.settings.test_command, state.spec.task_id, number
+            ):
+                call = acts.ToolCallSummary(
+                    id=command.call_id, name=command.tool, input=command.arguments
+                )
+                result = await self._run_tool(index, call, read_only=True)
+                # A command that did not finish has no exit code worth reading.
+                exit_code = result.exit_code if result.ok else None
+                checks.append(
+                    acts.CheckRun(
+                        command=command.label,
+                        call_id=command.call_id,
+                        passed=exit_code == 0,
+                        exit_code=exit_code,
+                        output_ref=result.output_ref,
+                    )
+                )
+            diff_id = verifier.diff_call_id(state.spec.task_id, number)
+            diff_call = acts.ToolCallSummary(id=diff_id, name=verifier.GIT_DIFF, input={})
+            diff = await self._run_tool(index, diff_call, read_only=True)
+        except _SandboxLost:
+            return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
+        shown = acts.CheckRun(
+            command=verifier.GIT_DIFF, call_id=diff_id, passed=diff.ok, output_ref=diff.output_ref
+        )
+        return acts.ReviewBrief(checks=checks, diff=shown)
+
+    async def _run_verifier(self, plan: Plan, brief: acts.ReviewBrief) -> VerifierVerdict | Outcome:
+        """Run the verifier until it submits a verdict. An outcome means the task ends here.
+
+        The verifier has a transcript of its own, so it starts from none and keeps no notes. An
+        invalid verdict gets one repair turn (F14), and a second one ends the task with ERROR
+        "verifier submitted an invalid verdict twice: ...". A verifier that has not submitted after
+        verifier.MAX_TURNS turns ends it with ERROR "verifier submitted no verdict in 15 turns".
+        The turn budget of the task applies to these turns as to any other.
+        """
+        state = self.state
+        state.transcript_ref = None
+        state.notes = None
+        failures = 0  # verdicts that were not valid so far, for the one repair turn
+        idle = 0  # replies in a row that ended without a tool call
+        for _ in range(verifier.MAX_TURNS):
+            if self._out_of_turns():
+                return self._end(rules.turn_limit_outcome(), Phase.FAILED)
+            index = state.turn_index
+            sampled = await self._sample(index, Role.VERIFIER, review=brief)
+            if isinstance(sampled, Outcome):
+                state.turn_index = index + 1
+                return self._end(sampled, Phase.FAILED)
+            calls = rules.runnable_calls(sampled, sampled.tool_call_summaries)
+            if not calls:
+                verdict = rules.idle_turn(idle)
+                idle = verdict.count
+                ended = await self._idle_read_only(
+                    index, sampled, verdict, Role.VERIFIER, verifier.NUDGE
+                )
+                if ended is not None:
+                    return ended
+                continue
+
+            idle = 0
+            ran = await self._verifier_calls(index, sampled, calls, failures, plan)
+            if isinstance(ran, Outcome):
+                return ran  # the sandbox was lost for good
+            failures = ran.failures
+            if ran.outcome is not None:
+                return self._end(ran.outcome, Phase.FAILED)
+            if ran.verdict is not None:
+                return ran.verdict
+            await self._relieve(index, sampled.context_decision, Role.VERIFIER)
+        return self._end(verifier.no_verdict_outcome(verifier.MAX_TURNS), Phase.FAILED)
+
+    async def _verifier_calls(
+        self,
+        index: int,
+        reply: acts.LlmTurnOutput,
+        calls: list[acts.ToolCallSummary],
+        failures: int,
+        plan: Plan,
+    ) -> verifier.VerdictCalls | Outcome:
+        """Run the calls of one verifier turn, read-only, and answer them all in the transcript."""
+        return await self._read_only_calls(
+            index, reply, calls, lambda run: verifier.run_calls(calls, run, plan, failures)
+        )
+
+    async def _send_back(self, review: verifier.Review) -> None:
+        """Tell the coder what the review found, as a user message at the end of its transcript.
+
+        The message goes after the answers to the coder's last calls, where the API takes text
+        from the harness (the nudge goes there too). It takes a turn index of its own: the log of
+        the task has one part of results for each turn (context/log.py), and the coder's next
+        turn would write over this one if they shared an index. The coder then goes on in the
+        phase CODING, with the plan and the transcript it had.
+        """
+        state = self.state
+        if state.transcript_ref is None:
+            # The coder has made a turn to get here. Asking again changes nothing.
+            raise ApplicationError(
+                "the coder has no transcript to be sent back to", non_retryable=True
+            )
+        index = state.turn_index
+        state.transcript_ref = await self._call(
+            acts.APPEND_RESULTS,
+            acts.AppendResultsInput(
+                task_id=state.spec.task_id,
+                turn_index=index,
+                transcript_ref=state.transcript_ref,
+                results=[],
+                user_text=verifier.coder_message(review),
+                window_tokens=self._window(),
+            ),
+        )
+        state.turn_index = index + 1
+        state.phase = Phase.CODING
+
+    # ---------- the pause for a hint ----------
+    async def _pause(self, signal: StuckSignal) -> Outcome | None:
+        """Ask a person for help and wait. None when the task is unblocked and goes on.
+
+        An outcome means the task ends here: it has had all its pauses, or nobody answered in
+        time. A cancel during the wait unwinds to the cancel path.
+        """
+        state = self.state
+        if not workflow.patched(PAUSE_PATCH):
+            return await self._asked_before_the_pause(signal)
+        if state.stuck_count >= stuck.MAX_PAUSES:
+            return self._end(stuck.pauses_used_outcome(signal), Phase.FAILED)
+        pause = state.stuck_count + 1
+        wait = acts.hint_wait(self._tuning())
+        # Counted before the first await. A hint that arrives while the question is written is
+        # then an answer to it, and one that came before it answered nothing yet.
+        seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
+        state.phase = Phase.PAUSED
+        self.paused_reason = f"waiting for a hint after {signal.reason.value.replace('_', ' ')}"
+        await self._ask(signal, pause)
+        try:
+            await workflow.wait_condition(
+                lambda: self._answered(seen) is not None or self.cancel_request is not None,
+                timeout=wait,
+            )
+        except TimeoutError:
+            self._stop_if_cancelled()
+            return self._end(stuck.unanswered_outcome(signal, wait), Phase.FAILED)
+        self._stop_if_cancelled()
+        await self._resume(pause, seen)
+        return None
+
+    async def _asked_before_the_pause(self, signal: StuckSignal) -> Outcome | None:
+        """What a run did before the pause existed, for the histories that recorded it.
+
+        A stuck signal had only been recorded, and `ask_human` recorded the question and ended
+        the task as stuck in phase PAUSED.
+        """
+        if signal.reason is not StuckReason.AGENT_ASKED:
+            return None
+        question = signal.evidence[0]
+        await self._note(
+            PAUSED_EVENT,
+            {"reason": ASKED_REASON, "question": question, "turn_index": self.state.turn_index},
+        )
+        return self._end(coder.asked_outcome(question), Phase.PAUSED)
+
+    async def _ask(self, signal: StuckSignal, pause: int) -> None:
+        """Write the question and show it: on the issue, or in the event of a local task."""
+        state = self.state
+        spec = state.spec
+        asked = await self._call(
+            acts.SUMMARIZE_FOR_HUMAN,
+            acts.SummarizeInput(
+                task_id=spec.task_id,
+                turn_index=max(state.turn_index - 1, 0),
+                spec=spec,
+                transcript_ref=state.transcript_ref,
+                notes=state.notes,
+                reason=signal.reason,
+                evidence=signal.evidence,
+                pause=pause,
+                script_ref=self._script(),
+            ),
+        )
+        state.cost_usd += asked.cost_usd
+        payload: dict[str, Any] = {
+            "reason": signal.reason.value,
+            "pause": pause,
+            "question": asked.question,
+            "turn_index": state.turn_index,
+        }
+        if lifecycle.is_github_task(spec):
+            await self._call(acts.POST_COMMENT, lifecycle.stuck_comment(spec, pause, asked.comment))
+            await self._needs_human(pause)
+        else:
+            payload["comment"] = asked.comment
+        # The event comes last, so that whoever sees it can rely on the comment and the label.
+        await self._note(PAUSED_EVENT, payload)
+
+    def _answered(self, seen: _Unanswered) -> str | None:
+        """How the pause was answered since `seen`: by a hint, by a budget top-up, or not yet."""
+        state = self.state
+        if len(state.hints) > seen.hints:
+            return HINT_VIA
+        if state.extra_budget_usd > seen.usd or state.extra_turns > seen.turns:
+            return BUDGET_VIA
+        return None
+
+    async def _resume(self, pause: int, seen: _Unanswered) -> None:
+        """Go back to coding from a clean slate.
+
+        The hint is already in `state.hints`, and the next llm_turn shows it to the model. The
+        detector starts again from an empty window, so a pattern that goes on builds up from
+        nothing, and `stuck_count` counts the pause as spent.
+        """
+        state = self.state
+        via = self._answered(seen)
+        payload: dict[str, Any] = {"pause": pause, "via": via, "turn_index": state.turn_index}
+        if via == HINT_VIA:
+            payload["by"] = state.hints[seen.hints].split(": ", 1)[0]
+        state.stuck_count += 1
+        state.stuck_window = []
+        state.phase = Phase.CODING
+        self.paused_reason = None
+        await self._human_done(pause)
+        await self._note(RESUMED_EVENT, payload)
 
     async def _end_lost(
         self,
         index: int,
         transcript_ref: BlobRef,
         calls: list[acts.ToolCallSummary],
-        finished: list[ToolResult],
+        finished: Sequence[ToolResult],
         lost: _SandboxLost,
     ) -> Outcome:
         """End the run for a sandbox that keeps dying, with every call of the turn answered.
@@ -917,8 +1944,19 @@ class TaskWorkflow:
         state.turn_index = index + 1
         return self._end(rules.error(SANDBOX_LOST), Phase.FAILED)
 
-    async def _sample(self, index: int, role: Role = Role.CODER) -> acts.LlmTurnOutput | Outcome:
+    def _hints_for(self, role: Role) -> list[str]:
+        """The hints a model turn is given: the task's, and for the planner the rejections too."""
+        hints = list(self.state.hints)
+        if role is Role.PLANNER:
+            hints.extend(self.revision_hints)
+        return hints
+
+    async def _sample(
+        self, index: int, role: Role = Role.CODER, review: acts.ReviewBrief | None = None
+    ) -> acts.LlmTurnOutput | Outcome:
         """Call the model until one reply can be used, or the run has to end (D8, D9).
+
+        `review` is for the verifier: what its first message is built from.
 
         A prompt that is over the window is compacted down to the last two turns, and the turn
         is asked once more (F6). It is asked again only if the compaction changed the view. A
@@ -941,12 +1979,13 @@ class TaskWorkflow:
                         notes=state.notes,
                         plan=state.plan,
                         memory_ref=state.memory_ref,
-                        hints=list(state.hints),
+                        hints=self._hints_for(role),
                         high_output_cap=sampling.retried,
                         paused_ref=paused_ref,
                         script_ref=self._script(),
                         window_tokens=self._window(),
                         context_mode=self._context_mode(),
+                        review=review,
                     ),
                 )
             except ActivityError as err:
@@ -1046,7 +2085,8 @@ class TaskWorkflow:
                 turn_index=index,
                 transcript_ref=reply.transcript_ref,
                 results=[],
-                user_text=rules.NUDGE,
+                # The coder of a plan is not offered `finish`, so it is sent to its own tool.
+                user_text=rules.NUDGE if state.plan is None else coder.NUDGE,
                 window_tokens=self._window(),
             ),
         )
@@ -1056,7 +2096,7 @@ class TaskWorkflow:
 
     async def _run_tool(
         self, index: int, call: acts.ToolCallSummary, *, read_only: bool = False
-    ) -> ToolResult:
+    ) -> acts.ToolExecResult:
         """Run one tool call. `read_only` is for the planning phase: the tree is put back after."""
         state = self.state
         recreated = 0
@@ -1103,7 +2143,11 @@ class TaskWorkflow:
         return self._end(finished, Phase.DONE)
 
     async def _deliver(self, finished: Outcome) -> Outcome:
-        """Open the draft pull request and move the label. Ends the task with its URL."""
+        """Open the pull request and move the label. Ends the task with its URL.
+
+        The pull request is ready for review when a verifier passed the work and a command of the
+        pre-check backed it, and a draft otherwise (`verified_tests`, set by `_verify`).
+        """
         state = self.state
         issue = state.spec.issue_number
         base_sha = state.spec.base_sha
@@ -1123,6 +2167,7 @@ class TaskWorkflow:
                     summary=finished.summary,
                     base_sha=base_sha,
                     head_sha=state.head_sha,
+                    plan=state.plan,
                 ),
             )
         except ActivityError as err:
@@ -1141,6 +2186,7 @@ class TaskWorkflow:
                 base_sha=built.base_sha,
                 head_sha=built.head_sha,
                 title=built.title,
+                verified_tests=self.verified_tests,
             ),
         )
         await self._label(lifecycle.on_pr_opened(state.spec))
@@ -1153,7 +2199,7 @@ class TaskWorkflow:
             await self._call(acts.ADD_LABEL if step.add else acts.REMOVE_LABEL, step.label)
 
     async def _needs_human(self, pause: int) -> None:
-        """Ask for a person on the issue. For the pause of Phases 5 and 7: `pause` counts from 1."""
+        """Ask for a person on the issue, for a pause (LH-506, Phase 7): `pause` counts from 1."""
         if lifecycle.is_github_task(self.state.spec):
             await self._label(lifecycle.on_pause(self.state.spec, pause))
 
@@ -1167,6 +2213,16 @@ class TaskWorkflow:
         request = self.cancel_request
         if request is None:
             raise ApplicationError("cancel path without a cancel request", non_retryable=True)
+        if not workflow.patched(OUTCOME_PATCH):
+            await self._clean_up_after_cancel(request)
+        # The sandbox of a cancelled task is destroyed with that of every other end, in _wind_up.
+        outcome = Outcome(
+            kind=OutcomeKind.CANCELLED, summary=cancel_summary(request.by, request.reason)
+        )
+        return self._end(outcome, Phase.CANCELLED)
+
+    async def _clean_up_after_cancel(self, request: CancelRequest) -> None:
+        """What a cancel did before LH-507, for the histories that recorded it."""
         # Cleanup is not run through _call: a second cancel must not interrupt it.
         try:
             await workflow.execute_activity(
@@ -1184,10 +2240,6 @@ class TaskWorkflow:
             # running, so the failure is logged and the run still ends as cancelled. The cause
             # is what says why; the error itself only says that the activity failed.
             workflow.logger.warning("cleanup after a cancel failed: %s", err.cause or err)
-        outcome = Outcome(
-            kind=OutcomeKind.CANCELLED, summary=cancel_summary(request.by, request.reason)
-        )
-        return self._end(outcome, Phase.CANCELLED)
 
     # ---------- helpers ----------
     async def _call[In, Out](self, act: acts.Act[In, Out], arg: In) -> Out:
@@ -1270,5 +2322,6 @@ class TaskWorkflow:
 
     def _end(self, outcome: Outcome, phase: Phase) -> Outcome:
         self.state.phase = phase
+        self.paused_reason = None
         self.outcome = outcome
         return outcome

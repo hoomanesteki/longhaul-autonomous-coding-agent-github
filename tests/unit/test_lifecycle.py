@@ -218,3 +218,148 @@ def test_whatever_the_login_the_denial_key_is_a_valid_key(login: str) -> None:
 
     workflow_id, purpose, seq = key.split(":")
     assert effect_key(workflow_id, purpose, int(seq)) == key
+
+
+# ---------- LH-502: the plan gate ----------
+def test_waiting_for_a_plan_decision_adds_needs_human_and_deciding_removes_it() -> None:
+    (waiting,) = lifecycle.on_plan_review(spec(), 1)
+    (decided,) = lifecycle.on_plan_decided(spec(), 1)
+
+    assert (waiting.add, waiting.label.label) == (True, "longhaul:needs-human")
+    assert (decided.add, decided.label.label) == (False, "longhaul:needs-human")
+    assert (waiting.label.number, decided.label.number) == (42, 42)
+
+
+def test_the_plan_gate_keys_cannot_meet_the_keys_of_a_pause() -> None:
+    # A later pause counts from 1 and adds the same label. If its key matched the one of the
+    # first plan review, the ledger would call the write done and the label would never be set.
+    s = spec()
+    gate = [*lifecycle.on_plan_review(s, 1), *lifecycle.on_plan_decided(s, 1)]
+    pause = [*lifecycle.on_pause(s, 1), *lifecycle.on_resume(s, 1)]
+    gate_keys = {step.label.idempotency_key for step in gate}
+    pause_keys = {step.label.idempotency_key for step in pause}
+    assert gate_keys.isdisjoint(pause_keys)
+
+
+def test_each_version_of_the_plan_has_review_keys_of_its_own() -> None:
+    s = spec()
+    first, second = lifecycle.on_plan_review(s, 1)[0], lifecycle.on_plan_review(s, 2)[0]
+    assert first.label.idempotency_key == effect_key("lh-acme-calc-42", "label_plan_review_on", 1)
+    assert first.label.idempotency_key != second.label.idempotency_key
+    assert lifecycle.on_plan_decided(s, 1)[0].label.idempotency_key == effect_key(
+        "lh-acme-calc-42", "label_plan_review_off", 1
+    )
+    assert lifecycle.on_plan_decided(s, 1)[0].label.idempotency_key != (
+        lifecycle.on_plan_decided(s, 2)[0].label.idempotency_key
+    )
+
+
+def test_the_review_comment_tells_the_maintainer_how_to_answer() -> None:
+    comment = lifecycle.plan_review_comment(spec(), 2, hours=24)
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert "version 2" in comment.body
+    assert "/longhaul approve" in comment.body
+    assert "/longhaul reject <feedback>" in comment.body
+    assert "24 hours" in comment.body
+    assert not has_marker(comment.body)
+    assert comment.idempotency_key == effect_key("lh-acme-calc-42", "plan_review", 2)
+
+
+def test_the_review_comment_does_not_start_with_a_command() -> None:
+    # The poller reads the first line of a comment. A comment of ours has the marker and is
+    # dropped anyway, but the text must not be able to pass for an order if it is quoted.
+    body = lifecycle.plan_review_comment(spec(), 1, hours=24).body
+    assert not body.lstrip().lower().startswith("/longhaul")
+
+
+def test_every_plan_gate_key_is_valid_and_distinct() -> None:
+    s = spec()
+    keys = [
+        *(step.label.idempotency_key for step in lifecycle.on_plan_review(s, 1)),
+        *(step.label.idempotency_key for step in lifecycle.on_plan_decided(s, 1)),
+        lifecycle.plan_review_comment(s, 1, hours=24).idempotency_key,
+    ]
+    assert len(set(keys)) == len(keys)
+    for key in keys:
+        workflow_id, purpose, seq = key.split(":")
+        assert effect_key(workflow_id, purpose, int(seq)) == key
+
+
+# ---------- LH-506: the pause for a hint ----------
+def test_each_pause_has_a_question_key_of_its_own() -> None:
+    first = lifecycle.stuck_comment(spec(), 1, "the question")
+    second = lifecycle.stuck_comment(spec(), 2, "the question")
+
+    assert (first.task_id, first.repo, first.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert first.body == "the question"
+    assert first.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 1)
+    assert second.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 2)
+    assert not has_marker(first.body), "the marker is added by post_comment"
+
+
+# ---------- LH-507: the labels a task ends with ----------
+def ending(kind: OutcomeKind, *, draft: bool = False) -> list[tuple[bool, str]]:
+    steps = lifecycle.on_end(spec(), kind, pr_opened=draft)
+    return [(step.add, step.label.label) for step in steps]
+
+
+def test_a_task_that_opened_its_pull_request_has_its_labels_already() -> None:
+    # on_pr_opened ran when the pull request opened, with the same keys.
+    assert ending(OutcomeKind.PR_OPENED) == []
+
+
+@pytest.mark.parametrize("kind", [OutcomeKind.STUCK, OutcomeKind.BUDGET_EXHAUSTED])
+def test_a_task_that_gave_up_asks_for_a_person(kind: OutcomeKind) -> None:
+    assert ending(kind) == [(False, lifecycle.WORKING), (True, lifecycle.NEEDS_HUMAN)]
+
+
+def test_a_stuck_task_with_a_partial_draft_also_shows_the_pull_request() -> None:
+    assert ending(OutcomeKind.STUCK, draft=True) == [
+        (False, lifecycle.WORKING),
+        (True, lifecycle.NEEDS_HUMAN),
+        (True, lifecycle.PR_OPEN),
+    ]
+
+
+def test_a_task_that_failed_asks_for_a_person() -> None:
+    assert ending(OutcomeKind.ERROR) == [(False, lifecycle.WORKING), (True, lifecycle.NEEDS_HUMAN)]
+
+
+def test_a_cancelled_task_asks_for_nobody() -> None:
+    # A task that was paused when it was cancelled still carries needs-human.
+    assert ending(OutcomeKind.CANCELLED) == [
+        (False, lifecycle.WORKING),
+        (False, lifecycle.NEEDS_HUMAN),
+    ]
+
+
+def test_the_working_label_comes_off_with_the_key_it_always_had() -> None:
+    # The label was taken off when the pull request opened, so a task that ends later asks the
+    # ledger for the same write and gets the answer it recorded.
+    (first, *_) = lifecycle.on_end(spec(), OutcomeKind.STUCK, pr_opened=False)
+    (swap, *_) = lifecycle.on_pr_opened(spec())
+    assert first.label.idempotency_key == swap.label.idempotency_key
+
+
+def test_every_ending_label_key_is_valid_and_distinct() -> None:
+    keys = [
+        step.label.idempotency_key
+        for kind in OutcomeKind
+        for step in lifecycle.on_end(spec(), kind, pr_opened=True)
+    ]
+    for key in set(keys):
+        workflow_id, purpose, seq = key.split(":")
+        assert effect_key(workflow_id, purpose, int(seq)) == key
+    # needs-human on and off must not share a key, or the second write would be skipped.
+    on = lifecycle.on_end(spec(), OutcomeKind.STUCK, pr_opened=False)[1].label.idempotency_key
+    off = lifecycle.on_end(spec(), OutcomeKind.CANCELLED, pr_opened=False)[1].label.idempotency_key
+    assert on != off
+
+
+def test_the_final_comment_is_on_the_issue_under_one_key() -> None:
+    comment = lifecycle.final_comment(spec(), "the report")
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert comment.body == "the report"
+    assert comment.idempotency_key == effect_key("lh-acme-calc-42", "final", 1)

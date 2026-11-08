@@ -4,10 +4,14 @@ The plan puts these in durable/activities/github.py. That module holds the polle
 the delivery has a file of its own.
 
 `build_pr_branch` runs on the host, from the task's bare repo. It reads the default branch from
-the API, titles one commit with the summary the agent gave to `finish`, and makes the branch
-`longhaul-pr/<n>` with one commit on top of the base (checkpoints/squash.py). The base is the sha
-that the workflow handed over, not the `base` tag of the repo, which the sandbox can move. It
-pushes nothing.
+the API, titles the commits, and makes the branch `longhaul-pr/<n>` on top of the base
+(checkpoints/squash.py). A task without a plan gets one commit, titled with the summary the agent
+gave to `finish`. A task with a plan (LH-503) gets one commit for each step that is done, titled
+from the step's description, and one for the work after the last step, titled from the summary.
+The workflow hands over the plan with the status of each step, and the checkpoints that the steps
+left are read from the `checkpoints` table, because the sha of a checkpoint is not in the state.
+The pull request keeps the title of the summary either way. The base is the sha that the workflow
+handed over, not the `base` tag of the repo, which the sandbox can move. It pushes nothing.
 The branch is the same commit on every attempt, so a retry changes nothing.
 
 `deliver` takes that branch to GitHub in two steps, both through the idempotency ledger of
@@ -17,16 +21,22 @@ github/side_effects.py and both safe to run again:
    signs in with the token on the command line of that one git process, so the sandbox never sees
    it (ADR-0009). The push has a ledger row of its own (`push`, key `<task>:push:1`), which keeps
    the audit trail whole and lets a retry skip the push once it has landed.
-2. **Pull request.** `create_pr`, the plain function and not the activity, opens a draft with key
-   `<task>:pr:1`. It returns the URL of an open pull request from the same branch instead of
-   opening a second one, even when the ledger was lost. The request is a draft until a verifier
-   has passed the work (Phase 5).
+2. **Pull request.** `create_pr`, the plain function and not the activity, opens the pull request
+   with key `<task>:pr:1`. It returns the URL of an open pull request from the same branch instead
+   of opening a second one, even when the ledger was lost. The request is a draft unless a verifier
+   passed the work (LH-504): then `DeliverInput.verified_tests` holds its counts, the request is
+   ready for review, and the body says "Verified: <counts>".
 
 The body is built here, and not in the workflow, from what only the worker can read: the diff of
 the branch, and the `tool_calls` row and output blob of the last `run_tests` call. It is the same
 bytes on every attempt (github/pr_body.py), because `create_pr` refuses a reused key with other
 text. Everything it needs is fixed in the input of the activity or in rows that no longer change
 once the task has finished.
+
+The body also carries the run report of the task (LH-705, reports/render.py), inside a `<details>`
+block. The report is stored the first time it is built and read back on every later attempt
+(durable/activities/report.py), so the retried body is the same bytes even if the tables have
+grown. A worker built without a report source opens the pull request without one.
 
 Failures. A GitHub error is retryable or not as the client classified it (support.github_failure).
 A request that no retry can fix, such as a key used for another effect, a bad name or a template
@@ -52,14 +62,17 @@ from longhaul.checkpoints.push import ForbiddenBranchError, push_branch
 from longhaul.checkpoints.squash import (
     Group,
     NothingToDeliverError,
+    StepEnd,
     build_pr_branch,
     commit_subject,
     file_stats,
+    group_by_step,
     parse_author,
     pr_branch_name,
     repo_scope,
 )
-from longhaul.db.records import ToolCallRecord
+from longhaul.contracts import OutcomeKind
+from longhaul.db.records import CheckpointRecord, ToolCallRecord
 from longhaul.durable import acts
 from longhaul.durable.activities.support import github_failure, heartbeating, not_retried, small
 from longhaul.github.client import GitHubClient, GitHubError
@@ -87,11 +100,19 @@ TESTS_TOOL = "run_tests"
 
 
 class DeliveryRecords(Protocol):
-    """The part of the recorder that these activities use: one event written, one row read."""
+    """The part of the recorder that these activities use: one event written, rows read."""
 
     async def record_event(self, task_id: str, type: str, payload: dict[str, Any]) -> None: ...
 
     async def last_tool_call(self, task_id: str, name: str) -> ToolCallRecord | None: ...
+
+    async def step_checkpoints(self, task_id: str) -> list[CheckpointRecord]: ...
+
+
+class ReportSource(Protocol):
+    """Where deliver gets the run report of a task: RunReports, or a fake in a test."""
+
+    async def stored_or_new(self, task_id: str, *, outcome: str | None = None) -> str: ...
 
 
 class DeliveryActivities:
@@ -116,6 +137,7 @@ class DeliveryActivities:
         *,
         author: str,
         templates: Path,
+        reports: ReportSource | None = None,
     ) -> None:
         parse_author(author)
         self._store = store
@@ -126,6 +148,7 @@ class DeliveryActivities:
         self._blobs = blobs
         self._author = author
         self._templates = templates
+        self._reports = reports
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -145,7 +168,7 @@ class DeliveryActivities:
             )
             built = await build_pr_branch(
                 inp.task_id,
-                [Group(title, inp.head_sha)],
+                await self._groups(inp, title),
                 base_sha=inp.base_sha,
                 store=self._store,
                 default_branch=default_branch,
@@ -168,6 +191,23 @@ class DeliveryActivities:
                 base_branch=default_branch,
                 title=title,
             )
+        )
+
+    async def _groups(self, inp: acts.BuildPrBranchInput, title: str) -> list[Group]:
+        """The commits of the branch: one for the whole task, or one for each done step.
+
+        A task without a plan never reads the table.
+        """
+        if inp.plan is None:
+            return [Group(title, inp.head_sha)]
+        rows = await self._records.step_checkpoints(inp.task_id)
+        return group_by_step(
+            inp.plan,
+            [StepEnd(row.step_id, row.sha) for row in rows if row.step_id is not None],
+            summary=inp.summary,
+            head_sha=inp.head_sha,
+            scope=repo_scope(inp.repo),
+            fallback=FALLBACK_DESCRIPTION,
         )
 
     # ---------- deliver ----------
@@ -225,7 +265,14 @@ class DeliveryActivities:
         files = await file_stats(inp.task_id, inp.base_sha, inp.head_sha, store=self._store)
         tests = await self._last_tests(inp.task_id)
         body = render_pr_body(
-            inp.issue_number, inp.summary, files, tests, templates=self._templates
+            inp.issue_number,
+            inp.summary,
+            files,
+            tests,
+            templates=self._templates,
+            verified=inp.verified_tests,
+            partial=inp.partial,
+            report=await self._report(inp.task_id, partial=inp.partial),
         )
         return PullRequestInput(
             task_id=inp.task_id,
@@ -234,9 +281,30 @@ class DeliveryActivities:
             base=inp.base_branch,
             title=inp.title,
             body=body,
-            draft=True,  # until a verifier has passed the work (Phase 5)
+            draft=inp.verified_tests is None,  # ready for review only once a verifier passed it
             idempotency_key=effect_key(inp.task_id, "pr", 1),
         )
+
+    async def _report(self, task_id: str, *, partial: bool) -> str | None:
+        """The run report for the body, or None for a worker with no report source.
+
+        The outcome is `pr_opened` because this is the activity that opens the pull request and
+        the workflow records the outcome after it. The draft of a stuck task (`partial`, LH-507)
+        is opened in the wind-up of a task that ended `stuck`, before that outcome is recorded,
+        so its report says `stuck`. A task the database does not know has nothing
+        to report, and a retry would find the same, so the body goes without. So does a report
+        that cannot be built, for the same reason.
+        """
+        if self._reports is None:
+            return None
+        try:
+            kind = OutcomeKind.STUCK if partial else OutcomeKind.PR_OPENED
+            return await self._reports.stored_or_new(task_id, outcome=kind.value)
+        except (LookupError, ValueError, TemplateError) as exc:
+            # The report is optional. A folder of templates from before it, or a plan row that
+            # fails validation, must not stop a pull request whose branch is already pushed.
+            log.warning("no run report for task %s: %s", task_id, exc)
+            return None
 
     # ---------- what the body says about the tests ----------
     async def _last_tests(self, task_id: str) -> LastTestRun | None:

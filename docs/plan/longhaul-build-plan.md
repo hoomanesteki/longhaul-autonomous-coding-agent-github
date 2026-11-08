@@ -2505,7 +2505,7 @@ The review of LH-306 found the problems below before the Phase 3 gate. Each was 
     2. Post the comment (key `stuck:<n>`) and add `longhaul:needs-human`.
     3. Set phase `PAUSED` and wait for `hint`, `add_budget` or `cancel` with a timeout.
   - On `hint`:
-    1. Append a user message "Hint from @<user>: <text>".
+    1. Append a user message "Hint from @<user>: <text>". As built, the text has no `@` ("Hint from <user>: <text>"), the form that the hint tests since LH-308 and the console mirror ("Hint from console: ...") already use.
     2. Reset the detector window and remove the label.
     3. Record a `resumed` event. `stuck_count += 1`.
   - After 3 pauses, or on timeout, end with outcome `stuck`.
@@ -2558,6 +2558,23 @@ The review of LH-306 found the problems below before the Phase 3 gate. Each was 
 2. **Why does a failing pre-check override the model's verdict?** Tests are ground truth. The model reviews code quality and plan coverage; it doesn't get to decide that failing tests are fine.
 3. **How do you avoid false "stuck" alarms?** Each rule needs specific evidence (the same failing command hash, the same edited region, no test movement), and thresholds are config. Phase 9 reports the stuck rate and how often a hint actually unblocked the task.
 4. **Why roles in one workflow and not separate agents?** They share one sandbox and one workspace history. Separate child workflows would add handoffs and transcript plumbing without a benefit at this scale.
+
+
+### Phase 5 fix stories (from the gate)
+
+The first `make gate PHASE=5` and the independent gate review found the problems below. Each was reproduced with a failing test before it was fixed.
+
+#### LH-591 · Stuck evidence names the command, and the demo repo
+- **Epic:** E9 · **Points:** 1 · **Branch:** `fix/lh-591-phase5-gate` · **Depends on:** LH-504, LH-505
+- **Story:** As a maintainer, I want the stuck evidence to name the command that failed and the checkpoint smoke to find its repo, so that the Phase 5 gate holds on any machine.
+- **Build:**
+  - The evidence text of a failed command names the program, not its path (`python -m pytest -q`, not `/long/path/.venv/bin/python -m ...`), so the 80-character cut keeps what ran. The failure hash still uses the whole command.
+  - `config/longhaul.example.yaml` lists `hoomanesteki/lh-demo-inventory` with `plan_approval_required: true`, as Integration checkpoint 5 expects.
+- **Acceptance criteria:**
+  - [ ] The failing-run test passes from a checkout whose path is long.
+  - [ ] The example config has the repo that Integration checkpoint 5 labels.
+- **Tests:** `tests/unit/test_activities_tools.py::test_the_label_of_a_command_names_the_program_and_not_its_path`
+- **Files:** `src/longhaul/durable/activities/signals.py`, `config/longhaul.example.yaml`, tests
 
 ---
 

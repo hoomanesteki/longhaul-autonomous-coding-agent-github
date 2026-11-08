@@ -82,7 +82,9 @@ def github_clone_url(repo: str) -> str:
 def clone_url_under(base: str) -> Callable[[str], str]:
     """A clone address builder for a server that is not github.com: `<base>/<owner>/<name>.git`.
 
-    A GitHub Enterprise server has its own host, and a test points it at a folder of bare repos.
+    `base` is the address of a git server or a folder of bare repos. A GitHub Enterprise server
+    has its own host, a test points it at a folder, and the chaos suite uses a folder so a run can
+    push to a repo that sits on this machine (LH-904).
     """
     root = base.rstrip("/")
 

@@ -371,9 +371,14 @@ class Demo:
         polled = await client.execute_workflow(
             PollerWorkflow.run, id=f"lh-demo-poll-{uuid.uuid4().hex[:8]}", task_queue=self.queue
         )
+        # The ids come first: close() ends the workflows and removes the sandboxes by id, and a
+        # poll that started the wrong number of tasks still started some.
+        self.task_ids = await asyncio.to_thread(self.read_task_ids)
         if polled.started != len(SCENARIOS):
             raise DemoError(f"the poller started {polled.started} tasks, not {len(SCENARIOS)}")
-        self.task_ids = await asyncio.to_thread(self.read_task_ids)
+        missing = [s.key for s in SCENARIOS if s.key not in self.task_ids]
+        if missing:
+            raise DemoError(f"no task row for {', '.join(missing)}")
         log(f"started {', '.join(self.task_ids.values())}")
 
         async def reaches(key: str, phase: Phase) -> None:
@@ -383,7 +388,8 @@ class Demo:
                     status = await read_status(handle, timeout_s=10)
                 except RPCError:
                     # A query waits for a worker to replay the workflow, which takes a while
-                    # when three tasks start at once.
+                    # when three tasks start at once. A query that fails at once must not spin.
+                    await asyncio.sleep(1)
                     continue
                 if status.phase is phase:
                     return
@@ -416,7 +422,7 @@ class Demo:
         with psycopg.connect(self.database) as conn:
             found = conn.execute("SELECT repo, id FROM tasks").fetchall()
         rows = {str(repo): str(task_id) for repo, task_id in found}
-        return {s.key: str(rows[s.repo]) for s in SCENARIOS}
+        return {s.key: rows[s.repo] for s in SCENARIOS if s.repo in rows}
 
     async def seed_lessons(self) -> None:
         """Two candidates in the memory of the first repo, as a finished task would propose them."""

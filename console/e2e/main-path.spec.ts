@@ -2,7 +2,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 
 // What scripts/seed_demo.sh puts on the stack. tests/unit/test_console_e2e.py keeps these names
 // in step with the script, so a rename on one side fails a unit test and not this one.
-const TOKEN = process.env.LONGHAUL_ADMIN_TOKEN ?? "demo-admin-token";
+const TOKEN = process.env.LONGHAUL_ADMIN_TOKEN || "demo-admin-token";
 const SHIPPED = { title: "Fix add() so it sums", repo: "demo/calc-shipped" };
 const STUCK = { title: "Fix add() after a hint" };
 const PLAN = { title: "Fix add() after a plan review" };

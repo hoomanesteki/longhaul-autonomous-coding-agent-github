@@ -13,10 +13,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -101,7 +102,11 @@ def test_the_spec_approves_the_lessons_the_seed_makes(demo: ModuleType) -> None:
 
 
 def test_the_spec_logs_in_with_the_token_the_seed_uses(demo: ModuleType) -> None:
-    assert f'?? "{demo.DEFAULT_TOKEN}"' in SPEC.read_text(encoding="utf-8")
+    # The driver uses "or", so an empty LONGHAUL_ADMIN_TOKEN gives the default there. The spec
+    # must treat the empty string the same way, or it types a token the API never accepted.
+    text = SPEC.read_text(encoding="utf-8")
+    assert f'process.env.LONGHAUL_ADMIN_TOKEN || "{demo.DEFAULT_TOKEN}"' in text
+    assert "LONGHAUL_ADMIN_TOKEN ??" not in text
 
 
 def test_the_spec_names_the_four_steps_of_the_plan() -> None:
@@ -118,6 +123,131 @@ def test_the_hint_step_waits_at_most_fifteen_seconds_for_coding() -> None:
     spec = SPEC.read_text(encoding="utf-8")
     assert "const SEEN = { timeout: 15_000 };" in spec
     assert re.search(r'toHaveText\("coding", SEEN\)', spec)
+
+
+# ---------- the seed step ----------
+class FakeHandle:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+    async def result(self) -> Any:
+        from longhaul.contracts import OutcomeKind
+
+        return SimpleNamespace(kind=OutcomeKind.PR_OPENED, summary="")
+
+
+def seeded(demo: ModuleType, monkeypatch: pytest.MonkeyPatch, started: int) -> Any:
+    """A Demo whose Temporal client, poller and task table are fakes."""
+    import longhaul.durable.client as client_module
+
+    class FakeClient:
+        async def execute_workflow(self, *args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(started=started)
+
+    async def connect(*args: Any, **kwargs: Any) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(client_module, "connect", connect)
+    monkeypatch.setattr(client_module, "get_task", lambda _client, task_id: FakeHandle(task_id))
+    run = demo.Demo(port="1", token="t")
+    run.fake = SimpleNamespace(label_names=lambda repo, issue: ["longhaul:needs-human"])
+    return run
+
+
+async def test_the_seed_remembers_the_tasks_when_the_poller_starts_too_few(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # close() removes workflows and sandboxes by task id, so the ids must be known before the
+    # count is checked.
+    run = seeded(demo, monkeypatch, started=2)
+    ids = {s.key: f"{s.repo.replace('/', '-')}-{run.issue_number}" for s in demo.SCENARIOS}
+    monkeypatch.setattr(run, "read_task_ids", lambda: ids)
+    try:
+        with pytest.raises(demo.DemoError, match="started 2 tasks"):
+            await run.seed_tasks()
+        assert run.task_ids == ids
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+async def test_the_seed_remembers_the_tasks_it_finds_when_a_row_is_missing(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = seeded(demo, monkeypatch, started=3)
+    found = {demo.SCENARIOS[0].key: "demo-calc-shipped-1", demo.SCENARIOS[1].key: "stuck-1"}
+    monkeypatch.setattr(run, "read_task_ids", lambda: found)
+    try:
+        with pytest.raises(demo.DemoError, match="plan"):
+            await run.seed_tasks()
+        assert run.task_ids == found
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+def test_read_task_ids_returns_the_rows_it_finds(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    rows = [(demo.SCENARIOS[0].repo, "a-1"), ("other/repo", "x-1")]
+    conn = SimpleNamespace(execute=lambda _sql: SimpleNamespace(fetchall=lambda: rows))
+    monkeypatch.setattr(psycopg, "connect", lambda _url: _Ctx(conn))
+    run = demo.Demo(port="1", token="t")
+    run.database = "postgresql://unused"
+    try:
+        assert run.read_task_ids() == {demo.SCENARIOS[0].key: "a-1"}
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+class _Ctx:
+    def __init__(self, conn: Any) -> None:
+        self.conn = conn
+
+    def __enter__(self) -> Any:
+        return self.conn
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+
+async def test_a_status_query_that_fails_at_once_is_retried_after_a_pause(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from temporalio.service import RPCError, RPCStatusCode
+
+    import longhaul.durable.client as client_module
+    from longhaul.contracts import Phase
+
+    run = seeded(demo, monkeypatch, started=3)
+    ids = {s.key: f"{s.key}-1" for s in demo.SCENARIOS}
+    monkeypatch.setattr(run, "read_task_ids", lambda: ids)
+    wanted = {ids["stuck"]: Phase.PAUSED, ids["plan"]: Phase.AWAITING_PLAN_APPROVAL}
+    failures = {"left": 5}
+
+    async def read_status(handle: FakeHandle, timeout_s: float = 0) -> Any:
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise RPCError("no worker", RPCStatusCode.DEADLINE_EXCEEDED, b"")
+        return SimpleNamespace(phase=wanted[handle.task_id])
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(client_module, "read_status", read_status)
+    monkeypatch.setattr(demo.asyncio, "sleep", sleep)
+    try:
+        await run.seed_tasks()
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+    # Five failed queries, each followed by a pause of a second.
+    assert sleeps.count(1) >= 5
 
 
 # ---------- the config the worker runs on ----------

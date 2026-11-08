@@ -2878,8 +2878,9 @@ The first `make gate PHASE=5` and the independent gate review found the problems
   # set budgets.task_usd: 0.50 for lh-demo-textkit, label an issue
   gh issue view 1 --repo hoomanesteki/lh-demo-textkit --comments | tail -15   # budget pause comment
   gh issue comment 1 --repo hoomanesteki/lh-demo-textkit --body "/longhaul budget +1"
-  open http://localhost:3000   # Grafana: Longhaul dashboard
-  open http://localhost:16686  # Jaeger: search service longhaul-worker
+  docker compose up -d jaeger otel-collector   # the trace backend, before the run
+  open http://localhost:${LH_GRAFANA_PORT:-3000}      # Grafana: Longhaul dashboard
+  open http://localhost:${LH_JAEGER_UI_PORT:-16686}   # Jaeger: search service longhaul-worker
   uv run longhaul report lh-hoomanesteki-lh-demo-textkit-1
   ```
 

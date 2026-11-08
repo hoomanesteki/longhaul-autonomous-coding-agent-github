@@ -316,3 +316,21 @@ async def test_each_version_of_a_plan_and_each_task_has_a_row_of_its_own() -> No
     await recorder.record_plan(PlanRecord("lh-y", 1, a_plan("other task")))
     assert sorted(recorder.plans) == [("lh-x", 1), ("lh-x", 2), ("lh-y", 1)]
     assert recorder.plans[("lh-x", 2)].plan.summary == "second"
+
+
+# ---------- LH-605: the events of a task, read back ----------
+async def test_events_of_a_task_come_back_in_the_order_they_were_written() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "stuck", {"reason": "edit_churn"})
+    await recorder.record_event("lh-y", "stuck", {"reason": "no_progress"})
+    await recorder.record_event("lh-x", "compaction", {"tokens_before": 9})
+    await recorder.record_event("lh-x", "verdict", {"issues": ["a"]})
+
+    got = await recorder.events_of("lh-x", ["stuck", "verdict"])
+
+    assert got == [
+        EventRecord("lh-x", "stuck", {"reason": "edit_churn"}),
+        EventRecord("lh-x", "verdict", {"issues": ["a"]}),
+    ]
+    assert await recorder.events_of("lh-x", []) == []
+    assert await recorder.events_of("lh-none", ["stuck"]) == []

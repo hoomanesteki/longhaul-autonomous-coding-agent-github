@@ -78,6 +78,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "cleanup",
         "compact",
         "ensure_sandbox",
+        "extract_lessons",
         "llm_turn",
         "load_memory",
         "poll_once",
@@ -106,6 +107,7 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
+        (acts.EXTRACT_LESSONS, acts.ExtractLessonsInput, acts.ExtractLessonsOutput),
         (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
         (acts.CLEAN_REPOS, NoneType, acts.JanitorResult),
     ],
@@ -149,6 +151,9 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
         # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
         pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
+        # Not in the table. One compactor call and a few inserts, after the task has ended. It
+        # has the heartbeat of the other model calls so that a cancel reaches it.
+        pytest.param(acts.EXTRACT_LESSONS, 5 * 60, 30, 3, id="extract_lessons"),
         # Not in the table. A step update is one event and at most one checkpoint row.
         pytest.param(acts.RECORD_STEP, 2 * 60, None, 3, id="record_step"),
     ],

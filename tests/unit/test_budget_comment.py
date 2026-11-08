@@ -11,9 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+
 from longhaul.cost.budget import BudgetNumbers, BudgetReason
 from longhaul.github.budget_comment import render_budget_comment
-
 from longhaul.github.commands import CommandKind, parse_command
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase7]

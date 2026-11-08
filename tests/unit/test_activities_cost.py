@@ -12,17 +12,17 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from longhaul.cost.budget import BudgetNumbers, BudgetReason, BudgetVerdict
-from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 from tests.fakes.fake_github import FAKE_BASE_URL, FakeGitHub
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.contracts import Budgets, Role, Usage
+from longhaul.cost.budget import BudgetNumbers, BudgetReason, BudgetVerdict
 from longhaul.cost.ledger import MemoryLedger
 from longhaul.cost.pricing import Pricing
 from longhaul.durable import acts
+from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger as EffectLedger
 from longhaul.github.side_effects import effect_key, marker

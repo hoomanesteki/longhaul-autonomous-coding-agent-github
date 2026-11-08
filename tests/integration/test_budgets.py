@@ -29,7 +29,6 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from temporalio import activity
 from temporalio.client import WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -60,6 +59,7 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
 from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
+from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.plan import PlanActivities, StepActivities
@@ -124,26 +124,15 @@ def write_script(tmp_path: Path, steps: list[dict[str, Any]]) -> Path:
 
 # ---------- the provider ----------
 class Probe(ScriptedProvider):
-    """A scripted provider that can hold the model call of one coder turn.
+    """A scripted provider that counts the model calls of the coder."""
 
-    With `hold_turn` the call of that turn waits for `gate`, and `held` is set while it waits,
-    so a test can let virtual time pass in the middle of a run.
-    """
-
-    def __init__(self, script: Path, *, hold_turn: int | None = None) -> None:
+    def __init__(self, script: Path) -> None:
         super().__init__(script)
         self.calls = 0
-        self.hold_turn = hold_turn
-        self.held = asyncio.Event()
-        self.gate = asyncio.Event()
 
     async def complete(self, **kwargs: Any) -> LLMResponse:
-        role = parse_role_line(kwargs["system"])
-        if role == "coder":
+        if parse_role_line(kwargs["system"]) == "coder":
             self.calls += 1
-            if self.hold_turn == self.calls - 1:
-                self.held.set()
-                await self.gate.wait()
         return await super().complete(**kwargs)
 
 
@@ -227,14 +216,13 @@ async def light(
     env: WorkflowEnvironment,
     script: Path,
     *,
-    hold_turn: int | None = None,
     tmp_path: Path | None = None,
 ) -> AsyncIterator[World]:
     """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue."""
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     costs = CostLedger(PRICES)
-    provider = Probe(script, hold_turn=hold_turn)
+    provider = Probe(script)
     registry = default_registry(test_command="true", blobs=blobs)
 
     def config_for(role: Role) -> LoopConfig:
@@ -334,8 +322,12 @@ async def top_up(handle: WorkflowHandle[Any, Outcome], usd: float = 0.0, turns: 
     await handle.signal(TaskWorkflow.add_budget, args=["maintainer", usd, turns])
 
 
-def timeline(history: WorkflowHistory) -> list[str]:
-    """The model turns, the budget checks, the signals and the timers, in recorded order."""
+def timeline(history: WorkflowHistory, *, timers: bool = False) -> list[str]:
+    """The model turns, the budget checks and the signals, in recorded order.
+
+    A wait with a timeout starts a timer that the server ends or the signal makes moot, so timers
+    are left out unless a test asks for them.
+    """
     names: list[str] = []
     for event in history.events:
         if event.HasField("activity_task_scheduled_event_attributes"):
@@ -344,9 +336,9 @@ def timeline(history: WorkflowHistory) -> list[str]:
                 names.append(name)
         elif event.HasField("workflow_execution_signaled_event_attributes"):
             names.append(f"signal:{event.workflow_execution_signaled_event_attributes.signal_name}")
-        elif event.HasField("timer_started_event_attributes"):
+        elif timers and event.HasField("timer_started_event_attributes"):
             names.append("timer_started")
-        elif event.HasField("timer_fired_event_attributes"):
+        elif timers and event.HasField("timer_fired_event_attributes"):
             names.append("timer_fired")
     return names
 
@@ -541,6 +533,57 @@ async def test_a_turn_limit_nobody_lifts_ends_with_budget_exhausted(
     assert outcome.summary == "turn budget of 2 turns is spent: no top-up in 24 hours"
 
 
+# ---------- the planner ----------
+PLAN: dict[str, Any] = {
+    "summary": "Read the notes.",
+    "steps": [
+        {"id": "s1", "description": "Read", "files": ["notes.txt"], "done_when": "it is read"},
+        {"id": "s2", "description": "Report", "files": [], "done_when": "it is reported"},
+    ],
+    "acceptance_checks": ["true"],
+    "risks": [],
+}
+
+
+async def test_the_planner_is_held_to_the_budget_too(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [
+        {"match": {"role": "planner", "turn_index": 0}, "respond": {"tool_calls": [READ]}},
+        {
+            "match": {"role": "planner", "turn_index": 1},
+            "respond": {"tool_calls": [{"name": "submit_plan", "input": PLAN}]},
+        },
+        {
+            "match": {"role": "coder", "turn_index": 0},
+            "respond": {
+                "tool_calls": [{"name": "submit_for_review", "input": {"summary": SUMMARY}}]
+            },
+        },
+    ]
+    limits = Budgets(task_usd=50.0, task_turns=1, task_wall_minutes=240, daily_repo_usd=500.0)
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(
+            env.client,
+            world.spec(limits),
+            task_queue=world.queue,
+            plan=True,
+            enforce_budgets=True,
+        )
+        await paused(world, handle)
+        status = await handle.query(TaskWorkflow.status)
+        assert status.turn_index == 1, "the planner read once, and its second turn was held back"
+        (asked,) = world.events("paused")
+        assert asked["reason"] == "task_turns"
+
+        await top_up(handle, turns=5)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    (resumed,) = world.events("resumed")
+    assert resumed["via"] == "budget"
+
+
 # ---------- the wall clock ----------
 async def start_in_the_past(
     env: WorkflowEnvironment, world: World, spec: TaskSpec, minutes_ago: int
@@ -581,21 +624,27 @@ async def test_wall_clock_pause(env: WorkflowEnvironment, tmp_path: Path) -> Non
 async def test_wall_clock_pause_in_the_middle_of_a_run(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    script = write_script(tmp_path, reads_then_finish(4))
-    limits = Budgets(task_usd=50.0, task_turns=60, task_wall_minutes=60, daily_repo_usd=500.0)
-    async with light(env, script, hold_turn=1) as world:
+    """Time passes while the first model call is retried, and the second turn is not started."""
+    # Six overloads in a row: the retries wait 2, 4, 8, 16, 32 and 64 seconds, over a minute. The
+    # test server skips those waits while a test waits for the result, so nobody tops up and the
+    # task runs to the end of its wait.
+    overloaded = {
+        "match": {"role": "coder", "turn_index": 0},
+        "respond": {"raise": "overloaded", "times": 6},
+    }
+    script = write_script(tmp_path, [overloaded, *reads_then_finish(3)])
+    limits = Budgets(task_usd=50.0, task_turns=60, task_wall_minutes=1, daily_repo_usd=500.0)
+    async with light(env, script) as world:
         handle = await begin(env, world, world.spec(limits))
-        await asyncio.wait_for(world.provider.held.wait(), WAIT_S)
-        await env.sleep(timedelta(minutes=90))  # the second model call takes its time
-        world.provider.gate.set()
-        await paused(world, handle)
-        (asked,) = world.events("paused")
-        assert asked["reason"] == "wall_clock" and asked["turn_index"] == 2
-        assert asked["numbers"]["elapsed_minutes"] > 90
-        await top_up(handle, usd=1.0)
         outcome = await result_of(handle)
 
-    assert outcome.kind is OutcomeKind.PR_OPENED
+    (asked,) = world.events("paused")
+    assert asked["reason"] == "wall_clock" and asked["turn_index"] == 1
+    assert asked["numbers"]["elapsed_minutes"] > 1
+    # The overloads were not billed, so the ledger holds the one turn that was answered.
+    assert {e.turn_index for e in world.costs.entries} == {0}, "the second turn was not started"
+    assert outcome.kind is OutcomeKind.BUDGET_EXHAUSTED
+    assert outcome.summary == "time budget of 1 minute is spent: no top-up in 24 hours"
 
 
 async def test_time_spent_waiting_for_a_hint_is_not_time_spent_working(
@@ -675,7 +724,7 @@ async def test_daily_waits_until_midnight(env: WorkflowEnvironment, tmp_path: Pa
     assert outcome.kind is OutcomeKind.PR_OPENED
     (resumed,) = world.events("resumed")
     assert resumed["via"] == "midnight"
-    names = timeline(history)
+    names = timeline(history, timers=True)
     assert "signal:add_budget" not in names
     assert names.index("timer_started") < names.index("timer_fired") < names.index("llm_turn")
     assert_checked_before_every_turn(names)
@@ -743,7 +792,8 @@ async def test_a_task_of_an_issue_asks_once_with_a_key_and_moves_the_label(
         await top_up(handle, usd=5.0)
         await wait_until(lambda: len(world.events("resumed")) >= 1, "the resume")
         assert NEEDS_HUMAN not in world.fake.label_names(REPO, world.number)
-        await result_of(handle)
+        # The task would go on to open a pull request, and this world has no delivery.
+        await handle.terminate("the test has seen what it came for")
 
     assert world.fake.count_comments(REPO, world.number, containing=":budget:") == 1
 
@@ -793,9 +843,10 @@ async def test_the_daily_pause_of_an_issue_says_so_and_asks_for_no_one(
         (comment,) = [c for c in world.fake.comment_bodies(REPO, world.number) if ":budget:1" in c]
         assert "goes on by itself" in comment and "00:00 UTC" in comment
         assert NEEDS_HUMAN not in world.fake.label_names(REPO, world.number)
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
         outcome = await result_of(handle)
 
-    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert outcome.kind is OutcomeKind.CANCELLED
 
 
 # ---------- tasks that do not enforce budgets ----------

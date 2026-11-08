@@ -12,10 +12,12 @@ goes:
 | ended, stuck or error | `longhaul:working` is removed, `longhaul:needs-human` is added |
 | ended, cancelled | `longhaul:working` and `longhaul:needs-human` are removed |
 
-The pause for a hint (LH-506) uses the middle two rows and `stuck_comment`. The pause for a plan
-or a budget (Phases 5 and 7) will use the same helpers. The end of a task (LH-507) uses `on_end`
-and `final_comment`: a task that opened its pull request has its labels already, a task that gave
-up or failed asks for a person, and a task that was cancelled asks for nobody.
+The pause for a hint (LH-506) uses the middle two rows and `stuck_comment`. The pause for a budget
+(LH-702) uses the same two rows with keys of its own, `on_budget_pause` and `on_budget_resume`, and
+the comment of github/budget_comment.py. The pause for a plan (Phase 5) will use the same helpers.
+The end of a task (LH-507) uses `on_end` and `final_comment`: a task that opened its pull request
+has its labels already, a task that gave up or failed asks for a person, and a task that was
+cancelled asks for nobody.
 
 The commands of LH-308 add two comments. `status_comment` is what a task posts when a
 maintainer asks `/longhaul status`, and `denied_comment` is the answer to a command from
@@ -46,6 +48,8 @@ __all__ = [
     "denied_comment",
     "final_comment",
     "is_github_task",
+    "on_budget_pause",
+    "on_budget_resume",
     "on_end",
     "on_pause",
     "on_pickup",
@@ -140,6 +144,21 @@ def on_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
 def on_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
     """The person answered. `pause` is the number that on_pause was given."""
     return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off", pause))]
+
+
+def on_budget_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
+    """Ask for a person to lift a budget. `pause` counts the budget pauses of the task from 1.
+
+    The keys are not those of `on_pause`. Both count from 1, so a task that was stuck once and
+    then ran out of budget would otherwise reuse the key of its first label, and the write would
+    find itself done already.
+    """
+    return [LabelStep(True, _label(spec, NEEDS_HUMAN, "label_needs_human_budget_on", pause))]
+
+
+def on_budget_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
+    """The budget was topped up. `pause` is the number that on_budget_pause was given."""
+    return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_budget_off", pause))]
 
 
 def on_end(spec: TaskSpec, kind: OutcomeKind, *, pr_opened: bool) -> list[LabelStep]:

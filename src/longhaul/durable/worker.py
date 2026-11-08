@@ -53,6 +53,12 @@ What it is built from, and why each piece is what it is:
   either, so a worker whose config holds another number stops too. `summarize_for_human`, which
   writes the question for a person, is an activity of the compactor and renders its comment from
   the templates folder.
+* The budgets (LH-702) have two activities. Every worker registers `check_budget`, which the
+  workflow calls before each model turn of a task that enforces them. It reads the sums of the
+  worker's own ledger, and prices the next call with the model and the output cap of the role
+  from the same config as the model activities. With the GitHub token the worker also registers
+  `post_budget`, which tells the issue why a budget stopped the task, through the same ledger as
+  the other writes.
 * The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers
   `post_final`, which reads the diff stats from the checkpoint store and posts the final comment
   through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
@@ -123,6 +129,7 @@ from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
 from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
+from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
@@ -311,7 +318,8 @@ def build_parts(
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
     memory = build_memory(cfg.memory, sessions)
     recorder = SqlRecorder(sessions)
-    ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
+    pricing = load_pricing(settings.provider, cfg)
+    ledger = SqlLedger(sessions, pricing)
     # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
     registry = default_registry(
         test_command=DEFAULT_TEST_COMMAND,
@@ -346,6 +354,7 @@ def build_parts(
         meters=meters,
         templates=templates_path(settings),
     )
+    budgets = BudgetActivities(pricing, ledger, config_for)
     tools = ToolActivities(
         registry,
         sandboxes,
@@ -397,6 +406,9 @@ def build_parts(
                 templates=templates_path(settings),
             ).activities,
             *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
+            *BudgetCommentActivities(
+                github, effects, templates=templates_path(settings)
+            ).activities,
             *FinalCommentActivities(
                 github, effects, StoreDiffs(store), templates=templates_path(settings)
             ).activities,
@@ -405,6 +417,7 @@ def build_parts(
         activities=[
             *llm.activities,
             *compactor.activities,
+            *budgets.activities,
             *tools.activities,
             *workspace.activities,
             *notes.activities,

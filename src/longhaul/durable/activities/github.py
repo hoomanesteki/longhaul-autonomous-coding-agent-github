@@ -332,6 +332,8 @@ class PollerActivities:
                 task_queue=self._task_queue,
                 plan=True,
                 open_draft_on_stuck=entry.open_draft_on_stuck,
+                # A task of an issue runs unattended, so it stops at its budgets and asks (LH-702).
+                enforce_budgets=True,
             )
         except WorkflowAlreadyStartedError:
             log.info("task %s exists already, so it is not started again", spec.task_id)

@@ -54,6 +54,11 @@ non-retryable error kinds of a model call, and a heartbeat timeout. It writes no
 rows of its calls. The comment itself is posted by `post_comment`, so every worker registers the
 first and only a worker with a token the second.
 
+The budgets (LH-702) add two. `check_budget` is in section 3.7 with 30 seconds and 3 attempts: two
+sums over the ledger and some arithmetic, which every worker registers. `post_budget` renders the
+comment that says why a budget stopped the task and posts it under the key `<task>:budget:<n>`. It
+is a `post_comment` with a rendered body, so it has that policy and sits in `GITHUB`.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -75,7 +80,7 @@ What crosses an activity boundary stays small (ADR-0005, invariants I2):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import NoneType
 from typing import Any, Literal, Self
 
@@ -88,6 +93,7 @@ from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
+    Budgets,
     CarryState,
     Outcome,
     Plan,
@@ -102,6 +108,7 @@ from longhaul.contracts import (
     ToolResult,
     Usage,
 )
+from longhaul.cost.budget import BudgetNumbers, BudgetReason, BudgetVerdict
 from longhaul.durable.payload_guard import PayloadTooLargeError
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput
 from longhaul.roles.stuck import CallSignal
@@ -263,9 +270,27 @@ class RunState(CarryState):
 
     `memory_ref` is the memory block that load_memory wrote for the task, or None when the task
     has none. It is set once, by the run that prepared the workspace, and never changes.
+
+    The budget fields are those of LH-702. They are in the state and not in the memo because they
+    change while the task runs, and the state is what a hand-over carries. A history that began
+    before the story has none of them, and the defaults give it the behaviour it recorded.
+
+    - `enforce_budgets` is set when the task starts (`start_task(enforce_budgets=True)`). A task
+      without it makes no budget check and ends at its turn limit with ERROR "turn limit", as
+      before.
+    - `budget_pauses` counts the pauses for a budget, which number the comment `budget:<n>`.
+    - `paused_s` is the seconds the task has spent waiting for a person or for midnight. The wall
+      clock leaves them out, and a top-up after a wall-clock pause sets it to the whole time the
+      task has run, which starts a new window.
+    - `last_input_tokens` is the size of the last request that was sent, which is the floor of
+      the next one and what the budget check prices as input.
     """
 
     memory_ref: BlobRef | None = None
+    enforce_budgets: bool = False
+    budget_pauses: int = Field(default=0, ge=0)
+    paused_s: float = Field(default=0.0, ge=0)
+    last_input_tokens: int = Field(default=0, ge=0)
 
 
 class PrepareWorkspaceOutput(BaseModel):
@@ -549,6 +574,49 @@ class SummarizeOutput(BaseModel):
     question: str
     status: SummaryStatus
     cost_usd: float = Field(default=0.0, ge=0)
+
+
+class CheckBudgetInput(BaseModel):
+    """What check_budget needs to say whether the next model call fits the budgets (LH-702).
+
+    The activity reads the sums from the ledger, and prices the next call with the model of
+    `role`: the workflow cannot read the config, so it names the role and the activity finds the
+    model and the output cap. `limits` are those of the task, `extra_usd` and `extra_turns` the
+    top-ups it has had. `spent_task_usd` is the workflow's running total, which the activity uses
+    when the ledger says less, as a worker with no database does. `now` is `workflow.now()`: the
+    day of the repo is judged by the time of the workflow, so a task that waited for midnight
+    sees the new day, in a test with a skipped clock as well as in production.
+    """
+
+    task_id: str
+    repo: str
+    role: Role
+    turn_index: int = Field(ge=0)
+    limits: Budgets
+    extra_usd: float = Field(default=0.0, ge=0)
+    extra_turns: int = Field(default=0, ge=0)
+    spent_task_usd: float = Field(default=0.0, ge=0)
+    last_input_tokens: int = Field(default=0, ge=0)
+    now: datetime
+
+
+class PostBudgetInput(BaseModel):
+    """What post_budget needs: the numbers of a pause, and the issue to tell.
+
+    The activity renders the comment from this and builds the key `<task>:budget:<pause>` from
+    the task id, so a retry and a run after a Continue-As-New send the same one. A limit of the
+    task has `wait_s`, how long the task waits for a top-up. The daily limit has `resume_at`,
+    when the day of the repo starts again.
+    """
+
+    task_id: str
+    repo: str
+    number: int  # the issue
+    pause: int = Field(ge=1)
+    reason: BudgetReason
+    numbers: BudgetNumbers
+    wait_s: float | None = Field(default=None, gt=0)
+    resume_at: datetime | None = None
 
 
 class CleanupInput(BaseModel):
@@ -1002,6 +1070,27 @@ RECORD_STEP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+# The budget check before a model turn (LH-702): two sums over the ledger and some arithmetic, so
+# section 3.7 gives it 30 seconds and 3 attempts. A model without a price fails it for good.
+CHECK_BUDGET = Act(
+    "check_budget",
+    CheckBudgetInput,
+    BudgetVerdict,
+    start_to_close=timedelta(seconds=30),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED, "PricingError"]),
+)
+
+# The comment on the issue when a budget stops a task (LH-702). It is a post_comment whose body the
+# activity renders from the numbers and a template, so it has the policy of post_comment and sits
+# in GITHUB with the other writes.
+POST_BUDGET = Act(
+    "post_budget",
+    PostBudgetInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
 # The report on the issue when a task ends (LH-507). It is a post_comment whose body the activity
 # renders from the diff stats and a template, so it has the policy of post_comment and sits in
 # GITHUB with the other writes.
@@ -1042,6 +1131,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     STORE_PLAN,
     RECORD_STEP,
     CLEAN_REPOS,
+    CHECK_BUDGET,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -1054,6 +1144,7 @@ GITHUB: tuple[Act[Any, Any], ...] = (
     DELIVER,
     POST_PLAN,
     POST_FINAL,
+    POST_BUDGET,
 )
 
 

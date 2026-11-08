@@ -10,7 +10,6 @@ from types import NoneType
 from typing import Any, get_args
 
 import pytest
-from longhaul.cost.budget import BudgetVerdict
 from pydantic import BaseModel, ValidationError
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.workflow import ActivityCancellationType
@@ -38,6 +37,7 @@ from longhaul.contracts import (
     ToolResult,
     Usage,
 )
+from longhaul.cost.budget import BudgetVerdict
 from longhaul.durable import acts
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, assert_small
 from longhaul.github import side_effects

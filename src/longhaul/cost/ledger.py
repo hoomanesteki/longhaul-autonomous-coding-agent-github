@@ -26,11 +26,18 @@ no one is an increment, an activity that runs again cannot count a call twice. A
 again is a call that was billed again, and has a row of its own. Calls of the compactor are rows
 like any other, so the totals say what a task cost to run, compaction included.
 
-`MemoryLedger` keeps the rows in a list for unit tests, and `NoLedger` records nothing, for a
-caller with no database.
+What was spent (LH-702). The budget check reads two sums: what a task has cost, and what a repo
+has cost since a moment, which is how the daily limit finds the start of the day. Both are
+`Spending` methods, kept apart from `Ledger` so that a writer that only records need not read.
+The sums are over the rows, as the totals above are, so a call that was billed and then retried
+counts twice. The time of a row is the time of the call (`ts`), and a day is judged by it.
+
+`MemoryLedger` keeps the rows in a list for unit tests, and `NoLedger` records nothing and
+reports nothing spent, for a caller with no database.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Protocol
 
@@ -54,6 +61,11 @@ def _priced(pricing: Pricing, usage: Usage, model: str) -> Decimal:
     return pricing.cost(usage, model).quantize(_MILLIONTH, rounding=ROUND_HALF_UP)
 
 
+def _sum(value: object) -> Decimal:
+    """The sum a query returned, as dollars. An empty set sums to 0."""
+    return Decimal(0) if value is None else Decimal(str(value))
+
+
 @dataclass(frozen=True)
 class LedgerEntry:
     """One row of the ledger, as the memory ledger keeps it."""
@@ -65,6 +77,9 @@ class LedgerEntry:
     attempt: int
     usage: Usage
     usd: Decimal
+    # When the call was made. It is not part of what makes two rows equal, so a test that builds
+    # the row it expects does not have to know the time.
+    at: datetime = field(default_factory=lambda: datetime.now(UTC), compare=False)
 
 
 class Ledger(Protocol):
@@ -78,12 +93,30 @@ class Ledger(Protocol):
         ...
 
 
+class Spending(Protocol):
+    """What the ledger can say about money already spent, for the budget check."""
+
+    async def spent_by_task(self, task_id: str) -> Decimal:
+        """The dollars of every row of the task."""
+        ...
+
+    async def spent_by_repo_since(self, repo: str, since: datetime) -> Decimal:
+        """The dollars of the rows of the repo whose call was made at or after `since`."""
+        ...
+
+
 class NoLedger:
     """A ledger that writes nothing and costs nothing, for a caller with no database."""
 
     async def record(
         self, task_id: str, repo: str, model: str, turn_index: int, attempt: int, usage: Usage
     ) -> Decimal:
+        return Decimal(0)
+
+    async def spent_by_task(self, task_id: str) -> Decimal:
+        return Decimal(0)
+
+    async def spent_by_repo_since(self, repo: str, since: datetime) -> Decimal:
         return Decimal(0)
 
 
@@ -100,6 +133,12 @@ class MemoryLedger:
         usd = _priced(self._pricing, usage, model)
         self.entries.append(LedgerEntry(task_id, repo, model, turn_index, attempt, usage, usd))
         return usd
+
+    async def spent_by_task(self, task_id: str) -> Decimal:
+        return sum((e.usd for e in self.entries if e.task_id == task_id), Decimal(0))
+
+    async def spent_by_repo_since(self, repo: str, since: datetime) -> Decimal:
+        return sum((e.usd for e in self.entries if e.repo == repo and e.at >= since), Decimal(0))
 
 
 class SqlLedger:
@@ -160,3 +199,17 @@ class SqlLedger:
             await session.execute(row)
             await session.execute(totals)
         return usd
+
+    async def spent_by_task(self, task_id: str) -> Decimal:
+        query = select(func.coalesce(func.sum(CostLedgerRow.usd), 0)).where(
+            CostLedgerRow.task_id == task_id
+        )
+        async with self._sessions() as session:
+            return _sum(await session.scalar(query))
+
+    async def spent_by_repo_since(self, repo: str, since: datetime) -> Decimal:
+        query = select(func.coalesce(func.sum(CostLedgerRow.usd), 0)).where(
+            CostLedgerRow.repo == repo, CostLedgerRow.ts >= since
+        )
+        async with self._sessions() as session:
+            return _sum(await session.scalar(query))

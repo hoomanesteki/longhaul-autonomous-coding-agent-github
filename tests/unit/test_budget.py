@@ -10,10 +10,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from longhaul.cost.budget import BudgetReason
 
 from longhaul.contracts import Budgets, OutcomeKind
 from longhaul.cost import budget
+from longhaul.cost.budget import BudgetReason
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase7]
 

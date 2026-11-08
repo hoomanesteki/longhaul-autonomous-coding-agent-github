@@ -279,7 +279,8 @@ def console_comment(
 def _amounts(usd: float, turns: int) -> str:
     parts = []
     if usd > 0:
-        parts.append(f"${usd:.2f}")
+        # A top-up under a cent would read as "$0.00", as if nothing was added.
+        parts.append(f"${usd:.2f}" if usd >= 0.005 else "<$0.01")
     if turns > 0:
         parts.append(f"{turns} turn" if turns == 1 else f"{turns} turns")
     return " and ".join(parts)

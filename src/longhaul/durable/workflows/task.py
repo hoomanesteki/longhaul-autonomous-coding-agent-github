@@ -807,7 +807,8 @@ class TaskWorkflow:
 
         The order is the order of what costs the most when it is left behind. The sandbox goes
         first, because GitHub can be down for twenty minutes and a container must not wait for it.
-        Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
+        Then the console comments that are still being posted get their grace. Then, for a task
+        of an issue: the draft pull request of a stuck task whose repo asked
         for one, the final comment (which links that pull request), and the final labels. The
         note for the metrics comes last, so it counts a task that has finished all of this.
 
@@ -820,8 +821,9 @@ class TaskWorkflow:
             await self._note_outcome(outcome)
             return outcome
         state = self.state
-        await self._settle_mirrors()
         await self._try("cleanup", self._wind_call(acts.CLEANUP, self._cleanup_input(outcome)))
+        # After the cleanup, so that a GitHub that is down does not hold the container.
+        await self._settle_mirrors()
         if lifecycle.is_github_task(state.spec):
             outcome = await self._open_draft(outcome)
             await self._report(outcome)

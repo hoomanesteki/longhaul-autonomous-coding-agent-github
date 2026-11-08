@@ -37,6 +37,7 @@ REQUIRED_JOBS = {
     "docs",
     "terraform",
     "console",
+    "console-e2e",
     "ci",
 }
 

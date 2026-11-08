@@ -801,8 +801,12 @@ async def test_the_check_of_a_first_request_carries_what_the_request_is_made_fro
         outcome = await result_of(handle)
 
     assert outcome.kind is OutcomeKind.PR_OPENED
-    for seen in world.checks:
-        assert seen.spec is not None and seen.spec.task_id == seen.task_id
+    for role in (Role.PLANNER, Role.CODER, Role.VERIFIER):
+        first = [seen for seen in world.checks if seen.role is role][0]
+        assert first.spec is not None and first.spec.task_id == first.task_id
+    # A request that follows another is priced from it, and carries nothing else.
+    later = [seen for seen in world.checks if seen.last_input_tokens > 0]
+    assert later and all(seen.spec is None for seen in later)
     (coder_check,) = [seen for seen in world.checks if seen.role is Role.CODER]
     assert coder_check.plan is not None
     (verifier_check,) = [seen for seen in world.checks if seen.role is Role.VERIFIER]

@@ -44,6 +44,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from longhaul.context.tokens import cache_ratio
+from longhaul.cost.budget import BudgetReason
 from longhaul.github.pr_body import defuse
 from longhaul.reports.data import EventInfo, PlanVersion, ReportData, ToolTotals, TurnInfo
 from longhaul.telemetry.logging import redact
@@ -90,6 +91,13 @@ SEGMENT_LABELS = {"planner": "Planning", "coder": "Coding", "verifier": "Verifyi
 GONE = frozenset({"rejected", "superseded"})
 ANSWERS = {"hint": "a hint", "budget": "a budget top-up"}
 BUDGET_VIA = "budget"
+# A daily-limit pause ends by itself at 00:00 UTC, and `resumed` says so with this `via`.
+MIDNIGHT_VIA = "midnight"
+# The `kind` of the events of a budget pause. A pause for a hint has none. The stuck counter and
+# the budget counter both start at 1, so a `resumed` event answers the `paused` event of its own
+# kind and number, never the one of the other kind that has the same number.
+BUDGET_KIND = "budget"
+HINT_KIND = "hint"
 # The outcome kind of a cancel and the start of the summary the workflow writes for it
 # (durable/workflows/task.py cancel_summary).
 CANCELLED_KIND = "cancelled"
@@ -267,14 +275,36 @@ def _approval(plans: list[PlanVersion]) -> list[_Entry]:
     ]
 
 
-def _pause(event: EventInfo, answers: Mapping[Any, EventInfo]) -> _Entry:
+BUDGET_REASONS = frozenset(reason.value for reason in BudgetReason)
+
+
+def _kind(event: EventInfo) -> str:
+    """Which counter numbers the pause an event belongs to: the budget's or the hint's.
+
+    The workflow writes `kind` on the events of a budget pause. A history from before the field
+    has none, and the limit that stopped the task (`reason` of a pause) or the way out (`via` of
+    a resume) says the same.
+    """
+    if event.payload.get("kind") == BUDGET_KIND:
+        return BUDGET_KIND
+    if event.type == PAUSED_EVENT and event.payload.get("reason") in BUDGET_REASONS:
+        return BUDGET_KIND
+    if event.type == RESUMED_EVENT and event.payload.get("via") in (BUDGET_VIA, MIDNIGHT_VIA):
+        return BUDGET_KIND
+    return HINT_KIND
+
+
+def _pause(event: EventInfo, answers: Mapping[tuple[str, Any], EventInfo]) -> _Entry:
     reason = _words(event.payload.get("reason", "unknown"))
-    answer = answers.get(event.payload.get("pause"))
-    if answer is None:
+    answer = answers.get((_kind(event), event.payload.get("pause")))
+    if answer is None or answer.ts < event.ts:
         return _Entry(event.ts, "Paused", _text(f"{reason}, not answered"))
+    waited = _duration((answer.ts - event.ts).total_seconds())
+    if answer.payload.get("via") == MIDNIGHT_VIA:
+        # Nobody answered the daily limit: the day changed.
+        return _Entry(event.ts, "Paused", _text(f"{reason}, waited until midnight UTC ({waited})"))
     via = ANSWERS.get(str(answer.payload.get("via")), "an answer")
     who = answer.payload.get("by")
-    waited = _duration((answer.ts - event.ts).total_seconds())
     by = f" from {who}" if who else ""
     return _Entry(event.ts, "Paused", _text(f"{reason}, answered with {via}{by} after {waited}"))
 
@@ -310,7 +340,7 @@ def _verdict(event: EventInfo, counted: int) -> _Entry:
 
 
 def _event_entries(events: list[EventInfo]) -> list[_Entry]:
-    answers = {e.payload.get("pause"): e for e in events if e.type == RESUMED_EVENT}
+    answers = {(_kind(e), e.payload.get("pause")): e for e in events if e.type == RESUMED_EVENT}
     entries: list[_Entry] = []
     rounds = 0
     for e in events:

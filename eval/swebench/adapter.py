@@ -53,7 +53,9 @@ from longhaul.github.intake import MAX_BODY_BYTES, clip_text
 DATASET = select_subset.DATASET
 PREDICTIONS_FILE = "predictions.jsonl"
 # Plan section 8.4: the dollar cap on SWE-bench is 4. The turns and the time are the custom set's.
-BUDGETS = Budgets(task_usd=4.0, task_turns=150, task_wall_minutes=120)
+# The day's limit of the repo is set out of reach, as the custom set does (eval/run.py): a run
+# caps each task and nothing more.
+BUDGETS = Budgets(task_usd=4.0, task_turns=150, task_wall_minutes=120, daily_repo_usd=1_000_000.0)
 
 START_MARK = ">>>>> Start Test Output"
 END_MARK = ">>>>> End Test Output"

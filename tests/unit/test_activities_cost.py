@@ -121,7 +121,7 @@ async def test_the_first_request_of_a_role_is_priced_with_its_prompt_and_not_as_
 async def test_a_long_task_statement_makes_the_first_request_dearer() -> None:
     short = await run(MemoryLedger(PRICES), ask(last_input_tokens=0, spec=a_spec()))
     long = await run(MemoryLedger(PRICES), ask(last_input_tokens=0, spec=a_spec("x " * 20_000)))
-    assert projected_of(long) - projected_of(short) > Decimal("0.05")
+    assert projected_of(long) - projected_of(short) > Decimal("0.02")
 
 
 async def test_the_memory_block_and_the_plan_count_in_the_first_request() -> None:

@@ -19,9 +19,17 @@ under `keystone/code`. This module maps it:
   the pause, the model calls the same tool again, and the backend settles the held request with
   Keystone's `keystone__await_approval` tool instead of asking a second time.
 
-Anything else that goes wrong, such as a gateway that cannot be reached, is raised and not
-returned. It is not the model's doing, and a result would hide it: Temporal runs the activity
-again, and a call that Keystone could not decide never runs. There is no fallback to the
+A request that Keystone holds can be used once, by the session that made it, within its
+`approvals.ttl_seconds`. The backend keeps the request id in memory and drops it only once the
+request is settled. When Keystone refuses the settling because the session is gone or the time ran
+out, the model is told that the approval could not be used, and its next call asks anew.
+
+Anything else that goes wrong is raised and not returned: a gateway that cannot be reached, and
+Keystone's own faults (`KS_UPSTREAM_ERROR`, `KS_UPSTREAM_TIMEOUT`), which say that the worker's
+tool server failed or did not answer. They are not the model's doing, and a result would hide
+them and count them toward the stuck rule. Temporal runs the activity again, from the checkpoint,
+so a command that had run is undone before it runs a second time. A call that Keystone could not
+decide never runs. There is no fallback to the
 direct backend, because the point of the mode is that nothing runs unchecked.
 
 The session. Keystone keeps what a session has read (its flags and taint) per MCP session, and
@@ -65,6 +73,9 @@ AWAIT_TOOL = "keystone__await_approval"
 CODE_KEY = "keystone/code"
 APPROVAL_KEY = "keystone/approval_id"
 PENDING = "KS_APPROVAL_PENDING"
+REJECTED = "KS_APPROVAL_REJECTED"
+UPSTREAM_ERROR = "KS_UPSTREAM_ERROR"
+UPSTREAM_TIMEOUT = "KS_UPSTREAM_TIMEOUT"
 # `[keystone:KS_DENIED] call 01J... denied: <reason>`
 _REFUSAL = re.compile(r"^\[keystone:(?P<code>[A-Z_]+)\] call \S+ [^:]*: (?P<reason>.*)$", re.DOTALL)
 _EXIT_LINE = re.compile(r"^exit code: (?P<code>-?\d+)")
@@ -81,6 +92,13 @@ MAX_SESSIONS = 256
 MAX_HELD = 1024
 
 TokenSource = Callable[[], str | None]
+
+
+class KeystoneFault(RuntimeError):
+    """Keystone could not get the call run, through no fault of the model.
+
+    It is an ordinary exception, so Temporal retries the activity under its retry policy.
+    """
 
 
 class _Connection:
@@ -180,7 +198,9 @@ class KeystoneBackend:
             return await DirectBackend().run(registry, sandbox, call, ctx, sandbox_id=sandbox_id)
         began = time.monotonic()
         key = (ctx.task_id, call.name, _digest(call.input))
-        approval_id = self._held.pop(key, None)
+        # The entry stays until the request is settled, so that a retry of this activity after a
+        # failed send settles the same request and does not hold the call a second time.
+        approval_id = self._held.get(key)
         if approval_id is not None:
             sent = await self._send(ctx.task_id, AWAIT_TOOL, {"approval_id": approval_id})
         else:
@@ -188,11 +208,18 @@ class KeystoneBackend:
             sent = await self._send(ctx.task_id, self._prefix + call.name, arguments)
         elapsed = int((time.monotonic() - began) * 1000)
         reply = interpret(sent, call, elapsed)
+        if reply.code in (UPSTREAM_ERROR, UPSTREAM_TIMEOUT):
+            raise _fault(reply, call)
+        result = reply.result
+        if approval_id is not None and reply.code != PENDING:
+            del self._held[key]  # used, rejected, expired or lost: the request is spent
+            if not result.ok and reply.code not in (None, REJECTED):
+                result = _unusable(result, call)
         if reply.approval_id is not None:
             self._held[key] = reply.approval_id
             while len(self._held) > MAX_HELD:
                 self._held.popitem(last=False)
-        return Ran(reply.result, reply.question)
+        return Ran(result, reply.question)
 
     async def _send(
         self, task_id: str, name: str, arguments: dict[str, Any]
@@ -242,6 +269,7 @@ class Reply:
     result: ToolResult
     question: str | None = None
     approval_id: str | None = None
+    code: str | None = None  # the Keystone code of a refusal, None for a tool's own result
 
 
 def interpret(sent: types.CallToolResult, call: ToolCall, duration_ms: int = 0) -> Reply:
@@ -257,9 +285,34 @@ def interpret(sent: types.CallToolResult, call: ToolCall, duration_ms: int = 0) 
             f"not run: Keystone is holding this call{shown} until a person approves it. {reason}\n"
             f"Once a person has decided, call {call.name} again with the same arguments."
         )
-        return Reply(_result(call, False, output, duration_ms), question, approval_id)
+        return Reply(_result(call, False, output, duration_ms), question, approval_id, code)
     exit_code = _exit_code(sent, call, text) if code is None else None
-    return Reply(_result(call, not sent.is_error, text, duration_ms, exit_code))
+    return Reply(_result(call, not sent.is_error, text, duration_ms, exit_code), code=code)
+
+
+def _fault(reply: Reply, call: ToolCall) -> KeystoneFault:
+    reason = reply.result.output
+    if reply.code == UPSTREAM_TIMEOUT:
+        return KeystoneFault(
+            f"Keystone gave up waiting for the worker's tool server on {call.name} "
+            f"[{UPSTREAM_TIMEOUT}]: {reason} The command may have run, and the retry starts from "
+            f"the checkpoint. If tests or installs are cut short, raise timeout_s for the tool in "
+            f"the upstream's config in Keystone (docs/runbook.md)."
+        )
+    return KeystoneFault(
+        f"Keystone could not get {call.name} run by the worker's tool server "
+        f"[{UPSTREAM_ERROR}]: {reason}"
+    )
+
+
+def _unusable(result: ToolResult, call: ToolCall) -> ToolResult:
+    """Say that a person's approval was lost, so the model does not take it for a plain denial."""
+    note = (
+        f"The approval of this call could not be used: its request expired, or the Keystone "
+        f"session that made it is gone. The call did not run. Call {call.name} again to make a "
+        f"new request, which a person has to approve again."
+    )
+    return result.model_copy(update={"output": f"{result.output}\n{note}"})
 
 
 def _result(

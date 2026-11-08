@@ -753,8 +753,9 @@ async def test_the_third_rejection_ends_the_task_as_stuck(
     assert len(world.provider.of("planner")) == 3
     assert world.provider.of("coder") == []
     assert len(world.plan_comments(number)) == 3
-    # The last rejection is an answer, so nobody is asked any more.
-    assert world.review_labels(number) == ["labeled", "unlabeled"] * 3
+    # Each rejection is an answer, so its label comes off. The task then ends as stuck, and a
+    # stuck task asks for a person (LH-507), so the label goes on once more at the end.
+    assert world.review_labels(number) == ["labeled", "unlabeled"] * 3 + ["labeled"]
 
 
 async def test_a_cancel_while_waiting_ends_the_task_as_cancelled(

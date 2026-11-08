@@ -376,7 +376,7 @@ async def label_to_pr(stack: Stack) -> None:
     assert task_id in comments[0]
     assert "## Plan, version 1" in comments[1], comments[1]
     assert f"<!-- longhaul:key={task_id}:plan_comment:1 -->" in comments[1], comments[1]
-    assert comments[2].startswith("## Longhaul opened a draft pull request"), comments[2]
+    assert comments[2].startswith("## Longhaul opened a pull request\n"), comments[2]
     assert str(outcome.pr_url) in comments[2], comments[2]
     assert f"<!-- longhaul:key={task_id}:final:1 -->" in comments[2], comments[2]
 

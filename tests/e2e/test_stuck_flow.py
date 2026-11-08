@@ -159,7 +159,7 @@ async def stuck_to_pr(stack: Stack) -> None:
     assert [c for c in comments if c.startswith("Picked up")] != []
     # pickup, plan, question, the maintainer's hint, and the final comment
     assert len(comments) == 5, comments
-    assert comments[-1].startswith("## Longhaul opened a draft pull request"), comments[-1]
+    assert comments[-1].startswith("## Longhaul opened a pull request\n"), comments[-1]
 
     # The label came with the question, went with the answer, and the pull request label stayed.
     assert [(e.action, e.label) for e in fake.label_events(repo, issue)] == [

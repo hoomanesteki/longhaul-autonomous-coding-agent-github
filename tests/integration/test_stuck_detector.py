@@ -1,10 +1,12 @@
 """The stuck detector inside TaskWorkflow (LH-505).
 
 A scripted coder loops the way a stuck agent does, and the workflow feeds each coder turn to the
-detector. When a rule fires, the workflow records one `stuck` event and carries on: the pause and
-the question to a person are LH-506. The workflow runs on a time skipping Temporal test server
-with the real llm_turn, tool_exec, append_results and record_event activities, a fake sandbox and
-the memory stores, so the tests need nothing but the test server.
+detector. When a rule fires, the workflow records one `stuck` event and pauses for a person
+(LH-506, tests/integration/test_pause_flow.py). Here the question is a stand-in that answers with
+a hint at once, so these tests stay about the detector: they see the event and the task going on.
+The workflow runs on a time skipping Temporal test server with the real llm_turn, tool_exec,
+append_results and record_event activities, a fake sandbox and the memory stores, so the tests
+need nothing but the test server.
 
 tests/unit/test_stuck.py has every rule on its own. These tests are about the wiring: the facts
 that tool_exec works out reach the detector, a planner is never watched, the window crosses a
@@ -24,7 +26,7 @@ from typing import Any
 import pytest
 import yaml
 from temporalio import activity
-from temporalio.client import WorkflowHandle
+from temporalio.client import Client, WorkflowHandle
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
@@ -136,6 +138,19 @@ class Boxes:
             await box.destroy()
 
 
+class Asker:
+    """Stands in for summarize_for_human: it hints the task at once, so the pause is short."""
+
+    def __init__(self, client: Client) -> None:
+        self.client = client
+
+    @activity.defn(name=acts.SUMMARIZE_FOR_HUMAN.name)
+    async def summarize_for_human(self, inp: acts.SummarizeInput) -> acts.SummarizeOutput:
+        handle = self.client.get_workflow_handle(inp.task_id)
+        await handle.signal(TaskWorkflow.hint, args=["maintainer", "go on"])
+        return acts.SummarizeOutput(comment="stand-in", question="?", status="ok")
+
+
 @dataclass
 class World:
     queue: str
@@ -193,6 +208,7 @@ async def light(env: WorkflowEnvironment, script: Path) -> AsyncIterator[World]:
                 *EventActivities(recorder).activities,
                 *PlanActivities(recorder).activities,
                 *StepActivities(recorder).activities,
+                Asker(env.client).summarize_for_human,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,
@@ -224,7 +240,7 @@ async def test_a_planted_repeated_failure_records_one_stuck_event(
     assert event["reason"] == "repeated_failure"
     assert event["turn_index"] == 2
     assert event["evidence"] == [f"{FAILING_COMMAND} failed 3 times with the same {KEY_ERROR}"]
-    # Recording is all this story does. The pause is LH-506's, so the task finishes as asked.
+    # The stand-in hints the task at once, so it finishes as asked.
     assert outcome.kind is OutcomeKind.PR_OPENED and outcome.summary == SUMMARY
     assert status.phase is Phase.DONE
 

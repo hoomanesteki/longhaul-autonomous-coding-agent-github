@@ -232,6 +232,15 @@ def test_stuck_limits_the_workflow_cannot_follow_stop_the_worker(tmp_path: Path)
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
+def test_a_hint_wait_the_workflow_cannot_follow_stops_the_worker(tmp_path: Path) -> None:
+    # The pause waits for the number of hours the workflow was built with, as the detector uses
+    # its own copy of the limits. A different number in the file would be accepted and ignored.
+    stuck = CONFIG.stuck.model_copy(update={"hint_wait_hours": 48})
+    config = CONFIG.model_copy(update={"stuck": stuck})
+    with pytest.raises(ValueError, match=r"stuck\.hint_wait_hours.*48.*24"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
 def test_the_worker_shares_its_blob_store_with_other_processes(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.blobs, S3BlobStore)

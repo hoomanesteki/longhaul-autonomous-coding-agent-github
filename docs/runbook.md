@@ -875,8 +875,14 @@ uv run python eval/report/build_report.py swe-single-shot swe-naive swe-full \
 | Computes Wilson 95% intervals and McNemar's exact test (`eval/report/stats.py`, no scipy) | The resolve rates come from 15 or 40 tasks, so the intervals matter more than the points. |
 | Counts a task that was not graded as attempted and not resolved | It follows the resolve rate of plan section 8.5. The page names the runs that have such tasks. |
 | Adds no date | The same files give the same page. |
+| Shows a task that ended before grading with the end summary of the result file as its reason | The grader line of such a task only repeats the outcome. A task that was graded and failed keeps the grader line. |
 
-With no run ids it writes the placeholder, which says that no real run exists and gives the commands to make one. `docs/results.md` stays that placeholder until a real run is reported, and `tests/unit/test_report_tables.py` fails when the committed file differs from it. Runs that a script played (`provider: scripted`) are refused, because their numbers say nothing about a model. `--allow-scripted` builds a dry-run page from them, with a notice above the first number, to try the builder. The fixtures behind the tests are in `tests/fixtures/eval_results/` and `scripts/make_eval_result_fixtures.py` rewrites them.
+Two steps of the real run are easy to miss, and `docs/results.md` (the placeholder) lists both:
+
+* **The chaos recordings.** `eval/chaos/chaos.py --record --provider anthropic` records the four chaos tasks with a real model (it needs `ANTHROPIC_API_KEY`). Without it the suite replays the committed scripted recordings, and the builder refuses its summary without `--allow-scripted`.
+* **The memory ablation.** `--memory off` is only recorded. Start the worker on a copy of the config with `memory.enabled: false` (`LONGHAUL_CONFIG=...`) before the "without" run, and run a warm-up pass with memory on before the "with" run, as plan section 8.4 asks.
+
+With no run ids it writes the placeholder, which says that no real run exists and gives the commands to make one. `docs/results.md` stays that placeholder until a real run is reported. `tests/unit/test_report_tables.py` accepts the placeholder or a page the builder wrote: it reads the run ids and the git sha from the footer of the committed page, rebuilds the page from `eval/results`, and fails when the two differ, so commit the result folders with the page. Runs that a script played (`provider: scripted`) are refused, because their numbers say nothing about a model. `--allow-scripted` builds a dry-run page from them, with a notice above the first number, to try the builder. The fixtures behind the tests are in `tests/fixtures/eval_results/` and `scripts/make_eval_result_fixtures.py` rewrites them.
 
 ## CI
 

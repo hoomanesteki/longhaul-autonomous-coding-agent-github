@@ -40,12 +40,32 @@ $RUN --set custom --config naive --run-id custom-naive --run-set custom-headline
 $RUN --set custom --config full --run-id custom-full --run-set custom-headline
 $RUN --set custom --config full --run-id custom-full-2 --run-set custom-headline
 
-# Ablations, on a Haiku-class worker. The partner of each is a plain full run on the same model.
+# Ablations, on a Haiku-class worker. Plan section 8.4 warms memory with a prior pass, so the
+# warm-up runs first and its notes are approved before the plain full run, which is the partner
+# of both ablations. The warm-up run stays out of the report.
+$RUN --set custom --config full --run-id abl-warmup --run-set ablations
+# approve the notes it learned: longhaul memory list --status candidate, then memory approve
 $RUN --set custom --config full --run-id abl-full --run-set ablations
 $RUN --set custom --config full --context-mode no_compaction --run-id abl-no-compaction \
   --run-set ablations
-$RUN --set custom --config full --memory off --run-id abl-no-memory --run-set ablations
+```
 
+The memory ablation needs a restart. `--memory off` is only recorded in the result files, and the
+worker keeps the memory settings of its own config. So stop the worker, copy the config with
+`memory.enabled: false`, start the worker on the copy, and then run the "without" side:
+
+```bash
+# in a copy of the config (config/longhaul.no-memory.yaml), set memory.enabled: false, then
+LONGHAUL_CONFIG=config/longhaul.no-memory.yaml uv run longhaul worker
+$RUN --set custom --config full --memory off --run-id abl-no-memory --run-set ablations
+```
+
+The chaos suite replays recorded model answers. Record the four chaos tasks with a real model
+first, because the report refuses a suite whose recordings were scripted:
+
+```bash
+export ANTHROPIC_API_KEY=...        # the recording calls the model
+uv run python eval/chaos/chaos.py --record --provider anthropic
 uv run python eval/chaos/chaos.py --runs 20 --seed 7
 ```
 

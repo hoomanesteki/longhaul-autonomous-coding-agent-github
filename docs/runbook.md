@@ -266,6 +266,8 @@ The pull request branch has one commit on top of the base commit, whatever numbe
 
 The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call, and a line `Verified: <counts>` when a verifier passed the work) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
 
+A worker talks to github.com unless it is told otherwise. `LONGHAUL_GITHUB_API_URL` names another REST API, and `LONGHAUL_GITHUB_CLONE_BASE` names the folder or server that repos are cloned from and pushed to, as `<base>/<owner>/<name>.git`. It wins over `LONGHAUL_GITHUB_WEB_URL`, which does the same for the web address of a GitHub Enterprise server. The full chaos suite sets the API address and the clone base to point a worker at a FakeGitHub on this machine (see "The full chaos suite"). The token is only sent with git requests to github.com, so a clone base never receives it.
+
 Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
 
 ### The prompt cache
@@ -579,7 +581,8 @@ The task is `tests/fixtures/scripts/inventory_fix.yaml`: eleven turns, with read
 | Marker | Runs | Kills per run | Model | Where it runs |
 |---|---|---|---|---|
 | `chaos_lite` | 5 | 1 | scripted | `make gate`, and the `chaos-lite` CI job at night and by hand |
-| `chaos` without `chaos_lite` | 20 | 1 to 3 | replay | on request, in Phase 9 |
+| `chaos` without `chaos_lite` | 20 | 1 to 3 | replay | on request, in Phase 9. The worker is the only thing killed. |
+| `eval/chaos/chaos.py` | 20 | 1 to 3 | replay | on request, in Phase 9. Four kinds of kill, a private Temporal and Postgres, and a count of the writes to GitHub. See "The full chaos suite". |
 
 ```bash
 uv run pytest -m chaos_lite                    # 6 to 9 minutes
@@ -603,9 +606,45 @@ Each of the first three asserts the kill point from the last activity line in th
 
 **The mutation check.** The test must fail when the recovery code is gone. To see it, comment out `await self._checkpoints.restore(sandbox, pre_sha)` in `ToolActivities._start_from` (`src/longhaul/durable/activities/tools.py`) and run `uv run pytest tests/chaos/test_kill_worker.py::test_kill_during_tool_exec_resumes`. The retried command appends its line to the half done tree of the first attempt, `CHANGES.txt` ends up with the line twice, and the test fails on the diff. Put the line back afterwards. The result of this check belongs in the gate report.
 
+## The full chaos suite
+
+`eval/chaos/chaos.py` puts a number behind "survives crashes": 20 runs of four recorded custom tasks, each killed one to three times, with a count of what each run left behind. It is the Phase 9 suite (LH-904). `eval/chaos/README.md` has the details, and this section has what an operator needs.
+
+```bash
+make up && make sandbox-image
+uv run python eval/chaos/chaos.py --runs 20 --seed 7     # about an hour
+uv run python eval/chaos/chaos.py --runs 2 --seed 7      # the short version
+```
+
+**It leaves the services of `make up` alone.** The suite restarts Temporal and Postgres on purpose, and other work on the machine uses the ones of `make up`. So it starts a second compose project from the same `docker-compose.yml`, named `longhaul-chaos-<8 hex>`, with other host ports that it picks free, and with the volumes that compose gives that project. The Temporal dev server runs with `--db-filename` on a volume, as it does in the main file, so a restart keeps the workflows. At the end the suite removes the containers, volumes and network of its project, found by the compose label. It does not run `docker compose down`, and `eval/chaos/services.py` refuses any project name without the prefix. MinIO is shared, and each run removes its own blobs. If a suite is killed, remove `longhaul-chaos-*` containers and volumes by hand.
+
+**The kills.** Each kill is one of four kinds, drawn from the seed:
+
+| Kind | What it does | What has to hold |
+|---|---|---|
+| `worker` | SIGKILL to the worker, then a new worker | the activity runs again from its `pre_sha` |
+| `sandbox` | `docker kill` of the container of the task | the sandbox is made again at the head commit |
+| `temporal` | restart of the Temporal container | the workflow goes on from the saved history |
+| `postgres` | restart of the Postgres container | the activities that failed on the database run again |
+
+When a kill lands follows the progress of a run that was not killed (the harness's `plan_kills`), and it may land in the delivery of the pull request, which is where a repeated write would show. With seed 7 each kind is hit at least four times, and `tests/unit/test_chaos_plan.py::test_kill_type_coverage` asserts it.
+
+**What it records.** `eval/results/chaos-<date>/summary.json` and one `run-NN.json` for each run:
+
+| Field | Meaning |
+|---|---|
+| `completed`, `diff_equals_reference` | the task ended with a pull request, and its diff is the diff of the same task without a kill |
+| `extra_ledger_rows`, `extra_cost_usd` | model calls billed again after a kill, and what they cost, against the run without a kill |
+| `resume_latency_s` | for each kill, the time from the end of the kill to the start of the next activity, from the timestamps in Temporal's history. The clock of the Docker VM is compared with this machine's first (`clock_offset_s`) |
+| `side_effects`, `expected_side_effects`, `duplicate_side_effects`, `missing_side_effects` | comments, label changes and pull requests found on the FakeGitHub of the run, against the 1, 3 and 1 that a task writes |
+
+If the private Temporal stops answering (its SQLite connection can be left interrupted on a busy machine), a watchdog restarts it after 60 seconds, and `temporal_heals` in the summary counts those restarts. The writes are counted from the state of FakeGitHub and not from the `side_effects` table, because that table is where a retry decides whether a write already happened. The heartbeat timeout of these runs is 20 seconds, so the latency of a killed worker is mostly that. The exit code says that the suite ran. Whether the runs survived is in the summary, and a run that did not has a `run-NN.log` with the worker logs.
+
+**The recordings** in `eval/chaos/recordings/<task id>/` are scripted runs, because no key was available when they were made. `uv run python eval/chaos/chaos.py --record --provider anthropic` records a real model into the same folders and replaces them. See "Record and replay model calls" for how a recording is matched.
+
 ## Record and replay model calls
 
-The full chaos suite must not depend on what a model says, so it plays a recording. A recording is a folder with one JSON file per model call: the request, the reply, and the turn. Two settings control it:
+The replayed chaos runs must not depend on what a model says, so they play a recording. A recording is a folder with one JSON file per model call: the request, the reply, and the turn. Two settings control it:
 
 | Setting | Meaning |
 |---|---|
@@ -626,7 +665,7 @@ LONGHAUL_RECORD=1 LONGHAUL_RECORDINGS_DIR=eval/chaos/recordings/inventory \
   --issue-file tests/fixtures/repos/inventory/ISSUE.md
 ```
 
-Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The full chaos suite plays this folder when it holds recordings. Until then it records a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and plays that.
+Record without kills, and commit the folder. The first recording of a request is kept, so a folder that holds an older run must be emptied first. The replay tests of `tests/chaos/test_kill_worker.py` play this folder when it holds recordings. Until then they record a scripted run of `inventory_fix.yaml` through the same code, in a temporary folder, and play that. The four tasks of `eval/chaos/chaos.py` have folders of their own, recorded with `chaos.py --record` (see "The full chaos suite").
 
 ## Metrics and the dashboard
 

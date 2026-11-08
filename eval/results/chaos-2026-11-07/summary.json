@@ -1,0 +1,1138 @@
+{
+  "name": "chaos-2026-11-07",
+  "seed": 7,
+  "runs": 20,
+  "git_sha": "974a62e5a73a0b00bae2803cea5b4a23a0ca5b43",
+  "tasks": [
+    "calc-01",
+    "calc-02",
+    "calc-03",
+    "inventory-01"
+  ],
+  "recordings": {
+    "calc-01": "scripted",
+    "calc-02": "scripted",
+    "calc-03": "scripted",
+    "inventory-01": "scripted"
+  },
+  "compose_project": "longhaul-chaos-15636219",
+  "temporal_heals": 0,
+  "started_at": "2026-11-07T19:19:35.993717Z",
+  "ended_at": "2026-11-07T19:53:35.541487Z",
+  "wall_time_s": 2039.54777,
+  "clock_offset_s": 0.0943458080291748,
+  "completed": 20,
+  "completion_rate": 1.0,
+  "diff_matches": 20,
+  "survived": 18,
+  "kills_planned": {
+    "worker": 10,
+    "sandbox": 12,
+    "temporal": 12,
+    "postgres": 11
+  },
+  "kills_landed": {
+    "worker": 10,
+    "sandbox": 11,
+    "temporal": 9,
+    "postgres": 9
+  },
+  "extra_ledger_rows": 1,
+  "extra_cost_usd": 0.00473,
+  "resume_latency": {
+    "count": 37,
+    "median_s": 2.034399,
+    "p95_s": 22.123943,
+    "max_s": 34.59516
+  },
+  "resume_latency_by_type": {
+    "worker": {
+      "count": 9,
+      "median_s": 16.596307,
+      "p95_s": 21.836775,
+      "max_s": 21.836775
+    },
+    "sandbox": {
+      "count": 11,
+      "median_s": 0.353637,
+      "p95_s": 22.123943,
+      "max_s": 22.123943
+    },
+    "temporal": {
+      "count": 9,
+      "median_s": 2.034399,
+      "p95_s": 10.53368,
+      "max_s": 10.53368
+    },
+    "postgres": {
+      "count": 8,
+      "median_s": 1.361695,
+      "p95_s": 34.59516,
+      "max_s": 34.59516
+    }
+  },
+  "duplicate_side_effects": 0,
+  "missing_side_effects": 0,
+  "runs_with_side_effect_mismatch": 0,
+  "results": [
+    {
+      "run": 1,
+      "task_id": "calc-01",
+      "workflow_id": "lh-chaos-calc-01-9169544f",
+      "seed": 7001,
+      "kills_planned": [
+        "sandbox"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "llm_turn",
+          "struck_at": "2026-11-07T19:22:20.212936Z",
+          "resume_latency_s": 0.104469
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.01995,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.104469
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 136.2
+    },
+    {
+      "run": 2,
+      "task_id": "calc-02",
+      "workflow_id": "lh-chaos-calc-02-549bb85c",
+      "seed": 7002,
+      "kills_planned": [
+        "sandbox"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:26:23.102216Z",
+          "resume_latency_s": 0.887797
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.020216,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.887797
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 77.9
+    },
+    {
+      "run": 3,
+      "task_id": "calc-03",
+      "workflow_id": "lh-chaos-calc-03-7c21a739",
+      "seed": 7003,
+      "kills_planned": [
+        "sandbox"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:28:28.905370Z",
+          "resume_latency_s": 0.739511
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 9,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.041258,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.739511
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 80.6
+    },
+    {
+      "run": 4,
+      "task_id": "inventory-01",
+      "workflow_id": "lh-chaos-inventory-01-de20cd14",
+      "seed": 7004,
+      "kills_planned": [
+        "temporal",
+        "sandbox",
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:31:26.866790Z",
+          "resume_latency_s": 2.814394
+        },
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "bundle_checkpoint",
+          "struck_at": "2026-11-07T19:31:30.524525Z",
+          "resume_latency_s": 0.369631
+        },
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:31:32.880334Z",
+          "resume_latency_s": 20.34305
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 13,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.068066,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        2.814394,
+        0.369631,
+        20.34305
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 95.6
+    },
+    {
+      "run": 5,
+      "task_id": "calc-01",
+      "workflow_id": "lh-chaos-calc-01-50cd01f6",
+      "seed": 7005,
+      "kills_planned": [
+        "sandbox",
+        "temporal",
+        "sandbox"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "record_event",
+          "struck_at": "2026-11-07T19:32:45.968584Z",
+          "resume_latency_s": 22.123943
+        },
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:33:10.373100Z",
+          "resume_latency_s": 2.099283
+        },
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "build_pr_branch",
+          "struck_at": "2026-11-07T19:33:12.810843Z",
+          "resume_latency_s": 0.353637
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.01995,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        22.123943,
+        2.099283,
+        0.353637
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 62.4
+    },
+    {
+      "run": 6,
+      "task_id": "calc-02",
+      "workflow_id": "lh-chaos-calc-02-94daadcc",
+      "seed": 7006,
+      "kills_planned": [
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:33:53.558987Z",
+          "resume_latency_s": 1.417074
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.020216,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        1.417074
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 42.8
+    },
+    {
+      "run": 7,
+      "task_id": "calc-03",
+      "workflow_id": "lh-chaos-calc-03-e34a3310",
+      "seed": 7007,
+      "kills_planned": [
+        "postgres",
+        "worker",
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "remove_label",
+          "struck_at": "2026-11-07T19:35:05.956922Z",
+          "resume_latency_s": 3.236509
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:35:10.339532Z",
+          "resume_latency_s": null
+        },
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:35:22.392787Z",
+          "resume_latency_s": null
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 9,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.041258,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        3.236509
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 84.1
+    },
+    {
+      "run": 8,
+      "task_id": "inventory-01",
+      "workflow_id": "lh-chaos-inventory-01-b585b30a",
+      "seed": 7008,
+      "kills_planned": [
+        "sandbox",
+        "worker"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "deliver",
+          "struck_at": "2026-11-07T19:36:11.290038Z",
+          "resume_latency_s": 10.131863
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:36:11.509072Z",
+          "resume_latency_s": 9.912829
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 13,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.068066,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        10.131863,
+        9.912829
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 56.9
+    },
+    {
+      "run": 9,
+      "task_id": "calc-01",
+      "workflow_id": "lh-chaos-calc-01-f10795ac",
+      "seed": 7009,
+      "kills_planned": [
+        "temporal",
+        "temporal",
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "build_pr_branch",
+          "struck_at": "2026-11-07T19:36:55.611974Z",
+          "resume_latency_s": 1.186887
+        },
+        {
+          "type": "temporal",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        },
+        {
+          "type": "postgres",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.01995,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        1.186887
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 34.8
+    },
+    {
+      "run": 10,
+      "task_id": "calc-02",
+      "workflow_id": "lh-chaos-calc-02-76869db3",
+      "seed": 7010,
+      "kills_planned": [
+        "temporal"
+      ],
+      "kills": [
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:37:22.586444Z",
+          "resume_latency_s": 2.034399
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.020216,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        2.034399
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 31.5
+    },
+    {
+      "run": 11,
+      "task_id": "calc-03",
+      "workflow_id": "lh-chaos-calc-03-e4976237",
+      "seed": 7011,
+      "kills_planned": [
+        "temporal",
+        "temporal",
+        "sandbox"
+      ],
+      "kills": [
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:38:06.215234Z",
+          "resume_latency_s": 1.441896
+        },
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:38:10.748012Z",
+          "resume_latency_s": 2.593867
+        },
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "bundle_checkpoint",
+          "struck_at": "2026-11-07T19:38:13.947874Z",
+          "resume_latency_s": 0.066321
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 9,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.041258,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        1.441896,
+        2.593867,
+        0.066321
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 60.6
+    },
+    {
+      "run": 12,
+      "task_id": "inventory-01",
+      "workflow_id": "lh-chaos-inventory-01-2f6d1852",
+      "seed": 7012,
+      "kills_planned": [
+        "worker",
+        "temporal",
+        "temporal"
+      ],
+      "kills": [
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "ensure_sandbox",
+          "struck_at": "2026-11-07T19:39:02.441268Z",
+          "resume_latency_s": 20.890074
+        },
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:39:26.191284Z",
+          "resume_latency_s": 1.485202
+        },
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "append_results",
+          "struck_at": "2026-11-07T19:39:31.367268Z",
+          "resume_latency_s": 1.472252
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 13,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.068066,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        20.890074,
+        1.485202,
+        1.472252
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 70.5
+    },
+    {
+      "run": 13,
+      "task_id": "calc-01",
+      "workflow_id": "lh-chaos-calc-01-54c939aa",
+      "seed": 7013,
+      "kills_planned": [
+        "sandbox",
+        "worker",
+        "worker"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:40:08.272354Z",
+          "resume_latency_s": 0.008141
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:40:22.375994Z",
+          "resume_latency_s": 16.880047
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:40:40.566728Z",
+          "resume_latency_s": 10.273743
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.01995,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.008141,
+        16.880047,
+        10.273743
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 71.4
+    },
+    {
+      "run": 14,
+      "task_id": "calc-02",
+      "workflow_id": "lh-chaos-calc-02-89cc2b24",
+      "seed": 7014,
+      "kills_planned": [
+        "worker",
+        "worker"
+      ],
+      "kills": [
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:41:22.355017Z",
+          "resume_latency_s": 16.596307
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:41:40.039910Z",
+          "resume_latency_s": 9.953221
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.020216,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        16.596307,
+        9.953221
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 56.2
+    },
+    {
+      "run": 15,
+      "task_id": "calc-03",
+      "workflow_id": "lh-chaos-calc-03-7531c2e5",
+      "seed": 7015,
+      "kills_planned": [
+        "postgres",
+        "worker",
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:42:14.209923Z",
+          "resume_latency_s": 0.634734
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "llm_turn",
+          "struck_at": "2026-11-07T19:42:16.024806Z",
+          "resume_latency_s": 21.836775
+        },
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:42:40.997651Z",
+          "resume_latency_s": 0.236811
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 9,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.041258,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.634734,
+        21.836775,
+        0.236811
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 56.7
+    },
+    {
+      "run": 16,
+      "task_id": "inventory-01",
+      "workflow_id": "lh-chaos-inventory-01-1ebe3924",
+      "seed": 7016,
+      "kills_planned": [
+        "sandbox",
+        "temporal"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:43:22.453424Z",
+          "resume_latency_s": 0.016377
+        },
+        {
+          "type": "temporal",
+          "landed": true,
+          "place": "ensure_sandbox",
+          "struck_at": "2026-11-07T19:43:26.962092Z",
+          "resume_latency_s": 10.53368
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 13,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.068066,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.016377,
+        10.53368
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 59.0
+    },
+    {
+      "run": 17,
+      "task_id": "calc-01",
+      "workflow_id": "lh-chaos-calc-01-10b956fb",
+      "seed": 7017,
+      "kills_planned": [
+        "sandbox",
+        "postgres",
+        "temporal"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        },
+        {
+          "type": "postgres",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        },
+        {
+          "type": "temporal",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [
+        "none of the 3 planned kills happened"
+      ],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.01995,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 39.9
+    },
+    {
+      "run": 18,
+      "task_id": "calc-02",
+      "workflow_id": "lh-chaos-calc-02-120f7e0e",
+      "seed": 7018,
+      "kills_planned": [
+        "temporal"
+      ],
+      "kills": [
+        {
+          "type": "temporal",
+          "landed": false,
+          "place": null,
+          "struck_at": null,
+          "resume_latency_s": null
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [
+        "none of the 1 planned kills happened"
+      ],
+      "ledger_rows": 5,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.020216,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 64.9
+    },
+    {
+      "run": 19,
+      "task_id": "calc-03",
+      "workflow_id": "lh-chaos-calc-03-8a7647ec",
+      "seed": 7019,
+      "kills_planned": [
+        "postgres",
+        "postgres",
+        "worker"
+      ],
+      "kills": [
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:46:20.082292Z",
+          "resume_latency_s": 0.754628
+        },
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:46:22.533920Z",
+          "resume_latency_s": 1.306316
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:46:24.235031Z",
+          "resume_latency_s": 15.848549
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 9,
+      "extra_ledger_rows": 0,
+      "cost_usd": 0.041258,
+      "extra_cost_usd": 0.0,
+      "resume_latency_s": [
+        0.754628,
+        1.306316,
+        15.848549
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 64.7
+    },
+    {
+      "run": 20,
+      "task_id": "inventory-01",
+      "workflow_id": "lh-chaos-inventory-01-d848de1b",
+      "seed": 7020,
+      "kills_planned": [
+        "sandbox",
+        "worker",
+        "postgres"
+      ],
+      "kills": [
+        {
+          "type": "sandbox",
+          "landed": true,
+          "place": "tool_exec",
+          "struck_at": "2026-11-07T19:47:16.979196Z",
+          "resume_latency_s": 0.212085
+        },
+        {
+          "type": "worker",
+          "landed": true,
+          "place": "llm_turn",
+          "struck_at": "2026-11-07T19:47:17.764989Z",
+          "resume_latency_s": 21.712453
+        },
+        {
+          "type": "postgres",
+          "landed": true,
+          "place": "between activities",
+          "struck_at": "2026-11-07T19:47:42.213021Z",
+          "resume_latency_s": 34.59516
+        }
+      ],
+      "completed": true,
+      "outcome": "pr_opened",
+      "diff_equals_reference": true,
+      "problems": [],
+      "ledger_rows": 14,
+      "extra_ledger_rows": 1,
+      "cost_usd": 0.072796,
+      "extra_cost_usd": 0.00473,
+      "resume_latency_s": [
+        0.212085,
+        21.712453,
+        34.59516
+      ],
+      "side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "expected_side_effects": {
+        "comments": 1,
+        "label_events": 3,
+        "pull_requests": 1
+      },
+      "duplicate_side_effects": 0,
+      "missing_side_effects": 0,
+      "wall_time_s": 160.3
+    }
+  ]
+}

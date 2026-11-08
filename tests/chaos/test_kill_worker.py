@@ -28,7 +28,9 @@ to an earlier one.
 Markers. `chaos_lite` is the five runs of CI and of the gates. `chaos` alone is the full suite: 20
 seeded runs with 1 to 3 kills each, answered by the replay provider, for Phase 9. It plays
 eval/chaos/recordings/inventory when that holds a recording of a real model, and otherwise it
-records a scripted run first, with the same code.
+records a scripted run first, with the same code. These runs kill the worker only. The Phase 9
+suite of eval/chaos/chaos.py (LH-904) adds the sandbox, the Temporal server and Postgres, a
+private Temporal and Postgres, and a count of the writes to GitHub.
 
 Run `make up` and `make sandbox-image` first. The workspace setup installs pytest from PyPI.
 """

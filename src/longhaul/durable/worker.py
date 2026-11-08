@@ -25,6 +25,8 @@ What it is built from, and why each piece is what it is:
   local folders only and still recovers the sandbox of a GitHub task. LONGHAUL_GITHUB_API_URL and
   LONGHAUL_GITHUB_WEB_URL point it at a GitHub Enterprise server, or at a FakeGitHub and a folder
   of bare repos in the end-to-end test of LH-308. Unset, they mean api.github.com and github.com.
+  LONGHAUL_GITHUB_CLONE_BASE names a folder or server for clones only and wins over the web URL;
+  the chaos suite of LH-904 uses it.
 * Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
   that is all a worker leaves behind, and it says where the kill landed.
 * With the token the worker also registers the GitHub writes (post_comment, add_label,
@@ -140,7 +142,7 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
-from longhaul.github.remote import GitHubRemote, clone_url_under
+from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_url
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.memory.embedder import make_embedder
@@ -220,11 +222,14 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
     return get_provider(settings)
 
 
-def _github_remote(settings: EnvSettings, github: GitHubClient, auth: PatAuth) -> GitHubRemote:
-    """The remote of the worker: github.com, or the server that LONGHAUL_GITHUB_WEB_URL names."""
-    if settings.github_web_url is None:
-        return GitHubRemote(github, auth)
-    return GitHubRemote(github, auth, clone_url=clone_url_under(settings.github_web_url))
+def clone_url_for(settings: EnvSettings) -> Callable[[str], str]:
+    """Where repos are cloned from: github.com, or the base the settings name.
+
+    LONGHAUL_GITHUB_CLONE_BASE (LH-904) names a folder or server for clones only, and wins over
+    LONGHAUL_GITHUB_WEB_URL (LH-308), the web address of a GitHub Enterprise server.
+    """
+    base = settings.github_clone_base or settings.github_web_url
+    return github_clone_url if base is None else clone_url_under(base)
 
 
 def build_memory(cfg: Memory, sessions: async_sessionmaker[AsyncSession]) -> PgMemoryStore | None:
@@ -357,7 +362,7 @@ def build_parts(
     if settings.github_token is not None:
         auth = PatAuth(settings.github_token)
         github = GitHubClient(settings.github_api_url or GITHUB_API_URL, auth)
-        remote = _github_remote(settings, github, auth)
+        remote = GitHubRemote(github, auth, clone_url=clone_url_for(settings))
     workspace = WorkspaceActivities(
         sandboxes,
         store,

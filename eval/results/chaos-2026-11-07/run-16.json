@@ -1,0 +1,51 @@
+{
+  "run": 16,
+  "task_id": "inventory-01",
+  "workflow_id": "lh-chaos-inventory-01-1ebe3924",
+  "seed": 7016,
+  "kills_planned": [
+    "sandbox",
+    "temporal"
+  ],
+  "kills": [
+    {
+      "type": "sandbox",
+      "landed": true,
+      "place": "tool_exec",
+      "struck_at": "2026-11-07T19:43:22.453424Z",
+      "resume_latency_s": 0.016377
+    },
+    {
+      "type": "temporal",
+      "landed": true,
+      "place": "ensure_sandbox",
+      "struck_at": "2026-11-07T19:43:26.962092Z",
+      "resume_latency_s": 10.53368
+    }
+  ],
+  "completed": true,
+  "outcome": "pr_opened",
+  "diff_equals_reference": true,
+  "problems": [],
+  "ledger_rows": 13,
+  "extra_ledger_rows": 0,
+  "cost_usd": 0.068066,
+  "extra_cost_usd": 0.0,
+  "resume_latency_s": [
+    0.016377,
+    10.53368
+  ],
+  "side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "expected_side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "duplicate_side_effects": 0,
+  "missing_side_effects": 0,
+  "wall_time_s": 59.0
+}

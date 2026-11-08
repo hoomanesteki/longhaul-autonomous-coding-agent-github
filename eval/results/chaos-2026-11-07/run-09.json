@@ -1,0 +1,58 @@
+{
+  "run": 9,
+  "task_id": "calc-01",
+  "workflow_id": "lh-chaos-calc-01-f10795ac",
+  "seed": 7009,
+  "kills_planned": [
+    "temporal",
+    "temporal",
+    "postgres"
+  ],
+  "kills": [
+    {
+      "type": "temporal",
+      "landed": true,
+      "place": "build_pr_branch",
+      "struck_at": "2026-11-07T19:36:55.611974Z",
+      "resume_latency_s": 1.186887
+    },
+    {
+      "type": "temporal",
+      "landed": false,
+      "place": null,
+      "struck_at": null,
+      "resume_latency_s": null
+    },
+    {
+      "type": "postgres",
+      "landed": false,
+      "place": null,
+      "struck_at": null,
+      "resume_latency_s": null
+    }
+  ],
+  "completed": true,
+  "outcome": "pr_opened",
+  "diff_equals_reference": true,
+  "problems": [],
+  "ledger_rows": 5,
+  "extra_ledger_rows": 0,
+  "cost_usd": 0.01995,
+  "extra_cost_usd": 0.0,
+  "resume_latency_s": [
+    1.186887
+  ],
+  "side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "expected_side_effects": {
+    "comments": 1,
+    "label_events": 3,
+    "pull_requests": 1
+  },
+  "duplicate_side_effects": 0,
+  "missing_side_effects": 0,
+  "wall_time_s": 34.8
+}

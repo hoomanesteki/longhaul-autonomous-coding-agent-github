@@ -1,0 +1,89 @@
+# Fixes eval task calc-03: add a mean() function to the calc package.
+# Nine turns, with a new test file and a look at the diff before the last test run, so that a
+# run of this script has several edits and a few tool calls of each kind. The chaos suite
+# records this script (eval/chaos/README.md). The first eight steps run by turn index, and the
+# last one also waits for a passing run of the whole suite ("7 passed": the four tests of the
+# repo and the three this script adds).
+steps:
+  - respond:
+      text: "Looking at the repo layout."
+      tool_calls:
+        - {name: list_dir, input: {path: "."}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: src/calc/__init__.py}}
+  - respond:
+      tool_calls:
+        - {name: read_file, input: {path: tests/test_calc.py}}
+  - respond:
+      text: "mean() takes a sequence, so the module needs Sequence."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/calc/__init__.py
+            old_str: |-
+              """Small arithmetic helpers."""
+
+
+              def add(a: int, b: int) -> int:
+            new_str: |-
+              """Small arithmetic helpers."""
+
+              from collections.abc import Sequence
+
+
+              def add(a: int, b: int) -> int:
+  - respond:
+      text: "Adding mean() after divide()."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/calc/__init__.py
+            old_str: "    return a // b"
+            # |2- keeps the four spaces in front of the first line.
+            new_str: |2-
+                  return a // b
+
+
+              def mean(values: Sequence[float]) -> float:
+                  """Return the arithmetic mean of values. An empty sequence raises ValueError."""
+                  if not values:
+                      raise ValueError("mean() needs at least one value")
+                  return sum(values) / len(values)
+  - respond:
+      text: "A test file for the new function."
+      tool_calls:
+        - name: write_file
+          input:
+            path: tests/test_mean.py
+            content: |
+              import pytest
+              from calc import mean
+
+
+              def test_mean_of_a_list() -> None:
+                  assert mean([1, 2, 3, 4]) == pytest.approx(2.5)
+
+
+              def test_mean_of_one_item_is_a_float() -> None:
+                  result = mean((10,))
+                  assert result == 10.0
+                  assert isinstance(result, float)
+
+
+              def test_mean_of_an_empty_list_raises() -> None:
+                  with pytest.raises(ValueError):
+                      mean([])
+  - respond:
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - respond:
+      tool_calls:
+        - {name: run_tests, input: {}}
+  - match:
+      turn_index: 8
+      last_tool_result_contains: "7 passed"
+    respond:
+      tool_calls:
+        - name: finish
+          input: {summary: "Added mean() to calc, with tests for a list, one item and an empty list. All tests pass."}

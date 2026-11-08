@@ -208,3 +208,21 @@ def test_another_server_gets_no_name_that_could_change_the_address(repo: str) ->
 async def test_a_remote_built_on_another_base_clones_from_it() -> None:
     remote = GitHubRemote(Canned({}, {}), PatAuth(TOKEN), clone_url=clone_url_under("/srv/remotes"))
     assert remote.clone_url("acme/calc") == "/srv/remotes/acme/calc.git"
+
+
+# ---------- LH-904: a clone base other than github.com ----------
+def test_a_clone_base_gives_every_repo_an_address_under_it() -> None:
+    clone = clone_url_under("/tmp/remotes/")
+
+    assert clone("acme/calc") == "/tmp/remotes/acme/calc.git"
+    assert clone_url_under("http://git.internal:3000")("acme/calc") == (
+        "http://git.internal:3000/acme/calc.git"
+    )
+
+
+def test_a_remote_built_on_a_clone_base_checks_the_repo_name_first() -> None:
+    remote = GitHubRemote(Canned({}, {}), PatAuth(TOKEN), clone_url=clone_url_under("/r"))
+
+    assert remote.clone_url("acme/calc") == "/r/acme/calc.git"
+    with pytest.raises(ValueError, match="owner/name"):
+        remote.clone_url("../calc")

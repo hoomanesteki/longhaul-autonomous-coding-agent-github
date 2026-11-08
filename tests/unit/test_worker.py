@@ -314,6 +314,42 @@ async def test_a_worker_with_a_github_token_can_prepare_github_repos(tmp_path: P
     assert parts.github is not None and parts.github._http.is_closed
 
 
+async def test_a_worker_talks_to_the_github_it_is_told_about(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(
+            tmp_path,
+            github_token="github-token-for-tests",
+            github_api_url="http://127.0.0.1:8099",
+            github_clone_base=str(tmp_path / "remotes"),
+        ),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "http://127.0.0.1:8099"
+        remote = _workspace_of(parts)._github
+        assert remote.clone_url("acme/calc") == f"{tmp_path / 'remotes'}/acme/calc.git"
+    finally:
+        await parts.close()
+
+
+async def test_a_worker_with_no_endpoints_set_talks_to_github_com(tmp_path: Path) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests"),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        assert parts.github is not None
+        assert str(parts.github._http.base_url).rstrip("/") == "https://api.github.com"
+        assert _workspace_of(parts)._github.clone_url("acme/calc") == (
+            "https://github.com/acme/calc.git"
+        )
+    finally:
+        await parts.close()
+
+
 def test_a_worker_without_a_github_token_prepares_local_folders_only(tmp_path: Path) -> None:
     parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
     assert _workspace_of(parts)._github is None
@@ -639,6 +675,19 @@ async def test_the_api_and_the_clone_address_follow_the_settings(tmp_path: Path)
         )
     finally:
         await parts.close()
+
+
+def test_a_clone_base_wins_over_the_web_url(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        github_web_url="https://git.example.com",
+        github_clone_base=str(tmp_path / "remotes"),
+    )
+
+    assert worker.clone_url_for(settings)("acme/calc") == f"{tmp_path / 'remotes'}/acme/calc.git"
+    assert worker.clone_url_for(make_settings(tmp_path))("acme/calc") == (
+        "https://github.com/acme/calc.git"
+    )
 
 
 # ---------- memory (LH-604) ----------

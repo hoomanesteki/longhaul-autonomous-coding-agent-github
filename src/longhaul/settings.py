@@ -62,11 +62,14 @@ class EnvSettings(BaseSettings):
     github_app_id: int | None = None
     github_app_key_path: Path | None = None
     # Where GitHub is. Unset means api.github.com and github.com. A GitHub Enterprise server sets
-    # both, and the end-to-end test of LH-308 points them at a FakeGitHub and a folder of bare
-    # repos. The web URL is the base of `<base>/<owner>/<name>.git`, which is what the host clones
-    # from and pushes to.
+    # the API and web URLs, and the end-to-end test of LH-308 points them at a FakeGitHub and a
+    # folder of bare repos. The web URL is the base of `<base>/<owner>/<name>.git`, which is what
+    # the host clones from and pushes to. The clone base (LH-904) names a folder or server for
+    # clones only and wins over the web URL; the chaos suite points a worker at a FakeGitHub it
+    # serves on this machine, so it can count what a run wrote.
     github_api_url: str | None = None
     github_web_url: str | None = None
+    github_clone_base: str | None = None
     admin_token: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
     # Script file for the scripted provider; the provider factory reads it (LH-197).

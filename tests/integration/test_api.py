@@ -37,6 +37,7 @@ from tests.integration.test_task_workflow import (
     wait_until,
 )
 
+from longhaul.api import routes_tasks
 from longhaul.api.app import create_app
 from longhaul.api.deps import ApiContext
 from longhaul.blobs.base import blob_key
@@ -45,8 +46,10 @@ from longhaul.contracts import (
     LLMResponse,
     MemoryItem,
     Message,
+    Outcome,
     OutcomeKind,
     Phase,
+    TaskStatus,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -456,8 +459,34 @@ async def seed_turn(stack: Stack) -> None:
     await add_event(stack.sessions, 15, "stuck", note=f"saw {OPENAI_KEY}")
 
 
-async def test_outputs_redacted(api: Stack) -> None:
+async def test_outputs_redacted(api: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
     await seed_turn(api)
+    leaky = f"export OPENAI_API_KEY={OPENAI_KEY}"
+    async with api.sessions.begin() as session:
+        session.add(
+            PlanRow(
+                task_id=TASK,
+                version=1,
+                plan=a_plan().model_copy(update={"summary": leaky}).model_dump(),
+                status="proposed",
+            )
+        )
+
+    async def leaky_status(ctx: Any, task_id: str) -> tuple[str, TaskStatus]:
+        status = TaskStatus(
+            task_id=task_id,
+            phase=Phase.CODING,
+            turn_index=3,
+            cost_usd=0.1,
+            last_checkpoint=None,
+            plan_version=1,
+            paused_reason=f"asked about {leaky}",
+            outcome=Outcome(kind=OutcomeKind.STUCK, summary=f"gave up with {leaky}"),
+        )
+        return "running", status
+
+    monkeypatch.setattr(routes_tasks, "live_status", leaky_status)
+    detail = await api.get(f"/api/tasks/{TASK}")
 
     latest = await api.get(f"/api/tasks/{TASK}/turns/3")
     first = await api.get(f"/api/tasks/{TASK}/turns/3", attempt=1)
@@ -468,7 +497,13 @@ async def test_outputs_redacted(api: Stack) -> None:
     stored = (await api.blobs.get_by_key(blob_key(TASK, "turns", 3, "response-2.json"))).decode()
     assert OPENAI_KEY in stored
 
-    for response in (latest, first, output, timeline):
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["plan"]["plan"]["summary"] == f"export OPENAI_API_KEY={REDACTED}"
+    assert body["live"]["paused_reason"] == f"asked about export OPENAI_API_KEY={REDACTED}"
+    assert body["live"]["outcome"]["summary"] == f"gave up with export OPENAI_API_KEY={REDACTED}"
+
+    for response in (detail, latest, first, output, timeline):
         assert response.status_code == 200
         assert OPENAI_KEY not in response.text
         assert GITHUB_TOKEN not in response.text

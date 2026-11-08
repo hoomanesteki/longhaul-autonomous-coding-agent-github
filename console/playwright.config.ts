@@ -29,7 +29,7 @@ export default defineConfig({
     command: "bash ../scripts/seed_demo.sh",
     url: `${BASE_URL}/healthz`,
     // Three sandboxes set up their workspace from PyPI before the stack counts as ready.
-    timeout: 480_000,
+    timeout: 600_000,
     reuseExistingServer: false,
     // The script removes its containers, volumes, blobs, database and workflows when it gets
     // SIGTERM. The default is SIGKILL, which would leave them behind.

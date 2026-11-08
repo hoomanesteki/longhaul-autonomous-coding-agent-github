@@ -153,6 +153,8 @@ class TimelineToolCall(BaseModel):
     exit_code: int | None
     duration_ms: int
     has_output: bool
+    # The commit the call left behind. None for a call that changed nothing.
+    post_sha: str | None
 
 
 TimelineItem = Annotated[

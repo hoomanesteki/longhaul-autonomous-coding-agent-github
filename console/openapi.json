@@ -1209,6 +1209,17 @@
             "title": "Ok",
             "type": "boolean"
           },
+          "post_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Sha"
+          },
           "ts": {
             "format": "date-time",
             "title": "Ts",
@@ -1227,7 +1238,8 @@
           "ok",
           "exit_code",
           "duration_ms",
-          "has_output"
+          "has_output",
+          "post_sha"
         ],
         "title": "TimelineToolCall",
         "type": "object"

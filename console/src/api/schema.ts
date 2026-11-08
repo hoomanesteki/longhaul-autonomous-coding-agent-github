@@ -752,6 +752,8 @@ export interface components {
             name: string;
             /** Ok */
             ok: boolean;
+            /** Post Sha */
+            post_sha: string | null;
             /**
              * Ts
              * Format: date-time

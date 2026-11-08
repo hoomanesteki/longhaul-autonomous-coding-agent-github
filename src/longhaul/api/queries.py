@@ -277,6 +277,7 @@ async def _calls_by_key(
             exit_code=call.exit_code,
             duration_ms=call.duration_ms,
             has_output=call.output_ref is not None,
+            post_sha=call.post_sha,
         )
         for call in await session.scalars(stmt)
     }

@@ -79,6 +79,9 @@ What it is built from, and why each piece is what it is:
   again before the worker connects, and refuses a table that another embedder wrote. With it off,
   the worker builds no store: no map and no commands are kept, and the memory block of the
   prompt stays empty. load_memory is registered either way, because the workflow names it.
+  `memory.mode: off` (LH-607) is the weaker switch: the store stays, so that prepare_workspace
+  still verifies the commands and sets the test command, but load_memory answers with an empty
+  block, no repo map is built and no lessons are drafted. It is how a run goes without notes.
   The same store takes the lessons of a finished task (LH-605): extract_lessons asks the compactor
   model for up to 5 notes and writes them as candidates, and a worker with no store answers it
   with "skipped".
@@ -314,6 +317,10 @@ def build_parts(
     engine = make_engine(settings.database_url.get_secret_value())
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
     memory = build_memory(cfg.memory, sessions)
+    # The ablation switch (LH-607). Off leaves the store in the workspace, which verifies the
+    # commands, and takes it away from everything that would put notes in a prompt or add to them.
+    notes_on = cfg.memory.mode == "on"
+    prompt_memory = memory if notes_on else None
     recorder = SqlRecorder(sessions)
     ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
     # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
@@ -375,9 +382,10 @@ def build_parts(
         memory=memory,
         github=remote,
         blobs=blobs,
+        map_repo=notes_on,
     )
-    notes = MemoryActivities(memory, blobs)
-    lessons = LessonActivities(memory, recorder, provider, blobs, config_for, ledger=ledger)
+    notes = MemoryActivities(prompt_memory, blobs)
+    lessons = LessonActivities(prompt_memory, recorder, provider, blobs, config_for, ledger=ledger)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)

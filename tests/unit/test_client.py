@@ -19,6 +19,7 @@ from longhaul.contracts import BlobRef, CarryState, Phase, RepoSettings, TaskSpe
 from longhaul.durable import client as durable_client
 from longhaul.durable.acts import (
     CONTEXT_MODE_MEMO_KEY,
+    OPEN_DRAFT_MEMO_KEY,
     PLAN_MEMO_KEY,
     SCRIPT_MEMO_KEY,
     TUNING_MEMO_KEY,
@@ -351,3 +352,16 @@ async def test_start_task_passes_the_plan_switch_with_the_script_and_the_tuning(
         SCRIPT_MEMO_KEY: SCRIPT,
         PLAN_MEMO_KEY: True,
     }
+
+
+# ---------- LH-507: a draft pull request when the task is stuck ----------
+async def test_start_task_passes_the_draft_on_stuck_switch_in_the_memo(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, open_draft_on_stuck=True)
+    assert fake.calls[0][1]["memo"] == {OPEN_DRAFT_MEMO_KEY: True}
+
+
+async def test_start_task_leaves_the_switch_out_when_it_is_off(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, open_draft_on_stuck=False)
+    assert fake.calls[0][1]["memo"] is None

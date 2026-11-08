@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, hint, listTasks, rejectPlan } from "../api/client";
+import { ApiError, approvePlan, hint, listTasks, rejectPlan } from "../api/client";
 import { clearToken, setToken } from "../api/token";
 
 // The client talks to `fetch` and to nothing else, so a stub of it sees every request.
@@ -68,12 +68,24 @@ describe("api client", () => {
     expect(JSON.parse(String(init.body))).toEqual({ text: "try the other test" });
   });
 
-  it("sends an empty JSON object for an action with an optional body", async () => {
+  it("sends an action without a body as a bare POST", async () => {
+    fetchStub.mockResolvedValue(reply({ task_id: "t1", signal: "approve_plan", by: "console" }));
+
+    await approvePlan("t1");
+
+    const { url, init, headers } = lastRequest();
+    expect(url).toBe("/api/tasks/t1/approve-plan");
+    expect(init.method).toBe("POST");
+    expect(init.body).toBeUndefined();
+    expect(headers.has("content-type")).toBe(false);
+  });
+
+  it("sends the feedback of a rejected plan", async () => {
     fetchStub.mockResolvedValue(reply({ task_id: "t1", signal: "reject_plan", by: "console" }));
 
-    await rejectPlan("t1", {});
+    await rejectPlan("t1", { feedback: "split step 2" });
 
-    expect(JSON.parse(String(lastRequest().init.body))).toEqual({});
+    expect(JSON.parse(String(lastRequest().init.body))).toEqual({ feedback: "split step 2" });
   });
 
   it("raises an ApiError with the status and the detail of the API", async () => {

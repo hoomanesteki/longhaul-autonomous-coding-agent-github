@@ -17,3 +17,6 @@ spikes
 tests
 scripts
 eval
+# The console is built inside the image (docker/api/Dockerfile), from its sources and lock file.
+console/node_modules
+console/dist

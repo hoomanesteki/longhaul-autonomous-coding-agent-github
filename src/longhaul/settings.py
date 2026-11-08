@@ -94,6 +94,9 @@ class EnvSettings(BaseSettings):
     # until the console has a login (LH-807); a container that publishes the port needs 0.0.0.0.
     api_host: str = "127.0.0.1"
     api_port: int = Field(default=8000, ge=0, le=65535)
+    # The built console (console/dist) that the API serves at `/` (LH-802). Empty means the API
+    # serves the API only, as it does next to the Vite dev server.
+    console_dir: str = ""
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.

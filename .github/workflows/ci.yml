@@ -408,6 +408,31 @@ jobs:
       - name: Render the docs site
         run: quarto render site
 
+  # The console (console/): lint, typecheck, test and build. The API types are generated from
+  # console/openapi.json, so the job generates them again and fails when the committed file
+  # differs, before the typecheck reads it. A test in the unit job keeps openapi.json itself in
+  # step with the Python app.
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      - run: npm run api:types
+      - run: git diff --exit-code src/api/schema.ts
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
   # Checks the Terraform in deploy/terraform/aws without an AWS account: the format, then
   # `init -backend=false` (the providers, no state) and `validate`. Nothing here makes a plan or
   # applies anything, because CI holds no cloud credentials. Applying is manual and is followed
@@ -461,7 +486,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, types, unit, integration, e2e, security, compose, docs, terraform]
+    needs: [lint, types, unit, integration, e2e, security, compose, docs, console, terraform]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

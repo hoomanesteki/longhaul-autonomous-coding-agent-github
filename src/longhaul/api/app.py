@@ -24,6 +24,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -33,9 +34,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from longhaul.api import metrics, queries, routes_memory, routes_tasks
+from longhaul.api.console import mount_console
 from longhaul.api.deps import ApiContext, Ctx, open_context
 from longhaul.api.schemas import Health, RepoView
-from longhaul.settings import EnvSettings
+from longhaul.settings import EnvSettings, get_settings
 
 __all__ = ["create_app", "openapi_schema", "render_openapi"]
 
@@ -58,7 +60,13 @@ async def from_settings(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-def create_app(context: ApiContext | None = None) -> FastAPI:
+def create_app(context: ApiContext | None = None, console_dir: Path | None = None) -> FastAPI:
+    """Build the app. `console_dir` is the built console to serve at `/`.
+
+    A deployment (no context) takes the folder from LONGHAUL_CONSOLE_DIR, and the tests that give
+    a context also give the folder or none. `openapi_schema()` passes neither a context nor a
+    folder, and the file routes are left out of the schema in any case.
+    """
     app = FastAPI(
         title=TITLE,
         description=DESCRIPTION,
@@ -72,8 +80,23 @@ def create_app(context: ApiContext | None = None) -> FastAPI:
     app.include_router(routes_tasks.router)
     app.include_router(routes_memory.router)
     add_system_routes(app)
+    folder = console_dir if console_dir is not None else configured_console_dir(context)
+    if folder is not None:
+        mount_console(app, folder)  # last, so that every route above it wins
     app.middleware("http")(count_requests)
     return app
+
+
+def configured_console_dir(context: ApiContext | None) -> Path | None:
+    """The folder of LONGHAUL_CONSOLE_DIR, for the app a deployment starts.
+
+    An app built on a context is a test's. It reads no settings, so a developer's environment
+    cannot change what a test serves.
+    """
+    if context is not None:
+        return None
+    configured = get_settings().console_dir
+    return Path(configured) if configured else None
 
 
 async def count_requests(

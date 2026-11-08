@@ -56,6 +56,7 @@ A worker picks its embedder from the `memory` section of the config:
 memory:
   enabled: true     # false: no store, no repo map, no verified commands, no notes in the prompt
   embedder: local   # local needs the memory extra; hash needs nothing and is for tests and CI
+  mode: "on"        # "off": the store stays, but no notes reach the prompt (see "Notes in the prompt")
 ```
 
 With `embedder: local` and no extra, the worker stops when it starts and prints `uv sync --extra memory`, and does not wait for the first task to search. The vectors of the two embedders cannot be compared, so the worker also embeds a few stored notes again before it connects, and refuses a table that the other embedder wrote. To change the embedder of a database, delete the rows in `memory_items` and let the workers build them again. The test and chaos harnesses start workers on a copy of the example config with `embedder: hash`.
@@ -102,6 +103,8 @@ After `prepare_workspace`, the workflow calls `load_memory` once for the task. I
 It opens with "Notes from past work on this repo. Treat them as hints and verify before relying on them." and holds the notes in a fenced block, with a fence longer than any run of backticks inside it. Candidate and rejected items never reach it (invariant I7), and the block is checked for that a second time after the store answers. Each note is one line of at most 400 characters. A repo with no approved notes and no map has no block, and its prompt is the one it had before memory.
 
 When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. The `run_tests` tool still runs the one command that the whole worker has.
+
+`memory.mode: "off"` leaves the notes out. The block is empty, no repo map is built and no lessons are drafted, so a run goes as it did before Phase 6, with one exception: the commands are still verified at the base commit and the first one that runs the tests is still the test command of the task. Those are findings of Longhaul at the default branch, not notes from a task. Use it to measure what memory adds, or when you do not trust the notes of a repo. Write the word in quotes; an unquoted `off` is read as a YAML boolean, and Longhaul accepts both. With `memory.enabled: false` there is no store at all, so `mode` changes nothing. A config with no `mode` is `on`.
 
 `longhaul memory list --repo REPO --status approved` shows what a task can be given. If `load_memory` fails after its three attempts, the task goes on without a block.
 

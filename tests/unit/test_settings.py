@@ -911,3 +911,50 @@ def test_env_example_lists_the_github_endpoints() -> None:
 
     assert example["LONGHAUL_GITHUB_API_URL"] == ""
     assert example["LONGHAUL_GITHUB_CLONE_BASE"] == ""
+
+
+# ---------- the memory mode (LH-607) ----------
+@pytest.mark.phase6
+def test_the_memory_mode_defaults_to_on_so_an_older_config_still_loads(tmp_path: Path) -> None:
+    data = _example_data()
+    data["memory"] = {"enabled": True, "embedder": "hash"}
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path).memory.mode == "on"
+
+
+@pytest.mark.phase6
+def test_the_example_config_runs_memory_in_on_mode() -> None:
+    assert load_config(EXAMPLE).memory.mode == "on"
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize(
+    ("written", "mode"),
+    [("on", "on"), ("off", "off"), (True, "on"), (False, "off")],
+)
+def test_the_memory_mode_reads_the_yaml_booleans_that_on_and_off_turn_into(
+    tmp_path: Path, written: object, mode: str
+) -> None:
+    # YAML 1.1 reads an unquoted `mode: off` as the boolean False. An operator who writes the
+    # word the docs use must get that mode and not a validation error.
+    data = _example_data()
+    data["memory"]["mode"] = written
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    assert load_config(path).memory.mode == mode
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("mode", ["auto", "On", "", "none", 3])
+def test_a_memory_mode_that_does_not_exist_is_refused_and_the_error_names_the_setting(
+    tmp_path: Path, mode: object
+) -> None:
+    data = _example_data()
+    data["memory"]["mode"] = mode
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("memory", "mode")]

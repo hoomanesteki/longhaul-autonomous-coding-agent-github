@@ -820,6 +820,28 @@ def test_a_worker_with_memory_off_builds_no_store_and_keeps_the_activity(tmp_pat
 
 
 @pytest.mark.phase6
+def test_a_worker_in_off_mode_keeps_the_commands_and_leaves_out_the_prompt_and_the_lessons(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path),
+        with_memory(mode="off"),
+        FakeManager(),  # type: ignore[arg-type]
+    )
+
+    # The store stays, because the verified commands set the test command of a task (LH-603).
+    assert isinstance(parts.memory, PgMemoryStore)
+    workspace = _workspace_of(parts)
+    assert workspace._memory is parts.memory
+    # The map goes into the block only, so a run that leaves the block out does not build it.
+    assert workspace.repo_maps is None
+    # load_memory still answers, with an empty block, and nothing is drafted at the end of a task.
+    assert loader_of(parts)._memory is None
+    assert lessons_of(parts)._sink is None
+    assert names_of(parts) == sorted(act.name for act in acts.ALL)
+
+
+@pytest.mark.phase6
 def test_the_local_embedder_without_the_memory_extra_stops_the_worker_at_the_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

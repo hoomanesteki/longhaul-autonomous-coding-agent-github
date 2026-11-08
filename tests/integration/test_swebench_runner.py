@@ -32,6 +32,7 @@ from tests.integration.test_eval_runner import (  # noqa: F401  (fixtures)
     remove_leftovers,
     require_image,
     stack,
+    worker_prices,
 )
 
 from eval import results, run

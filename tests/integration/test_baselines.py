@@ -34,6 +34,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.phase9]
 # The stack of test_eval_runner.py. Pytest finds a fixture by the name it has in the module.
 database = eval_stack.database
 stack = eval_stack.stack
+worker_prices = eval_stack.worker_prices
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "tests" / "fixtures" / "scripts"

@@ -27,14 +27,25 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
+# The example config turns memory on with the local embedder, which needs fastembed (the memory
+# extra, ADR-0010). A worker without it stops at its start. Every sync names the extra, because a
+# sync without it removes the packages that an earlier one installed.
+#
 # The dependencies first, so a change to the source does not install them again.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-dev --no-install-project
+RUN uv sync --locked --no-dev --no-install-project --extra memory
+
+# The model is part of the image: a worker then starts with no network, and every container of
+# a build embeds with the same file, which the hub could otherwise replace between two builds.
+# fastembed would use the system temp directory, which is not a place to keep it. The model id
+# is the one in src/longhaul/memory/embedder.py (tests/unit/test_worker_image.py compares them).
+ENV FASTEMBED_CACHE_PATH=/opt/fastembed
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')"
 
 COPY src ./src
 COPY config ./config
 COPY templates ./templates
-RUN uv sync --locked --no-dev --no-editable
+RUN uv sync --locked --no-dev --no-editable --extra memory
 
 # The settings come from LONGHAUL_* variables (see .env.example). The config file is the example
 # one unless LONGHAUL_CONFIG names another.

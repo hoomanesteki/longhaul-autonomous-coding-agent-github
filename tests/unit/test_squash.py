@@ -7,15 +7,20 @@ pushes it.
 
 from __future__ import annotations
 
+import re
+import string
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 from tests.fakes.fake_github import git
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import BASE_TAG, CheckpointError, GitCheckpointStore
 from longhaul.checkpoints.push import ForbiddenBranchError
 from longhaul.checkpoints.squash import (
+    MAX_SCOPE_CHARS,
     MAX_SUBJECT_CHARS,
     Author,
     Group,
@@ -34,6 +39,14 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase3]
 
 TASK = "lh-acme-calc-7"
 AUTHOR = "longhaul <longhaul@users.noreply.github.com>"
+ZWSP = "\N{ZERO WIDTH SPACE}"
+FALLBACK = "resolve the issue"
+# What still works on GitHub in a commit subject or a pull request title: a reference to an
+# issue ("#7", "GH-7", "owner/repo#7"), a link, which also closes an issue after "fixes", and a
+# mention. A zero width space after the mark ends each of them.
+LIVE_TEXT = re.compile(
+    rf"#(?=\d)|GH-(?=\d)|://(?=[^\s{ZWSP}])|(?<![\w@])@(?=[A-Za-z0-9])", re.IGNORECASE
+)
 
 
 # ---------- names and the author ----------
@@ -134,6 +147,122 @@ def test_the_subject_is_one_line_without_control_characters() -> None:
     assert subject.isprintable()
 
 
+# ---------- the subject cannot act on GitHub ----------
+@pytest.mark.parametrize(
+    ("summary", "readable"),
+    [
+        ("Fixes #7, see @alice", "fix(calc): fixes #7, see @alice"),
+        ("Fixed #7 and #8", "fix(calc): fix #7 and #8"),
+        ("Closes acme/other#12", "fix(calc): closes acme/other#12"),
+        ("Resolves GH-7 for @acme/reviewers", "fix(calc): resolves GH-7 for @acme/reviewers"),
+        (
+            "Resolves https://github.com/acme/calc/issues/7",
+            "fix(calc): resolves https://github.com/acme/calc/issues/7",
+        ),
+        ("fix(math): close #3", "fix(math): close #3"),
+    ],
+)
+def test_the_subject_cannot_close_an_issue_or_notify_a_person(summary: str, readable: str) -> None:
+    # The subject is the commit message and the title of the pull request. GitHub closes an issue
+    # when a pull request that says "fixes #7" merges, and a title that says "@alice" notifies her.
+    subject = commit_subject(summary, scope="calc", fallback=FALLBACK)
+
+    assert LIVE_TEXT.search(subject) is None
+    assert subject.replace(ZWSP, "") == readable, "a reader sees the text that was written"
+
+
+def test_a_mark_in_the_subject_gets_a_zero_width_space_like_the_body() -> None:
+    subject = commit_subject("fixes #7, see @alice", scope="calc", fallback=FALLBACK)
+
+    assert subject == f"fix(calc): fixes #{ZWSP}7, see @{ZWSP}alice"
+
+
+# ---------- the scope and the length of the subject ----------
+def test_a_scope_that_is_too_long_gives_way_to_the_scope_of_the_caller() -> None:
+    subject = commit_subject(f"feat({'a' * 80}): add pow", scope="calc", fallback=FALLBACK)
+
+    assert subject == "feat(calc): add pow"
+
+
+def test_a_scope_of_the_longest_size_is_kept() -> None:
+    longest = "a" * MAX_SCOPE_CHARS
+
+    subject = commit_subject(f"feat({longest}): add pow", scope="calc", fallback=FALLBACK)
+
+    assert subject == f"feat({longest}): add pow"
+
+
+@pytest.mark.parametrize("scope", ["x" * (MAX_SCOPE_CHARS + 1), "a) b", "a\nb", "(calc)", "café"])
+def test_a_scope_from_the_caller_that_cannot_be_one_is_left_out(scope: str) -> None:
+    assert commit_subject("Fixed it", scope=scope, fallback=FALLBACK) == "fix: fix it"
+
+
+def test_a_header_longer_than_the_limit_cannot_push_the_subject_past_it() -> None:
+    # The header alone was 90 characters. The room left for the text came out negative, and
+    # slicing by a negative number kept the end of the text.
+    summary = "feat(" + "s" * 80 + "): " + "add the missing power function " * 4
+
+    subject = commit_subject(summary, scope="x" * 90, fallback=FALLBACK)
+
+    assert len(subject) <= MAX_SUBJECT_CHARS
+    assert subject.startswith("feat: add the missing power function")
+
+
+def test_a_description_that_is_one_long_word_is_cut_inside_it() -> None:
+    subject = commit_subject("w" * 200, scope="calc", fallback=FALLBACK)
+
+    assert subject == "fix(calc): " + "w" * (MAX_SUBJECT_CHARS - len("fix(calc): "))
+
+
+def test_a_description_that_nothing_is_left_of_after_the_cut_gets_the_fallback() -> None:
+    # It has a word, so it is not empty, but the cut and the trimming of the end leave nothing.
+    subject = commit_subject("(" * 200 + "a", scope="calc", fallback=FALLBACK)
+
+    assert subject == "fix(calc): resolve the issue"
+
+
+PROPERTY = settings(
+    max_examples=300,
+    deadline=None,
+    # A loaded CI runner must not fail the build over speed.
+    suppress_health_check=[HealthCheck.too_slow],
+)
+SCOPE_CHARS = string.ascii_letters + string.digits + "._-"
+KINDS = ["feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore"]
+# A summary that is a conventional subject already, with a scope of any length: the shape that
+# hands the scope of the model over to the subject.
+CONVENTIONAL_SUMMARIES = st.builds(
+    lambda kind, scope, bang, rest: f"{kind}({scope}){bang}: {rest}",
+    st.sampled_from(KINDS),
+    st.text(alphabet=SCOPE_CHARS, min_size=1, max_size=200),
+    st.sampled_from(["", "!"]),
+    st.text(max_size=300),
+)
+# Text made of the marks that have an effect on GitHub.
+MARKED_SUMMARIES = st.lists(
+    st.sampled_from(
+        ["fixes", "closes", "#", "7", "@", "alice", "GH-", "acme/calc", "://", " ", ".", "w" * 40]
+    ),
+    max_size=40,
+).map("".join)
+
+
+@PROPERTY
+@given(
+    summary=st.one_of(st.text(max_size=500), CONVENTIONAL_SUMMARIES, MARKED_SUMMARIES),
+    scope=st.one_of(st.text(max_size=100), st.text(alphabet=SCOPE_CHARS, max_size=100)),
+)
+def test_every_subject_is_one_line_under_the_limit_with_no_live_marks(
+    summary: str, scope: str
+) -> None:
+    subject = commit_subject(summary, scope=scope, fallback=FALLBACK)
+
+    assert len(subject) <= MAX_SUBJECT_CHARS
+    assert len(subject.splitlines()) == 1
+    assert subject == subject.strip()
+    assert LIVE_TEXT.search(subject) is None
+
+
 @pytest.mark.parametrize(
     ("repo", "scope"),
     [
@@ -180,7 +309,12 @@ class Rig:
 
     async def build(self, *groups: Group, default: str = "main") -> PrBranch:
         return await build_pr_branch(
-            TASK, list(groups), store=self.store, default_branch=default, author=AUTHOR
+            TASK,
+            list(groups),
+            base_sha=self.base,
+            store=self.store,
+            default_branch=default,
+            author=AUTHOR,
         )
 
 
@@ -257,6 +391,7 @@ async def test_the_author_and_committer_are_the_configured_ones(rig: Rig) -> Non
     built = await build_pr_branch(
         TASK,
         [Group("fix(calc): change a", head)],
+        base_sha=rig.base,
         store=rig.store,
         default_branch="main",
         author="Ada <ada@example.com>",
@@ -272,7 +407,11 @@ async def test_the_author_comes_from_the_setting_by_default(rig: Rig) -> None:
     rig.publish()
 
     built = await build_pr_branch(
-        TASK, [Group("fix(calc): x", head)], store=rig.store, default_branch="main"
+        TASK,
+        [Group("fix(calc): x", head)],
+        base_sha=rig.base,
+        store=rig.store,
+        default_branch="main",
     )
 
     assert rig.bare("log", "-1", "--format=%an <%ae>", built.head_sha) == DEFAULT_GIT_AUTHOR
@@ -326,7 +465,7 @@ async def test_an_empty_list_of_groups_is_refused(rig: Rig) -> None:
         await rig.build()
 
 
-async def test_the_base_is_the_tag_of_the_bare_repo(rig: Rig) -> None:
+async def test_the_branch_starts_at_the_base_it_is_given(rig: Rig) -> None:
     head = rig.write({"a.txt": "two\n"}, "lh: edit 1")
     rig.publish()
 
@@ -334,6 +473,61 @@ async def test_the_base_is_the_tag_of_the_bare_repo(rig: Rig) -> None:
     built = await rig.build(Group("fix(calc): x", head))
 
     assert built.base_sha == rig.base
+    assert rig.bare("rev-parse", f"{built.head_sha}^") == rig.base
+
+
+@pytest.mark.parametrize("move", ["to a checkpoint", "to a stray commit", "away"])
+async def test_a_base_tag_that_the_agent_moves_does_not_move_the_base_of_the_branch(
+    rig: Rig, move: str
+) -> None:
+    # The sandbox has the bare repo read-write, so the `base` tag is the agent's to move.
+    first = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    head = rig.write({"c.txt": "new\n"}, "lh: write 2")
+    rig.publish()
+    git("checkout", "-q", "--orphan", "other", cwd=rig.work)
+    stray = rig.write({"z.txt": "z\n"}, "unrelated")
+    git("push", "-q", "-f", str(rig.store.repo_path(TASK)), "HEAD:refs/heads/stray", cwd=rig.work)
+    if move == "away":
+        rig.bare("tag", "-d", BASE_TAG)
+    else:
+        rig.bare("tag", "-f", BASE_TAG, first if move == "to a checkpoint" else stray)
+
+    built = await rig.build(Group("fix(calc): change a", head))
+
+    assert built.base_sha == rig.base
+    assert rig.bare("rev-list", f"{rig.base}..{built.head_sha}").splitlines() == [built.head_sha]
+    assert rig.bare("rev-parse", f"{built.head_sha}^") == rig.base
+    assert rig.bare("diff", rig.base, built.head_sha) == rig.bare("diff", rig.base, head)
+
+
+async def test_a_base_that_is_not_in_the_repo_is_refused(rig: Rig) -> None:
+    head = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    rig.publish()
+
+    with pytest.raises(CheckpointError, match="is not in the checkpoint repository"):
+        await build_pr_branch(
+            TASK,
+            [Group("fix(calc): x", head)],
+            base_sha="f" * 40,
+            store=rig.store,
+            default_branch="main",
+        )
+
+    assert "refs/heads/longhaul-pr/7" not in rig.bare("for-each-ref", "--format=%(refname)")
+
+
+async def test_a_base_that_is_not_a_sha_is_refused(rig: Rig) -> None:
+    head = rig.write({"a.txt": "two\n"}, "lh: edit 1")
+    rig.publish()
+
+    with pytest.raises(ValueError, match="invalid sha"):
+        await build_pr_branch(
+            TASK,
+            [Group("fix(calc): x", head)],
+            base_sha="refs/tags/base",
+            store=rig.store,
+            default_branch="main",
+        )
 
 
 # ---------- the diff stat ----------

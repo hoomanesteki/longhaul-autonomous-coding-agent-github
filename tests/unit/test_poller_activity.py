@@ -28,6 +28,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GitHubClient, PatAuth
+from longhaul.github.side_effects import MemoryLedger
 from longhaul.settings import AppConfig, RepoEntry, load_config
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase3]
@@ -100,7 +101,9 @@ def temporal() -> FakeTemporal:
 def poller(
     github: GitHubClient | None, store: MemoryTaskStore, config: AppConfig | None = None
 ) -> PollerActivities:
-    return PollerActivities(github, store, config or config_with(entry()), task_queue=QUEUE)
+    return PollerActivities(
+        github, store, config or config_with(entry()), task_queue=QUEUE, ledger=MemoryLedger()
+    )
 
 
 async def poll(activities: PollerActivities, temporal: FakeTemporal) -> acts.PollResult:
@@ -164,6 +167,18 @@ async def test_the_workflow_starts_on_the_task_queue_with_the_spec_of_the_issue(
     assert (spec.task_id, spec.repo, spec.issue_number) == (f"lh-acme-calc-{number}", REPO, number)
     assert (spec.title, spec.body) == ("add() is wrong", "add(2, 3) gives -1")
     assert spec.settings.repo == REPO
+
+
+async def test_a_task_of_the_poller_plans_before_it_codes(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    # The poller is how issues become tasks, and the plan is what a maintainer reads first.
+    fake.seed_issue(REPO, "add() is wrong", labels=[LABEL])
+
+    await poll(poller(github, store), temporal)
+
+    ((_, kwargs),) = temporal.started
+    assert kwargs["memo"] == {acts.PLAN_MEMO_KEY: True}
 
 
 async def test_a_task_that_finished_is_not_started_again_while_the_label_stays(

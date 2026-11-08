@@ -1,0 +1,34 @@
+diff --git a/pyproject.toml b/pyproject.toml
+index b769c81..69994b3 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
+ name = "textkit"
+ version = "0.1.0"
+ requires-python = ">=3.12"
+-dependencies = ["tomli>=2.0"]
+ 
+ [project.optional-dependencies]
+ dev = ["pytest>=8"]
+diff --git a/src/textkit/config.py b/src/textkit/config.py
+index 8e39419..31ded31 100644
+--- a/src/textkit/config.py
++++ b/src/textkit/config.py
+@@ -1,10 +1,9 @@
+ """Defaults for textkit, kept in a small TOML file."""
+ 
++import tomllib
+ from pathlib import Path
+ from typing import Any
+ 
+-import tomli
+-
+ 
+ def load_defaults(path: Path | str) -> dict[str, Any]:
+     """Return the settings in the TOML file at path, or an empty dict when it is missing."""
+@@ -12,4 +11,4 @@ def load_defaults(path: Path | str) -> dict[str, Any]:
+     if not file.exists():
+         return {}
+     with file.open("rb") as handle:
+-        return tomli.load(handle)
++        return tomllib.load(handle)

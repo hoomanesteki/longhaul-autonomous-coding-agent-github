@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from longhaul.context.modes import ContextMode
+from longhaul.context.tokens import result_cap
 from longhaul.contracts import Budgets, EffortLevel, RepoSettings, SandboxLimits
 
 # The identity of the commits on a pull request branch, written the way git writes an author.
@@ -60,6 +61,12 @@ class EnvSettings(BaseSettings):
     github_token: SecretStr | None = None
     github_app_id: int | None = None
     github_app_key_path: Path | None = None
+    # Where GitHub is. Unset means api.github.com and github.com. A GitHub Enterprise server sets
+    # both, and the end-to-end test of LH-308 points them at a FakeGitHub and a folder of bare
+    # repos. The web URL is the base of `<base>/<owner>/<name>.git`, which is what the host clones
+    # from and pushes to.
+    github_api_url: str | None = None
+    github_web_url: str | None = None
     admin_token: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
     # Script file for the scripted provider; the provider factory reads it (LH-197).
@@ -171,6 +178,24 @@ class Context(StrictModel):
     # (`longhaul run --context-mode`), and that wins over this one.
     mode: ContextMode = ContextMode.FULL
 
+    def for_window(self, window_tokens: int | None) -> Self:
+        """The policy of a run that asks for a window of its own (`longhaul run --window`).
+
+        Only two numbers change. The window is the one asked for, and the cap for one tool result
+        is cut to fit it (context.tokens.result_cap): a result of 4,000 tokens, which the config
+        allows in a window of 200,000, would fill half of a window of 8,000, and the room that
+        llm_turn keeps for the results of a turn would never be there. The thresholds are shares
+        of the window, so they follow it. None gives the policy as it is.
+        """
+        if window_tokens is None:
+            return self
+        return self.model_copy(
+            update={
+                "window_tokens": window_tokens,
+                "tool_output_max_tokens": result_cap(self.tool_output_max_tokens, window_tokens),
+            }
+        )
+
 
 class Loop(StrictModel):
     max_verify_rounds: int
@@ -178,6 +203,9 @@ class Loop(StrictModel):
     max_tokens_per_turn: int
     # The cap for the one retry of a turn that stopped on max_tokens.
     max_tokens_retry: int
+    # The turns the planner gets to submit its plan. The workflow keeps a copy of the number in
+    # acts.PLANNER_MAX_TURNS, because it cannot read this file, and a unit test keeps them equal.
+    planner_max_turns: int = Field(ge=1)
 
     @model_validator(mode="after")
     def _retry_cap_is_not_below_the_first_cap(self) -> Self:
@@ -204,6 +232,21 @@ class Telemetry(StrictModel):
     capture_content: bool
 
 
+class Memory(StrictModel):
+    """What the agent remembers about a repo between tasks (Phase 6, ADR-0010).
+
+    `embedder` says which model makes the vectors that notes are found by. `local` is the real
+    one and needs the `memory` extra (`uv sync --extra memory`). `hash` needs nothing installed
+    and finds notes by shared words only, which is for tests and CI. The vectors of the two
+    cannot be compared, so a database holds the rows of one, and a worker refuses to start on a
+    table that another embedder wrote. With `enabled` off the worker builds no store, keeps no
+    repo map or verified commands, and the memory block of the prompt stays empty.
+    """
+
+    enabled: bool
+    embedder: Literal["local", "hash"]
+
+
 class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
@@ -214,6 +257,7 @@ class AppConfig(StrictModel):
     loop: Loop
     stuck: Stuck
     telemetry: Telemetry
+    memory: Memory
     pricing_file: Path
 
 

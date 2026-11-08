@@ -20,6 +20,12 @@ with a unique index (migration 0008), and an add that finds the note returns the
 first one, whatever its status. A rejected note therefore stays rejected when a task proposes
 it again.
 
+One table holds the vectors of one embedder (ADR-0010). Nothing in a row says which, so
+`check_embedder` finds out when a worker starts: it embeds the text of a few stored notes again
+and compares the new vectors with the stored ones. The same embedder gives the same vector, and
+another one gives an unrelated vector, so the worker can refuse a table it would search with the
+wrong ruler.
+
 The contract's MemoryItem has no `source_ref`, so `add_candidate` takes it as an extra keyword.
 `MemoryEntry` is what `list_items` returns, with the columns that MemoryItem leaves out.
 """
@@ -29,7 +35,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, get_args
@@ -48,6 +56,7 @@ __all__ = [
     "DEFAULT_BRANCH_APPROVER",
     "KINDS",
     "STATUSES",
+    "EmbedderMismatchError",
     "MemoryEntry",
     "MemoryItemNotFoundError",
     "PgMemoryStore",
@@ -74,8 +83,22 @@ _VERIFIABLE_KINDS = ("repo_map", "command")
 _ITERATIVE_SCAN = "SET LOCAL hnsw.iterative_scan = strict_order"
 
 
+# How alike the stored vector of a note and a new vector of its text must be for the two to come
+# from one embedder. The same embedder gives 1.0 up to rounding (pgvector keeps 32-bit floats).
+# Another embedder gives a vector with no relation to the first, whose cosine sits near zero.
+_SAME_EMBEDDER = 0.99
+# How many stored notes `check_embedder` embeds again, and the text it embeds when there is none.
+# The shortest notes are taken: they are the cheapest to embed, and a map of a big repo is not.
+_CHECKED_ROWS = 5
+_PROBE_TEXT = "Which embedder wrote this table?"
+
+
 class MemoryItemNotFoundError(LookupError):
     """No memory item has the id that was asked for."""
+
+
+class EmbedderMismatchError(ValueError):
+    """The table holds vectors that the embedder in use did not write."""
 
 
 @dataclass(frozen=True)
@@ -126,20 +149,33 @@ class PgMemoryStore:
 
     # ---------- reading ----------
     async def search(
-        self, repo: str, query: str, k: int, approved_only: bool = True
+        self,
+        repo: str,
+        query: str,
+        k: int,
+        approved_only: bool = True,
+        *,
+        kinds: Sequence[str] | None = None,
     ) -> list[MemoryItem]:
         """The k items of `repo` nearest to `query` by cosine distance, nearest first.
 
         Only approved items are returned unless `approved_only` is False, which drops the
-        filter on status altogether. Each item that comes back has its `uses` counted and its
-        `last_used_at` set, in the same transaction as the read.
+        filter on status altogether. `kinds` limits the search to those kinds: the lessons of a
+        repo, say, which would otherwise compete with its repo maps and commands for the k places.
+        Each item that comes back has its `uses` counted and its `last_used_at` set, in the same
+        transaction as the read.
         """
         if k < 1:
             raise ValueError(f"k must be at least 1, got {k}")
+        unknown = set(kinds or ()) - set(KINDS)
+        if unknown:
+            raise ValueError(f"unknown kind {sorted(unknown)}: a kind is one of {', '.join(KINDS)}")
         [vector] = await self._embed([query])
         nearest = select(MemoryItemRow).where(MemoryItemRow.repo == repo)
         if approved_only:
             nearest = nearest.where(MemoryItemRow.status == "approved")
+        if kinds is not None:
+            nearest = nearest.where(MemoryItemRow.kind.in_(kinds))
         nearest = nearest.order_by(MemoryItemRow.embedding.cosine_distance(vector)).limit(k)
         async with self._sessions.begin() as session:
             await session.execute(text(_ITERATIVE_SCAN))
@@ -213,6 +249,40 @@ class PgMemoryStore:
         )
         async with self._sessions() as session:
             return (await session.scalars(stmt)).first() is not None
+
+    async def check_embedder(self) -> None:
+        """Raise EmbedderMismatchError when another embedder wrote the vectors of the table.
+
+        A worker calls this when it starts. It embeds the text of up to five stored notes again
+        and compares each new vector with the stored one. With no notes there is nothing to
+        compare, and one text is embedded all the same, so that a model that cannot load fails
+        here and not on the first search of a task. A table that holds rows of two embedders is
+        found out when the sample has a row of the other one.
+        """
+        stmt = (
+            select(MemoryItemRow.id, MemoryItemRow.content, MemoryItemRow.embedding)
+            .order_by(func.length(MemoryItemRow.content), MemoryItemRow.id)
+            .limit(_CHECKED_ROWS)
+        )
+        async with self._sessions() as session:
+            sample = (await session.execute(stmt)).all()
+        try:
+            fresh = await self._embed([row.content for row in sample] or [_PROBE_TEXT])
+        except Exception as exc:  # a model that cannot be downloaded or loaded; not a cancel
+            raise ValueError(
+                f"the memory embedder could not embed a text: {type(exc).__name__}: {exc}"
+            ) from exc
+        for row, vector in zip(sample, fresh, strict=False):
+            stored = [float(x) for x in row.embedding]
+            alike = _cosine(stored, vector) if len(stored) == len(vector) else 0.0
+            if alike < _SAME_EMBEDDER:
+                raise EmbedderMismatchError(
+                    f"memory item {row.id} was not embedded by the embedder that memory.embedder "
+                    f"names: a new vector of its text has a cosine of {alike:.2f} with the stored "
+                    "one. Vectors of two embedders cannot be compared (ADR-0010). Set "
+                    "memory.embedder to the embedder that wrote the table, or delete the rows "
+                    "and let them be built again"
+                )
 
     # ---------- writing ----------
     async def add_candidate(self, item: MemoryItem, *, source_ref: str | None = None) -> str:
@@ -318,6 +388,12 @@ class PgMemoryStore:
         async with self._sessions.begin() as session:
             if (await session.execute(stmt)).first() is None:
                 raise MemoryItemNotFoundError(f"no memory item {item_id!r}")
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
+    norms = math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))
+    return dot / norms if norms else 0.0
 
 
 def _parse_id(item_id: str) -> uuid.UUID:

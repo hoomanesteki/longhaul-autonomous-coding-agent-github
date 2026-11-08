@@ -21,15 +21,16 @@ number and so is not delivered; `github_spec` has one.
 """
 
 import asyncio
+import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import WorkflowFailureError, WorkflowHandle, WorkflowHistory
 from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 from temporalio.testing import WorkflowEnvironment
@@ -121,6 +122,13 @@ class Stubs:
     order of all activities, and not in `log`. `names()` therefore lists the loop's activities
     only, and `github_names()` the others.
 
+    load_memory (LH-604) is logged in `memory_loads` and nowhere else, as the activities of a task
+    on a worker with a memory store: each entry is the names of the activities that had run
+    before it, then its input. It does not wait at a gate and is not in `log` or `every`, so the
+    exact lists of the tests below stay what they were. `prepared_with` adds fields to the output
+    of prepare_workspace, such as `memory_enabled=True`, which is what makes the workflow call
+    it.
+
     The note that a run makes at its end (acts.OUTCOME_EVENT, LH-704) goes in `outcomes`, with
     the run that made it. It does not wait at a gate and is not in `log`, so the order of the
     other calls stays what each test below says. An error in `fails` for record_event is raised
@@ -150,11 +158,15 @@ class Stubs:
         self.overflow: dict[int, int] = {}
         self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
         self.outcomes: list[tuple[str, acts.RecordEventInput]] = []
+        self.memory_loads: list[tuple[list[str], acts.LoadMemoryInput]] = []
+        self.memory_block = ref("memory/memory-block.txt")
+        self.prepared_with: dict[str, Any] = {}
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
         return [
             self.prepare_workspace,
+            self.load_memory,
             self.ensure_sandbox,
             self.llm_turn,
             self.tool_exec,
@@ -217,7 +229,16 @@ class Stubs:
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
         await self._enter(acts.PREPARE_WORKSPACE.name, spec)
-        return acts.PrepareWorkspaceOutput(sandbox_id="sbx-1", base_sha=BASE, head_sha=BASE)
+        return acts.PrepareWorkspaceOutput(
+            sandbox_id="sbx-1", base_sha=BASE, head_sha=BASE, **self.prepared_with
+        )
+
+    @activity.defn(name=acts.LOAD_MEMORY.name)
+    async def load_memory(self, inp: acts.LoadMemoryInput) -> BlobRef:
+        self.memory_loads.append((list(self.every), inp))
+        if acts.LOAD_MEMORY.name in self.fails:
+            raise self.fails[acts.LOAD_MEMORY.name]
+        return self.memory_block
 
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
@@ -424,13 +445,15 @@ async def start_cancelled(
 
 
 @asynccontextmanager
-async def running(env: WorkflowEnvironment, stubs: Stubs) -> AsyncIterator[str]:
-    """A worker for the workflow and the stubs. Yields the task queue it polls."""
+async def running(
+    env: WorkflowEnvironment, stubs: Stubs, workflows: Sequence[type] = (TaskWorkflow,)
+) -> AsyncIterator[str]:
+    """A worker for the workflows (TaskWorkflow) and the stubs. Yields the task queue it polls."""
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     async with Worker(
         env.client,
         task_queue=queue,
-        workflows=[TaskWorkflow],
+        workflows=workflows,
         activities=stubs.activities,
         workflow_runner=workflow_runner(),
     ):
@@ -1110,6 +1133,47 @@ async def test_the_script_and_the_tuning_can_ride_in_the_same_memo(
 
     assert [turn.script_ref for turn in stubs.payloads(acts.LLM_TURN.name)] == [script]
     assert timeouts(sched["llm_turn"]) == (10 * 60, 2)
+
+
+# ---------- a window of the run's own (LH-407) ----------
+async def test_the_window_in_the_tuning_goes_to_every_activity_that_counts_tokens(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    def script(turn: int) -> list[acts.ToolCallSummary]:
+        return [call("read_file", f"c{turn}", path="calc.py")] if turn < 2 else [finish()]
+
+    stubs = Stubs(script)
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=acts.Tuning(window_tokens=8_000)
+        )
+        await result_of(handle)
+
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    tools = stubs.payloads(acts.TOOL_EXEC.name)
+    appended = stubs.payloads(acts.APPEND_RESULTS.name)
+    assert (len(turns), len(tools), len(appended)) == (3, 2, 3)
+    assert [i.window_tokens for i in (*turns, *tools, *appended)] == [8_000] * 8
+
+
+async def test_a_run_without_a_window_sends_none_to_the_activities(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(
+        lambda turn: [call("read_file", "c0", path="calc.py")] if turn < 1 else [finish()]
+    )
+    async with running(env, stubs) as queue:
+        handle = await start_task(
+            env.client, spec, task_queue=queue, tuning=acts.Tuning(heartbeat_timeout_s=30)
+        )
+        await result_of(handle)
+
+    payloads = [
+        *stubs.payloads(acts.LLM_TURN.name),
+        *stubs.payloads(acts.TOOL_EXEC.name),
+        *stubs.payloads(acts.APPEND_RESULTS.name),
+    ]
+    assert payloads and {i.window_tokens for i in payloads} == {None}
 
 
 # ---------- sandbox recovery (LH-206) ----------
@@ -2168,7 +2232,11 @@ async def test_the_pull_request_is_built_from_the_last_checkpoint_and_the_finish
 
     (build,) = stubs.payloads(acts.BUILD_PR_BRANCH.name)
     assert build == acts.BuildPrBranchInput(
-        task_id=gh_spec.task_id, repo="acme/calc", summary="all done", head_sha=sha(1)
+        task_id=gh_spec.task_id,
+        repo="acme/calc",
+        summary="all done",
+        base_sha=BASE,
+        head_sha=sha(1),
     )
     (deliver,) = stubs.payloads(acts.DELIVER.name)
     assert deliver == acts.DeliverInput(
@@ -2233,6 +2301,22 @@ async def test_the_pickup_is_not_repeated_after_a_hand_over(env: WorkflowEnviron
     assert outcome == FINISHED
     assert len(stubs.run_ids) == 2
     assert stubs.github_names() == [*PICKUP, *DELIVERY]
+
+
+async def test_the_base_of_the_pull_request_is_kept_across_a_hand_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # The workspace is prepared in the first run and the pull request is built in the second.
+    # The base is the one the workspace was prepared at, and the workflow state carries it.
+    stubs = Stubs(edits_then_finishes(4))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, github_spec(), task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == 2
+    (build,) = stubs.payloads(acts.BUILD_PR_BRANCH.name)
+    assert build.base_sha == BASE
+    assert build.head_sha == sha(4)
 
 
 async def test_a_task_that_cannot_be_picked_up_does_no_work(
@@ -2352,13 +2436,71 @@ async def test_the_github_activities_get_the_policies_of_section_3_7(
     assert acts.CREATE_PR.name not in sched, "deliver calls create_pr itself, inside the activity"
 
 
-async def test_the_helpers_for_a_pause_and_a_resume_are_workflow_methods(
-    gh_spec: TaskSpec,
+@workflow.defn(sandboxed=False)
+class PauseProbe:
+    """Pauses and resumes a task twice with the helpers that Phases 5 and 7 will call.
+
+    Nothing calls `_needs_human` and `_human_done` yet, so this workflow builds a TaskWorkflow
+    from the state it is given and calls them, the way the loop will. It is not sandboxed: the
+    sandbox would load this test module a second time.
+    """
+
+    @workflow.run
+    async def run(self, state: CarryState) -> None:
+        task = TaskWorkflow(state)
+        await task._needs_human(1)
+        await task._human_done(1)
+        await task._needs_human(2)
+
+
+async def pause_and_resume(env: WorkflowEnvironment, stubs: Stubs, task: TaskSpec) -> None:
+    async with running(env, stubs, workflows=[PauseProbe]) as queue:
+        await env.client.execute_workflow(
+            PauseProbe.run,
+            initial_state(task),
+            id=f"pause-{uuid.uuid4().hex[:8]}",
+            task_queue=queue,
+        )
+
+
+async def test_a_pause_adds_the_needs_human_label_and_a_resume_removes_it(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:
-    # Phases 5 and 7 call these when a task pauses and resumes. They run the same label steps
-    # that lifecycle gives, as activities, so there is nothing else to wire.
-    assert callable(TaskWorkflow._needs_human)
-    assert callable(TaskWorkflow._human_done)
+    stubs = Stubs()
+    await pause_and_resume(env, stubs, gh_spec)
+
+    # Three label activities, in the order of the calls. Each pause has a key of its own, and the
+    # resume of a pause has another, so a repeated step is a no-op on GitHub and a new pause is
+    # a new effect.
+    assert stubs.every == [acts.ADD_LABEL.name, acts.REMOVE_LABEL.name, acts.ADD_LABEL.name]
+    first_pause, second_pause = stubs.payloads(acts.ADD_LABEL.name)
+    (resume,) = stubs.payloads(acts.REMOVE_LABEL.name)
+    assert first_pause == lifecycle.on_pause(gh_spec, 1)[0].label
+    assert resume == lifecycle.on_resume(gh_spec, 1)[0].label
+    assert second_pause == lifecycle.on_pause(gh_spec, 2)[0].label
+    assert {first_pause.label, resume.label, second_pause.label} == {lifecycle.NEEDS_HUMAN}
+    assert (first_pause.repo, first_pause.number) == ("acme/calc", 42)
+    assert (
+        len({first_pause.idempotency_key, resume.idempotency_key, second_pause.idempotency_key})
+        == 3
+    )
+    assert stubs.names() == [], "nothing but labels is written"
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        pytest.param(make_spec(repo="local:/work/calc", issue=42), id="local folder with issue"),
+        pytest.param(make_spec(repo="acme/calc", issue=None), id="repo without issue"),
+    ],
+)
+async def test_a_task_that_is_not_an_issue_has_no_label_to_change_on_a_pause(
+    env: WorkflowEnvironment, task: TaskSpec
+) -> None:
+    stubs = Stubs()
+    await pause_and_resume(env, stubs, task)
+
+    assert stubs.every == []
 
 
 # ---------- the note at the end of a run (LH-704) ----------
@@ -2577,3 +2719,439 @@ async def test_histories_of_a_run_with_a_mode_replay(env: WorkflowEnvironment) -
         data_converter=guarded_data_converter,
     )
     await replayer.replay_workflow(history)
+
+
+# ---------- LH-308: report_status ----------
+def status_posts(stubs: Stubs) -> list[CommentInput]:
+    """The comments of the activity post_comment, without the pickup."""
+    return [c for c in stubs.payloads(acts.POST_COMMENT.name) if ":status:" in c.idempotency_key]
+
+
+async def at_the_first_turn(
+    env: WorkflowEnvironment, stubs: Stubs, spec: TaskSpec, queue: str, **options: Any
+) -> WorkflowHandle[Any, Outcome]:
+    """Start the task and hold it inside its first model call, with the pickup already done."""
+    stubs.hold(acts.LLM_TURN.name)
+    handle = await start_task(env.client, spec, task_queue=queue, **options)
+    await wait_for_phase(handle, Phase.CODING)
+    await wait_until(lambda: acts.LLM_TURN.name in stubs.names(), "the turn to start")
+    return handle
+
+
+async def test_report_status_posts_a_status_comment_through_the_activity(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status comment")
+        seen = await handle.query(TaskWorkflow.status)
+        stubs.release(acts.LLM_TURN.name)
+        outcome = await result_of(handle)
+
+    (posted,) = status_posts(stubs)
+    assert posted == lifecycle.status_comment(gh_spec, seen, by="maintainer", n=1)
+    assert posted.idempotency_key == f"{gh_spec.task_id}:status:1"
+    assert "coding" in posted.body
+    assert outcome == FINISHED, "the status request did not disturb the task"
+
+
+async def test_each_status_request_gets_the_next_key(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+
+        for who in ("maintainer", "writer", "maintainer"):
+            await handle.signal(TaskWorkflow.report_status, who)
+        await wait_until(lambda: len(status_posts(stubs)) == 3, "three status comments")
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+
+    posts = sorted(status_posts(stubs), key=lambda c: c.idempotency_key)
+    assert [c.idempotency_key for c in posts] == [
+        f"{gh_spec.task_id}:status:{n}" for n in (1, 2, 3)
+    ]
+    assert [("`writer`" in c.body) for c in posts] == [False, True, False]
+
+
+async def test_a_replay_posts_no_status_comment_again(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status comment")
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 2, "the second status comment")
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)  # raises if a replay would change the commands
+
+
+async def test_the_status_count_survives_a_hand_over(env: WorkflowEnvironment) -> None:
+    # The key of a status comment is its number. A run that began again at 1 would reuse the key
+    # of an earlier comment with other text, and that is an error.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    stubs.hold_turn(4)  # the second run's second turn
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the first status comment")
+        stubs.release_turn(1)
+
+        await wait_until(lambda: stubs.started(4), "a turn of the second run")
+        assert len(stubs.run_ids) == 2
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 2, "the second status comment")
+        stubs.release_turn(4)
+        await result_of(handle)
+
+    assert [c.idempotency_key for c in status_posts(stubs)] == [
+        f"{spec.task_id}:status:1",
+        f"{spec.task_id}:status:2",
+    ]
+
+
+async def test_a_status_comment_that_cannot_be_posted_does_not_fail_the_task(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        stubs.fails = {
+            acts.POST_COMMENT.name: ApplicationError(
+                "Resource not accessible", type=acts.GITHUB_FATAL, non_retryable=True
+            )
+        }
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release(acts.LLM_TURN.name)
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+
+
+async def test_a_task_without_an_issue_has_nowhere_to_report_its_status(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, spec, queue)
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await handle.query(TaskWorkflow.status)  # the signal has been handled by now
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+
+    assert stubs.payloads(acts.POST_COMMENT.name) == []
+
+
+async def test_a_cancel_does_not_wait_for_a_status_comment(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue, tuning=SHORT_HEARTBEAT)
+        stubs.hold(acts.POST_COMMENT.name)  # the status comment cannot be posted
+
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+
+
+async def test_a_cancel_at_a_hand_over_does_not_wait_for_a_status_comment(
+    env: WorkflowEnvironment,
+) -> None:
+    # GitHub is failing, so the status comment keeps retrying. The task reaches its hand-over
+    # meanwhile, and a person who cancels there must not wait for the comment.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, heartbeat_timeout_s=2)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)  # the status comment cannot be posted
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+        await wait_until(lambda: acts.RECORD_EVENT.name in stubs.names(), "the hand-over")
+
+        await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+        outcome = await result_of(handle)
+
+    assert outcome == Outcome(kind=OutcomeKind.CANCELLED, summary="cancelled by maintainer: enough")
+    assert len(stubs.run_ids) == 1, "the task did not hand over after the cancel"
+
+
+async def test_a_status_comment_that_is_still_posting_does_not_stop_the_hand_over(
+    env: WorkflowEnvironment,
+) -> None:
+    # The hand-over gives the comment a short while, then goes on without it. The count is in
+    # the memo already, so the next status comment gets a new key.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.hold_turn(1)
+    tuning = acts.Tuning(continue_as_new_every_turns=3, status_grace_s=1)
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=tuning)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        stubs.hold(acts.POST_COMMENT.name)
+        await handle.signal(TaskWorkflow.report_status, "maintainer")
+        await wait_until(lambda: len(status_posts(stubs)) == 1, "the status attempt")
+        stubs.release_turn(1)
+
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED
+    assert len(stubs.run_ids) == 2, "the task handed over while the status comment was pending"
+
+
+# ---------- LH-604: the memory block is loaded once and rides in every turn ----------
+MAP_REF = ref("memory/repo-map.txt")
+WITH_MEMORY: dict[str, Any] = {"memory_enabled": True, "repo_map_ref": MAP_REF}
+
+
+async def test_load_memory_runs_once_after_prepare_and_the_block_goes_to_every_turn(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.prepared_with = WITH_MEMORY
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    ((before, loaded),) = stubs.memory_loads
+    # After the workspace is ready, and before the model has been asked anything.
+    assert before == ["prepare_workspace"]
+    assert loaded == acts.LoadMemoryInput(spec=spec, repo_map_ref=MAP_REF)
+    assert stubs.every[0] == "prepare_workspace"
+    assert stubs.every[1] == "llm_turn"
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 3
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
+
+
+async def test_a_worker_without_memory_adds_no_activity_to_the_task(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # What prepare_workspace says decides it, and the output of a worker that has no store (or an
+    # output recorded before LH-604) says nothing. So the sequence of an old history is the same.
+    stubs = Stubs(reads_then_finishes(1))
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert stubs.memory_loads == []
+    assert {t.memory_ref for t in stubs.payloads(acts.LLM_TURN.name)} == {None}
+
+
+async def test_the_block_survives_continue_as_new_and_is_not_loaded_again(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # Runs of turns 0-2 and 3-5 and 6. A new run would find other lessons if it asked again, and
+    # the prompt must be the same bytes for the whole task.
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.prepared_with = WITH_MEMORY
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert len(stubs.run_ids) == 3
+    assert len(stubs.memory_loads) == 1
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 7
+    assert [t.memory_ref for t in turns] == [stubs.memory_block] * len(turns)
+
+
+async def test_the_compaction_gets_the_block_as_well(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(2))
+    stubs.prepared_with = WITH_MEMORY
+    stubs.decisions[0] = "compact"
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    (compaction,) = compactions(stubs)
+    assert compaction.memory_ref == stubs.memory_block
+
+
+async def test_a_memory_that_cannot_be_loaded_does_not_fail_the_task(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    # The notes are hints. After its retries the activity gives up, and the task goes on without.
+    stubs = Stubs(reads_then_finishes(1))
+    stubs.prepared_with = WITH_MEMORY
+    stubs.fails[acts.LOAD_MEMORY.name] = ApplicationError(
+        "the store is down", type="OperationalError", non_retryable=True
+    )
+    outcome, final = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert final.phase is Phase.DONE
+    assert len(stubs.memory_loads) == 1
+    assert {t.memory_ref for t in stubs.payloads(acts.LLM_TURN.name)} == {None}
+
+
+async def test_the_verified_test_command_fills_in_a_repo_that_names_none(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    assert spec.settings.test_command is None
+    stubs = Stubs(edits_then_finishes(4))
+    stubs.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    # Every model turn, in every run, builds its prompt from a spec that names the command, and
+    # the spec of the task is otherwise what it was.
+    turns = stubs.payloads(acts.LLM_TURN.name)
+    assert len(turns) == 5
+    assert {t.spec.settings.test_command for t in turns} == {"pytest -q"}
+    assert all(t.spec.model_copy(update={"settings": spec.settings}) == spec for t in turns)
+
+
+async def test_a_test_command_in_the_settings_is_never_replaced(
+    env: WorkflowEnvironment,
+) -> None:
+    named = make_spec().model_copy(
+        update={"settings": RepoSettings(repo="acme/calc", test_command="make check")}
+    )
+    stubs = Stubs()
+    stubs.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    await play(env, stubs, named)
+
+    assert {t.spec.settings.test_command for t in stubs.payloads(acts.LLM_TURN.name)} == {
+        "make check"
+    }
+
+
+async def test_histories_with_and_without_the_memory_call_replay(env: WorkflowEnvironment) -> None:
+    """An old history has no load_memory and a new one has it, and the same code replays both.
+
+    The first task is what the workflow did before LH-604: its prepare_workspace output has no
+    memory flag, so it never calls the activity. The second is a task on a worker with a store,
+    which calls it once, and hands over to a new run after three turns.
+    """
+    old, new = Stubs(reads_then_finishes(3)), Stubs(edits_then_finishes(4))
+    new.prepared_with = {**WITH_MEMORY, "test_command": "pytest -q"}
+    async with running(env, old) as queue:
+        before = await start_task(env.client, make_spec("lh-acme-calc-61"), task_queue=queue)
+        await result_of(before)
+    async with running(env, new) as queue:
+        first = await start_task(
+            env.client, make_spec("lh-acme-calc-62"), task_queue=queue, tuning=EVERY_3
+        )
+        await result_of(first)
+        histories = [
+            await before.fetch_history(),
+            await env.client.get_workflow_handle(
+                "lh-acme-calc-62", run_id=first.first_execution_run_id
+            ).fetch_history(),
+            await env.client.get_workflow_handle("lh-acme-calc-62").fetch_history(),
+        ]
+
+    assert old.memory_loads == [] and len(new.memory_loads) == 1
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    for history in histories:
+        await replayer.replay_workflow(history)
+
+
+def _with_prepare_result(history: WorkflowHistory, **fields: Any) -> WorkflowHistory:
+    """The history with `fields` added to the recorded result of prepare_workspace."""
+    scheduled = next(
+        event.event_id
+        for event in history.events
+        if event.HasField("activity_task_scheduled_event_attributes")
+        and event.activity_task_scheduled_event_attributes.activity_type.name
+        == acts.PREPARE_WORKSPACE.name
+    )
+    completed = next(
+        event.activity_task_completed_event_attributes
+        for event in history.events
+        if event.HasField("activity_task_completed_event_attributes")
+        and event.activity_task_completed_event_attributes.scheduled_event_id == scheduled
+    )
+    payload = completed.result.payloads[0]
+    payload.data = json.dumps({**json.loads(payload.data), **fields}).encode()
+    return history
+
+
+async def test_a_history_in_which_old_code_saw_the_memory_flag_replays(
+    env: WorkflowEnvironment,
+) -> None:
+    """A rolling upgrade can hand the prepare result of a new worker to old workflow code.
+
+    The new worker returns memory_enabled=true. The old workflow code ignores the field and goes
+    on to llm_turn, so that is the command the history holds. A worker that runs the new code
+    must replay it without a load_memory call, which `workflow.patched` decides: the history has
+    no marker for it. The history is recorded with the flag off and its recorded result is then
+    edited to carry the flag, which gives the history that the old code would have written.
+    """
+    stubs = Stubs(reads_then_finishes(1))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, make_spec("lh-acme-calc-63"), task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert stubs.memory_loads == []
+    seen = _with_prepare_result(history, memory_enabled=True, repo_map_ref=MAP_REF.model_dump())
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(seen)
+
+
+def _patch_markers(history: WorkflowHistory) -> list[str]:
+    return [
+        event.marker_recorded_event_attributes.marker_name
+        for event in history.events
+        if event.HasField("marker_recorded_event_attributes")
+        and event.marker_recorded_event_attributes.marker_name == "core_patch"
+    ]
+
+
+async def test_a_task_with_memory_records_the_patch_marker_and_one_without_does_not(
+    env: WorkflowEnvironment,
+) -> None:
+    # The marker is what lets a worker tell a history of this code from a history of old code.
+    # A task that never asks about memory has no use for it, which keeps the history of every
+    # task on a worker with no store as it was.
+    with_memory, without = Stubs(reads_then_finishes(1)), Stubs(reads_then_finishes(1))
+    with_memory.prepared_with = WITH_MEMORY
+    async with running(env, with_memory) as queue:
+        first = await start_task(env.client, make_spec("lh-acme-calc-64"), task_queue=queue)
+        await result_of(first)
+        marked = await first.fetch_history()
+    async with running(env, without) as queue:
+        second = await start_task(env.client, make_spec("lh-acme-calc-65"), task_queue=queue)
+        await result_of(second)
+        plain = await second.fetch_history()
+
+    assert len(_patch_markers(marked)) == 1
+    assert _patch_markers(plain) == []

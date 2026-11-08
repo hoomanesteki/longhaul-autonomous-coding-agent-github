@@ -1,0 +1,905 @@
+# Fixes tests/fixtures/repos/longlog: twelve modules, each with one planted bug and a
+# test. The run takes 62 turns: a full run of the suite, then five turns for each module
+# (read it, edit it, run its own test, look at the diff, run the whole suite), then finish.
+#
+# The suite prints 5,000 lines of trace, so the model reads a head, a tail and a handle,
+# and the turns after it see a stub. The steps match only what survives that: the summary
+# line that run_tests puts at the top of its result, the file that read_file returns, the
+# diff that edit_file returns, and the first lines of a git diff. No step looks at the
+# trace, or at a result that has been elided.
+#
+# Steps are keyed by turn_index as well. The index counts the turns that a compaction
+# folded into notes, so a step matches the same turn before and after one.
+#
+# The compactor answers with notes that list the modules fixed so far. The step that edits
+# a module says `Fixed <module>:`, and so do the notes. The highest module that the
+# request mentions, in the turns to fold or in the previous notes, is the one the notes go
+# up to. The steps run from the last module down, and the first that matches answers.
+#
+# The first compaction of the long-task test folds the fixes of chunks, clamp and dedupe, and has
+# no previous notes. Every step above dedupe belongs to a later round, and asks for the previous
+# notes as well: the line `"Fixed chunks:` with its quote is how the notes are printed in the
+# request (as JSON), while a turn to fold shows the same words as `said: Fixed chunks:`. A run
+# that does not carry the notes from one compaction to the next gets the last step, which lists
+# no module, and the long-task test fails on the notes it finds.
+# Its steps are the ones in compactor.yaml, after the coder.
+steps:
+  # Turn 0: the first full run.
+  - match:
+      role: coder
+      turn_index: 0
+    respond:
+      text: "I start by running the whole suite to see how many modules fail. The trace will be long, so I read the summary line first."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 1 of 12: chunks. Turns 1 to 5.
+  - match:
+      role: coder
+      turn_index: 1
+      last_tool_result_contains: "summary: 12 failed"
+    respond:
+      text: "The next failing test is test_chunk_keeps_the_last_partial_chunk. It splits five items into pieces of two and expects a last piece that holds the fifth. I open src/longlog/chunks.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/chunks.py"}}
+  - match:
+      role: coder
+      turn_index: 2
+      last_tool_result_contains: "return [items[i : i + size] for i in range(0, len(items) - size + 1, size)]"
+    respond:
+      text: "Fixed chunks: the range stopped early, so the last short chunk was dropped. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/chunks.py
+            old_str: "    return [items[i : i + size] for i in range(0, len(items) - size + 1, size)]"
+            new_str: "    return [items[i : i + size] for i in range(0, len(items), size)]"
+  - match:
+      role: coder
+      turn_index: 3
+      last_tool_result_contains: "+++ b/src/longlog/chunks.py"
+    respond:
+      text: "I run only tests/test_chunks.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_chunks.py"}}
+  - match:
+      role: coder
+      turn_index: 4
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 5
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that chunks is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 2 of 12: clamp. Turns 6 to 10.
+  - match:
+      role: coder
+      turn_index: 6
+      last_tool_result_contains: "summary: 11 failed, 1 passed"
+    respond:
+      text: "The next failing test is test_clamp_allows_the_upper_bound. It limits 15 to the range 0 to 10 and expects 10, the upper bound itself. I open src/longlog/clamp.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/clamp.py"}}
+  - match:
+      role: coder
+      turn_index: 7
+      last_tool_result_contains: "return max(low, min(value, high - 1))"
+    respond:
+      text: "Fixed clamp: the upper bound was one too low. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/clamp.py
+            old_str: "    return max(low, min(value, high - 1))"
+            new_str: "    return max(low, min(value, high))"
+  - match:
+      role: coder
+      turn_index: 8
+      last_tool_result_contains: "+++ b/src/longlog/clamp.py"
+    respond:
+      text: "I run only tests/test_clamp.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_clamp.py"}}
+  - match:
+      role: coder
+      turn_index: 9
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 10
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that clamp is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 3 of 12: dedupe. Turns 11 to 15.
+  - match:
+      role: coder
+      turn_index: 11
+      last_tool_result_contains: "summary: 10 failed, 2 passed"
+    respond:
+      text: "The next failing test is test_dedupe_keeps_the_first_copy. It removes the repeats from 3, 1, 3, 2, 1 and expects the first copy of each to stay. I open src/longlog/dedupe.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/dedupe.py"}}
+  - match:
+      role: coder
+      turn_index: 12
+      last_tool_result_contains: "return [item for i, item in enumerate(items) if item not in items[i + 1 :]]"
+    respond:
+      text: "Fixed dedupe: it kept the last copy of an item and not the first. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/dedupe.py
+            old_str: "    return [item for i, item in enumerate(items) if item not in items[i + 1 :]]"
+            new_str: "    return [item for i, item in enumerate(items) if item not in items[:i]]"
+  - match:
+      role: coder
+      turn_index: 13
+      last_tool_result_contains: "+++ b/src/longlog/dedupe.py"
+    respond:
+      text: "I run only tests/test_dedupe.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_dedupe.py"}}
+  - match:
+      role: coder
+      turn_index: 14
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 15
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that dedupe is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 4 of 12: initials. Turns 16 to 20.
+  - match:
+      role: coder
+      turn_index: 16
+      last_tool_result_contains: "summary: 9 failed, 3 passed"
+    respond:
+      text: "The next failing test is test_initials_uses_every_word. It reads three words and expects one capital letter for each. I open src/longlog/initials.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/initials.py"}}
+  - match:
+      role: coder
+      turn_index: 17
+      last_tool_result_contains: "return \"\".join(word[0] for word in name.split()[:1]).upper()"
+    respond:
+      text: "Fixed initials: it read only the first word of the name. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/initials.py
+            old_str: "    return \"\".join(word[0] for word in name.split()[:1]).upper()"
+            new_str: "    return \"\".join(word[0] for word in name.split()).upper()"
+  - match:
+      role: coder
+      turn_index: 18
+      last_tool_result_contains: "+++ b/src/longlog/initials.py"
+    respond:
+      text: "I run only tests/test_initials.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_initials.py"}}
+  - match:
+      role: coder
+      turn_index: 19
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 20
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that initials is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 5 of 12: leap. Turns 21 to 25.
+  - match:
+      role: coder
+      turn_index: 21
+      last_tool_result_contains: "summary: 8 failed, 4 passed"
+    respond:
+      text: "The next failing test is test_a_century_divisible_by_400_is_a_leap_year. It asks about the year 2000, which is a century divisible by 400. I open src/longlog/leap.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/leap.py"}}
+  - match:
+      role: coder
+      turn_index: 22
+      last_tool_result_contains: "return year % 4 == 0 and year % 100 != 0"
+    respond:
+      text: "Fixed leap: years divisible by 400 were not counted as leap years. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/leap.py
+            old_str: "    return year % 4 == 0 and year % 100 != 0"
+            new_str: "    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0"
+  - match:
+      role: coder
+      turn_index: 23
+      last_tool_result_contains: "+++ b/src/longlog/leap.py"
+    respond:
+      text: "I run only tests/test_leap.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_leap.py"}}
+  - match:
+      role: coder
+      turn_index: 24
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 25
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that leap is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 6 of 12: ordinal. Turns 26 to 30.
+  - match:
+      role: coder
+      turn_index: 26
+      last_tool_result_contains: "summary: 7 failed, 5 passed"
+    respond:
+      text: "The next failing test is test_the_teens_end_in_th. It expects 11, 12 and 13 to end in th, and not in st, nd and rd. I open src/longlog/ordinal.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/ordinal.py"}}
+  - match:
+      role: coder
+      turn_index: 27
+      last_tool_result_contains: "return f\"{number}{suffixes.get(number % 10, 'th')}\""
+    respond:
+      text: "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/ordinal.py
+            old_str: "    return f\"{number}{suffixes.get(number % 10, 'th')}\""
+            new_str: "    if 10 <= number % 100 <= 20:\n        return f\"{number}th\"\n    return f\"{number}{suffixes.get(number % 10, 'th')}\""
+  - match:
+      role: coder
+      turn_index: 28
+      last_tool_result_contains: "+++ b/src/longlog/ordinal.py"
+    respond:
+      text: "I run only tests/test_ordinal.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_ordinal.py"}}
+  - match:
+      role: coder
+      turn_index: 29
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 30
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that ordinal is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 7 of 12: pages. Turns 31 to 35.
+  - match:
+      role: coder
+      turn_index: 31
+      last_tool_result_contains: "summary: 6 failed, 6 passed"
+    respond:
+      text: "The next failing test is test_page_count_rounds_up. It shows 21 items ten at a time and expects three pages. I open src/longlog/pages.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/pages.py"}}
+  - match:
+      role: coder
+      turn_index: 32
+      last_tool_result_contains: "return total // per_page"
+    respond:
+      text: "Fixed pages: the division rounded down, so the last page was missing. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/pages.py
+            old_str: "    return total // per_page"
+            new_str: "    return -(-total // per_page)"
+  - match:
+      role: coder
+      turn_index: 33
+      last_tool_result_contains: "+++ b/src/longlog/pages.py"
+    respond:
+      text: "I run only tests/test_pages.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_pages.py"}}
+  - match:
+      role: coder
+      turn_index: 34
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 35
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that pages is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 8 of 12: percent. Turns 36 to 40.
+  - match:
+      role: coder
+      turn_index: 36
+      last_tool_result_contains: "summary: 5 failed, 7 passed"
+    respond:
+      text: "The next failing test is test_percent_of_a_whole. It asks for 1 as a percentage of 8 and expects 12.5. I open src/longlog/percent.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/percent.py"}}
+  - match:
+      role: coder
+      turn_index: 37
+      last_tool_result_contains: "return round(whole / part * 100, 1)"
+    respond:
+      text: "Fixed percent: the operands were the wrong way round. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/percent.py
+            old_str: "    return round(whole / part * 100, 1)"
+            new_str: "    return round(part / whole * 100, 1)"
+  - match:
+      role: coder
+      turn_index: 38
+      last_tool_result_contains: "+++ b/src/longlog/percent.py"
+    respond:
+      text: "I run only tests/test_percent.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_percent.py"}}
+  - match:
+      role: coder
+      turn_index: 39
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 40
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that percent is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 9 of 12: ranges. Turns 41 to 45.
+  - match:
+      role: coder
+      turn_index: 41
+      last_tool_result_contains: "summary: 4 failed, 8 passed"
+    respond:
+      text: "The next failing test is test_inclusive_range_includes_the_stop. It asks for the numbers from 3 to 6 and expects both ends to be in the list. I open src/longlog/ranges.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/ranges.py"}}
+  - match:
+      role: coder
+      turn_index: 42
+      last_tool_result_contains: "return list(range(start, stop))"
+    respond:
+      text: "Fixed ranges: the stop value was left out of the range. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/ranges.py
+            old_str: "    return list(range(start, stop))"
+            new_str: "    return list(range(start, stop + 1))"
+  - match:
+      role: coder
+      turn_index: 43
+      last_tool_result_contains: "+++ b/src/longlog/ranges.py"
+    respond:
+      text: "I run only tests/test_ranges.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_ranges.py"}}
+  - match:
+      role: coder
+      turn_index: 44
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 45
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that ranges is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 10 of 12: slug. Turns 46 to 50.
+  - match:
+      role: coder
+      turn_index: 46
+      last_tool_result_contains: "summary: 3 failed, 9 passed"
+    respond:
+      text: "The next failing test is test_slugify_lowercases. It turns \"Hello, World!\" into a slug and expects it in lower case. I open src/longlog/slug.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/slug.py"}}
+  - match:
+      role: coder
+      turn_index: 47
+      last_tool_result_contains: "return \"-\".join(words)"
+    respond:
+      text: "Fixed slug: the words were not lower-cased. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/slug.py
+            old_str: "    return \"-\".join(words)"
+            new_str: "    return \"-\".join(words).lower()"
+  - match:
+      role: coder
+      turn_index: 48
+      last_tool_result_contains: "+++ b/src/longlog/slug.py"
+    respond:
+      text: "I run only tests/test_slug.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_slug.py"}}
+  - match:
+      role: coder
+      turn_index: 49
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 50
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that slug is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 11 of 12: stats. Turns 51 to 55.
+  - match:
+      role: coder
+      turn_index: 51
+      last_tool_result_contains: "summary: 2 failed, 10 passed"
+    respond:
+      text: "The next failing test is test_mean_keeps_the_fraction. It takes the mean of 1 and 2 and expects 1.5 and not 1. I open src/longlog/stats.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/stats.py"}}
+  - match:
+      role: coder
+      turn_index: 52
+      last_tool_result_contains: "return sum(values) // len(values)"
+    respond:
+      text: "Fixed stats: the mean used integer division. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/stats.py
+            old_str: "    return sum(values) // len(values)"
+            new_str: "    return sum(values) / len(values)"
+  - match:
+      role: coder
+      turn_index: 53
+      last_tool_result_contains: "+++ b/src/longlog/stats.py"
+    respond:
+      text: "I run only tests/test_stats.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_stats.py"}}
+  - match:
+      role: coder
+      turn_index: 54
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 55
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that stats is green and which module fails next. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # Module 12 of 12: words. Turns 56 to 60.
+  - match:
+      role: coder
+      turn_index: 56
+      last_tool_result_contains: "summary: 1 failed, 11 passed"
+    respond:
+      text: "The next failing test is test_word_count_ignores_extra_spaces. It counts three words that are separated by runs of spaces and expects 3. I open src/longlog/words.py to see how the function is written before I touch anything. The suite prints thousands of trace lines after its summary, so I read the summary line and leave the trace alone. If I ever need a detail from it, I can page through the output handle with read_output. Reading the module first costs one turn, and it saves me from editing a line that I have only guessed at. A module this short should show its problem at once."
+      tool_calls:
+        - {name: read_file, input: {path: "src/longlog/words.py"}}
+  - match:
+      role: coder
+      turn_index: 57
+      last_tool_result_contains: "return len(text.split(\" \"))"
+    respond:
+      text: "Fixed words: splitting on one space counted every extra space as a word. I change that one line and keep the rest of the module as it is, so that the diff stays small and easy to review. I copy the line from the file I just read as old_str, because edit_file only accepts a piece of text that matches exactly once. I do not touch the test, because the test states what the function is meant to do, and the function is what is wrong. Nothing else in the package imports this module, so no other file can be affected."
+      tool_calls:
+        - name: edit_file
+          input:
+            path: src/longlog/words.py
+            old_str: "    return len(text.split(\" \"))"
+            new_str: "    return len(text.split())"
+  - match:
+      role: coder
+      turn_index: 58
+      last_tool_result_contains: "+++ b/src/longlog/words.py"
+    respond:
+      text: "I run only tests/test_words.py first, so that a failure points at this one change and not at one of the other modules. The whole suite takes about as long, but its output is long, and I would rather read a short result before I spend a turn on the long one. If the test still fails, I read the failure before I change anything else, and I do not stack a second edit on top of one that I have not checked."
+      tool_calls:
+        - {name: run_tests, input: {target: "tests/test_words.py"}}
+  - match:
+      role: coder
+      turn_index: 59
+      last_tool_result_contains: "summary: 1 passed"
+    respond:
+      text: "The targeted test passes. Before the full run I look at the diff against base, to check that the edit touched one place and nothing else. The diff grows with every module I fix, so I only need its first lines to see that the earlier fixes are still in place. The diff is also the record that I hand over at the end, so I want it clean, with no stray change in it and no leftover from an attempt that did not work."
+      tool_calls:
+        - {name: git_diff, input: {}}
+  - match:
+      role: coder
+      turn_index: 60
+      last_tool_result_contains: "diff --git a/src/longlog/chunks.py"
+    respond:
+      text: "The diff is what I meant to write. Now the whole suite, to see that words is green and that everything passes. The summary line is all I need from it: the number of failures should drop by one, and the other modules should be as they were. If another module has started to fail because of this edit, the count will show it, and I will look at that module before I go on to the next one."
+      tool_calls:
+        - {name: run_tests, input: {}}
+  # The last full run passes, so the task is done.
+  - match:
+      role: coder
+      turn_index: 61
+      last_tool_result_contains: "summary: 12 passed"
+    respond:
+      text: "All twelve modules are fixed and the whole suite passes, so I am done."
+      tool_calls:
+        - {name: finish, input: {summary: "Fixed the planted bug in each of the 12 longlog modules. 12 passed."}}
+
+  # ---- the compactor, as in compactor.yaml ----
+  # 12 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed words:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: &goal "Fix the planted bug in each of the 12 modules of src/longlog, one module at a time, until the whole suite passes."
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py, src/longlog/stats.py, src/longlog/words.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Fixed stats: the mean used integer division"
+              - "Fixed words: splitting on one space counted every extra space as a word"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests: []
+            open_hypotheses: []
+            tried_and_failed: &tried
+              - "Reading the trace of a test run. It has 5,000 lines: use the summary line, and read_output with a pattern when a detail is needed."
+            covers_turns_up_to: 0
+  # 11 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed stats:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py, src/longlog/stats.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Fixed stats: the mean used integer division"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_words.py::test_word_count_ignores_extra_spaces"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 10 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed slug:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py, src/longlog/slug.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Fixed slug: the words were not lower-cased"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_stats.py::test_mean_keeps_the_fraction"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 9 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed ranges:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py, src/longlog/ranges.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Fixed ranges: the stop value was left out of the range"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_slug.py::test_slugify_lowercases"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 8 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed percent:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py, src/longlog/percent.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Fixed percent: the operands were the wrong way round"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_ranges.py::test_inclusive_range_includes_the_stop"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 7 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed pages:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py, src/longlog/pages.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Fixed pages: the division rounded down, so the last page was missing"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_percent.py::test_percent_of_a_whole"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 6 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed ordinal:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py, src/longlog/ordinal.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Fixed ordinal: 11, 12 and 13 got st, nd and rd instead of th"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_pages.py::test_page_count_rounds_up"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 5 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed leap:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py, src/longlog/leap.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Fixed leap: years divisible by 400 were not counted as leap years"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_ordinal.py::test_the_teens_end_in_th"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 4 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed initials:"
+      request_contains: '"Fixed chunks:'
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py, src/longlog/initials.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Fixed initials: it read only the first word of the name"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_leap.py::test_a_century_divisible_by_400_is_a_leap_year"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 3 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed dedupe:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py, src/longlog/dedupe.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Fixed dedupe: it kept the last copy of an item and not the first"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_initials.py::test_initials_uses_every_word"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 2 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed clamp:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py, src/longlog/clamp.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Fixed clamp: the upper bound was one too low"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_dedupe.py::test_dedupe_keeps_the_first_copy"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 1 of 12 modules fixed.
+  - match:
+      role: compactor
+      user_text_contains: "Fixed chunks:"
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: [src/longlog/chunks.py]
+            decisions:
+              - "Fixed chunks: the range stopped early, so the last short chunk was dropped"
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_clamp.py::test_clamp_allows_the_upper_bound"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0
+  # 0 of 12 modules fixed.
+  - match:
+      role: compactor
+    respond:
+      tool_calls:
+        - name: record_progress_notes
+          input:
+            goal: *goal
+            plan_status: []
+            files_touched: []
+            decisions:
+              - "Work in alphabetical order: run the full suite, read the failing module, edit one line, run its test, check git_diff, run the full suite again."
+            failing_tests:
+              - "tests/test_chunks.py::test_chunk_keeps_the_last_partial_chunk"
+            open_hypotheses: []
+            tried_and_failed: *tried
+            covers_turns_up_to: 0

@@ -1,0 +1,295 @@
+# The custom task set (plan section 8.2): fifteen tasks on three repos, five on each.
+#
+# `base_sha` is the commit that scripts/make_fixture_git.py makes of eval/custom/repos/<repo>.
+# It changes whenever a file in that folder changes. `python eval/custom_tasks.py` prints the
+# current ones, and tests/unit/test_eval_tasks.py fails until this file matches them.
+#
+# `hidden_tests` is the file that decides whether the task is solved. The agent never sees it.
+# eval/custom/reference/<id>.patch is a fix that passes it, kept to prove the tests can pass.
+# The issue text is all the agent gets, so it says what the code should do, in words.
+- id: calc-01
+  repo: calc
+  base_sha: ec21da226ade95fe727b22900a8eaa656d451abb
+  category: bugfix
+  hidden_tests: eval/custom/hidden_tests/calc/test_calc_01_add.py
+  issue_title: add() returns the difference
+  issue_body: |
+    `calc.add` subtracts its arguments instead of adding them.
+
+    ```python
+    from calc import add
+
+    add(2, 3)  # returns -1, expected 5
+    ```
+
+    `multiply` looks fine. Only `add` is wrong. It should work for negative numbers and for
+    fractions too.
+
+- id: calc-02
+  repo: calc
+  base_sha: ec21da226ade95fe727b22900a8eaa656d451abb
+  category: bugfix
+  hidden_tests: eval/custom/hidden_tests/calc/test_calc_02_divide.py
+  issue_title: divide() drops the fraction
+  issue_body: |
+    `calc.divide` rounds its answer down to a whole number.
+
+    ```python
+    from calc import divide
+
+    divide(7, 2)   # returns 3, expected 3.5
+    divide(-7, 2)  # returns -4, expected -3.5
+    ```
+
+    Dividing by zero must still raise `ZeroDivisionError`, and numbers that divide evenly
+    should give the same answer as before.
+
+- id: calc-03
+  repo: calc
+  base_sha: ec21da226ade95fe727b22900a8eaa656d451abb
+  category: feature
+  hidden_tests: eval/custom/hidden_tests/calc/test_calc_03_mean.py
+  issue_title: Add a mean() function
+  issue_body: |
+    Please add `mean(values)` to the `calc` package. It takes a list or tuple of numbers and
+    returns their arithmetic mean as a float.
+
+    ```python
+    from calc import mean
+
+    mean([1, 2, 3, 4])  # 2.5
+    mean((10,))         # 10.0
+    ```
+
+    An empty sequence has no mean, so `mean([])` should raise `ValueError`.
+
+- id: calc-04
+  repo: calc
+  base_sha: ec21da226ade95fe727b22900a8eaa656d451abb
+  category: feature
+  hidden_tests: eval/custom/hidden_tests/calc/test_calc_04_percent_change.py
+  issue_title: Add percent_change()
+  issue_body: |
+    We need `percent_change(old, new)` in the `calc` package. It returns how much a value
+    changed, as a percentage of the old value. An increase is positive and a decrease is
+    negative.
+
+    ```python
+    from calc import percent_change
+
+    percent_change(50, 75)  # 50.0
+    percent_change(80, 60)  # -25.0
+    percent_change(10, 10)  # 0.0
+    ```
+
+    A starting value of zero has no percentage, so `percent_change(0, 5)` should raise
+    `ValueError`.
+
+- id: calc-05
+  repo: calc
+  base_sha: ec21da226ade95fe727b22900a8eaa656d451abb
+  category: refactor
+  hidden_tests: eval/custom/hidden_tests/calc/test_calc_05_ops_module.py
+  issue_title: Move the arithmetic functions into calc/ops.py
+  issue_body: |
+    `src/calc/__init__.py` holds the code of `add`, `multiply` and `divide`. We want the package
+    file to be only a list of exports, and the code to live in a new module, `calc/ops.py`.
+
+    After the change:
+
+    - `calc.ops` defines `add`, `multiply` and `divide`.
+    - `from calc import add, multiply, divide` still works, and gives the same function objects
+      as `calc.ops`.
+    - Nothing else changes. Every function behaves exactly as it does today.
+
+- id: textkit-01
+  repo: textkit
+  base_sha: 594dc7ac59b49159e36acdaa29f9967b9676703b
+  category: bugfix
+  hidden_tests: eval/custom/hidden_tests/textkit/test_textkit_01_accents.py
+  issue_title: slugify() breaks accented letters
+  issue_body: |
+    `textkit.slugify` treats every non-ASCII letter as a separator, so accented words get
+    split apart.
+
+    ```python
+    from textkit import slugify
+
+    slugify("Crème Brûlée")  # returns "cr-me-br-l-e", expected "creme-brulee"
+    ```
+
+    Accented Latin letters should fold to their base letter (`è` becomes `e`, `û` becomes
+    `u`). Plain ASCII input must behave as before.
+
+- id: textkit-02
+  repo: textkit
+  base_sha: 594dc7ac59b49159e36acdaa29f9967b9676703b
+  category: bugfix
+  hidden_tests: eval/custom/hidden_tests/textkit/test_textkit_02_truncate.py
+  issue_title: truncate() returns text longer than the width
+  issue_body: |
+    `textkit.truncate(text, width)` is meant to give a label that fits in `width` characters,
+    but the "..." it adds is on top of the width.
+
+    ```python
+    from textkit import truncate
+
+    truncate("hello world", 8)  # returns "hello wo...", which is 11 characters
+    ```
+
+    The suffix should count toward the width, so the result is never longer than `width`. For
+    the example above the answer is `"hello..."`. This holds for a custom `suffix` as well.
+    Text that already fits must come back unchanged.
+
+- id: textkit-03
+  repo: textkit
+  base_sha: 594dc7ac59b49159e36acdaa29f9967b9676703b
+  category: feature
+  hidden_tests: eval/custom/hidden_tests/textkit/test_textkit_03_camel_to_snake.py
+  issue_title: Add camel_to_snake()
+  issue_body: |
+    Please add `camel_to_snake(text)` to `textkit`. It turns camelCase and PascalCase names
+    into snake_case, and keeps runs of capitals together as one word.
+
+    ```python
+    from textkit import camel_to_snake
+
+    camel_to_snake("userName")             # "user_name"
+    camel_to_snake("HTTPServer")           # "http_server"
+    camel_to_snake("getHTTPResponseCode")  # "get_http_response_code"
+    camel_to_snake("already_snake")        # "already_snake"
+    ```
+
+    An empty string gives an empty string.
+
+- id: textkit-04
+  repo: textkit
+  base_sha: 594dc7ac59b49159e36acdaa29f9967b9676703b
+  category: refactor
+  hidden_tests: eval/custom/hidden_tests/textkit/test_textkit_04_make_slug.py
+  issue_title: Rename slugify() to make_slug()
+  issue_body: |
+    The name `slugify` is easy to mix up with the function of the same name in other
+    libraries. Please rename it to `make_slug`.
+
+    - `from textkit import make_slug` works, and it does what `slugify` does today.
+    - `slugify` stays for now as a deprecated alias. It returns the same result as `make_slug`
+      and also emits a `DeprecationWarning`, so callers have time to move.
+    - `make_slug` itself must not warn.
+
+- id: textkit-05
+  repo: textkit
+  base_sha: 594dc7ac59b49159e36acdaa29f9967b9676703b
+  category: dependency
+  hidden_tests: eval/custom/hidden_tests/textkit/test_textkit_05_tomllib.py
+  issue_title: Drop the tomli dependency
+  issue_body: |
+    `textkit.config` reads its defaults with the third-party package `tomli`. The project
+    already requires Python 3.12, and since Python 3.11 the standard library has `tomllib`
+    with the same API.
+
+    Please stop using `tomli`: the code should import `tomllib`, and `tomli` should be removed
+    from the dependencies in `pyproject.toml`. `load_defaults` must behave as it does today,
+    including the empty result for a missing file.
+
+- id: inventory-01
+  repo: inventory
+  base_sha: 62182bed78999ec38135c9a9ac85db8b6ec221a9
+  category: bugfix
+  hidden_tests: eval/custom/hidden_tests/inventory/test_inventory_01_stock.py
+  issue_title: remove() allows negative stock
+  issue_body: |
+    `Inventory.remove()` does not check how much is on hand. Removing more than is in stock
+    leaves a negative count.
+
+    ```python
+    from inventory import Inventory
+
+    inv = Inventory()
+    inv.add("widget", 2)
+    inv.remove("widget", 5)
+    inv.quantity("widget")  # returns -3, should be rejected
+    ```
+
+    Expected: `remove()` raises an error that names the SKU and leaves the stock unchanged. This
+    also covers a SKU that was never added. Removing exactly what is in stock is fine.
+
+    Please add an `InventoryError`, importable from `inventory`, for this. It must be a
+    subclass of `ValueError`, so callers can catch inventory problems on their own and old
+    code that catches `ValueError` keeps working.
+
+- id: inventory-02
+  repo: inventory
+  base_sha: 62182bed78999ec38135c9a9ac85db8b6ec221a9
+  category: refactor
+  hidden_tests: eval/custom/hidden_tests/inventory/test_inventory_02_checks.py
+  issue_title: Share the quantity check
+  issue_body: |
+    `Inventory.add`, `Inventory.remove` and `Reservations.reserve` each repeat the same check
+    and the same message, "quantity must be positive". Please move it to one place.
+
+    Add `inventory/checks.py` with `validate_quantity(quantity)`. It returns the quantity when
+    it is positive, and raises `ValueError("quantity must be positive")` when it is zero or
+    negative. The three methods call it, and the text of the message appears in the code only
+    once. What the methods do and what they raise stays the same.
+
+- id: inventory-03
+  repo: inventory
+  base_sha: 62182bed78999ec38135c9a9ac85db8b6ec221a9
+  category: dependency
+  hidden_tests: eval/custom/hidden_tests/inventory/test_inventory_03_optional_yaml.py
+  issue_title: Make PyYAML optional
+  issue_body: |
+    Most users of `inventory` only need the JSON export, yet `pip install inventory` pulls in
+    PyYAML because `inventory/export.py` imports it at the top.
+
+    Please make PyYAML optional:
+
+    - It is no longer a required dependency. Put it in an optional extra named `yaml`.
+    - `import inventory` and `dump_json` work when PyYAML is not installed.
+    - `dump_yaml` raises `ImportError` with a short hint when PyYAML is missing.
+    - Our own tests still use PyYAML, so keep it installed for development.
+
+- id: inventory-04
+  repo: inventory
+  base_sha: 62182bed78999ec38135c9a9ac85db8b6ec221a9
+  category: flaky
+  hidden_tests: eval/custom/hidden_tests/inventory/test_inventory_04_unique_ids.py
+  issue_title: Reservations lose stock when made in the same second
+  issue_body: |
+    Customers report that sometimes a reservation seems to vanish and the stock comes back
+    early. We can reproduce it by reserving twice in quick succession:
+
+    ```python
+    holds = Reservations(inv)           # inv has 10 widgets
+    first = holds.reserve("widget", 1, ttl_s=60)
+    second = holds.reserve("widget", 2, ttl_s=60)
+    first == second                     # True when both calls fall in the same second
+    holds.available("widget")           # 8 instead of 7
+    ```
+
+    Whether it happens depends on how fast the machine is, which makes it hard to catch. Every
+    reservation needs an id that no other reservation of the same `Reservations` object has,
+    however close in time they are made. Releasing one hold must not free the stock of another.
+
+- id: inventory-05
+  repo: inventory
+  base_sha: 62182bed78999ec38135c9a9ac85db8b6ec221a9
+  category: flaky
+  hidden_tests: eval/custom/hidden_tests/inventory/test_inventory_05_clock.py
+  issue_title: Make reservation expiry testable without sleeping
+  issue_body: |
+    `tests/test_reservations.py::test_an_expired_hold_frees_its_stock` sleeps for 0.3 seconds
+    and waits for a 0.01 second hold to expire. It is slow, and it fails on busy CI machines.
+
+    Let `Reservations` take a clock, so tests can move time by hand:
+
+    ```python
+    clock = FakeClock()
+    holds = Reservations(inv, clock=clock)
+    ```
+
+    `clock` is a function that takes no arguments and returns the current time in seconds as
+    a float. A hold lasts `ttl_s` seconds on that clock: it is still active just before, and
+    gone when the clock reaches `ttl_s` seconds after the reservation. Without a `clock`
+    argument, `Reservations` behaves as it does today and uses a real clock.

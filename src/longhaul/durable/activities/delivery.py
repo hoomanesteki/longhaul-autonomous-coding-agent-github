@@ -5,7 +5,9 @@ the delivery has a file of its own.
 
 `build_pr_branch` runs on the host, from the task's bare repo. It reads the default branch from
 the API, titles one commit with the summary the agent gave to `finish`, and makes the branch
-`longhaul-pr/<n>` with one commit on top of the base (checkpoints/squash.py). It pushes nothing.
+`longhaul-pr/<n>` with one commit on top of the base (checkpoints/squash.py). The base is the sha
+that the workflow handed over, not the `base` tag of the repo, which the sandbox can move. It
+pushes nothing.
 The branch is the same commit on every attempt, so a retry changes nothing.
 
 `deliver` takes that branch to GitHub in two steps, both through the idempotency ledger of
@@ -144,6 +146,7 @@ class DeliveryActivities:
             built = await build_pr_branch(
                 inp.task_id,
                 [Group(title, inp.head_sha)],
+                base_sha=inp.base_sha,
                 store=self._store,
                 default_branch=default_branch,
                 author=self._author,

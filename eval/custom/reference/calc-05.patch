@@ -1,0 +1,45 @@
+diff --git a/src/calc/__init__.py b/src/calc/__init__.py
+index e4e9e1f..87a1ed3 100644
+--- a/src/calc/__init__.py
++++ b/src/calc/__init__.py
+@@ -1,16 +1,5 @@
+ """Small arithmetic helpers."""
+ 
++from calc.ops import add, divide, multiply
+ 
+-def add(a: int, b: int) -> int:
+-    """Return the sum of a and b."""
+-    return a - b
+-
+-
+-def multiply(a: int, b: int) -> int:
+-    """Return the product of a and b."""
+-    return a * b
+-
+-
+-def divide(a: float, b: float) -> float:
+-    """Return a divided by b. Dividing by zero raises ZeroDivisionError."""
+-    return a // b
++__all__ = ["add", "divide", "multiply"]
+diff --git a/src/calc/ops.py b/src/calc/ops.py
+new file mode 100644
+index 0000000..a5f5da4
+--- /dev/null
++++ b/src/calc/ops.py
+@@ -0,0 +1,16 @@
++"""The arithmetic functions."""
++
++
++def add(a: int, b: int) -> int:
++    """Return the sum of a and b."""
++    return a - b
++
++
++def multiply(a: int, b: int) -> int:
++    """Return the product of a and b."""
++    return a * b
++
++
++def divide(a: float, b: float) -> float:
++    """Return a divided by b. Dividing by zero raises ZeroDivisionError."""
++    return a // b

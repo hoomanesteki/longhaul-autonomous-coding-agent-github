@@ -1,0 +1,28 @@
+diff --git a/src/inventory/reservations.py b/src/inventory/reservations.py
+index 527ba2f..563b9b9 100644
+--- a/src/inventory/reservations.py
++++ b/src/inventory/reservations.py
+@@ -1,5 +1,6 @@
+ """Short holds on stock, for orders that are still being paid."""
+ 
++import itertools
+ import time
+ from dataclasses import dataclass
+ 
+@@ -19,6 +20,7 @@ class Reservations:
+     def __init__(self, inventory: Inventory) -> None:
+         self._inventory = inventory
+         self._holds: dict[str, _Hold] = {}
++        self._ids = itertools.count(1)
+ 
+     def reserve(self, sku: str, quantity: int, ttl_s: float) -> str:
+         """Hold quantity of sku for ttl_s seconds and return the reservation id."""
+@@ -27,7 +29,7 @@ class Reservations:
+         free = self.available(sku)
+         if quantity > free:
+             raise ValueError(f"{sku}: only {free} available")
+-        reservation_id = f"res-{int(time.time())}"
++        reservation_id = f"res-{next(self._ids)}"
+         self._holds[reservation_id] = _Hold(sku, quantity, time.time() + ttl_s)
+         return reservation_id
+ 

@@ -1,0 +1,97 @@
+--- a/src/longlog/chunks.py
++++ b/src/longlog/chunks.py
+@@ -5,4 +5,4 @@
+     """Return the items in lists of at most `size`. The last list may be shorter."""
+     if size < 1:
+         raise ValueError("size must be at least 1")
+-    return [items[i : i + size] for i in range(0, len(items) - size + 1, size)]
++    return [items[i : i + size] for i in range(0, len(items), size)]
+--- a/src/longlog/clamp.py
++++ b/src/longlog/clamp.py
+@@ -5,4 +5,4 @@
+     """Return value limited to the closed range from low to high."""
+     if low > high:
+         raise ValueError("low must not be above high")
+-    return max(low, min(value, high - 1))
++    return max(low, min(value, high))
+--- a/src/longlog/dedupe.py
++++ b/src/longlog/dedupe.py
+@@ -3,4 +3,4 @@
+ 
+ def dedupe(items: list[int]) -> list[int]:
+     """Return the items without repeats, in the order they first appear."""
+-    return [item for i, item in enumerate(items) if item not in items[i + 1 :]]
++    return [item for i, item in enumerate(items) if item not in items[:i]]
+--- a/src/longlog/initials.py
++++ b/src/longlog/initials.py
+@@ -3,4 +3,4 @@
+ 
+ def initials(name: str) -> str:
+     """Return the first letter of each word of the name, in capitals."""
+-    return "".join(word[0] for word in name.split()[:1]).upper()
++    return "".join(word[0] for word in name.split()).upper()
+--- a/src/longlog/leap.py
++++ b/src/longlog/leap.py
+@@ -6,4 +6,4 @@
+ 
+     Years divisible by 4 are leap years, except centuries, unless the century is divisible by 400.
+     """
+-    return year % 4 == 0 and year % 100 != 0
++    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0
+--- a/src/longlog/ordinal.py
++++ b/src/longlog/ordinal.py
+@@ -4,4 +4,6 @@
+ def ordinal(number: int) -> str:
+     """Return the number with its suffix: 1st, 2nd, 3rd, 4th, 11th, 22nd."""
+     suffixes = {1: "st", 2: "nd", 3: "rd"}
++    if 10 <= number % 100 <= 20:
++        return f"{number}th"
+     return f"{number}{suffixes.get(number % 10, 'th')}"
+--- a/src/longlog/pages.py
++++ b/src/longlog/pages.py
+@@ -5,4 +5,4 @@
+     """Return how many pages show `total` items, `per_page` on each."""
+     if per_page < 1:
+         raise ValueError("per_page must be at least 1")
+-    return total // per_page
++    return -(-total // per_page)
+--- a/src/longlog/percent.py
++++ b/src/longlog/percent.py
+@@ -5,4 +5,4 @@
+     """Return `part` as a percentage of `whole`, rounded to one decimal place."""
+     if whole == 0:
+         raise ValueError("whole must not be zero")
+-    return round(whole / part * 100, 1)
++    return round(part / whole * 100, 1)
+--- a/src/longlog/ranges.py
++++ b/src/longlog/ranges.py
+@@ -3,4 +3,4 @@
+ 
+ def inclusive_range(start: int, stop: int) -> list[int]:
+     """Return the integers from `start` to `stop`, both included."""
+-    return list(range(start, stop))
++    return list(range(start, stop + 1))
+--- a/src/longlog/slug.py
++++ b/src/longlog/slug.py
+@@ -6,4 +6,4 @@
+ def slugify(text: str) -> str:
+     """Return the text as a slug: lower case words joined by single hyphens."""
+     words = re.findall(r"[A-Za-z0-9]+", text)
+-    return "-".join(words)
++    return "-".join(words).lower()
+--- a/src/longlog/stats.py
++++ b/src/longlog/stats.py
+@@ -5,4 +5,4 @@
+     """Return the average of the values."""
+     if not values:
+         raise ValueError("mean of no values")
+-    return sum(values) // len(values)
++    return sum(values) / len(values)
+--- a/src/longlog/words.py
++++ b/src/longlog/words.py
+@@ -3,4 +3,4 @@
+ 
+ def word_count(text: str) -> int:
+     """Return how many words the text has. White space of any length separates them."""
+-    return len(text.split(" "))
++    return len(text.split())

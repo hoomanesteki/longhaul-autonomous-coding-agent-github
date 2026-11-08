@@ -7,7 +7,7 @@ these tests pin what each side may rely on.
 from datetime import timedelta
 from pathlib import Path
 from types import NoneType
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -19,6 +19,8 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Plan,
+    PlanStep,
     ProgressNotes,
     ProviderErrorKind,
     RepoSettings,
@@ -70,9 +72,11 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         "compact",
         "ensure_sandbox",
         "llm_turn",
+        "load_memory",
         "poll_once",
         "prepare_workspace",
         "record_event",
+        "store_plan",
         "tool_exec",
     ]
     assert len(set(names)) == len(names)
@@ -91,6 +95,8 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.RECORD_EVENT, acts.RecordEventInput, NoneType),
         (acts.POLL_ONCE, NoneType, acts.PollResult),
         (acts.COMPACT, acts.CompactInput, acts.CompactOutput),
+        (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
+        (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -128,6 +134,10 @@ def test_each_activity_names_its_payload_types(
         # Section 3.7 gives compact 10 minutes and 5 attempts. The heartbeat is added for the
         # reason llm_turn has one: it is a model call, and a cancel has to reach it.
         pytest.param(acts.COMPACT, 10 * 60, 30, 5, id="compact"),
+        # Not in the table. A plan is one row, so it is sized like append_results.
+        pytest.param(acts.STORE_PLAN, 2 * 60, None, 3, id="store_plan"),
+        # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
+        pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -273,6 +283,62 @@ def test_the_server_can_ask_for_a_hand_over_at_any_turn() -> None:
     assert not acts.hand_off_due(7, suggested=False)
 
 
+@pytest.mark.parametrize("seconds", [0, -1])
+def test_tuning_rejects_a_status_grace_that_cannot_work(seconds: float) -> None:
+    with pytest.raises(ValidationError):
+        acts.Tuning(status_grace_s=seconds)
+
+
+def test_a_hand_over_waits_for_a_status_comment_as_long_as_the_tuning_says() -> None:
+    assert acts.status_grace() == acts.STATUS_GRACE == timedelta(seconds=30)
+    assert acts.status_grace(acts.Tuning(heartbeat_timeout_s=2)) == acts.STATUS_GRACE
+    assert acts.status_grace(acts.Tuning(status_grace_s=1.5)) == timedelta(seconds=1.5)
+
+
+@pytest.mark.parametrize("window", [0, -8_000])
+def test_tuning_rejects_a_window_that_cannot_hold_a_request(window: int) -> None:
+    with pytest.raises(ValidationError):
+        acts.Tuning(window_tokens=window)
+
+
+def test_a_window_in_the_tuning_changes_no_timeout() -> None:
+    for act in acts.ALL:
+        assert acts.options(act, acts.Tuning(window_tokens=8_000)) == acts.options(act, None)
+
+
+def test_the_activities_that_count_tokens_take_the_window_of_a_run() -> None:
+    inputs: list[Any] = [
+        acts.LlmTurnInput(
+            task_id="lh-x",
+            turn_index=0,
+            role=Role.CODER,
+            spec=SPEC,
+            transcript_ref=None,
+            window_tokens=8_000,
+        ),
+        acts.ToolExecInput(
+            task_id="lh-x",
+            turn_index=0,
+            call=acts.ToolCallSummary(id="t1", name="list_dir", input={}),
+            pre_sha=SHA,
+            sandbox_id="sbx-1",
+            window_tokens=8_000,
+        ),
+        acts.AppendResultsInput(
+            task_id="lh-x", turn_index=0, transcript_ref=REF, results=[], window_tokens=8_000
+        ),
+    ]
+    assert [i.window_tokens for i in inputs] == [8_000] * 3
+
+
+def test_a_run_without_a_window_of_its_own_sends_none() -> None:
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    append = acts.AppendResultsInput(task_id="lh-x", turn_index=0, transcript_ref=REF, results=[])
+    assert (turn.window_tokens, append.window_tokens) == (None, None)
+
+
 def test_tuning_rejects_unknown_fields() -> None:
     # A misspelled knob would otherwise be dropped and the run would use the long timeouts.
     with pytest.raises(ValidationError):
@@ -384,6 +450,7 @@ SAMPLES: list[BaseModel] = [
     acts.CleanupInput(task_id="lh-x", sandbox_id=None, reason="cancelled by alice"),
     acts.Tuning(heartbeat_timeout_s=2.5),
     acts.Tuning(continue_as_new_every_turns=3),
+    acts.Tuning(window_tokens=8_000),
     acts.BundleCheckpointInput(task_id="lh-x", turn_index=40),
     acts.RecordEventInput(
         task_id="lh-x", type="continue_as_new", payload={"turn_index": 40, "bundle": None}
@@ -737,6 +804,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         "create_pr",
         "deliver",
         "post_comment",
+        "post_plan",
         "remove_label",
     ]
     assert not {act.name for act in acts.ALL} & set(names)
@@ -751,6 +819,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         (acts.CREATE_PR, PullRequestInput, str),
         (acts.BUILD_PR_BRANCH, acts.BuildPrBranchInput, acts.PrBranchOutput),
         (acts.DELIVER, acts.DeliverInput, str),
+        (acts.POST_PLAN, acts.PostPlanInput, str),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -779,6 +848,8 @@ def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
         # Not in section 3.7. deliver pushes a branch (git's own limit is 10 minutes) and then
         # does what create_pr does, so a killed worker has to be noticed in a minute.
         pytest.param(acts.DELIVER, 10 * 60, 60, 5, id="deliver"),
+        # The plan comment is a post_comment whose body the activity renders.
+        pytest.param(acts.POST_PLAN, 2 * 60, None, 10, id="post_plan"),
     ],
 )
 def test_github_timeouts_and_attempts_match_section_3_7(
@@ -790,7 +861,7 @@ def test_github_timeouts_and_attempts_match_section_3_7(
 
 
 @pytest.mark.parametrize(
-    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR]
+    "act", [acts.POST_COMMENT, acts.ADD_LABEL, acts.REMOVE_LABEL, acts.CREATE_PR, acts.POST_PLAN]
 )
 def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
     assert act.retry.maximum_interval == timedelta(minutes=5)
@@ -823,7 +894,9 @@ def test_tuning_shortens_the_heartbeat_of_deliver_only() -> None:
 
 
 GITHUB_SAMPLES: list[BaseModel] = [
-    acts.BuildPrBranchInput(task_id="lh-x", repo="acme/calc", summary="Fixed it.", head_sha=SHA),
+    acts.BuildPrBranchInput(
+        task_id="lh-x", repo="acme/calc", summary="Fixed it.", base_sha="b" * 40, head_sha=SHA
+    ),
     acts.PrBranchOutput(
         branch="longhaul-pr/42",
         head_sha=SHA,
@@ -856,3 +929,127 @@ def test_github_payloads_survive_the_pydantic_data_converter(sample: BaseModel) 
 
 def test_nothing_to_deliver_is_named_after_the_error_class() -> None:
     assert NothingToDeliverError.__name__ == acts.NOTHING_TO_DELIVER
+
+
+# ---------- LH-501: the planner ----------
+def test_the_planner_turn_limit_follows_the_configured_one() -> None:
+    # Same reason as the tool timeout: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.loop.planner_max_turns == acts.PLANNER_MAX_TURNS == 20
+
+
+def test_planning_is_switched_on_by_a_memo_key_of_its_own() -> None:
+    assert acts.PLAN_MEMO_KEY == "plan"
+    assert len({acts.PLAN_MEMO_KEY, acts.SCRIPT_MEMO_KEY, acts.TUNING_MEMO_KEY}) == 3
+
+
+def test_a_tool_call_is_not_read_only_unless_the_workflow_says_so() -> None:
+    call = acts.ToolCallSummary(id="t1", name="read_file", input={"path": "a.py"})
+    default = acts.ToolExecInput(
+        task_id="lh-x", turn_index=0, call=call, pre_sha=SHA, sandbox_id="sbx-1"
+    )
+    planning = default.model_copy(update={"read_only": True})
+    assert default.read_only is False
+    assert planning.read_only is True
+
+
+def test_the_plan_activities_are_registered_where_their_inputs_need_a_token() -> None:
+    # Storing a plan needs the database only. Posting it needs a GitHub token.
+    assert acts.STORE_PLAN in acts.ALL
+    assert acts.POST_PLAN in acts.GITHUB
+    assert acts.STORE_PLAN not in acts.GITHUB and acts.POST_PLAN not in acts.ALL
+
+
+def test_a_plan_has_a_version_from_one() -> None:
+    plan = Plan(summary="s", steps=[], acceptance_checks=["pytest -q"])
+    with pytest.raises(ValidationError):
+        acts.StorePlanInput(task_id="lh-x", version=0, plan=plan)
+    with pytest.raises(ValidationError):
+        acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=0, plan=plan)
+
+
+PLAN = Plan(
+    summary="add() subtracts",
+    steps=[PlanStep(id="s1", description="Fix add()", done_when="the tests pass")],
+    acceptance_checks=["pytest -q"],
+    risks=["none known"],
+)
+PLAN_SAMPLES: list[BaseModel] = [
+    acts.StorePlanInput(task_id="lh-x", version=1, plan=PLAN),
+    acts.PostPlanInput(task_id="lh-x", repo="acme/calc", number=42, version=1, plan=PLAN),
+    acts.ToolExecInput(
+        task_id="lh-x",
+        turn_index=2,
+        call=acts.ToolCallSummary(id="t1", name="run_command", input={"command": "ls"}),
+        pre_sha=SHA,
+        sandbox_id="sbx-1",
+        read_only=True,
+    ),
+    acts.LlmTurnInput(
+        task_id="lh-x",
+        turn_index=0,
+        role=Role.PLANNER,
+        spec=SPEC,
+        transcript_ref=None,
+        plan=PLAN,
+    ),
+]
+
+
+@pytest.mark.parametrize("sample", PLAN_SAMPLES, ids=lambda sample: type(sample).__name__)
+def test_planner_payloads_survive_the_pydantic_data_converter(sample: BaseModel) -> None:
+    converter = pydantic_data_converter.payload_converter
+    payloads = converter.to_payloads([sample])
+    assert converter.from_payloads(payloads, [type(sample)]) == [sample]
+    assert_small(sample)
+
+
+# ---------- memory in the payloads (LH-604) ----------
+@pytest.mark.phase6
+def test_a_workspace_output_from_before_memory_still_parses_and_loads_no_memory() -> None:
+    # A history that was recorded before LH-604 holds this JSON. The workflow decides whether to
+    # call load_memory from it, so what it lacks must read as "no memory" and the old command
+    # sequence must not change.
+    old = '{"sandbox_id": "sbx-1", "base_sha": "' + SHA + '", "head_sha": "' + SHA + '"}'
+
+    out = acts.PrepareWorkspaceOutput.model_validate_json(old)
+
+    assert (out.memory_enabled, out.test_command, out.repo_map_ref) == (False, None, None)
+
+
+@pytest.mark.phase6
+def test_the_workspace_output_says_whether_the_worker_keeps_memory_and_the_test_command() -> None:
+    out = acts.PrepareWorkspaceOutput(
+        sandbox_id="sbx-1",
+        base_sha=SHA,
+        head_sha=SHA,
+        repo_map_ref=REF,
+        memory_enabled=True,
+        test_command="pytest -q",
+    )
+
+    back = acts.PrepareWorkspaceOutput.model_validate_json(out.model_dump_json())
+
+    assert back == out
+    assert (back.memory_enabled, back.test_command) == (True, "pytest -q")
+
+
+@pytest.mark.phase6
+def test_load_memory_takes_the_spec_and_the_map_of_the_workspace() -> None:
+    inp = acts.LoadMemoryInput(spec=SPEC, repo_map_ref=REF)
+    assert acts.LoadMemoryInput.model_validate_json(inp.model_dump_json()) == inp
+    assert acts.LoadMemoryInput(spec=SPEC).repo_map_ref is None
+
+
+@pytest.mark.phase6
+def test_the_model_turn_and_the_compaction_see_the_same_memory_block() -> None:
+    # The compactor counts the tokens of the request it would be part of, system prompt included.
+    turn = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.CODER, spec=SPEC, transcript_ref=None
+    )
+    assert turn.memory_ref is None
+    compact = acts.CompactInput(
+        task_id="lh-x", turn_index=3, role=Role.CODER, spec=SPEC, transcript_ref=REF
+    )
+    assert compact.memory_ref is None
+    assert acts.CompactInput(**{**compact.model_dump(), "memory_ref": REF}).memory_ref == REF

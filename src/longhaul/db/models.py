@@ -90,6 +90,11 @@ class Task(Base):
     )
     compactions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     max_fraction: Mapped[float] = mapped_column(Float, nullable=False, server_default=text("0"))
+    # The newest issue comment the poller has handled (LH-308): its time, for the `since` of the
+    # next request, and its id, which tells it from a comment of the same second. Null until the
+    # poller has picked the task up.
+    last_comment_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_comment_id: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -180,6 +185,33 @@ class ToolCallRow(Base):
     pre_sha: Mapped[str | None] = mapped_column(Text)
     post_sha: Mapped[str | None] = mapped_column(Text)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PlanRow(Base):
+    """One version of the plan of a task (LH-501).
+
+    The planner's plan is version 1. A plan that a person rejects is followed by a new version
+    (LH-502), and the old row is marked superseded, so the table is the history of the plan and
+    the workflow's CarryState holds only the version in force. `plan` is the contract (`Plan`)
+    as JSON. `decided_by` and `decided_at` stay empty until someone approves or rejects it.
+    """
+
+    __tablename__ = "plans"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('proposed', 'approved', 'rejected', 'superseded')", name="status"
+        ),
+    )
+
+    task_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'proposed'"))
+    decided_by: Mapped[str | None] = mapped_column(Text)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

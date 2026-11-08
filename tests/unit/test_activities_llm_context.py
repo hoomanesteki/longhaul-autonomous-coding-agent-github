@@ -739,3 +739,83 @@ async def test_a_retried_turn_records_the_same_share() -> None:
     await rig.run(turn_input(), attempt=2)
 
     assert rig.recorder.max_fractions == once
+
+
+# ---------- a window of the run's own (LH-407) ----------
+# `longhaul run --window` puts a window in the tuning of the task, and the workflow hands it to
+# each model turn. It takes the place of window_tokens in the config of the worker, which is a
+# large one in these tests, so that only the window of the run can make a request too big.
+async def test_a_run_can_ask_for_a_smaller_window_than_the_config_has() -> None:
+    messages = rounds(2, lines=40)
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")), policy=context(100_000))
+    ref = await rig.put(messages)
+
+    with pytest.raises(ApplicationError) as caught:
+        await rig.run(
+            turn_input(turn_index=2, transcript_ref=ref, window_tokens=window_for(messages, 0.9))
+        )
+
+    assert caught.value.type == ProviderErrorKind.CONTEXT_TOO_LONG.value
+    assert "of a window of" in str(caught.value)
+    assert rig.provider.calls == []
+
+
+async def test_without_a_window_of_its_own_a_run_has_the_window_of_the_config() -> None:
+    messages = rounds(2, lines=40)
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")), policy=context(100_000))
+
+    out = await rig.run(turn_input(turn_index=2, transcript_ref=await rig.put(messages)))
+
+    assert len(rig.provider.calls) == 1
+    assert out.context_decision == "ok"
+
+
+async def test_the_decision_for_the_next_turn_is_made_against_the_window_of_the_run() -> None:
+    messages = rounds(1, lines=3)
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")), policy=context(100_000))
+    ref = await rig.put(messages)
+
+    out = await rig.run(
+        turn_input(turn_index=1, transcript_ref=ref, window_tokens=window_for(messages, 0.7))
+    )
+
+    assert out.context_decision == "compact"
+
+
+async def test_the_room_kept_for_a_result_shrinks_with_the_window_of_the_run() -> None:
+    # The config allows 4,000 tokens for a result, which a window of this size cannot spare.
+    # The run's window lets a result take 1/32 of it, so one call leaves room for that much.
+    messages = rounds(1, lines=3)
+    window = window_for(messages, 0.5)
+    rig = Rig(reply("tool_use", use("c9")), policy=context(100_000, tool_output_max_tokens=window))
+
+    out = await rig.run(
+        turn_input(turn_index=1, transcript_ref=await rig.put(messages), window_tokens=window)
+    )
+
+    assert out.context_decision == "ok"  # 0.5 and 3 percent, not 0.5 and 100 percent
+
+
+async def test_one_run_asking_for_a_window_does_not_change_the_next_one() -> None:
+    messages = rounds(2, lines=40)
+    rig = Rig(reply("end_turn", TextBlock(text="Done.")), policy=context(100_000))
+    ref = await rig.put(messages)
+    with pytest.raises(ApplicationError):
+        await rig.run(
+            turn_input(turn_index=2, transcript_ref=ref, window_tokens=window_for(messages, 0.9))
+        )
+
+    out = await rig.run(turn_input(turn_index=2, transcript_ref=ref))
+
+    assert out.request_tokens == estimate(messages)
+    assert len(rig.provider.calls) == 1
+
+
+async def test_a_window_does_nothing_for_an_activity_without_a_context_policy() -> None:
+    rig = Rig(reply("tool_use", use("call-9")))
+    ref = await rig.put(rounds(8))
+
+    out = await rig.run(turn_input(turn_index=8, transcript_ref=ref, window_tokens=1_000))
+
+    assert out.context_decision == "ok"
+    assert results(rig.provider.calls[0]["messages"]) == results(rounds(8))

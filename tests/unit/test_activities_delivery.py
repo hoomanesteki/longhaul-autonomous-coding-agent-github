@@ -70,7 +70,9 @@ def make(
 
 
 def build_input(summary: str = "Fixed add().") -> acts.BuildPrBranchInput:
-    return acts.BuildPrBranchInput(task_id=TASK, repo="acme/calc", summary=summary, head_sha=SHA)
+    return acts.BuildPrBranchInput(
+        task_id=TASK, repo="acme/calc", summary=summary, base_sha=BASE, head_sha=SHA
+    )
 
 
 def deliver_input(branch: str = "longhaul-pr/42") -> acts.DeliverInput:
@@ -148,6 +150,7 @@ async def test_the_branch_is_built_from_the_title_the_summary_gives(
     )
     assert [tuple(g) for g in seen["groups"]] == [("fix(calc): fix add()", SHA)]
     assert (seen["default_branch"], seen["author"]) == ("main", AUTHOR)
+    assert seen["base_sha"] == BASE, "the base is the one the workflow handed over"
 
 
 async def test_a_task_that_changed_nothing_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:

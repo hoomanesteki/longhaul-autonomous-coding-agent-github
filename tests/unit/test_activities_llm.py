@@ -17,7 +17,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import FACTS_HEADING, FIRST_USER_MESSAGE, build_system_prompt
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import (
@@ -43,6 +43,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, json_size
 from longhaul.durable.scripts import script_key, upload_script
+from longhaul.roles import planner
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
@@ -175,6 +176,41 @@ async def test_the_first_turn_builds_the_request_from_the_spec() -> None:
     assert call["options"] == CallOptions(effort="medium")
     assert call["messages"] == [FIRST]
     assert call["tools"] == TOOLS
+
+
+# ---------- the memory block (LH-604) ----------
+BLOCK = "Notes from past work on this repo.\n\n```text\n- pytest -q\n```"
+
+
+@pytest.mark.phase6
+async def test_the_memory_block_of_the_task_ends_the_system_prompt_of_every_turn() -> None:
+    rig = Rig(reply("end_turn"), reply("end_turn"))
+    block = await rig.blobs.put(
+        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "memory-block.txt")
+    )
+    ref = await rig.put("transcript-1.json", answered(), turn=1)
+
+    await rig.run(turn_input(memory_ref=block))
+    await rig.run(turn_input(turn_index=1, transcript_ref=ref, memory_ref=block))
+
+    first, later = rig.provider.calls
+    assert first["system"] == later["system"] == build_system_prompt(Role.CODER, SPEC, BLOCK)
+    assert first["system"].endswith(BLOCK)
+
+
+@pytest.mark.phase6
+async def test_a_turn_without_a_memory_ref_sends_the_prompt_it_always_did() -> None:
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(memory_ref=None))
+    assert rig.provider.calls[0]["system"] == build_system_prompt(Role.CODER, SPEC)
+
+
+@pytest.mark.phase6
+async def test_an_empty_block_adds_no_section() -> None:
+    rig = Rig(reply("end_turn"))
+    empty = await rig.blobs.put(b"", key=blob_key(SPEC.task_id, "memory", 0, "block.txt"))
+    await rig.run(turn_input(memory_ref=empty))
+    assert rig.provider.calls[0]["system"] == build_system_prompt(Role.CODER, SPEC)
 
 
 async def test_no_effort_in_the_config_sends_no_options() -> None:
@@ -628,11 +664,12 @@ async def test_a_transcript_the_api_would_reject_fails_without_a_retry_and_witho
 
 
 async def test_a_role_without_a_prompt_fails_without_a_retry() -> None:
+    # The verifier gets its prompt in LH-504. The planner got its own in LH-501.
     rig = Rig()
     with pytest.raises(ApplicationError) as caught:
-        await rig.run(turn_input(role=Role.PLANNER))
+        await rig.run(turn_input(role=Role.VERIFIER))
     assert caught.value.non_retryable
-    assert "planner" in str(caught.value)
+    assert "verifier" in str(caught.value)
     assert rig.provider.calls == []
 
 
@@ -744,3 +781,91 @@ async def test_a_script_that_is_missing_from_the_store_fails_for_good() -> None:
     with pytest.raises(ApplicationError) as caught:
         await run_turn(activities, turn_input(script_ref=ref))
     assert caught.value.non_retryable
+
+
+# ---------- LH-501: a tool list and a first message for each role ----------
+PLANNER_TOOLS = planner.tool_specs(TOOLS)
+
+
+def planner_rig(*steps: Step) -> Rig:
+    rig = Rig(*steps)
+    rig.activities = LlmActivities(
+        rig.provider,
+        rig.blobs,
+        rig.recorder,
+        TOOLS,
+        lambda role: CFG,
+        role_tools={Role.PLANNER: PLANNER_TOOLS},
+    )
+    return rig
+
+
+async def test_the_planner_is_asked_with_its_own_prompt_tools_and_first_message() -> None:
+    rig = planner_rig(reply("tool_use", use("toolu_1", "list_dir", path=".")))
+    out = await rig.run(turn_input(role=Role.PLANNER))
+
+    (call,) = rig.provider.calls
+    assert call["system"] == build_system_prompt(Role.PLANNER, SPEC)
+    assert call["tools"] == PLANNER_TOOLS
+    assert call["messages"] == [
+        Message(role="user", content=[TextBlock(text=planner.FIRST_USER_MESSAGE)])
+    ]
+    # The first message is the one the planner was asked with, so the stored transcript has it.
+    assert (await rig.transcript(out.transcript_ref))[0] == call["messages"][0]
+
+
+async def test_the_coder_keeps_the_default_tools_when_the_planner_has_its_own() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.CODER))
+
+    (call,) = rig.provider.calls
+    assert call["tools"] == TOOLS
+    assert call["messages"] == [FIRST]
+    assert "submit_plan" not in {tool.name for tool in call["tools"]}
+
+
+async def test_the_planner_is_not_offered_the_tools_that_write() -> None:
+    rig = planner_rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.PLANNER))
+
+    offered = {tool.name for tool in rig.provider.calls[0]["tools"]}
+    assert offered == {*planner.TOOLS, "submit_plan"}
+    assert not offered & {"edit_file", "write_file", "finish"}
+
+
+async def test_without_role_tools_every_role_gets_the_default_list() -> None:
+    # A worker built before the planner existed passes none, and its roles keep their tools.
+    rig = Rig(reply("end_turn"))
+    await rig.run(turn_input(role=Role.CODER))
+    assert rig.provider.calls[0]["tools"] == TOOLS
+
+
+@pytest.mark.phase6
+async def test_the_planner_ends_its_system_prompt_with_the_memory_block_of_the_task() -> None:
+    # Block 4 belongs to the task, not to a role (LH-604): the planner reads the same notes as
+    # the coder, at the end of a system prompt whose blocks 1 and 2 are its own.
+    rig = planner_rig(reply("end_turn"), reply("end_turn"))
+    block = await rig.blobs.put(
+        BLOCK.encode(), key=blob_key(SPEC.task_id, "memory", 0, "memory-block.txt")
+    )
+
+    await rig.run(turn_input(role=Role.PLANNER, memory_ref=block))
+    await rig.run(turn_input(role=Role.CODER, memory_ref=block))
+
+    planning, coding = rig.provider.calls
+    assert planning["system"] == build_system_prompt(Role.PLANNER, SPEC, BLOCK)
+    assert (
+        planning["system"]
+        == f"{build_system_prompt(Role.PLANNER, SPEC)}\n\n{FACTS_HEADING}\n{BLOCK}"
+    )
+    assert planning["system"].endswith(BLOCK) and coding["system"].endswith(BLOCK)
+    assert planning["system"] != coding["system"]
+
+
+async def test_a_submit_plan_call_is_returned_like_any_call() -> None:
+    plan = {"summary": "s", "steps": [], "acceptance_checks": ["pytest -q"]}
+    rig = planner_rig(reply("tool_use", use("toolu_1", "submit_plan", **plan)))
+    out = await rig.run(turn_input(role=Role.PLANNER))
+
+    assert [c.name for c in out.tool_call_summaries] == ["submit_plan"]
+    assert out.tool_call_summaries[0].input == plan

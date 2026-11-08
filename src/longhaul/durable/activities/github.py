@@ -1,4 +1,5 @@
-"""The poller's activity: poll_once, which starts a task for each newly labeled issue (LH-307).
+"""The poller's activity: poll_once, which starts a task for each newly labeled issue (LH-307)
+and carries out the commands in their comments (LH-308).
 
 PollerWorkflow calls it once per tick of the Temporal Schedule (ADR-0008). One poll goes through
 the repos of the allowlist in config order. For each repo it lists the open issues that carry the
@@ -6,10 +7,21 @@ poller label, and for each issue that has no task yet it builds the TaskSpec (gi
 and starts a TaskWorkflow with durable/client.start_task. The task id is the workflow id, so the
 poll can run any number of times and an issue still gets one task.
 
-What the poller leaves to the task. It only reads from GitHub. The "Picked up" comment and the
-`longhaul:working` label are the task's own side effects, written by its first activity with an
-idempotency key (LH-306). A poller that wrote them would do it before the task exists, and a
-second poller could write them again.
+What the poller leaves to the task. It reads from GitHub, and it writes only the reply to a command
+from someone who may not steer (see below). The "Picked up" comment and the `longhaul:working`
+label are the task's own side effects, written by its first activity with an idempotency key
+(LH-306). A poller that wrote them would do it before the task exists, and a second poller could
+write them again.
+
+Commands (LH-308). After the new tasks are started, the poll reads the new comments of every open
+labeled issue that has a task, and carries out the slash commands in them: a signal to the task,
+or the next attempt for `/longhaul retry`. durable/activities/steering.py has the rules. This
+module only hands it the issues, and it starts the new attempts, because it owns the building of a
+spec. A new task gets a comment cursor in its row, at the newest comment its spec was built from,
+so nothing written before the label can act as a command.
+
+Every task the poller starts plans first (LH-501): the planner writes the plan, and the task
+posts it on the issue, before any code is written.
 
 An issue already has its task when any of these holds, and the poll leaves it alone:
 
@@ -53,12 +65,14 @@ from temporalio.client import Client
 from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 from longhaul.contracts import TaskSpec
-from longhaul.db.tasks import TaskStore
+from longhaul.db.tasks import CommentCursor, TaskStore
 from longhaul.durable import acts
+from longhaul.durable.activities.steering import Steering, pickup_cursor
 from longhaul.durable.activities.support import heartbeating
 from longhaul.durable.client import start_task
 from longhaul.github.client import GitHubClient, GitHubError, GitHubFatal, GitHubRetryable
 from longhaul.github.intake import is_allowlisted, is_local, issue_to_spec, task_id_for
+from longhaul.github.side_effects import Ledger
 from longhaul.settings import AppConfig, RepoEntry
 
 log = logging.getLogger(__name__)
@@ -73,11 +87,16 @@ class _Tally:
     issues: int = 0
     started: int = 0
     known: int = 0
+    commands: int = 0
     failures: list[tuple[str, Exception]] = field(default_factory=list)
 
     def result(self) -> acts.PollResult:
         return acts.PollResult(
-            repos=self.repos, issues=self.issues, started=self.started, known=self.known
+            repos=self.repos,
+            issues=self.issues,
+            started=self.started,
+            known=self.known,
+            commands=self.commands,
         )
 
 
@@ -145,7 +164,8 @@ class PollerActivities:
     `github` is None on a worker that has no token. The activity is still registered, and a poll
     on such a worker fails with a message that names the setting. `config` is read once, when
     the worker starts, as the rest of the worker's settings are. `task_queue` is the queue that
-    the tasks start on, which is the queue of the worker itself.
+    the tasks start on, which is the queue of the worker itself. `ledger` is the idempotency
+    ledger of the replies to commands from people who may not steer (github/side_effects.py).
     """
 
     def __init__(
@@ -155,11 +175,13 @@ class PollerActivities:
         config: AppConfig,
         *,
         task_queue: str,
+        ledger: Ledger,
     ) -> None:
         self._github = github
         self._store = store
         self._config = config
         self._task_queue = task_queue
+        self._ledger = ledger
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
@@ -186,10 +208,11 @@ class PollerActivities:
         except ValueError as exc:
             raise _config_error(f"the allowlist cannot be used: {exc}") from None
         tally = _Tally()
+        steering = Steering(github, self._store, self._ledger, self._begin_attempt)
         for entry in entries:
             tally.repos += 1
             try:
-                await self._poll_repo(client, github, entry, tally)
+                await self._poll_repo(client, github, steering, entry, tally)
             except (GitHubError, ValueError) as exc:
                 # ValueError is an issue that GitHub sent without a usable number or title.
                 # Waiting does not change it, so it counts as a failure for good.
@@ -199,11 +222,13 @@ class PollerActivities:
         if tally.failures:
             raise _failed(tally.failures)
         log.info(
-            "polled %d repos: %d labeled issues, %d tasks started, %d already known",
+            "polled %d repos: %d labeled issues, %d tasks started, %d already known, "
+            "%d commands carried out",
             tally.repos,
             tally.issues,
             tally.started,
             tally.known,
+            tally.commands,
         )
         return tally.result()
 
@@ -216,7 +241,12 @@ class PollerActivities:
         ]
 
     async def _poll_repo(
-        self, client: Client, github: GitHubClient, entry: RepoEntry, tally: _Tally
+        self,
+        client: Client,
+        github: GitHubClient,
+        steering: Steering,
+        entry: RepoEntry,
+        tally: _Tally,
     ) -> None:
         issues = await github.list_labeled_issues(entry.repo, self._config.poller.label)
         tally.issues += len(issues)
@@ -226,18 +256,53 @@ class PollerActivities:
             if task_id in known:
                 tally.known += 1
                 continue
-            spec = await self._spec(github, entry, issue)
-            if spec is None:
+            prepared = await self._prepare(github, entry, issue)
+            if prepared is None:
                 continue  # issue_to_spec has logged why
+            spec, cursor = prepared
             if await self._start(client, spec):
                 tally.started += 1
             else:
                 tally.known += 1
-            await self._store.record_pickup(spec)
+            await self._store.record_pickup(spec, cursor=cursor)
+        steered = await steering.steer_repo(client, entry, issues)
+        tally.commands += steered.commands
+        tally.failures.extend(steered.failures)
 
-    async def _spec(
-        self, github: GitHubClient, entry: RepoEntry, issue: Mapping[str, Any]
-    ) -> TaskSpec | None:
+    async def _begin_attempt(
+        self,
+        client: Client,
+        entry: RepoEntry,
+        issue: Mapping[str, Any],
+        attempt: int,
+        cursor: CommentCursor,
+    ) -> str | None:
+        """Start a later attempt of the task of an issue, for `/longhaul retry`.
+
+        It builds the spec from the issue as it is now. The row begins at `cursor`, the comment
+        that asked for the attempt. The workflow is started first and the row after it, as for a
+        new task. An attempt whose workflow exists already, because an earlier poll died before it
+        wrote the row, is not started again and gets its row.
+        """
+        github = self._github
+        if github is None:  # poll() has checked, and Steering only runs from there
+            raise _config_error("the worker has no GitHub token")
+        prepared = await self._prepare(github, entry, issue, attempt)
+        if prepared is None:
+            return None
+        spec, _ = prepared
+        await self._start(client, spec)
+        await self._store.record_pickup(spec, cursor=cursor)
+        return spec.task_id
+
+    async def _prepare(
+        self,
+        github: GitHubClient,
+        entry: RepoEntry,
+        issue: Mapping[str, Any],
+        attempt: int = 1,
+    ) -> tuple[TaskSpec, CommentCursor] | None:
+        """The spec of an attempt, and the newest comment it was built from."""
         comments = await github.list_comments(entry.repo, issue["number"])
         permissions: dict[str, Mapping[str, Any]] = {}
         for login in _logins(comments):
@@ -250,12 +315,17 @@ class PollerActivities:
                     entry.repo,
                     exc,
                 )
-        return issue_to_spec(entry, issue, comments, permissions)
+        spec = issue_to_spec(entry, issue, comments, permissions, attempt=attempt)
+        if spec is None:
+            return None
+        return spec, pickup_cursor(issue, comments)
 
     async def _start(self, client: Client, spec: TaskSpec) -> bool:
         """Start the workflow of the task. False when it exists already, which is as good."""
         try:
-            await start_task(client, spec, task_queue=self._task_queue)
+            # A task of the poller plans first: the plan is what a maintainer reads before any
+            # code is written (LH-501).
+            await start_task(client, spec, task_queue=self._task_queue, plan=True)
         except WorkflowAlreadyStartedError:
             log.info("task %s exists already, so it is not started again", spec.task_id)
             return False

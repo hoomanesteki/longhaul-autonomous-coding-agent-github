@@ -22,7 +22,9 @@ What it is built from, and why each piece is what it is:
   carries the tracing interceptor, so the worker built on it needs no list of its own.
 * GitHub repos need LONGHAUL_GITHUB_TOKEN, a fine-grained PAT (ADR-0012). The worker clones and
   pushes with it on the host; it never enters a sandbox (ADR-0009). Without it the worker takes
-  local folders only and still recovers the sandbox of a GitHub task.
+  local folders only and still recovers the sandbox of a GitHub task. LONGHAUL_GITHUB_API_URL and
+  LONGHAUL_GITHUB_WEB_URL point it at a GitHub Enterprise server, or at a FakeGitHub and a folder
+  of bare repos in the end-to-end test of LH-308. Unset, they mean api.github.com and github.com.
 * Every activity logs when it starts, ends or fails (durable/activity_log.py). After a SIGKILL
   that is all a worker leaves behind, and it says where the kill landed.
 * With the token the worker also registers the GitHub writes (post_comment, add_label,
@@ -39,11 +41,30 @@ What it is built from, and why each piece is what it is:
   start, with the name of the setting to change.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
+* The planner (LH-501) gets its own tool list from the same registry: the read and run tools and
+  `submit_plan`, and none that writes a file (roles/planner.py). `store_plan` writes the plans
+  table and every worker registers it. With the GitHub token the worker also registers
+  `post_plan`, which posts the plan as a comment through the same ledger as the other writes.
+  Whether a task plans at all is the task's choice (acts.PLAN_MEMO_KEY), not the worker's. The
+  workflow keeps its own copy of `loop.planner_max_turns`, so a worker whose config holds
+  another number stops before it takes a task.
 * The poller (LH-307) reads GitHub with LONGHAUL_GITHUB_TOKEN and starts tasks on this worker's
-  own queue. Without a token the worker still starts and still registers `poll_once`, so a
-  worker for local runs needs none. A poll on it fails with the name of the setting, and the
-  Temporal UI shows that. The Schedule that triggers the polls is made by `longhaul poller
-  install` and not by the worker.
+  own queue. It also carries out the slash commands in the comments of the task issues (LH-308),
+  and posts the one reply to a command from someone who may not steer, through the same
+  idempotency ledger as the other GitHub writes. Without a token the worker still starts and
+  still registers `poll_once`, so a worker for local runs needs none. A poll on it fails with the
+  name of the setting, and the Temporal UI shows that. The Schedule that triggers the polls is
+  made by `longhaul poller install` and not by the worker.
+* Memory follows the `memory` section of the config (LH-604, ADR-0010). With it on, the worker
+  builds one PgMemoryStore on its database, with the embedder the config names, and gives it to
+  prepare_workspace, which keeps the repo map and the verified commands in it, and to load_memory,
+  which reads the notes for the prompt from it. `local` is the real embedder and needs the memory
+  extra: a worker without it stops at the start and says `uv sync --extra memory`, and does not
+  wait for the first search of a task to find out. `hash` needs nothing and is for tests and CI.
+  The vectors of two embedders cannot be compared, so `check_memory` embeds a few stored notes
+  again before the worker connects, and refuses a table that another embedder wrote. With it off,
+  the worker builds no store: no map and no commands are kept, and the memory block of the
+  prompt stays empty. load_memory is registered either way, because the workflow names it.
 * The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
@@ -70,6 +91,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from temporalio.client import Client
 from temporalio.worker import Worker
@@ -84,11 +106,14 @@ from longhaul.cost.pricing import load_pricing
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
+from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.memory import MemoryActivities
+from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
 from longhaul.durable.activities.support import Meters
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -98,12 +123,22 @@ from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.github.client import GITHUB_API_URL, GitHubClient, PatAuth
-from longhaul.github.remote import GitHubRemote
+from longhaul.github.remote import GitHubRemote, clone_url_under
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
+from longhaul.memory.embedder import make_embedder
+from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
+from longhaul.roles import planner
 from longhaul.sandbox.docker_manager import DockerSandboxManager
-from longhaul.settings import AppConfig, EnvSettings, config_path, load_config, templates_path
+from longhaul.settings import (
+    AppConfig,
+    EnvSettings,
+    Memory,
+    config_path,
+    load_config,
+    templates_path,
+)
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
 from longhaul.tools.registry import default_registry
@@ -126,6 +161,22 @@ class WorkerParts:
     store: GitCheckpointStore
     engine: AsyncEngine
     github: GitHubClient | None = None
+    memory: PgMemoryStore | None = None
+
+    async def check_memory(self) -> None:
+        """Refuse to start on a memory table that another embedder wrote, or on a model that
+        cannot load. Nothing to check on a worker without a store.
+
+        The table is read, so a database that cannot be reached stops the worker here, with a
+        message, as it would stop its first task.
+        """
+        if self.memory is None:
+            return
+        try:
+            await self.memory.check_embedder()
+        except (SQLAlchemyError, OSError) as exc:
+            reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+            raise ValueError(f"could not check the memory table of the database: {reason}") from exc
 
     async def close(self) -> None:
         """Close the database pool and the GitHub client. The others hold no open connection."""
@@ -152,6 +203,32 @@ def build_provider(settings: EnvSettings) -> LLMProvider | None:
     return get_provider(settings)
 
 
+def _github_remote(settings: EnvSettings, github: GitHubClient, auth: PatAuth) -> GitHubRemote:
+    """The remote of the worker: github.com, or the server that LONGHAUL_GITHUB_WEB_URL names."""
+    if settings.github_web_url is None:
+        return GitHubRemote(github, auth)
+    return GitHubRemote(github, auth, clone_url=clone_url_under(settings.github_web_url))
+
+
+def build_memory(cfg: Memory, sessions: async_sessionmaker[AsyncSession]) -> PgMemoryStore | None:
+    """The memory store of the worker, or None when the config turns memory off.
+
+    It opens no connection, and the embedder loads no model: a local model is read on the first
+    text. A local embedder without its extra raises ValueError here, with the command that
+    installs it, so that the worker stops at the start.
+    """
+    if not cfg.enabled:
+        return None
+    try:
+        embedder = make_embedder(cfg.embedder)
+    except ModuleNotFoundError as exc:  # the extra; the command reports a ValueError in one line
+        raise ValueError(
+            f"memory.embedder is {cfg.embedder} and {exc}. Or set memory.embedder to hash, "
+            "or memory.enabled to false"
+        ) from exc
+    return PgMemoryStore(sessions, embedder)
+
+
 def build_parts(
     settings: EnvSettings, cfg: AppConfig, sandboxes: DockerSandboxManager
 ) -> WorkerParts:
@@ -160,6 +237,14 @@ def build_parts(
     `sandboxes` is a DockerSandboxManager. It is a parameter because building one connects to
     the Docker daemon, which a test of this wiring does not have.
     """
+    if cfg.loop.planner_max_turns != acts.PLANNER_MAX_TURNS:
+        # The workflow cannot read the config file and keeps its own copy of the limit. A
+        # different number here would be accepted and then ignored on every task.
+        raise ValueError(
+            f"loop.planner_max_turns is {cfg.loop.planner_max_turns}, but the workflow gives the "
+            f"planner {acts.PLANNER_MAX_TURNS} turns and cannot be told otherwise. "
+            f"Set it to {acts.PLANNER_MAX_TURNS}"
+        )
     if settings.database_url is None:
         raise ValueError("LONGHAUL_DATABASE_URL is not set")
     try:
@@ -169,6 +254,7 @@ def build_parts(
     store = GitCheckpointStore(blobs, root=settings.ckpt_dir)
     engine = make_engine(settings.database_url.get_secret_value())
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
+    memory = build_memory(cfg.memory, sessions)
     recorder = SqlRecorder(sessions)
     ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
     # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
@@ -192,6 +278,7 @@ def build_parts(
         ledger=ledger,
         context=cfg.context,
         meters=meters,
+        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
     )
     compactor = ContextActivities(
         provider,
@@ -212,26 +299,32 @@ def build_parts(
     )
     github: GitHubClient | None = None
     remote: GitHubRemote | None = None
+    # One ledger for every GitHub write, so that a key is held and recorded once.
+    effects = EffectLedger(sessions)
     if settings.github_token is not None:
         auth = PatAuth(settings.github_token)
-        github = GitHubClient(GITHUB_API_URL, auth)
-        remote = GitHubRemote(github, auth)
+        github = GitHubClient(settings.github_api_url or GITHUB_API_URL, auth)
+        remote = _github_remote(settings, github, auth)
     workspace = WorkspaceActivities(
         sandboxes,
         store,
         recorder,
         image=cfg.sandbox.image,
         limits=cfg.sandbox.limits,
+        memory=memory,
         github=remote,
+        blobs=blobs,
     )
+    notes = MemoryActivities(memory, blobs)
     events = EventActivities(recorder)
+    plans = PlanActivities(recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
-    poller = PollerActivities(github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue)
+    poller = PollerActivities(
+        github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue, ledger=effects
+    )
     delivery: list[Callable[..., Any]] = []
     if github is not None and remote is not None:
-        # One ledger for the writes and the delivery, so that a key is held and recorded once.
-        effects = EffectLedger(sessions)
         delivery = [
             *SideEffectActivities(github, effects).activities,
             *DeliveryActivities(
@@ -244,6 +337,7 @@ def build_parts(
                 author=settings.git_author,
                 templates=templates_path(settings),
             ).activities,
+            *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
         ]
     return WorkerParts(
         activities=[
@@ -251,7 +345,9 @@ def build_parts(
             *compactor.activities,
             *tools.activities,
             *workspace.activities,
+            *notes.activities,
             *events.activities,
+            *plans.activities,
             *poller.activities,
             *delivery,
         ],
@@ -259,6 +355,7 @@ def build_parts(
         store=store,
         engine=engine,
         github=github,
+        memory=memory,
     )
 
 
@@ -314,6 +411,7 @@ async def main() -> None:
     install_signal_handlers(stop)  # before the connection, so an early stop is not a crash
     endpoint: metrics.MetricsServer | None = None
     try:
+        await parts.check_memory()  # before the port is taken and the queue is polled
         endpoint = metrics.serve(settings.metrics_port, settings.metrics_host)
         log.info("metrics on http://%s:%d/metrics", settings.metrics_host, endpoint.port)
         client = await connect(settings.temporal_address, namespace=settings.temporal_namespace)

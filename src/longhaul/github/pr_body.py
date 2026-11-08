@@ -8,10 +8,12 @@ The text comes from templates/pr_body.md.j2. This module fills it in and keeps t
 * **Only the template can close an issue or mention a person.** The summary is what the model
   wrote when it finished, and the file names are the repo's. On GitHub "closes #7" in a pull
   request body closes issue 7 when the request merges, and "@name" notifies a person, so the
-  model's text could close an unrelated issue or ping anyone. `defuse` puts an invisible space
-  after the `@`, after the `#` of a number and after `://`, which ends the effect and leaves the
-  text readable. It also turns `<` into `&lt;`, so the model cannot hide text in a comment or add
-  markup. The one line that closes an issue is the last line of the template.
+  model's text could close an unrelated issue or ping anyone. `defuse` ends each such mark
+  (github/marks.py puts an invisible space after the `@`, after the `#` of a number, after `GH-`
+  and after `://`), which leaves the text readable. It also turns `<` into `&lt;`, so the model
+  cannot hide text in a comment or add markup. The one line that closes an issue is the last
+  line of the template. The commit subject, which titles the pull request, gets the same
+  treatment in checkpoints/squash.py.
 * **A short body.** GitHub refuses more than 65,536 characters. The summary is cut, the list of
   files stops at MAX_FILES and a file name is cut, so the body stays far under it.
 
@@ -32,6 +34,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from longhaul.checkpoints.squash import FileStat
+from longhaul.github.marks import defuse_marks
 
 __all__ = [
     "MAX_FILES",
@@ -49,11 +52,6 @@ MAX_PATH_CHARS = 200
 MAX_SUMMARY_CHARS = 4000
 SUMMARY_CUT = "(summary cut)"
 
-_ZERO_WIDTH_SPACE = "\N{ZERO WIDTH SPACE}"
-# An @ that starts a word is a mention. One inside a word, as in an address, is not.
-_MENTION = re.compile(r"(?<![\w@])@(?=[A-Za-z0-9])")
-_ISSUE_NUMBER = re.compile(r"#(?=\d)")
-_SCHEME = re.compile(r"://")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
@@ -73,10 +71,7 @@ class LastTestRun:
 
 def defuse(text: str) -> str:
     """Text from the model, safe to put on a page that people read. See the module docstring."""
-    text = text.replace("<", "&lt;")
-    text = _MENTION.sub(f"@{_ZERO_WIDTH_SPACE}", text)
-    text = _ISSUE_NUMBER.sub(f"#{_ZERO_WIDTH_SPACE}", text)
-    return _SCHEME.sub(f"://{_ZERO_WIDTH_SPACE}", text)
+    return defuse_marks(text.replace("<", "&lt;"))
 
 
 def _summary(text: str) -> str:

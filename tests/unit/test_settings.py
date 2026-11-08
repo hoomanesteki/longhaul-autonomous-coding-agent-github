@@ -151,8 +151,12 @@ def test_an_unknown_effort_level_is_rejected(tmp_path: Path, role: str, level: A
         pytest.param((), "effort", id="effort section"),
         pytest.param(("effort",), "compactor", id="effort.compactor"),
         pytest.param(("loop",), "max_tokens_retry", id="loop.max_tokens_retry"),
+        pytest.param(("loop",), "planner_max_turns", id="loop.planner_max_turns"),
         pytest.param((), "telemetry", id="telemetry section"),
         pytest.param(("telemetry",), "capture_content", id="telemetry.capture_content"),
+        pytest.param((), "memory", id="memory section"),
+        pytest.param(("memory",), "enabled", id="memory.enabled"),
+        pytest.param(("memory",), "embedder", id="memory.embedder"),
     ],
 )
 def test_new_settings_have_no_silent_default(
@@ -187,6 +191,26 @@ def test_the_retry_cap_cannot_be_below_the_normal_cap(tmp_path: Path, cap: int) 
     assert "max_tokens_per_turn" in str(excinfo.value)
 
 
+def test_the_planner_gets_twenty_turns_unless_the_config_says_otherwise(tmp_path: Path) -> None:
+    assert load_config(EXAMPLE).loop.planner_max_turns == 20
+    data = _example_data()
+    data["loop"]["planner_max_turns"] = 8
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+    assert load_config(path).loop.planner_max_turns == 8
+
+
+@pytest.mark.parametrize("turns", [0, -3])
+def test_the_planner_needs_at_least_one_turn(tmp_path: Path, turns: int) -> None:
+    data = _example_data()
+    data["loop"]["planner_max_turns"] = turns
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "planner_max_turns")]
+
+
 def test_the_retry_cap_may_equal_the_normal_cap(tmp_path: Path) -> None:
     data = _example_data()
     data["loop"]["max_tokens_retry"] = data["loop"]["max_tokens_per_turn"]
@@ -210,6 +234,7 @@ UNKNOWN_KEY_CASES = [
     pytest.param(("loop",), "max_verify_round", id="loop"),
     pytest.param(("stuck",), "no_progress_turn", id="stuck"),
     pytest.param(("telemetry",), "capture_contnt", id="telemetry"),
+    pytest.param(("memory",), "embeder", id="memory"),
 ]
 
 
@@ -440,6 +465,8 @@ def test_environment_wins_over_dotenv(isolated_cwd: Path, monkeypatch: pytest.Mo
         ("LONGHAUL_GITHUB_TOKEN", "github_token"),
         ("LONGHAUL_GITHUB_APP_ID", "github_app_id"),
         ("LONGHAUL_GITHUB_APP_KEY_PATH", "github_app_key_path"),
+        ("LONGHAUL_GITHUB_API_URL", "github_api_url"),
+        ("LONGHAUL_GITHUB_WEB_URL", "github_web_url"),
         ("LONGHAUL_ADMIN_TOKEN", "admin_token"),
         ("LONGHAUL_SCRIPT", "script"),
         ("LONGHAUL_RECORDINGS_DIR", "recordings_dir"),
@@ -721,3 +748,119 @@ def test_the_example_env_file_names_the_metrics_settings() -> None:
     example = _env_example()
     assert example["LONGHAUL_METRICS_PORT"] == "9464"
     assert example["LONGHAUL_METRICS_HOST"] == "127.0.0.1"
+
+
+# ---------- LH-308: where GitHub is ----------
+def test_github_is_github_dot_com_unless_the_environment_says_otherwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("LONGHAUL_GITHUB_API_URL", raising=False)
+    monkeypatch.delenv("LONGHAUL_GITHUB_WEB_URL", raising=False)
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+    assert (settings.github_api_url, settings.github_web_url) == (None, None)
+
+
+def test_github_can_be_a_server_of_our_own(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LONGHAUL_GITHUB_API_URL", "https://git.example.com/api/v3")
+    monkeypatch.setenv("LONGHAUL_GITHUB_WEB_URL", "https://git.example.com")
+    settings = EnvSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.github_api_url == "https://git.example.com/api/v3"
+    assert settings.github_web_url == "https://git.example.com"
+
+
+def test_env_example_lists_the_github_urls_blank() -> None:
+    env = _env_example()
+    assert env["LONGHAUL_GITHUB_API_URL"] == ""
+    assert env["LONGHAUL_GITHUB_WEB_URL"] == ""
+
+
+# ---------- LH-407: a window of the run's own ----------
+def test_a_smaller_window_shrinks_the_cap_for_one_result_with_it() -> None:
+    # The cap of the example config is 4,000 tokens, and a window of 8,000 cannot hold that
+    # for each result of a turn. A result may take 1/32 of the window at most.
+    policy = load_config(EXAMPLE).context
+
+    small = policy.for_window(8_000)
+
+    assert small.window_tokens == 8_000
+    assert small.tool_output_max_tokens == 250
+
+
+def test_a_smaller_window_changes_nothing_but_those_two_numbers() -> None:
+    policy = load_config(EXAMPLE).context
+
+    small = policy.for_window(8_000)
+
+    restored = small.model_copy(
+        update={
+            "window_tokens": policy.window_tokens,
+            "tool_output_max_tokens": policy.tool_output_max_tokens,
+        }
+    )
+    assert restored == policy
+
+
+def test_a_window_with_room_for_the_configured_cap_keeps_it() -> None:
+    policy = load_config(EXAMPLE).context
+
+    large = policy.for_window(400_000)
+
+    assert large.window_tokens == 400_000
+    assert large.tool_output_max_tokens == policy.tool_output_max_tokens
+
+
+def test_no_window_leaves_the_policy_as_it_is() -> None:
+    policy = load_config(EXAMPLE).context
+
+    assert policy.for_window(None) is policy
+
+
+def test_the_cap_is_never_below_one_token() -> None:
+    assert load_config(EXAMPLE).context.for_window(10).tool_output_max_tokens == 1
+
+
+def test_the_policy_is_not_changed_by_asking_for_a_window() -> None:
+    policy = load_config(EXAMPLE).context
+    before = policy.model_copy()
+
+    policy.for_window(8_000)
+
+    assert policy == before
+
+
+# ---------- the memory section (LH-604) ----------
+@pytest.mark.phase6
+def test_the_example_config_turns_memory_on_with_the_local_embedder() -> None:
+    memory = load_config(EXAMPLE).memory
+    assert (memory.enabled, memory.embedder) == (True, "local")
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("embedder", ["local", "hash"])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_the_memory_section_takes_both_embedders_on_or_off(
+    tmp_path: Path, embedder: str, enabled: bool
+) -> None:
+    data = _example_data()
+    data["memory"] = {"enabled": enabled, "embedder": embedder}
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    memory = load_config(path).memory
+
+    assert (memory.enabled, memory.embedder) == (enabled, embedder)
+
+
+@pytest.mark.phase6
+@pytest.mark.parametrize("embedder", ["openai", "Local", "", "fastembed", 3])
+def test_an_embedder_that_does_not_exist_is_refused_and_the_error_names_the_setting(
+    tmp_path: Path, embedder: object
+) -> None:
+    data = _example_data()
+    data["memory"]["embedder"] = embedder
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("memory", "embedder")]
+    assert "hash" in str(excinfo.value)

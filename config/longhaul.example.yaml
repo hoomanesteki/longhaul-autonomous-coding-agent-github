@@ -36,6 +36,7 @@ loop:
   continue_as_new_every_turns: 40
   max_tokens_per_turn: 8192
   max_tokens_retry: 64000   # cap for the one retry of a turn that stopped on max_tokens
+  planner_max_turns: 20     # planner turns before the task ends; the workflow fixes it at 20, so keep it
 stuck:
   no_progress_turns: 15
   repeated_failure_count: 3
@@ -44,4 +45,7 @@ stuck:
   hint_wait_hours: 24
 telemetry:
   capture_content: false   # true puts prompts and tool text into spans; leave off unless debugging
+memory:
+  enabled: true            # false: no repo map, no verified commands, no notes in the prompt
+  embedder: local          # local needs `uv sync --extra memory`; hash is for tests and CI
 pricing_file: config/pricing.yaml   # fill from the provider's pricing page; never hardcode in code

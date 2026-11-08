@@ -8,9 +8,10 @@ import it. The workflow reads the types and the policies. An activity registers 
 
 The policies are the ones in plan section 3.7. Two activities are not in that table and got
 their numbers here: `append_results`, which reads and writes one blob, and `cleanup`. Both are
-sized like `load_memory`. `ensure_sandbox` is in the table with 10 minutes and 5 attempts, and
-has a heartbeat timeout like `prepare_workspace`: it builds a container and runs the setup
-command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
+sized like `load_memory`, which has the table's 2 minutes and 3 attempts and no heartbeat: it is
+one search of the store and one blob write. `ensure_sandbox` is in the table with 10 minutes and
+5 attempts, and has a heartbeat timeout like `prepare_workspace`: it builds a container and runs
+the setup command, so a cancel has to reach it and a killed worker has to be noticed in a minute.
 `bundle_checkpoint` has the table's 5 minutes and 3 attempts and the same kind of heartbeat
 timeout, because it uploads the whole history of a repository. `record_event` is a local
 activity: it is one row insert, and it runs inside the worker that holds the workflow. `compact`
@@ -35,6 +36,13 @@ boundary (CONTRIBUTING.md rule 5). `build_pr_branch` has the 5 minutes and 3 att
 3.7. `deliver` is not in the table. It pushes a branch, whose git timeout is 10 minutes, and then
 does what create_pr does, so it gets 10 minutes, a heartbeat that a killed worker is noticed by in
 a minute, and 5 attempts with the backoff of the writes.
+
+The planner (LH-501) adds two activities that are not in the table. `store_plan` writes one row
+of the `plans` table, so it is sized like `append_results` and every worker registers it.
+`post_plan` renders the plan as a checklist from a template and posts it with the idempotent
+`post_comment` of github/side_effects.py, under the key `<task>:plan_comment:<version>`. It is a
+GitHub write with the policy of `post_comment`, and it sits in `GITHUB` with them. The template is
+read inside the activity, so the workflow, which may not read files, passes the plan itself.
 
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
@@ -70,6 +78,7 @@ from longhaul.context.modes import ContextMode
 from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
+    CarryState,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
@@ -110,14 +119,28 @@ TOOL_TIMEOUT_S = 600
 # under the 4,096 at which the server suggests a hand-over (ADR-0004, appendix section 4). That
 # suggestion is the safety net for a turn with many calls.
 CONTINUE_AS_NEW_EVERY_TURNS = 40
+# How long a hand-over waits for a status comment that is still being posted (LH-308). A comment
+# that GitHub accepts takes a second or two, so this only runs out when the post keeps retrying.
+# The comment is then dropped with the run, and a cancel ends the wait at once.
+STATUS_GRACE = timedelta(seconds=30)
 
 # F6: when the window is too full to wait, or the provider says the prompt is too long, the view
 # is compacted down to this many recent turns and the notes. A proactive compaction keeps
 # `context.keep_recent_turns`, which the workflow cannot read, so the activity reads it.
 FORCED_KEEP_RECENT_TURNS = 2
 
+# The turns the planner gets to submit its plan (LH-501). The workflow cannot read the config
+# file, so the number is copied from `loop.planner_max_turns`. A unit test keeps the two equal.
+PLANNER_MAX_TURNS = 20
+
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
+# The workflow memo key that switches planning on for a task (LH-501). A task started with
+# `start_task(plan=True)` runs the planner before the coder, and one started without it goes
+# straight to coding, as every task did before the planner existed. It is in the memo for the
+# reasons the tuning and the script are: it reaches a worker in another process, survives a
+# replay and carries over Continue-As-New, so the plan is not made again after a hand-over.
+PLAN_MEMO_KEY = "plan"
 # The workflow memo key under which a run carries the BlobRef of its script. The scripted
 # provider runs in the worker, and a worker is started once for many tasks, so the script has to
 # travel with the task. `longhaul run --script` uploads it and the workflow hands the ref to every
@@ -137,6 +160,11 @@ CONTEXT_MODE_MEMO_KEY = "context_mode"
 # OutcomeKind value), `repo`, `turns`, `cost_usd` and a `summary` cut to OUTCOME_SUMMARY_CHARS.
 OUTCOME_EVENT = "outcome"
 OUTCOME_SUMMARY_CHARS = 500
+# The workflow memo key under which a run carries the count of the status comments it has posted
+# (LH-308). The key of a status comment is its number, and a run that began counting at 1 again
+# after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
+# contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
+STATUS_MEMO_KEY = "status_posts"
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -182,17 +210,54 @@ FORBIDDEN_BRANCH = "ForbiddenBranchError"
 
 
 # ---------- payloads ----------
+class RunState(CarryState):
+    """CarryState plus what only the workflow carries from run to run (LH-604).
+
+    CarryState is a shared contract (contracts.py) with no field for the memory block, and this
+    story does not change it. The workflow takes and hands over this subclass instead, so the
+    extra field rides through Continue-As-New with the rest of the state. The JSON of a CarryState
+    is a valid RunState with no block, which is how a workflow that an older worker started
+    decodes, and the JSON of a RunState is a valid CarryState to a reader that does not know the
+    field.
+
+    `memory_ref` is the memory block that load_memory wrote for the task, or None when the task
+    has none. It is set once, by the run that prepared the workspace, and never changes.
+    """
+
+    memory_ref: BlobRef | None = None
+
+
 class PrepareWorkspaceOutput(BaseModel):
     """What the workflow keeps of a prepared workspace.
 
     `repo_map_ref` is the repo map for the task's issue (LH-602): text in the blob store, for
     the memory block of the prompt (LH-604). It is None when the worker has no memory store, or
     the map could not be built, and the task goes on without it.
+
+    `memory_enabled` says that this worker keeps memory, and so that the workflow should call
+    load_memory next. The workflow reads it from the recorded result and not from any setting,
+    so the history of a task that began before LH-604 has no such call to replay, and a worker
+    without a store adds no activity to its tasks. `test_command` is the first approved test
+    command of the repo (retrieve.first_test_command), and is set only when the repo settings
+    name none: the workflow puts it into the spec, so every prompt of the task names it.
     """
 
     sandbox_id: str
     base_sha: str
     head_sha: str
+    repo_map_ref: BlobRef | None = None
+    memory_enabled: bool = False
+    test_command: str | None = None
+
+
+class LoadMemoryInput(BaseModel):
+    """What load_memory needs to write the memory block of a task.
+
+    The spec gives the repo and the issue text that the lessons are searched by. `repo_map_ref`
+    is the map that prepare_workspace wrote for this issue, if it wrote one.
+    """
+
+    spec: TaskSpec
     repo_map_ref: BlobRef | None = None
 
 
@@ -238,10 +303,13 @@ class LlmTurnInput(BaseModel):
     transcript_ref: BlobRef | None  # None before the first turn
     # The notes reach the model in the first message of the view, where compaction put them
     # (context/compact.py apply), so the system prompt does not change with them (D7). This field
-    # is the workflow's copy, which it hands back to the compact activity. The plan and the memory
-    # block reach the model in Phases 5 and 6.
+    # is the workflow's copy, which it hands back to the compact activity. The plan reaches the
+    # model in Phase 5.
     notes: ProgressNotes | None = None
     plan: Plan | None = None
+    # The memory block that load_memory wrote for the task (LH-604): text in the blob store that
+    # ends the system prompt. It is the same ref on every turn of the task, in every run, so the
+    # prompt is the same bytes. None means the task has no block.
     memory_ref: BlobRef | None = None
     # Every hint of the task, "<by>: <text>", in the order they came. The activity shows the model
     # the ones that are not in the transcript yet (turns.show_hints). The pause and hint flow of
@@ -255,6 +323,8 @@ class LlmTurnInput(BaseModel):
     # The script that answers this task instead of the provider of the worker. It comes from the
     # memo (SCRIPT_MEMO_KEY) and is the same on every turn of a task.
     script_ref: BlobRef | None = None
+    # The context window this run asked for (Tuning.window_tokens), in place of the config's.
+    window_tokens: int | None = Field(default=None, ge=1)
     # The context mode this run asked for, from the memo (CONTEXT_MODE_MEMO_KEY). None means the
     # run did not ask, and the config of the worker decides.
     context_mode: ContextMode | None = None
@@ -297,6 +367,12 @@ class ToolExecInput(BaseModel):
     call: ToolCallSummary
     pre_sha: str | None  # the checkpoint the call must start from
     sandbox_id: str
+    # A call of the planning phase (LH-501). The activity runs it, and then puts the tree back on
+    # `pre_sha` if it changed anything, and saves no checkpoint. The default is the coder's call.
+    read_only: bool = False
+    # The context window of the run (Tuning.window_tokens). A tool pages its output to the cap for
+    # one result, and that cap shrinks with a small window (context.tokens.result_cap).
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 class ToolResultSummary(BaseModel):
@@ -326,6 +402,8 @@ class AppendResultsInput(BaseModel):
     results: list[ToolResultSummary]
     # Text from the harness, such as the nudge. It goes after the results, as the API requires.
     user_text: str | None = None
+    # The context window of the run, as in ToolExecInput: the results are cut to the cap that fits.
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 # What a compaction came to. The first three are context.compact.CompactStatus, and a test keeps
@@ -353,6 +431,9 @@ class CompactInput(BaseModel):
     script_ref: BlobRef | None = None
     # The context mode of the run, as in LlmTurnInput. Only `full` compacts.
     context_mode: ContextMode | None = None
+    # The memory block of the task, as in LlmTurnInput. The system prompt that the token counts
+    # are made from has it, as the one that the model turn sends does.
+    memory_ref: BlobRef | None = None
 
 
 class CompactOutput(BaseModel):
@@ -405,25 +486,30 @@ class PollResult(BaseModel):
 
     `repos` is the allowlisted repos it looked at, `issues` the open issues it saw with the label,
     `started` the tasks it started, and `known` the issues it left alone because their task
-    already has a row or a workflow.
+    already has a row or a workflow. `commands` is the comment commands (LH-308) that it carried
+    out: a signal sent to a task, or an attempt started by `/longhaul retry`.
     """
 
     repos: int = Field(default=0, ge=0)
     issues: int = Field(default=0, ge=0)
     started: int = Field(default=0, ge=0)
     known: int = Field(default=0, ge=0)
+    commands: int = Field(default=0, ge=0)
 
 
 class BuildPrBranchInput(BaseModel):
-    """What build_pr_branch needs: the finish summary, which titles the commit, and the checkpoint.
+    """What build_pr_branch needs: the finish summary, which titles the commit, and the two ends.
 
-    `head_sha` is the latest checkpoint the workflow knows. The work of the whole task is the
-    change from the base commit to it.
+    `base_sha` is the commit the workspace was prepared at (PrepareWorkspaceOutput.base_sha),
+    which the workflow keeps. The activity does not read it from the checkpoint repo, where the
+    sandbox could move the `base` tag. `head_sha` is the latest checkpoint the workflow knows.
+    The work of the whole task is the change from the base to the head.
     """
 
     task_id: str
     repo: str
     summary: str
+    base_sha: str
     head_sha: str
 
 
@@ -440,6 +526,28 @@ class PrBranchOutput(BaseModel):
     base_sha: str
     base_branch: str
     title: str
+
+
+class StorePlanInput(BaseModel):
+    """What store_plan needs: a version of the plan of a task, for the `plans` table."""
+
+    task_id: str
+    version: int = Field(ge=1)
+    plan: Plan
+
+
+class PostPlanInput(BaseModel):
+    """What post_plan needs: the plan, to render as a checklist, and the issue to post it on.
+
+    The idempotency key is built by the activity from the task id and the version, so a retry
+    and a run after a Continue-As-New send the same one.
+    """
+
+    task_id: str
+    repo: str
+    number: int  # the issue
+    version: int = Field(ge=1)
+    plan: Plan
 
 
 class DeliverInput(BaseModel):
@@ -584,6 +692,14 @@ POLL_ONCE = Act(
     ),
 )
 
+LOAD_MEMORY = Act(
+    "load_memory",
+    LoadMemoryInput,
+    BlobRef,  # the rendered memory block, as text
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 COMPACT = Act(
     "compact",
     CompactInput,
@@ -653,6 +769,14 @@ CREATE_PR = Act(
     retry=_github_write(10, _GITHUB_ERRORS),
 )
 
+POST_PLAN = Act(
+    "post_plan",
+    PostPlanInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
 BUILD_PR_BRANCH = Act(
     "build_pr_branch",
     BuildPrBranchInput,
@@ -673,9 +797,18 @@ DELIVER = Act(
     retry=_github_write(5, [*_GITHUB_ERRORS, FORBIDDEN_BRANCH]),
 )
 
+STORE_PLAN = Act(
+    "store_plan",
+    StorePlanInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
+    LOAD_MEMORY,
     LLM_TURN,
     TOOL_EXEC,
     APPEND_RESULTS,
@@ -684,6 +817,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     RECORD_EVENT,
     POLL_ONCE,
     COMPACT,
+    STORE_PLAN,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -694,21 +828,25 @@ GITHUB: tuple[Act[Any, Any], ...] = (
     CREATE_PR,
     BUILD_PR_BRANCH,
     DELIVER,
+    POST_PLAN,
 )
 
 
 # ---------- per-run tuning ----------
 class Tuning(BaseModel):
-    """Per-run changes to the section 3.7 timeouts, for tests and chaos runs.
+    """Per-run changes to the section 3.7 timeouts and to the context window.
 
-    After a hard kill the server notices a dead activity only when its heartbeat timeout
-    passes: up to 60 s for `prepare_workspace` and `ensure_sandbox`, 30 s for `llm_turn`, 15 s
-    for `tool_exec` (ADR-0004 section 3). A chaos run that kills the worker five times cannot
-    wait that long, so it starts its tasks with a shorter heartbeat timeout.
+    The timeouts are for tests and chaos runs. After a hard kill the server notices a dead
+    activity only when its heartbeat timeout passes: up to 60 s for `prepare_workspace` and
+    `ensure_sandbox`, 30 s for `llm_turn`, 15 s for `tool_exec` (ADR-0004 section 3). A chaos run
+    that kills the worker five times cannot wait that long, so it starts its tasks with a shorter
+    heartbeat timeout.
+
+    The window is for a run that has to fill it: `longhaul run --window` (LH-407).
 
     The value travels in the workflow memo, not in a global, so it works for a worker in
-    another process, survives a replay and carries over Continue-As-New. A production run
-    has no tuning.
+    another process, survives a replay and carries over Continue-As-New. A run that changes
+    nothing has no tuning.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -720,6 +858,14 @@ class Tuning(BaseModel):
     # number. Every run of the chain then hands over after that many turns, because the memo
     # carries over Continue-As-New.
     continue_as_new_every_turns: int | None = Field(default=None, ge=1)
+    # The wait of a hand-over for a status comment that cannot be posted. The test server does
+    # not skip time while an activity runs, so a test of the drop would wait 30 s without this.
+    status_grace_s: float | None = Field(default=None, gt=0)
+    # The context window of this run, in tokens, in place of context.window_tokens of the config of
+    # the worker. The activities that count tokens read it from their inputs (llm_turn, tool_exec
+    # and append_results), and settings.Context.for_window says what it changes. The long-task
+    # test needs a window that 62 turns fill, and the config's holds a task of hundreds of them.
+    window_tokens: int | None = Field(default=None, ge=1)
 
 
 def options(act: Act[Any, Any], tuning: Tuning | None = None) -> workflow.ActivityConfig:
@@ -768,6 +914,13 @@ def continue_as_new_every(tuning: Tuning | None = None) -> int:
     if tuning is not None and tuning.continue_as_new_every_turns is not None:
         return tuning.continue_as_new_every_turns
     return CONTINUE_AS_NEW_EVERY_TURNS
+
+
+def status_grace(tuning: Tuning | None = None) -> timedelta:
+    """The wait of a hand-over for a status comment: the run's tuning, or STATUS_GRACE."""
+    if tuning is not None and tuning.status_grace_s is not None:
+        return timedelta(seconds=tuning.status_grace_s)
+    return STATUS_GRACE
 
 
 def hand_off_due(turn_index: int, tuning: Tuning | None = None, *, suggested: bool = False) -> bool:

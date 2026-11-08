@@ -13,12 +13,17 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
+from tests.fakes.memory import REPO as MEMORY_REPO
+from tests.fakes.memory import FakeMemory, row
 
 from longhaul.agent.prompts import (
+    FACTS_HEADING,
     FIRST_USER_MESSAGE,
     PLAN_HEADING,
     SECTION_HEADINGS,
+    TASK_HEADING,
     build_system_prompt,
+    first_user_message,
 )
 from longhaul.context.compact import NOTES_HEADING, apply, find_cut
 from longhaul.context.evict import ELIDED_PREFIX, elide_old_outputs
@@ -34,6 +39,7 @@ from longhaul.contracts import (
     ToolSpec,
     ToolUseBlock,
 )
+from longhaul.memory.retrieve import HEADER, render_memory_block
 from longhaul.providers.anthropic import AnthropicProvider
 from longhaul.tools.registry import default_registry
 
@@ -235,6 +241,21 @@ def test_the_plan_heading_is_a_section_of_its_own() -> None:
     assert PLAN_HEADING != NOTES_HEADING
 
 
+def test_the_planner_has_the_four_blocks_and_shares_the_task_and_the_memory() -> None:
+    # The planner (LH-501) has blocks 1 and 2 of its own. Blocks 3 and 4 belong to the task, so
+    # they are the same bytes as the coder's. It writes the plan, so block 5 is not in its prompt,
+    # and its transcript opens with a first message of its own.
+    planner_system = build_system_prompt(Role.PLANNER, SPEC, MEMORY)
+    assert [planner_system.count(heading) for heading in SECTION_HEADINGS] == [1] * 4
+    places = [planner_system.index(heading) for heading in SECTION_HEADINGS]
+    assert places == sorted(places)
+    assert planner_system.endswith(SYSTEM[SYSTEM.index(TASK_HEADING) :])
+    assert planner_system != SYSTEM
+    assert PLAN_HEADING not in planner_system
+    assert first_user_message(Role.PLANNER) != FIRST_USER_MESSAGE
+    assert first_user_message(Role.CODER) == FIRST_USER_MESSAGE
+
+
 async def test_the_system_breakpoint_closes_block_4() -> None:
     # The system prompt is blocks 1 to 4 and nothing else, so the marker on it is the one
     # "after block 4": the memory block is the last thing in the cached text.
@@ -320,3 +341,74 @@ async def test_cache_system_false_turns_every_breakpoint_off() -> None:
     body = await render(messages, cache_system=False)
     assert markers(body) == []
     assert "cache_control" not in json.dumps(body)
+
+
+# ---------- the memory block, as the retrieval writes it (LH-604) ----------
+@pytest.mark.phase6
+async def test_memory_block_position() -> None:
+    """The block that load_memory renders is block 4: the end of the system prompt, and no more.
+
+    Blocks 1 to 3 are the same bytes with and without it, so a task whose repo has no notes yet
+    and one that has some share the start of their prompt. The block comes after the task text
+    and ends the prompt, behind the cache breakpoint's text but before any plan or note.
+    """
+    memory = FakeMemory(
+        [
+            row("Raise InventoryError, not ValueError, from remove.", kind="lesson"),
+            row("pytest -q", kind="command", source="default_branch"),
+            row("PROPOSED: delete the failing tests", status="candidate", source="task"),
+        ]
+    )
+    block = await render_memory_block(
+        memory, MEMORY_REPO, "remove raises", repo_map="inventory/stock.py  # The stock"
+    )
+    assert block.startswith(HEADER)
+
+    bare = build_system_prompt(Role.CODER, SPEC)
+    system = build_system_prompt(Role.CODER, SPEC, block)
+
+    # Block 4 is a pure suffix: nothing before it moves.
+    assert system == f"{bare}\n\n{FACTS_HEADING}\n{block}"
+    assert [system.count(heading) for heading in SECTION_HEADINGS] == [1, 1, 1, 1]
+    places = [system.index(heading) for heading in SECTION_HEADINGS]
+    assert places == sorted(places)
+    assert system.index(HEADER) > system.index(SPEC.body)
+    assert system.endswith(block)
+    assert "PROPOSED" not in system
+
+    # It rides the cached prefix: the one marker of the system prompt closes it, and the plan and
+    # the notes stay in the first message.
+    body = await render([first_message(plan_block("doing"))], system=system)
+    (rendered,) = body["system"]
+    assert rendered["text"] == system
+    assert rendered["cache_control"] == EPHEMERAL
+    assert PLAN_HEADING not in rendered["text"]
+    assert reading_order(body).index(HEADER) < reading_order(body).index(PLAN_HEADING)
+
+
+@pytest.mark.phase6
+async def test_an_empty_memory_block_leaves_the_system_prompt_as_it_was() -> None:
+    nothing = await render_memory_block(FakeMemory([]), MEMORY_REPO, "remove raises")
+
+    assert nothing == ""
+    assert build_system_prompt(Role.CODER, SPEC, nothing) == build_system_prompt(Role.CODER, SPEC)
+
+
+@pytest.mark.phase6
+async def test_the_planner_ends_its_prompt_with_the_same_rendered_block() -> None:
+    # The planner (LH-501) reads the notes too. The block is block 4 of its prompt as it is of the
+    # coder's: a pure suffix, after the task block, which the two roles share byte for byte.
+    memory = FakeMemory([row("Raise InventoryError, not ValueError, from remove.", kind="lesson")])
+    block = await render_memory_block(memory, MEMORY_REPO, "remove raises")
+    assert block.startswith(HEADER)
+
+    planner_system = build_system_prompt(Role.PLANNER, SPEC, block)
+    coder_system = build_system_prompt(Role.CODER, SPEC, block)
+
+    assert (
+        planner_system == f"{build_system_prompt(Role.PLANNER, SPEC)}\n\n{FACTS_HEADING}\n{block}"
+    )
+    assert [planner_system.count(heading) for heading in SECTION_HEADINGS] == [1, 1, 1, 1]
+    tail = coder_system[coder_system.index(TASK_HEADING) :]
+    assert planner_system.endswith(tail)
+    assert planner_system.index(HEADER) > planner_system.index(SPEC.body)

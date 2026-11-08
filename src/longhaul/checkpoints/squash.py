@@ -14,17 +14,24 @@ commit for the group before (the base for the first). That is the diff of the gr
 and it needs no working tree and no patch to apply: it cannot conflict, and the last commit has
 the tree of the last checkpoint to the byte. A group that changes nothing makes no commit.
 
-The commits are the same every time. A retried `deliver` builds the branch again and then pushes
-it, and a push is never forced (checkpoints/push.py), so a second build that made a different
-commit would be refused after the first had been pushed. The author, the committer and both
-dates are therefore fixed: the names come from the setting, and the date is the date of the
-checkpoint commit, not the clock.
+The commits are the same every time. The `build_pr_branch` activity builds the branch from
+scratch, and it can run again for a task whose branch is already on the remote, for example after
+a restart. A push is never forced (checkpoints/push.py), so a second build that made a different
+commit would be refused. The author, the committer and both dates are therefore fixed: the names
+come from the setting, and the date is the date of the checkpoint commit, not the clock.
 
 The repo is the agent's. It can write refs and objects there, so this module reads only what it
-needs, with hooks off, and checks every sha it is given. The base is the `base` tag that
-init_task wrote. The branch is checked against the default branch with `assert_not_default`
+needs, with hooks off, and checks every sha it is given. That includes the base. The sandbox
+mounts the repo read-write, so the `base` tag that init_task wrote is the agent's to move, and
+the base is not read from it. The caller passes it, from the state of the workflow, which the
+sandbox cannot write. The branch is checked against the default branch with `assert_not_default`
 before anything is written (failure mode F15, invariant I5), and the default branch itself is
 never touched: the only ref this module writes is `refs/heads/longhaul-pr/<n>`.
+
+The subject line is text from the model, and it becomes the title of the pull request. It gets
+the same treatment as the body (github/marks.py): a closing keyword before an issue number, a
+reference to an issue and a mention lose their effect, so only the template of the body can
+close an issue.
 """
 
 from __future__ import annotations
@@ -36,7 +43,6 @@ from pathlib import Path
 from typing import NamedTuple
 
 from longhaul.checkpoints.git_store import (
-    BASE_TAG,
     CheckpointError,
     GitCheckpointStore,
     RepoNotFoundError,
@@ -47,9 +53,11 @@ from longhaul.checkpoints.git_store import (
     git_value,
 )
 from longhaul.checkpoints.push import assert_not_default, check_branch_name
+from longhaul.github.marks import ZERO_WIDTH_SPACE, defuse_marks
 from longhaul.settings import DEFAULT_GIT_AUTHOR
 
 __all__ = [
+    "MAX_SCOPE_CHARS",
     "MAX_SUBJECT_CHARS",
     "PR_BRANCH_PREFIX",
     "Author",
@@ -68,6 +76,8 @@ __all__ = [
 PR_BRANCH_PREFIX = "longhaul-pr/"
 # The style guide says "under 72 characters".
 MAX_SUBJECT_CHARS = 71
+# A scope names a part of the code, so it is short. A longer one gives way to the scope of the
+# caller, and a header that is too long would leave no room for the words.
 MAX_SCOPE_CHARS = 24
 
 
@@ -142,6 +152,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _BOLD = re.compile(r"\*\*|__")
 _LEADING_MARKUP = re.compile(r"^(?:[\s>#*+\-|]|\d+[.)]\s)+")
 _HAS_WORD = re.compile(r"[A-Za-z0-9]")
+_SCOPE = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_SCOPE_CHARS}}}")
 # The way a model usually opens a summary, and the verb a commit subject wants instead.
 _IMPERATIVE = {
     "added": "add",
@@ -209,10 +220,16 @@ def commit_subject(summary: str, *, scope: str, fallback: str) -> str:
     """A conventional commit subject from the summary the agent gave to `finish`.
 
     The type and scope of a summary that is already a conventional subject (`feat(math): add
-    pow`) are kept. Any other summary becomes `fix(<scope>): <first sentence>`, with the scope
-    given by the caller, the first letter in lower case and a past tense opening ("Fixed")
-    turned into the imperative ("fix"). The text is cut at a word to stay under 72 characters.
-    `fallback` is the description for a summary with no words in it.
+    pow`) are kept, unless the scope is too long (MAX_SCOPE_CHARS), in which case the scope of
+    the caller stands in for it. Any other summary becomes `fix(<scope>): <first sentence>`, with
+    the scope given by the caller, the first letter in lower case and a past tense opening
+    ("Fixed") turned into the imperative ("fix"). A scope that is no scope (too long, or with a
+    character outside letters, digits, dot, dash and underscore) is left out. The text is cut at
+    a word to stay under 72 characters, whatever the scope is.
+
+    Closing keywords, issue references and mentions in the text lose their effect (see the
+    module docstring), because the subject is the title of the pull request. `fallback` is the
+    description for a summary with no words in it.
     """
     words = _first_words(summary)
     kind, bang, written_scope = "fix", "", ""
@@ -222,20 +239,38 @@ def commit_subject(summary: str, *, scope: str, fallback: str) -> str:
         bang = found.group("bang") or ""
         written_scope = (found.group("scope") or "").lower()
         words = found.group("rest").strip()
-    description = _imperative(words) or fallback
-    scope = written_scope or scope
+    scope = next((s for s in (written_scope, scope) if _is_scope(s)), "")
     head = f"{kind}({scope}){bang}: " if scope else f"{kind}{bang}: "
-    return head + _fit(description, MAX_SUBJECT_CHARS - len(head))
+    room = MAX_SUBJECT_CHARS - len(head)
+    # Defuse before cutting: the invisible spaces count toward the length, and a cut only removes
+    # the end of the text, so it cannot bring a mark back to life.
+    fitted = _fit(defuse_marks(_imperative(words)), room)
+    return head + (fitted or _fit(defuse_marks(fallback), room))
+
+
+def _is_scope(scope: str) -> bool:
+    """True for a scope that fits the header as it stands, with nothing for GitHub to act on.
+
+    A scope such as `gh-7` would be an issue reference, and defusing it would put an invisible
+    character in the header, so it is not used.
+    """
+    return _SCOPE.fullmatch(scope) is not None and defuse_marks(scope) == scope
 
 
 def _fit(text: str, room: int) -> str:
-    """The text, or the part of it that fits in `room` characters and ends at a word."""
+    """The text, or the part of it that fits in `room` characters and ends at a word.
+
+    "" when there is no room. A negative room must not reach the slice, which would count from
+    the end of the text.
+    """
+    if room <= 0:
+        return ""
     if len(text) <= room:
         return text
     cut = text[:room]
     if text[room] != " " and " " in cut:
         cut = cut.rsplit(" ", 1)[0]
-    return cut.rstrip(" ,;:-/(")
+    return cut.rstrip(f" ,;:-/({ZERO_WIDTH_SPACE}")
 
 
 # ---------- reading the repo ----------
@@ -274,36 +309,29 @@ async def _committed_at(repo: Path, sha: str) -> str:
     return f"{found.group(1)} +0000"
 
 
-async def _base_commit(task_id: str, store: GitCheckpointStore) -> str:
-    """The commit that the task started from, read from the `base` tag of its bare repo."""
-    repo = _repo_of(task_id, store)
-    base = await git_value(
-        "rev-parse", "--verify", f"refs/tags/{BASE_TAG}^{{commit}}", git_dir=repo
-    )
-    if base is None:
-        raise CheckpointError(f"the repository of task {task_id} has no '{BASE_TAG}' tag")
-    return check_sha(base)
-
-
 # ---------- the branch ----------
 async def build_pr_branch(
     task_id: str,
     groups: Sequence[Group],
     *,
+    base_sha: str,
     store: GitCheckpointStore,
     default_branch: str,
     author: str = DEFAULT_GIT_AUTHOR,
 ) -> PrBranch:
     """Build `longhaul-pr/<n>` in the task's bare repo and return it.
 
-    The branch starts at the base commit and gets one commit for each group, in order, as the
-    module docstring describes. It is written once, at the end, so a failure leaves any earlier
-    branch as it was. The same arguments give the same commits.
+    The branch starts at `base_sha`, the commit the task started from, and gets one commit for
+    each group, in order, as the module docstring describes. The caller takes the base from the
+    state of the workflow, because the `base` tag in the repo is the agent's to move. The branch
+    is written once, at the end, so a failure leaves any earlier branch as it was. The same
+    arguments give the same commits.
 
     `default_branch` is the repo's default branch as GitHub reports it now. Raises
     ForbiddenBranchError if the branch would be that one, NothingToDeliverError if no group
-    changes a file, ValueError for an empty list or an author git would misread, and
-    CheckpointError if a checkpoint is missing or does not descend from the base.
+    changes a file, ValueError for an empty list, a sha that is not a sha or an author git would
+    misread, and CheckpointError if the base or a checkpoint is missing or a checkpoint does not
+    descend from the base.
     """
     if not groups:
         raise ValueError("a pull request branch needs at least one group of work")
@@ -311,7 +339,8 @@ async def build_pr_branch(
     branch = check_branch_name(pr_branch_name(task_id))
     assert_not_default(branch, default_branch)
     repo = _repo_of(task_id, store)
-    base = await _base_commit(task_id, store)
+    base = check_sha(base_sha)
+    await _require_commit(repo, base)
     parent_sha, parent_tree, last_end = base, await _tree(repo, base), base
     made = False
     for title, last_sha in groups:

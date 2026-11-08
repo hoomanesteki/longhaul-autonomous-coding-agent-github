@@ -40,6 +40,7 @@ from longhaul.tools.output import store_output
 pytestmark = [pytest.mark.integration, pytest.mark.phase3]
 
 ROOT = Path(__file__).resolve().parents[2]
+ZWSP = "\N{ZERO WIDTH SPACE}"
 ISSUE = 42
 SCRATCH = "longhaul/42"
 PR_BRANCH = "longhaul-pr/42"
@@ -88,7 +89,11 @@ class World:
 
     async def build(self, summary: str = SUMMARY) -> acts.PrBranchOutput:
         inp = acts.BuildPrBranchInput(
-            task_id=self.task_id, repo=REPO, summary=summary, head_sha=self.head_sha
+            task_id=self.task_id,
+            repo=REPO,
+            summary=summary,
+            base_sha=self.base_sha,
+            head_sha=self.head_sha,
         )
         out: acts.PrBranchOutput = await ActivityEnvironment().run(
             self.activities.build_pr_branch, inp
@@ -207,6 +212,29 @@ async def test_the_pr_branch_is_the_same_commit_when_built_again(world: World) -
     assert first == second
 
 
+async def test_a_base_tag_that_the_agent_moves_does_not_move_the_base_of_the_pull_request(
+    world: World,
+) -> None:
+    # The sandbox has the task's bare repo read-write at /ckpt, so the agent can move the tag.
+    # The base comes from the workflow state, which the sandbox cannot write.
+    first = world.bare("rev-parse", f"{world.head_sha}^")
+    assert first != world.base_sha
+    world.bare("tag", "-f", "base", first)
+
+    built = await world.build()
+    await world.deliver(built)
+
+    assert built.base_sha == world.base_sha
+    assert world.bare("rev-parse", f"{built.head_sha}^") == world.base_sha
+    assert world.bare("rev-list", f"{world.base_sha}..{built.head_sha}").splitlines() == [
+        built.head_sha
+    ]
+    (pull,) = world.fake.pulls(REPO)
+    assert "`src/calc/__init__.py`" in pull["body"], "the change the agent made first is in the PR"
+    assert "`tests/test_negative.py`" in pull["body"]
+    assert "2 files changed" in pull["body"]
+
+
 async def test_deliver_pushes_the_branch_and_opens_a_draft_pull_request(world: World) -> None:
     built = await world.build()
 
@@ -278,6 +306,7 @@ async def test_a_task_that_changed_nothing_has_nothing_to_deliver(world: World) 
         task_id=world.task_id,
         repo=REPO,
         summary="Looked and found it fine.",
+        base_sha=world.base_sha,
         head_sha=world.base_sha,
     )
 
@@ -364,6 +393,26 @@ async def test_the_summary_of_the_model_cannot_close_another_issue(world: World)
     (pull,) = world.fake.pulls(REPO)
     assert re.findall(r"(?i)\bcloses\s+#\d+", pull["body"]) == [f"Closes #{ISSUE}"]
     assert "@octocat" not in pull["body"]
+
+
+async def test_the_title_and_the_commit_cannot_close_another_issue_or_notify_anyone(
+    world: World,
+) -> None:
+    # The finish summary titles the commit, and the commit is the title of the pull request. A
+    # squash merge uses that title as the message on the default branch, where "fixes #7" closes
+    # issue 7.
+    summary = "Fixes #7, see @alice"
+    built = await world.build(summary)
+
+    await world.deliver(built, summary)
+
+    (pull,) = world.fake.pulls(REPO)
+    commit = world.bare("log", "-1", "--format=%s", built.head_sha)
+    assert pull["title"] == built.title == commit
+    assert f"#{ZWSP}7" in built.title
+    assert f"@{ZWSP}alice" in built.title
+    assert built.title.replace(ZWSP, "") == "fix(calc): fixes #7, see @alice"
+    assert not re.search(r"#\d|@\w", built.title)
 
 
 # ---------- the labels of the issue ----------

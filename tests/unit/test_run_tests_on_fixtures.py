@@ -26,6 +26,7 @@ AT_BASE = {
     "calc": "1 failed, 2 passed",
     "textkit": "1 failed, 2 passed",
     "inventory": "1 failed, 4 passed",
+    "longlog": "12 failed",
 }
 # The interpreter running this test, so it does not matter whether pytest is on PATH.
 TEST_COMMAND = f"{shlex.quote(sys.executable)} -m pytest -q"

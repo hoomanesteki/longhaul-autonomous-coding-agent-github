@@ -243,6 +243,14 @@ class _Loop:
     ) -> None:
         self.spec, self.provider, self.registry = spec, provider, registry
         self.sandbox, self.cfg, self.on_event = sandbox, cfg, on_event
+        if cfg.role is Role.PLANNER:
+            # The planner ends with `submit_plan`, which only TaskWorkflow judges
+            # (roles/planner.py). This loop ends with `finish` and offers every tool, so it would
+            # run a planner that can edit files and that nothing could stop.
+            raise ValueError(
+                "the in-process loop cannot run the planner role: it ends with submit_plan, "
+                "which only TaskWorkflow handles"
+            )
         # Built once. The system prompt, the tool list and the effort stay as they are for the
         # life of a transcript, because a change to any of them drops the prompt cache (D7, D8).
         self.system = build_system_prompt(cfg.role, spec)

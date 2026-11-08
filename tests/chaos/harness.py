@@ -58,6 +58,7 @@ from alembic.config import Config
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from temporalio.client import WorkflowExecutionStatus, WorkflowFailureError
+from tests.fakes.worker_config import hash_embedder_config
 
 from longhaul import cli
 from longhaul.blobs.s3 import S3BlobStore
@@ -72,7 +73,6 @@ from longhaul.settings import EnvSettings
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = ROOT / "tests" / "fixtures" / "repos" / "inventory"
 SCRIPT = ROOT / "tests" / "fixtures" / "scripts" / "inventory_fix.yaml"
-CONFIG = ROOT / "config" / "longhaul.example.yaml"
 IMAGE = "longhaul-sandbox:py312"
 # `uv run` and `uv sync` put the script next to the interpreter.
 LONGHAUL = Path(sys.executable).with_name("longhaul")
@@ -495,7 +495,7 @@ class Stack:
             LONGHAUL_BLOB_ACCESS_KEY=s["blob_access_key"],
             LONGHAUL_BLOB_SECRET_KEY=s["blob_secret_key"],
             LONGHAUL_CKPT_DIR=str(self.root / "ckpt"),
-            LONGHAUL_CONFIG=str(CONFIG),
+            LONGHAUL_CONFIG=str(hash_embedder_config(self.root)),
             **self.worker_env,
         )
         return env

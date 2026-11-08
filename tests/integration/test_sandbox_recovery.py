@@ -597,8 +597,8 @@ class DiesOnce:
         self.died = True
         raise RuntimeError("the worker was killed")
 
-    async def restore(self, sandbox: Sandbox, sha: str) -> None:
-        await self.store.restore(sandbox, sha)
+    async def restore(self, sandbox: Sandbox, sha: str, *, keep_ignored: bool = False) -> None:
+        await self.store.restore(sandbox, sha, keep_ignored=keep_ignored)
 
     async def bundle(self, task_id: str) -> BlobRef:
         return await self.store.bundle(task_id)

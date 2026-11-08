@@ -7,7 +7,7 @@ FakeGitHub.
 
 import pytest
 
-from longhaul.contracts import RepoSettings, TaskSpec
+from longhaul.contracts import Outcome, OutcomeKind, Phase, RepoSettings, TaskSpec, TaskStatus
 from longhaul.github import lifecycle
 from longhaul.github.intake import is_local
 from longhaul.github.lifecycle import LabelStep
@@ -131,3 +131,90 @@ def test_a_task_without_an_issue_has_nothing_to_label() -> None:
         lifecycle.on_pickup(spec(issue=None))
     with pytest.raises(ValueError, match="issue"):
         lifecycle.pickup_comment(spec(issue=None))
+
+
+# --- the comments of the commands (LH-308) -----------------------------------------------------
+
+
+def snapshot(**fields: object) -> TaskStatus:
+    values: dict[str, object] = {
+        "task_id": "lh-acme-calc-42",
+        "phase": Phase.CODING,
+        "turn_index": 7,
+        "cost_usd": 0.01234,
+        "last_checkpoint": "a" * 40,
+        "plan_version": None,
+    }
+    return TaskStatus.model_validate({**values, **fields})
+
+
+def test_a_status_comment_gives_the_phase_the_turn_the_spend_and_the_checkpoint() -> None:
+    comment = lifecycle.status_comment(spec(), snapshot(), by="maintainer", n=1)
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert "lh-acme-calc-42" in comment.body
+    assert "coding" in comment.body
+    assert "turn 7" in comment.body
+    assert "$0.0123" in comment.body
+    assert "aaaaaaa" in comment.body and "a" * 12 not in comment.body, "a short checkpoint"
+    assert not has_marker(comment.body), "the marker is added by post_comment"
+
+
+def test_a_status_comment_names_who_asked_without_notifying_them() -> None:
+    comment = lifecycle.status_comment(spec(), snapshot(), by="maintainer", n=1)
+
+    assert "`maintainer`" in comment.body
+    assert "@maintainer" not in comment.body
+
+
+def test_a_status_comment_before_the_first_checkpoint_says_so() -> None:
+    comment = lifecycle.status_comment(spec(), snapshot(last_checkpoint=None), by="m", n=1)
+
+    assert "no checkpoint yet" in comment.body
+
+
+def test_a_status_comment_of_an_ended_task_gives_the_outcome() -> None:
+    outcome = Outcome(kind=OutcomeKind.PR_OPENED, pr_url="https://example.test/p/1", summary="done")
+
+    comment = lifecycle.status_comment(
+        spec(), snapshot(phase=Phase.DONE, outcome=outcome), by="m", n=1
+    )
+
+    assert "pr_opened" in comment.body
+
+
+def test_each_status_request_has_a_key_of_its_own() -> None:
+    first = lifecycle.status_comment(spec(), snapshot(), by="m", n=1)
+    second = lifecycle.status_comment(spec(), snapshot(), by="m", n=2)
+
+    assert first.idempotency_key == effect_key("lh-acme-calc-42", "status", 1)
+    assert second.idempotency_key == effect_key("lh-acme-calc-42", "status", 2)
+
+
+def test_a_denial_is_the_polite_sentence_on_the_issue() -> None:
+    comment = lifecycle.denied_comment("lh-acme-calc-42", "acme/calc", 42, "Stranger")
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert "Only maintainers can steer this task" in comment.body
+    assert "@Stranger" in comment.body
+    assert not has_marker(comment.body)
+
+
+def test_a_denial_has_one_key_for_each_user_and_task() -> None:
+    def key(task: str, login: str) -> str:
+        return lifecycle.denied_comment(task, "acme/calc", 42, login).idempotency_key
+
+    assert key("lh-acme-calc-42", "Stranger") == key("lh-acme-calc-42", "stranger")
+    assert key("lh-acme-calc-42", "stranger") != key("lh-acme-calc-42", "other")
+    assert key("lh-acme-calc-42", "stranger") != key("lh-acme-calc-42-a2", "stranger")
+    assert key("lh-acme-calc-42", "a-b") != key("lh-acme-calc-42", "a_b")
+
+
+@pytest.mark.parametrize(
+    "login", ["octo-cat", "OctoCat", "x", "a" * 39, "app[bot]", "we ird/na:me"]
+)
+def test_whatever_the_login_the_denial_key_is_a_valid_key(login: str) -> None:
+    key = lifecycle.denied_comment("lh-acme-calc-42", "acme/calc", 42, login).idempotency_key
+
+    workflow_id, purpose, seq = key.split(":")
+    assert effect_key(workflow_id, purpose, int(seq)) == key

@@ -21,6 +21,7 @@ The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/prog
 | Host ports | `LH_*_PORT` in `.env` | If another project holds a default port, change it here. For Postgres, Temporal and MinIO also change the matching `LONGHAUL_*` URL or address, because compose and the code read separate variables. |
 | Database password | `LH_POSTGRES_PASSWORD` in `.env` | Default `longhaul`. Keep the password inside `LONGHAUL_DATABASE_URL` the same. |
 | Config file | `LONGHAUL_CONFIG` | Default `config/longhaul.example.yaml`. |
+| GitHub address | `LONGHAUL_GITHUB_API_URL`, `LONGHAUL_GITHUB_WEB_URL` | Blank means `api.github.com` and `github.com`. A GitHub Enterprise server sets the API address (`https://host/api/v3`) and the web address (`https://host`), and the worker clones from and pushes to `<web address>/<owner>/<name>.git`. The end-to-end test of the issue-to-PR path points them at a FakeGitHub and a folder of bare repos. |
 
 ### Ports and the database password
 
@@ -49,6 +50,16 @@ uv run pytest -m slow tests/slow/test_local_embedder.py -rs
 
 The first run downloads the model (66 MB). fastembed keeps it in `FASTEMBED_CACHE_PATH`, or under the system temp directory when that is unset, where a reboot may clear it. Set the variable to a folder that stays for any worker that embeds. Without the extra the test is skipped, and `-rs` shows how to install it. A plain `uv sync` takes the extra's packages out again. ADR-0010 has the reasons.
 
+A worker picks its embedder from the `memory` section of the config:
+
+```yaml
+memory:
+  enabled: true     # false: no store, no repo map, no verified commands, no notes in the prompt
+  embedder: local   # local needs the memory extra; hash needs nothing and is for tests and CI
+```
+
+With `embedder: local` and no extra, the worker stops when it starts and prints `uv sync --extra memory`, and does not wait for the first task to search. The vectors of the two embedders cannot be compared, so the worker also embeds a few stored notes again before it connects, and refuses a table that the other embedder wrote. To change the embedder of a database, delete the rows in `memory_items` and let the workers build them again. The test and chaos harnesses start workers on a copy of the example config with `embedder: hash`.
+
 ### Memory items
 
 The agent keeps notes about each repo (ADR-0010). `longhaul memory` shows them and decides on the ones that wait for a person. The commands read `LONGHAUL_DATABASE_URL`, so run them after `make up` and `make migrate`.
@@ -66,7 +77,7 @@ When a task starts, `prepare_workspace` runs the test and lint commands that the
 
 ### The repo map
 
-Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. The prompt builder (LH-604) reads it from the `repo_map_ref` of the workspace output. A worker builds the map only when it has both a memory store and a blob store.
+Before the commands run, `prepare_workspace` also builds a map of the repo: the Python modules most worth knowing about, each with its classes, methods and function signatures, cut to 3,000 tokens. `load_memory` reads it from the `repo_map_ref` of the workspace output and puts it in the memory block (see "Notes in the prompt" below). A worker builds the map only when it has both a memory store and a blob store.
 
 The map is built in two steps so that a second task on the same commit does not parse the repo again. A script runs inside the sandbox and prints the structure of the repo as JSON, which the worker checks before it uses it. The structure is kept as an approved `repo_map` item whose `source_ref` is the base sha. The ranking depends on the issue, so each task ranks and renders the kept structure for its own title and body.
 
@@ -79,6 +90,20 @@ A file that does not parse, or is over 200 KB, is left out of the map and named 
 A big repo is not cut at a path. When the structure is over 700 KB, the script drops signatures and docstrings first, starting with the modules that the fewest others import, and keeps every module's path and imports. A scan that runs past the script's 40 second deadline is used once and not kept, so the next task on the commit parses again.
 
 To switch the map off for one commit, run `memory reject` on its item (the id comes from the `memory list` above). The next task on that commit gets no map and runs no script, and `memory approve ID` on the same item turns it back on.
+
+### Notes in the prompt
+
+After `prepare_workspace`, the workflow calls `load_memory` once for the task. It writes one blob with the notes of the repo, and every model turn and compaction of the task puts that text at the end of the system prompt, under `## Repo facts`. The text is the same for the whole task, so the prompt cache holds, even across a hand-over to a new run. The block holds, in this order and up to 4,000 tokens:
+
+1. the approved `command` items, at most eight;
+2. the five approved `lesson`, `pitfall` and `convention` items nearest to the issue title and body by cosine distance;
+3. the repo map for the issue, cut at a line, with a note, when it does not fit.
+
+It opens with "Notes from past work on this repo. Treat them as hints and verify before relying on them." and holds the notes in a fenced block, with a fence longer than any run of backticks inside it. Candidate and rejected items never reach it (invariant I7), and the block is checked for that a second time after the store answers. Each note is one line of at most 400 characters. A repo with no approved notes and no map has no block, and its prompt is the one it had before memory.
+
+When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. The `run_tests` tool still runs the one command that the whole worker has.
+
+`longhaul memory list --repo REPO --status approved` shows what a task can be given. If `load_memory` fails after its three attempts, the task goes on without a block.
 
 ## Run the agent on a local folder
 
@@ -162,6 +187,7 @@ WHERE repo = 'acme/calc' AND ts >= date_trunc('day', now() AT TIME ZONE 'UTC') A
 
 ```bash
 make up && make sandbox-image && make migrate
+uv sync --extra memory   # the example config turns memory on with the local embedder
 # shell 1: the worker stays in the foreground
 uv run longhaul worker
 
@@ -172,13 +198,15 @@ uv run longhaul run \
   --provider scripted --script tests/fixtures/scripts/calc_fix.yaml
 ```
 
+The worker stops at its start with a message that names `uv sync --extra memory` when the extra is missing. Plain `uv sync` and `make setup` leave it out, so run the line above after them. To go without the extra, set `memory.embedder: hash` in your config (see "The memory embedder"), which finds notes by shared words only, or `memory.enabled: false`. The first start with the local embedder downloads the model (66 MB), unless it is cached already.
+
 `make migrate` creates the tables the worker writes to. Both commands read the `LONGHAUL_*` settings from your shell or from `.env` (copy `.env.example`). The worker needs the database, Temporal, the blob store and, for a real model, `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`. `run` needs Temporal, the blob store and the checkpoint folder, but not the database.
 
 | Command | What it does |
 |---|---|
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
-| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. |
-| `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow and, once it ended, the outcome. |
+| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
+| `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow, the compactions and the largest request of the task (`context: 5 compactions, max_fraction 0.59`) and, once it ended, the outcome. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
 
 ### What `run` does
@@ -212,6 +240,15 @@ SELECT ts, payload FROM events WHERE task_id = 'lh-local-calc-1a2b3c4d' AND type
 ```
 
 The log is a set of blobs under `tasks/<task id>/log/<turn>/`, a `reply.json` and a `results.json` for each turn. `longhaul.context.log.read_log(blobs, task_id)` joins them into one transcript. It is never elided or compacted, so a report can say what the agent did in turn 3 of 150. The view of a task is the `transcript_ref` of the workflow state, under `tasks/<task id>/turns/`.
+
+A task that has to compact on a short script can ask for a smaller window with `run --window N`. The number goes to the worker in the workflow memo, and every activity that counts tokens uses it in place of `window_tokens`. The cap for one tool result shrinks with it, to 1/32 of the window at most (250 tokens in a window of 8,000), so that a window this small has room for the results of a turn. The prompt and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.
+
+The long-task fixture `tests/fixtures/repos/longlog` runs the context system under this pressure. It has twelve modules with one planted bug each, and its test command prints 5,000 lines. `tests/fixtures/scripts/longlog.yaml` fixes one module in five turns, 62 turns in all, and `compactor.yaml` answers the compactor with notes that list the modules fixed so far. From the second compaction on its steps need the previous notes in the request, so a run that loses its notes between two compactions gets notes that list nothing and fails the test. The test `tests/e2e/test_long_task.py::test_longlog_many_compactions` runs the command below with `compact_at` 0.6 and `keep_recent_turns` 4, and checks that all twelve modules are fixed, that the task compacted at least three times and that no request took 85 percent of the window. The run compacts five times, at turns 16, 26, 36, 46 and 56, and its fullest request takes 59 percent of the window. The test then asks `longhaul status` for the same two numbers. It takes 2 to 5 minutes, depending on the load of the machine:
+
+```bash
+uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtures/repos/longlog/ISSUE.md \
+  --provider scripted --script tests/fixtures/scripts/longlog.yaml --window 8000
+```
 
 ### Pull requests and labels
 
@@ -283,6 +320,40 @@ FROM tasks WHERE id = 'lh-acme-calc-42';
 
 A task has these columns only when it has a row in `tasks`. The poller makes the row when it starts a task. `longhaul run` does not, so a task started with it has its calls in `cost_ledger` and its compactions in `events`, and the totals stay at 0. The cost ledger works the same way.
 
+`longhaul status TASK_ID` prints two of them in a `context:` line, such as `context: 5 compactions, max_fraction 0.59`. It reads the database of `LONGHAUL_DATABASE_URL`, and leaves the line out when no database is set or the task is not in it. For a task with a row the line is the row. For a task of `longhaul run`, which has none, it counts the distinct `compaction` events, and it divides the largest prompt that the provider reported for a model turn of the coder (input, cache reads and cache writes) by the window of the run: the `--window` that the task asked for, or else `context.window_tokens` of the config of the command. That figure is a little different from `max_fraction` of a row, which is the estimate from before the request was sent.
+
+### The plan
+
+A task can plan before it codes (LH-501, ADR-0007). The planner is a role of the same workflow. It has the tools that read and run (`list_dir`, `read_file`, `search`, `run_tests`, `run_command`, `read_output`) and the tool `submit_plan`, and it has no tool that writes a file. Any file that one of its commands writes is deleted again when the command ends, so the coder starts from the tree the task began with.
+
+Planning is a choice of the task. The poller turns it on for every task it starts from an issue. For `longhaul run` add `--plan`, and give the script steps for the `planner` role as well as for the coder:
+
+```bash
+uv run longhaul run --plan --path DIR --issue-file FILE --provider scripted --script FILE
+```
+
+A task started without `--plan` goes straight to coding, as it did before the planner.
+
+| Where | What shows the plan |
+|---|---|
+| `longhaul run`, `longhaul status` | The status line has `plan v1` once the plan is stored and posted, and the phase moves from `planning` to `coding`. |
+| Postgres | One row for each version in `plans`, with the plan as JSON and the status `proposed`. |
+| The issue | A task of an issue posts the plan as a checklist, once. The comment ends with the hidden marker for the key `<task id>:plan_comment:1`, so a retry finds it and posts nothing new. A task on a local folder posts nothing. |
+
+```sql
+SELECT version, status, plan->>'summary' FROM plans WHERE task_id = 'lh-acme-calc-42';
+```
+
+The planner has 20 turns to submit. That number is `acts.PLANNER_MAX_TURNS`, and `loop.planner_max_turns` must equal it: a worker whose config holds another number stops at the start and names the setting. A plan has 2 to 8 steps, each with a `done_when`, and at least one acceptance check. A plan that does not fit gets one repair turn: the answer to `submit_plan` lists what is wrong, and the planner may call it again. These ends are an `error` outcome with a fixed summary:
+
+| Summary | Meaning |
+|---|---|
+| `planner submitted an invalid plan twice: <problems>` | The repair turn did not fix the plan. |
+| `planner submitted no plan in 20 turns` | The planner used all its turns reading and running commands. |
+| `no tool calls` | Two replies in a row had no tool call. The first one gets a nudge to call `submit_plan`. |
+
+The turns of the planner count against `task_turns` like any other. The coder does not read the plan yet (LH-503).
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.
@@ -308,7 +379,7 @@ mkdir -p "$HOME/.longhaul/ckpt"
 docker compose --profile full up -d --build worker
 ```
 
-The service builds `docker/worker/Dockerfile` and mounts two things from the host. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
+The service builds `docker/worker/Dockerfile` and mounts two things from the host. The image installs the memory extra and loads the embedding model into `/opt/fastembed` when it is built, so the example config (`memory.embedder: local`) starts in a container with no network. The build downloads the model, which adds about 200 MB to the image. The checkpoint folder is mounted at the same path inside, because the worker gives that path to the Docker daemon as the source of a mount in each sandbox. The Docker socket is mounted so that the worker can start the sandboxes.
 
 **Security note.** Access to the Docker socket is the same as root on the host. Anything that runs in the worker, or takes it over, can start a container that mounts the whole disk. The sandboxes keep repo code away from the worker (no secrets in their environment, no network after the setup, no capabilities), but the worker itself is trusted. Run it only on a machine you would give that trust, never on a shared host, and publish no port from it beyond the metrics port below, which compose binds to `127.0.0.1`. The container runs as root, because the group of the socket differs between hosts and a non-root user could not open it. A worker started with `uv run longhaul worker` has the same reach, because your user can use Docker.
 
@@ -335,15 +406,42 @@ The worker needs `LONGHAUL_GITHUB_TOKEN` to poll. Without it the worker still st
 | `longhaul poller resume` | Starts them again. |
 | `longhaul poller trigger` | Polls now. It works on a paused Schedule, and it does nothing while a poll is running. |
 
-Each poll is a workflow named `longhaul-poller-run-<time>` in the Temporal UI (http://localhost:8233). It returns four counts: the repos it looked at, the labeled issues it saw, the tasks it started and the issues that already had a task. A poll fails when a repo cannot be read, for example a typo in the config or a token without access to it. The other repos are still polled first, and the failure names the repo.
+Each poll is a workflow named `longhaul-poller-run-<time>` in the Temporal UI (http://localhost:8233). It returns five counts: the repos it looked at, the labeled issues it saw, the tasks it started, the issues that already had a task and the comment commands it carried out. A poll fails when a repo cannot be read, for example a typo in the config or a token without access to it. The other repos are still polled first, and the failure names the repo.
 
 What the poller does and does not do:
 
 - A task id is `lh-<owner>-<repo>-<issue number>`, in lowercase. The task is started once. A row in `tasks` keeps a finished task from starting again while the label stays on the issue.
 - Only the allowlist counts. A labeled issue on a repo that is not in the config, or is there with `allowlisted: false`, is never read.
-- The poller only reads from GitHub. It posts no comment and sets no label. The task does that itself (LH-306).
+- The poller reads from GitHub and writes one thing: the reply to a command from someone who may not steer a task (see the next section). It sets no label and posts no "Picked up" comment. The task does that itself (LH-306).
 - A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. Nothing pushes the branch or opens a pull request until LH-306 adds the delivery, so a finished task leaves no change on GitHub yet.
 - To change the label or the interval, edit the config, restart the worker, and run `longhaul poller install` again for the interval.
+
+## Steer a task from its issue
+
+A person with write access to the repo steers a task with a comment on its issue (LH-308). The comment has to begin with the command, and each poll of the poller carries out the commands that were written since the last one.
+
+| Comment | What happens |
+|---|---|
+| `/longhaul approve` | Sends `approve_plan` to the task. |
+| `/longhaul reject <feedback>` | Sends `reject_plan` with the feedback. |
+| `/longhaul hint <text>` | Sends `hint`, and the model sees the text on its next turn. |
+| `/longhaul budget +<usd> [turns +<n>]` | Sends `add_budget`, for example `/longhaul budget +5 turns +20`. |
+| `/longhaul cancel [reason]` | Sends `cancel`. The task cleans up and ends as cancelled. |
+| `/longhaul status` | Sends `report_status`. The task answers with a comment that gives its phase, turn, spend and last checkpoint. |
+| `/longhaul retry` | Starts the next attempt of a task that has ended, as `<task id>-a2`, `-a3` and so on, from the issue as it is now. |
+
+Rules that keep a command from doing something nobody meant:
+
+- **Only the first line counts.** A command is not recognised after other text, inside a code block or a quote, or with extra words. `/longhaul approve now` does nothing, and so does a comment that only mentions a command. Case does not matter. Nothing is posted for a comment that is not a command, so a typo shows no sign.
+- **Only people with write access may steer.** The poller asks GitHub for the role of the author (admin, maintain and write count) every time it meets a command from them. A person without it, and a person whose role GitHub will not tell, gets one reply on the issue, "Only maintainers can steer this task", for each task, and the command is dropped. Comments of bots and the comments of Longhaul itself are never commands.
+- **A command is carried out once.** Each task row keeps the time and id of the newest comment handled (`tasks.last_comment_at` and `last_comment_id`). The cursor moves after the signal was sent, so a poll that fails halfway and is retried sends only the commands it had not sent. A worker that dies between the signal and the write of the cursor sends that one command again.
+- **Comments from before the label are not commands.** A new task starts its cursor at the newest comment its spec was built from.
+- **A task that has ended takes no command but `retry`.** Temporal refuses a signal to a closed workflow, and the command is dropped, not kept for the next attempt. `retry` on a task that still runs does nothing. Commands go to the latest attempt of the issue.
+- **Issues that are closed or have lost the label are not read.** To stop a task whose label was removed, cancel it with `longhaul cancel` or in the Temporal UI.
+
+Each poll now reads the new comments of every open labeled issue that has a task, which is one more GitHub call for each such issue, and one more for each author of a command that the poll has not asked about yet.
+
+The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one draft pull request and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner and for the coder. It needs `make up` and `make sandbox-image`, and takes about two minutes.
 
 ## Kill the worker on purpose
 
@@ -452,6 +550,74 @@ Things to know when you read the numbers:
 
 `tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 
+## Run the evaluation
+
+`eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.
+
+```bash
+make up && make sandbox-image && make migrate
+# shell 1: the worker, with the config you mean to measure
+uv run longhaul worker
+
+# shell 2: a dry run on two tasks with scripted answers (its results go to a scratch folder,
+# because they are not model results), then a real run
+uv run python eval/run.py --set custom --config full --limit 2 --run-id dry-1 \
+  --script tests/fixtures/scripts/eval --results-dir "${TMPDIR:-/tmp}/longhaul-dry"
+uv run python eval/run.py --set custom --config full --run-id headline-1
+```
+
+The runner needs the settings that `longhaul run` needs, plus `LONGHAUL_DATABASE_URL`, because the cost of a task is the sum of its rows in the cost ledger. It must see the same `LONGHAUL_CKPT_DIR` as the worker, because it reads the agent's patch from the checkpoint repo.
+
+| Flag | Meaning |
+|---|---|
+| `--set custom` | The 15 custom tasks. `swebench` is accepted and refused until LH-902. |
+| `--config full` | The product. `naive` and `single_shot` are accepted and refused until LH-903. |
+| `--run-id NAME` | Names the folder `eval/results/NAME`. A run id is never reused: the runner stops when the folder exists, even an empty one, or when Temporal knows a workflow `lh-eval-NAME-...`. |
+| `--limit N` | Only the first N tasks, in the order of `tasks.yaml`. |
+| `--concurrency K` | How many tasks run at once. The default is 1. |
+| `--model ID` | Checked against the coder model in the worker's config, and recorded. |
+| `--memory on\|off`, `--context-mode full\|no_compaction\|none` | Recorded in each result file. The worker reads memory and context settings from its own config, so start it with the settings you mean to measure. |
+| `--provider scripted --script PATH` | Plays a script. A file serves every task. A folder holds one `<task id>.yaml` per task. `--script` alone means the scripted provider. Every other `--provider` is only recorded: the worker answers with its own provider. |
+| `--results-dir`, `--pause-timeout-s` | Where results go (default `eval/results`), and how long a pause lasts before the runner ends the task (default 60). |
+
+### What a run does
+
+1. Checks everything it can before it starts a task: the model, each repo folder (it must match the `base_sha` in `tasks.yaml`, and must hold no hidden test), the scripts, and that the run id is new. The results folder is made last, so a run that stops here leaves nothing behind.
+2. Starts each task as a workflow with id `lh-eval-<run id>-<task id>`. The task is a folder on this machine (`local:/abs/path`), so nothing is written to GitHub. The plan gate is off, no hints are sent, and the caps are the ones of plan section 8.4: 2 dollars, 150 turns, 120 minutes.
+3. Watches the task. A pause marks it `intervention_needed`. A pause that lasts a minute ends the task with a cancel, because nobody is there to answer. A task that runs past its time limit is ended the same way, and one that ignores the cancel for 30 seconds is terminated.
+4. Reads the patch from the checkpoint repo and grades it. A task counts as resolved when the agent finished (outcome `pr_opened`) and the grader passed the patch. A task that ended any other way is not graded and is not resolved.
+5. Writes `<task id>.json` and `<task id>.patch`, removes the sandbox and the checkpoint repo of the task, and at the end writes `summary.json`.
+
+When the runner itself fails on a task, for example a lost connection or a database error, that task gets a result with outcome `error` and `resolved` null, and the other tasks go on. The summary counts it as attempted and not graded. Ctrl-C ends the whole run: the tasks that are running are terminated, no summary is written, and the run id cannot be used again.
+
+A result file holds the outcome, `resolved`, the grader's one-line reason, the cost and tokens from the ledger, the cache ratio, the wall time, the turns, the model, the commit of this checkout and the flags of the run. `scripted` is true when a script played the answers, and `provider` is what `--provider` asked for (null means the worker's own). A scripted run costs nothing and fixes what its script fixes, so keep its files out of `eval/results`, which the report reads, and leave them out of any number you quote. `compactions`, `verify_rounds` and `stuck_reasons` start at 0 and empty until the phases that count them have landed. `resolved` is `null` when the grader itself failed, and the summary counts those tasks as `ungraded`. The summary has the resolve rate over every started task, the cost per resolved task, the medians of wall time, tokens and cache ratio, and the number of tasks that needed a person. Intervals and paired tests come from the report (LH-905).
+
+### The custom task set
+
+`eval/custom/tasks.yaml` lists 15 tasks on three small repos that we own, five on each: `calc`, `textkit` and `inventory`. They are 5 bug fixes, 3 features, 3 refactors, 2 dependency changes and 2 flaky-test fixes, as plan section 8.2 asks.
+
+| Folder | What it holds |
+|---|---|
+| `eval/custom/repos/<repo>` | The repo as the agent gets it. Its own tests pass. |
+| `eval/custom/hidden_tests/<repo>` | The test file of each task. It fails on the repo as it is and passes on a correct fix. The agent never sees it. |
+| `eval/custom/reference/<id>.patch` | A fix that passes the hidden tests. It is kept to prove the tests can pass, and the agent never sees it either. |
+
+`base_sha` is the commit that `scripts/make_fixture_git.py` makes of the repo folder, so it changes whenever a file in the folder changes. Run `uv run python eval/custom_tasks.py` for the current values and copy them into `tasks.yaml`. A unit test and the runner both refuse to go on while they differ.
+
+Hidden tests stay out of the sandbox in three ways. The repo folders hold none of them. The runner reads each folder the way the worker copies it, and stops when it finds a hidden test or a reference patch there, by name or by content. And the integration test `test_hidden_tests_not_visible` searches a real sandbox for them.
+
+### The grader
+
+`eval/grade_custom.py` starts a fresh sandbox, builds the base commit of the task in it from a git bundle, runs the setup with the network on, and cuts the network. It then applies the patch, copies in the hidden tests and runs the repo tests and the hidden tests. Both runs must pass. Nothing of the repo runs on the host. Grade a patch by hand with:
+
+```bash
+uv run python eval/grade_custom.py calc-01 --patch eval/custom/reference/calc-01.patch
+```
+
+A failed setup raises an error and does not mark the patch as wrong, because the setup does not depend on the patch.
+
+`make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
+
 ## CI
 
 Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
@@ -459,10 +625,10 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | Job | What it does |
 |---|---|
 | `lint` | `ruff check` and `ruff format --check` |
-| `types` | `mypy src`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
+| `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
-| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack") |
+| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a draft pull request (see "Steer a task from its issue") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |

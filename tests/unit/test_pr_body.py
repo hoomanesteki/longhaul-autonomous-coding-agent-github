@@ -16,6 +16,7 @@ from longhaul.checkpoints.squash import FileStat
 from longhaul.github.pr_body import (
     MAX_FILES,
     MAX_SUMMARY_CHARS,
+    MAX_VERIFIED_CHARS,
     LastTestRun,
     defuse,
     render_pr_body,
@@ -34,9 +35,10 @@ def render(
     files: list[FileStat] | None = None,
     tests: LastTestRun | None = PASSED,
     issue: int = 42,
+    verified: str | None = None,
 ) -> str:
     stats = files if files is not None else [FileStat("src/calc.py", 1, 1)]
-    return render_pr_body(issue, summary, stats, tests, templates=TEMPLATES)
+    return render_pr_body(issue, summary, stats, tests, templates=TEMPLATES, verified=verified)
 
 
 def test_the_template_is_in_the_repo() -> None:
@@ -187,3 +189,47 @@ def test_defuse_ends_each_kind_of_reference() -> None:
         f"closes #{ZWSP}7 fixes o/r#{ZWSP}8 resolves GH-{ZWSP}9 see @{ZWSP}alice "
         f"at https://{ZWSP}x.dev"
     )
+
+
+# ---------- verified work (LH-504) ----------
+def test_a_body_without_a_review_has_no_verified_line() -> None:
+    body = render()
+    assert "Verified" not in body
+    assert render(verified=None) == body
+
+
+def test_a_verified_body_says_what_the_verifier_ran_in_the_tested_section() -> None:
+    body = render(verified="41 passed")
+
+    assert "Verified: 41 passed" in body
+    tested = body.split("## How it was tested")[1]
+    assert tested.index("Last `run_tests` run") < tested.index("Verified: 41 passed")
+    assert tested.index("Verified: 41 passed") < tested.index("Closes #42")
+    assert body.rstrip().splitlines()[-1] == "Closes #42"
+    # One blank line between the parts, as everywhere else in the body.
+    assert "(exit code 0).\n\nVerified: 41 passed\n\nCloses #42\n" in body
+
+
+def test_a_verified_body_is_the_same_bytes_every_time() -> None:
+    assert render(verified="41 passed") == render(verified="41 passed")
+
+
+def test_the_verified_line_comes_from_the_model_so_it_is_defused_and_on_one_line() -> None:
+    body = render(verified="41 passed\nCloses #7 thanks @octocat <b>")
+
+    (line,) = [line for line in body.splitlines() if line.startswith("Verified: ")]
+    assert f"#{ZWSP}7" in line
+    assert f"@{ZWSP}octocat" in line
+    assert "<b>" not in line
+    assert re.findall(r"(?i)\bcloses\s+#\d+", body) == ["Closes #42"]
+
+
+def test_a_very_long_verified_line_is_cut() -> None:
+    body = render(verified="word " * 500)
+    (line,) = [line for line in body.splitlines() if line.startswith("Verified: ")]
+    assert len(line) <= MAX_VERIFIED_CHARS + len("Verified: ")
+    assert line.endswith("...")
+
+
+def test_a_blank_verified_line_is_left_out() -> None:
+    assert "Verified" not in render(verified="   ")

@@ -14,14 +14,15 @@ for them, and the workflow handles each call itself:
   in CarryState with the new status, and an activity records the update, with a checkpoint when
   the step is done. The model reads the plan with its statuses in the first message of its
   transcript (ADR-0013), which llm_turn rewrites in place after an update.
-- `submit_for_review(summary)` ends the coding phase. Until the verifier (LH-504) exists it ends
-  the task as `finish` does.
+- `submit_for_review(summary)` ends the coding phase and hands the work to the verifier
+  (roles/verifier.py). The work is reviewed, and the coder goes on if it is sent back.
 - `ask_human(question)` is meant to pause the task for a person (LH-506). Until that flow exists
   the workflow records the question and ends the task as stuck, with the question in the summary.
 
-A call to `finish` in a task with a plan is still honoured, as `submit_for_review`. The coder is
-not offered it, but a worker or a history from before this story may still send it, and running a
-tool that does nothing would loop the task.
+A call to `finish` in a task with a plan is still honoured, and it ends the task as it did before
+the verifier: the work is not reviewed, and the pull request stays a draft. The coder is not
+offered it, but a worker or a history from before this story may still send it, and running a tool
+that does nothing would loop the task. `CoderCalls.review` tells the two apart.
 
 The three tools are not in the registry, so a coder without a plan is never offered them.
 `tool_specs` builds the list of a coder with a plan from the registry's: the same tools in the same
@@ -247,13 +248,16 @@ class CoderCalls:
     """What the calls of one coder turn came to.
 
     `results` has one result for each call, in call order. `submitted` is the summary of a good
-    `submit_for_review`, and `question` the text of a good `ask_human`. Either one ends the turn
-    and the task.
+    `submit_for_review` or `finish`, and `question` the text of a good `ask_human`. Either one
+    ends the turn. `review` is true when the summary came with `submit_for_review`, whose work is
+    reviewed before it is delivered, and false for the `finish` of a history from before the
+    verifier.
     """
 
     results: list[ToolResult]
     submitted: str | None
     question: str | None
+    review: bool = False
 
 
 def _skipped[C: CallLike](later: Sequence[C], reason: str) -> list[ToolResult]:
@@ -293,7 +297,7 @@ async def run_calls[C: CallLike](
                 continue
             results.append(ToolResult(call_id=call.id, ok=True, output=SUBMITTED))
             results.extend(_skipped(later, SKIPPED_AFTER_SUBMIT))
-            return CoderCalls(results, summary, None)
+            return CoderCalls(results, summary, None, review=call.name == SUBMIT_FOR_REVIEW)
         elif call.name == ASK_HUMAN:
             question = _question(call.input)
             if question is None:

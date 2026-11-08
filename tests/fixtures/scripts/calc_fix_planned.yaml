@@ -4,7 +4,8 @@
 # The planner reads the layout and the module and submits a plan of two steps. The coder then
 # makes the same edit as calc_fix.yaml. A coder with a plan is offered `update_step` and
 # `submit_for_review` in place of `finish` (LH-503), so once a test run passes ("3 passed" is the
-# whole calc suite) it marks both steps done and submits.
+# whole calc suite) it marks both steps done and submits. The work is then reviewed (LH-504): the
+# pre-check runs the repo's test command, and the verifier, in a transcript of its own, passes it.
 steps:
   - match: {role: planner, turn_index: 0}
     respond:
@@ -66,3 +67,13 @@ steps:
           input: {step_id: s2, status: done, note: "3 passed."}
         - name: submit_for_review
           input: {summary: "Changed add() to return a + b. All tests pass."}
+  - match: {role: verifier, turn_index: 0}
+    respond:
+      text: "The operator is fixed and the suite passes."
+      tool_calls:
+        - name: submit_verdict
+          input:
+            passed: true
+            tests_run: "pytest -q"
+            tests_summary: "3 passed"
+            issues: []

@@ -149,6 +149,10 @@ PLANNER_MAX_TURNS = 20
 # config holds another number stops before it takes a task.
 HINT_WAIT_HOURS = 24
 
+# The failed reviews after which a task ends as stuck (LH-504). The workflow cannot read the config
+# file, so the number is copied from `loop.max_verify_rounds`. A unit test keeps the two equal.
+MAX_VERIFY_ROUNDS = 3
+
 # The workflow memo key under which a run carries its Tuning.
 TUNING_MEMO_KEY = "tuning"
 # The workflow memo key that switches planning on for a task (LH-501). A task started with
@@ -310,6 +314,30 @@ class ToolCallSummary(BaseModel):
         return self
 
 
+class CheckRun(BaseModel):
+    """One command of the pre-check, or the diff, as the verifier's first message is built from it.
+
+    `command` is the label of the command, cut to a line. `passed` and `exit_code` are what the
+    workflow saw: a command passes when it finished with exit code 0, and `exit_code` is None for
+    one that did not finish. `output_ref` is the full text that tool_exec stored, which llm_turn
+    reads and cuts, so that a long test log never travels through the history. `call_id` names the
+    handle the verifier can page the rest with.
+    """
+
+    command: str
+    call_id: str
+    passed: bool
+    exit_code: int | None = None
+    output_ref: BlobRef | None = None
+
+
+class ReviewBrief(BaseModel):
+    """What the verifier is shown besides the plan: the pre-check, then the diff (LH-504)."""
+
+    checks: list[CheckRun] = Field(default_factory=list)
+    diff: CheckRun | None = None
+
+
 class LlmTurnInput(BaseModel):
     task_id: str
     turn_index: int
@@ -347,6 +375,10 @@ class LlmTurnInput(BaseModel):
     # The context mode this run asked for, from the memo (CONTEXT_MODE_MEMO_KEY). None means the
     # run did not ask, and the config of the worker decides.
     context_mode: ContextMode | None = None
+    # What the verifier reads in its first message besides the plan (LH-504). The activity builds
+    # that message once, when the transcript starts, so the later turns of a review ignore it. The
+    # other roles ignore it always.
+    review: ReviewBrief | None = None
 
 
 class LlmTurnOutput(BaseModel):
@@ -639,6 +671,10 @@ class DeliverInput(BaseModel):
     base_sha: str
     head_sha: str
     title: str
+    # The counts the verifier gave when it passed the work (LH-504), or None for work that no
+    # verifier passed. A pull request is ready for review exactly when this is set, and its body
+    # says "Verified: <this>". It is part of the input, so a retry builds the same request.
+    verified_tests: str | None = None
 
 
 # ---------- activities ----------

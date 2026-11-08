@@ -383,13 +383,14 @@ async def test_a_finish_call_leaves_no_room_for_a_result() -> None:
         ("update_step", {"step_id": "s1", "status": "done"}),
         ("submit_for_review", {"summary": "Done."}),
         ("ask_human", {"question": "Which one?"}),
+        ("submit_verdict", {"passed": True, "tests_run": "pytest -q", "tests_summary": "3 passed"}),
     ],
 )
 @pytest.mark.phase5
 async def test_a_step_tool_call_leaves_no_room_for_a_result(
-    name: str, args: dict[str, str]
+    name: str, args: dict[str, Any]
 ) -> None:
-    # LH-503: the workflow answers these three itself, with a line of text, as it does finish.
+    # LH-503 and LH-504: the workflow answers these itself, with a line of text, as it does finish.
     messages = rounds(1, lines=3)
     window = window_for(messages, 0.5)
     rig = Rig(

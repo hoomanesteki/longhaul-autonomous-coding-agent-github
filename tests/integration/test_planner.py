@@ -68,7 +68,7 @@ from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.memory import MemoryActivities
 from longhaul.durable.activities.plan import PlanActivities, PlanCommentActivities
-from longhaul.durable.activities.tools import PLANNING_NOTE, NoCheckpoints, ToolActivities
+from longhaul.durable.activities.tools import READ_ONLY_NOTE, NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
@@ -853,7 +853,7 @@ async def test_planner_cannot_mutate(env: WorkflowEnvironment, tmp_path: Path) -
         text = (await blobs.get_by_key(row.output_ref)).decode()
         assert "?? planner-note.txt" in text
         assert f"M {MODULE}" in text
-        assert text.endswith(PLANNING_NOTE)
+        assert text.endswith(READ_ONLY_NOTE)
 
         # The plan was stored all the same.
         assert recorder.plans[(task_id, 1)].plan == PLAN

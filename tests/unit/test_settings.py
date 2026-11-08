@@ -211,6 +211,18 @@ def test_the_planner_needs_at_least_one_turn(tmp_path: Path, turns: int) -> None
     assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "planner_max_turns")]
 
 
+@pytest.mark.parametrize("rounds", [0, -1])
+def test_the_verifier_needs_at_least_one_round(tmp_path: Path, rounds: int) -> None:
+    data = _example_data()
+    data["loop"]["max_verify_rounds"] = rounds
+    path = _write_yaml(tmp_path / "longhaul.yaml", data)
+
+    with pytest.raises(ValidationError) as excinfo:
+        load_config(path)
+
+    assert [error["loc"] for error in excinfo.value.errors()] == [("loop", "max_verify_rounds")]
+
+
 def test_the_retry_cap_may_equal_the_normal_cap(tmp_path: Path) -> None:
     data = _example_data()
     data["loop"]["max_tokens_retry"] = data["loop"]["max_tokens_per_turn"]

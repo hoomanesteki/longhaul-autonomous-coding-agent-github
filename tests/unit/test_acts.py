@@ -1180,3 +1180,55 @@ def test_a_decision_names_a_plan_version_from_one() -> None:
 @pytest.mark.phase5
 def test_a_decision_does_not_retry_an_oversized_payload() -> None:
     assert PayloadTooLargeError.__name__ in (acts.DECIDE_PLAN.retry.non_retryable_error_types or [])
+
+
+# ---------- LH-504: the verifier ----------
+def test_the_verify_round_limit_follows_the_configured_one() -> None:
+    # Same reason as the planner's turn limit: the workflow cannot read the config file.
+    config = load_config(ROOT / "config" / "longhaul.example.yaml")
+    assert config.loop.max_verify_rounds == acts.MAX_VERIFY_ROUNDS == 3
+
+
+def test_a_review_brief_is_small_and_names_its_outputs_by_ref() -> None:
+    ref = BlobRef(
+        key="tasks/lh-x/turns/0003/tool-verify1-tests-output.txt", sha256="0" * 64, size=9
+    )
+    brief = acts.ReviewBrief(
+        checks=[
+            acts.CheckRun(
+                command="pytest -q",
+                call_id="verify1-tests",
+                passed=False,
+                exit_code=1,
+                output_ref=ref,
+            )
+        ],
+        diff=acts.CheckRun(command="git_diff", call_id="verify1-diff", passed=True, output_ref=ref),
+    )
+    converter = pydantic_data_converter.payload_converter
+    (payload,) = converter.to_payloads([brief])
+    assert converter.from_payloads([payload], [acts.ReviewBrief]) == [brief]
+    assert len(payload.data) < 1_000
+
+
+def test_a_model_turn_has_no_review_unless_the_workflow_gives_one() -> None:
+    inp = acts.LlmTurnInput(
+        task_id="lh-x", turn_index=0, role=Role.VERIFIER, spec=SPEC, transcript_ref=None
+    )
+    assert inp.review is None
+
+
+def test_a_delivery_is_not_verified_unless_the_workflow_says_so() -> None:
+    inp = acts.DeliverInput(
+        task_id="lh-x",
+        repo="acme/calc",
+        issue_number=42,
+        summary="s",
+        branch="longhaul-pr/42",
+        base_branch="main",
+        base_sha=SHA,
+        head_sha=SHA,
+        title="fix(calc): fix it",
+    )
+    assert inp.verified_tests is None
+    assert inp.model_copy(update={"verified_tests": "3 passed"}).verified_tests == "3 passed"

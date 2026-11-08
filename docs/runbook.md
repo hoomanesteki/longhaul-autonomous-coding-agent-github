@@ -253,18 +253,18 @@ uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtu
 
 ### Pull requests and labels
 
-A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a draft pull request:
+A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (LH-306). A task of an issue, which has an `owner/name` repo and an issue number, shows its state on the issue through labels, and ends with a pull request. The pull request is ready for review when a verifier passed the work and at least one command of the pre-check backed it (see "The verifier and the send-back loop"), and a draft when not:
 
 | When | What the issue shows |
 |---|---|
 | The task starts | A "Picked up" comment, and the label `longhaul:working` |
-| The agent calls `finish` | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and a draft pull request is opened |
+| The agent calls `finish`, or the work of a coder with a plan passes its review | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and the pull request is opened, as a draft after `finish` and ready for review after a review |
 | The pull request is open | `longhaul:working` is removed and `longhaul:pr-open` is added |
 | A pause for a person (Phases 5 and 7) | `longhaul:needs-human` is added, and removed when the task resumes |
 
 The pull request branch has one commit on top of the base commit, whatever number of checkpoints the agent made. Its tree is the tree of the last checkpoint, so its diff is the diff of the scratch branch. The commit is titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`, and its author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
 
-The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
+The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call, and a line `Verified: <counts>` when a verifier passed the work) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
 
 Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
 
@@ -365,10 +365,10 @@ A coder that has a plan works it one step at a time (LH-503). It reads the plan 
 | Tool | What it does |
 |---|---|
 | `update_step(step_id, status, note)` | Sets the status of one step. A step that is `done` gets a checkpoint. A step id or a status the plan does not have is answered with an error and changes nothing. |
-| `submit_for_review(summary)` | Ends the coding, as `finish` does. A task of an issue goes on to open the draft pull request. |
+| `submit_for_review(summary)` | Ends the coding and starts the review (next section). A task of an issue goes on to open the pull request once the work passes. |
 | `ask_human(question)` | Asks a person. The pause flow is not built yet (LH-506), so the task records the question and ends as `stuck`, in the phase `paused`, with the question in the summary. |
 
-A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, as `submit_for_review`, for a worker or a history from before this story. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, without a review and with a draft pull request, for a worker or a history from before the verifier. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
 
 An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
 
@@ -432,6 +432,46 @@ Things to know:
 ```sql
 SELECT version, status, decided_by, decided_at FROM plans WHERE task_id = 'lh-acme-calc-42' ORDER BY version;
 ```
+
+### The verifier and the send-back loop
+
+A task with a plan does not trust `submit_for_review` (LH-504). The phase becomes `verifying`, and the work is checked in two halves. It passes only when both say so.
+
+| Half | What it does |
+|---|---|
+| The pre-check | Runs the test command of the repo, then every acceptance check of the plan that is a command, then `git_diff`. All of it is read-only: a file that a command writes is put back. A command that exits with a code other than 0, or does not finish, fails the review, whatever the verifier says. A repo with no test command and a plan with no command in its checks runs none, and the verdict decides alone. |
+| The verdict | A verifier with a fresh transcript gets the plan, the pre-check and the diff, reads the code with `list_dir`, `read_file`, `search`, `git_diff`, `run_tests` and `read_output`, and ends with `submit_verdict`: `passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. It has 15 turns for a round. |
+
+An acceptance check is a command when it starts with `$ ` or is a command in backticks and nothing else. The planner is told the mark. A check without it is read by the verifier and not run, so a sentence is never run as a command.
+
+| Result | What follows |
+|---|---|
+| The work passes | The task goes on as it did after `finish`. A task of an issue opens the pull request ready for review, with `Verified: <tests_summary>` in the body. When the pre-check ran no command, the counts are the verifier's word only, so the pull request is a draft and has no `Verified:` line. |
+| The work fails | The round is counted, the coder gets the user message `Review failed: <issues>. Fix step <send_back_step>.` at the end of its own transcript, and the phase is `coding` again. |
+| The work fails the third time | The task ends as `stuck` in the phase `failed`, with the reason and the last issues in the summary. A task of an issue has no pull request and keeps its labels (LH-507). |
+
+The number of failed reviews is `loop.max_verify_rounds`, and it must equal `acts.MAX_VERIFY_ROUNDS` (3): a worker whose config holds another number stops at the start and names the setting. The count is part of the state that crosses a hand-over to a new run.
+
+| Where | What shows the review |
+|---|---|
+| `status()`, `longhaul status` | The phase `verifying` while the pre-check and the verifier run. |
+| Postgres, `events` | One `verdict` event for each round, with `passed`, `model_passed`, `precheck_passed`, `tests_run`, `tests_summary`, `issues` and `send_back_step`. `passed` is the result, and the other two show which half failed. |
+| Postgres, `tool_calls` | The commands of the pre-check, with the ids `<task id>-verify<round>-tests`, `<task id>-verify<round>-check<n>` and `<task id>-verify<round>-diff`. The task id is part of the id because the table keys its rows by it. |
+| The pull request | Ready for review, with a `Verified:` line, after a pass. |
+
+```sql
+SELECT payload->>'round' AS round, payload->>'passed' AS passed, payload->>'model_passed' AS model, payload->>'precheck_passed' AS precheck, payload->'issues' AS issues
+FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'verdict' ORDER BY id;
+```
+
+These ends of the review are fixed, so a caller can tell them apart without reading prose:
+
+| Outcome | Meaning |
+|---|---|
+| `stuck`: `the work failed review 3 times; last review: <issues>` | Three reviews in a row failed. The coder was sent back after the first two, and the third ended the task. |
+| `error`: `verifier submitted an invalid verdict twice: <problems>` | The repair turn did not fix the verdict. This is not a failed round. |
+| `error`: `verifier submitted no verdict in 15 turns` | The verifier used all its turns reading. |
+| `error`: `turn limit` | The turns of the review count against `task_turns`, and the message that sends the coder back takes one too. A coder that submits with no turn left gets no review, and no command of the pre-check runs. |
 
 ### Stopping a worker
 
@@ -520,7 +560,7 @@ Rules that keep a command from doing something nobody meant:
 
 Each poll now reads the new comments of every open labeled issue that has a task, which is one more GitHub call for each such issue, and one more for each author of a command that the poll has not asked about yet.
 
-The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one draft pull request and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner and for the coder. It needs `make up` and `make sandbox-image`, and takes about two minutes.
+The end-to-end test of this path is `tests/e2e/test_issue_to_pr.py::test_label_to_pr_fake_github`. It serves a FakeGitHub over HTTP on port 8099 (a free port when 8099 is taken, and the test says so), starts `longhaul worker` against it with the scripted provider and the `calc` fixture, runs the poller once, and checks that the issue ends with one "Picked up" comment, one comment with the plan, one pull request that is ready for review and the label `longhaul:pr-open`. The task plans first, as every task of the poller does, so its script (`calc_fix_planned.yaml`) has steps for the planner, the coder and the verifier, and the review passes the work. It needs `make up` and `make sandbox-image`, and takes about two minutes.
 
 ## Kill the worker on purpose
 
@@ -756,7 +796,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
-| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a draft pull request (see "Steer a task from its issue") |
+| `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a pull request a verifier passed (see "Steer a task from its issue") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |

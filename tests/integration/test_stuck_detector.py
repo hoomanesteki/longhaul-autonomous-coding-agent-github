@@ -52,7 +52,7 @@ from longhaul.durable.client import start_task
 from longhaul.durable.workflow_sandbox import workflow_runner
 from longhaul.durable.workflows.task import TaskWorkflow
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
 
@@ -93,6 +93,9 @@ def coder_turns(*calls: dict[str, Any], then: dict[str, Any]) -> list[dict[str, 
 
 FAIL = tool("run_command", command=FAILING_COMMAND)
 FINISH = tool("finish", summary=SUMMARY)
+VERDICT = tool(
+    "submit_verdict", passed=True, tests_run="pytest -q", tests_summary="2 passed", issues=[]
+)
 
 
 def write_script(tmp_path: Path, steps: list[dict[str, Any]]) -> Path:
@@ -176,7 +179,10 @@ async def light(env: WorkflowEnvironment, script: Path) -> AsyncIterator[World]:
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     boxes = Boxes()
@@ -325,6 +331,8 @@ async def test_a_planner_that_repeats_a_failure_is_not_stuck(
     steps = [turn("planner", i, FAIL) for i in range(4)]
     steps += [turn("planner", 4, tool("submit_plan", **PLAN))]
     steps += [turn("coder", 0, tool("submit_for_review", summary=SUMMARY))]
+    # The work a planned coder submits is reviewed (LH-504), and this review passes it.
+    steps += [turn("verifier", 0, VERDICT)]
     async with light(env, write_script(tmp_path, steps)) as world:
         handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
         outcome = await result_of(handle)

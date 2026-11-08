@@ -58,17 +58,19 @@ ones too. A call that found its sandbox gone never ran, and is not timed.
 The result also carries the few facts that the stuck detector reads (LH-505): the count of passing
 tests of a test run, a hash of a command that failed, and the lines an edit changed. They are read
 from the whole text of the result before it is cut to a preview, because the workflow has only the
-preview (signals.py). A call of the planning phase gets none, since the planner is not watched.
+preview (signals.py). A read-only call, of the planning phase or of the review, gets none, since
+neither the planner nor the verifier is watched.
 
-The planning phase (LH-501) changes nothing. A call with `read_only` set runs from `pre_sha` like
-any other, and then the tree is looked at: if the call changed it, `restore(pre_sha)` puts it
-back, and no commit is made, so the result has no `post_sha` and no checkpoint row is written.
-Files that git ignores do not count, as for `is_at` before a call, so the caches of a test run are
-left alone. The text of the result ends with PLANNING_NOTE when something was undone, so the
-planner does not build on a file that is gone. The planner is not offered `edit_file` or
-`write_file`, and the workflow answers a call outside its tool set without running it. This reset
-is the guarantee under both: whatever a shell command did, the next call and the coder start from
-the checkpoint. A planner call that has no `pre_sha` has nothing to go back to and is left as it is.
+The planning phase (LH-501) and the review (LH-504) change nothing. A call with `read_only` set
+runs from `pre_sha` like any other, and then the tree is looked at: if the call changed it,
+`restore(pre_sha)` puts it back, and no commit is made, so the result has no `post_sha` and no
+checkpoint row is written. Files that git ignores do not count, as for `is_at` before a call, so
+the caches of a test run are left alone. The text of the result ends with READ_ONLY_NOTE when
+something was undone, so the planner and the verifier do not build on a file that is gone. Neither
+is offered `edit_file` or `write_file`, and the workflow answers a call outside its tool set
+without running it. This reset is the guarantee under both: whatever a shell command did, the next
+call and the coder start from the checkpoint. A read-only call that has no `pre_sha` has nothing to
+go back to and is left as it is.
 
 A sandbox that is gone fails the call with SandboxGoneError, which is not retried: asking again
 finds the same empty place. The workflow recreates the sandbox (workspace.py) and runs the call
@@ -123,10 +125,9 @@ from longhaul.tools.registry import ToolRegistry
 # advance, so `mutates` is False for both (tools/exec.py) and the tree is looked at after them.
 SHELL_TOOLS = frozenset({"run_command", "run_tests"})
 
-# What the planner reads at the end of a call that wrote files, which were then undone (LH-501).
-PLANNING_NOTE = (
-    "[planning phase: files cannot be changed here, so what this command wrote was undone]"
-)
+# What a read-only role (the planner, the verifier) reads at the end of a call that wrote files,
+# which were then undone (LH-501, LH-504). It names no phase, because every role shares it.
+READ_ONLY_NOTE = "[read-only: files cannot be changed here, so what this command wrote was undone]"
 
 
 class SandboxLookup(Protocol):
@@ -257,7 +258,7 @@ class ToolActivities:
                     post_sha = None
                     if await self._discard(sandbox, inp.pre_sha):
                         result = result.model_copy(
-                            update={"output": f"{result.output}\n{PLANNING_NOTE}"}
+                            update={"output": f"{result.output}\n{READ_ONLY_NOTE}"}
                         )
                 else:
                     post_sha = await self._save(sandbox, inp, call)

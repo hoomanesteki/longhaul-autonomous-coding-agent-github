@@ -11,8 +11,9 @@ The workspace setup builds a venv and installs pytest and calc from PyPI, so the
 outbound network.
 
 The poller runs once, as the Schedule would start it. The test then follows the task to its end
-and checks what the issue shows: one "Picked up" comment, one comment with the plan, one draft
-pull request, and the label `longhaul:pr-open` where `longhaul:working` was.
+and checks what the issue shows: one "Picked up" comment, one comment with the plan, one pull
+request that a verifier passed and is ready for review, and the label `longhaul:pr-open` where
+`longhaul:working` was.
 
 Nothing here touches what other work on the machine uses. The test has its own task queue, its
 own scratch database (migrated to head, then dropped), its own checkpoint folder, and a repo with
@@ -354,10 +355,12 @@ async def label_to_pr(stack: Stack) -> None:
     assert outcome.kind is OutcomeKind.PR_OPENED, shown
     assert outcome.pr_url, shown
 
-    # Exactly one pull request: a draft that closes the issue, from the branch of the task.
+    # Exactly one pull request that closes the issue, from the branch of the task. The verifier
+    # passed the work and the pre-check ran the test command, so it is ready for review (LH-504).
     (pull,) = fake.pulls(repo)
     assert pull["html_url"] == outcome.pr_url
-    assert pull["draft"] is True
+    assert pull["draft"] is False
+    assert "Verified: 3 passed" in pull["body"], pull["body"]
     assert pull["head"]["ref"] == f"longhaul-pr/{issue}"
     assert f"Closes #{issue}" in pull["body"], pull["body"]
     assert "3 passed" in pull["body"], pull["body"]

@@ -6,6 +6,7 @@ Docker: that the project can never be the default one, which commands start it, 
 compose file keeps the state of Temporal across the restarts that the suite makes.
 """
 
+import os
 import socket
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,7 @@ def test_the_ports_reach_compose_through_the_variables_its_file_reads() -> None:
         "LH_POSTGRES_PORT": "50471",
         "LH_TEMPORAL_PORT": "50472",
         "LH_TEMPORAL_UI_PORT": "50473",
+        "LH_POSTGRES_PASSWORD": services.POSTGRES_PASSWORD,
     }
     text = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     for name in env:
@@ -219,3 +221,14 @@ def test_the_watchdog_probes_the_private_temporal_and_not_another(
     assert private.watchdog.check() is False
 
     assert asked == ["127.0.0.1:50472"]
+
+
+def test_the_password_the_suite_connects_with_is_the_one_compose_gives_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LH_POSTGRES_PASSWORD", "from-the-owner-env")
+
+    env = {**os.environ, **services.compose_env(PORTS)}
+
+    assert env["LH_POSTGRES_PASSWORD"] == services.POSTGRES_PASSWORD
+    assert f":{services.POSTGRES_PASSWORD}@" in services.database_url(PORTS)

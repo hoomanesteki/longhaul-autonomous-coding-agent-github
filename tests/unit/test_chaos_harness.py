@@ -6,6 +6,7 @@ real process and a log file that grows on a timer, at the pace of the reference 
 twice that pace.
 """
 
+import asyncio
 import contextlib
 import subprocess
 import sys
@@ -648,3 +649,72 @@ def test_only_a_killed_worker_is_started_again(tmp_path: Path) -> None:
 
     assert [p.via for p in points] == ["sandbox", "postgres"]
     assert started == []
+
+
+# ---------- calls to a Temporal that restarts ----------
+def rpc_error(code: object) -> Exception:
+    from temporalio.service import RPCError
+
+    return RPCError("the server said so", code, b"")  # type: ignore[arg-type]
+
+
+def test_a_call_is_made_again_while_the_server_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from temporalio.service import RPCStatusCode
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(harness.asyncio, "sleep", no_sleep)
+    calls: list[int] = []
+
+    async def call() -> str:
+        calls.append(1)
+        if len(calls) < 3:
+            raise rpc_error(RPCStatusCode.UNAVAILABLE)
+        return "answer"
+
+    assert asyncio.run(harness.Stack.through_restarts(call)) == "answer"
+    assert len(calls) == 3
+
+
+def test_a_call_that_cannot_succeed_is_not_made_again() -> None:
+    from temporalio.service import RPCError, RPCStatusCode
+
+    calls: list[int] = []
+
+    async def call() -> str:
+        calls.append(1)
+        raise rpc_error(RPCStatusCode.NOT_FOUND)
+
+    async def bounded() -> str:
+        # A loop that never ends must fail this test and not hang the suite.
+        return await asyncio.wait_for(harness.Stack.through_restarts(call), timeout=3)
+
+    with pytest.raises(RPCError):
+        asyncio.run(bounded())
+    assert calls == [1]
+
+
+def test_the_status_read_after_a_run_gives_up_when_no_worker_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from temporalio.service import RPCStatusCode
+
+    async def never_answers(*_: object, **__: object) -> None:
+        raise rpc_error(RPCStatusCode.DEADLINE_EXCEEDED)
+
+    async def no_sleep(_: float) -> None:
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(harness, "read_status", never_answers)
+    monkeypatch.setattr(harness, "get_task", lambda *_: None)
+    monkeypatch.setattr(harness, "STATUS_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(harness, "RETRY_PAUSE_S", 0.01)
+
+    async def read() -> None:
+        await harness.Stack.final_status(object(), "lh-t-1")  # type: ignore[arg-type]
+
+    with pytest.raises(TimeoutError):
+        asyncio.run(asyncio.wait_for(read(), timeout=10))

@@ -232,3 +232,30 @@ def test_the_summary_can_be_read_back() -> None:
 def test_a_result_with_a_field_nobody_knows_is_refused() -> None:
     with pytest.raises(ValueError, match="extra"):
         RunResult.model_validate({**run_result().model_dump(), "luck": 1})
+
+
+# ---------- a run whose kills never happened ----------
+def test_a_run_none_of_whose_kills_landed_did_not_survive() -> None:
+    unharmed = run_result(
+        1,
+        kills_planned=["sandbox", "postgres"],
+        kills=[kill("sandbox", landed=False), kill("postgres", landed=False)],
+    )
+
+    assert not unharmed.survived
+    assert not run_result(2, kills_planned=["temporal"], kills=[]).survived
+    assert summary_of([run_result(3), unharmed]).survived == 1
+
+
+def test_a_run_with_one_landed_kill_among_planned_ones_survived() -> None:
+    partly = run_result(
+        1,
+        kills_planned=["worker", "postgres"],
+        kills=[kill("worker"), kill("postgres", landed=False)],
+    )
+
+    assert partly.survived
+
+
+def test_a_run_with_no_planned_kill_needs_no_landed_one() -> None:
+    assert run_result(1, kills_planned=[], kills=[]).survived

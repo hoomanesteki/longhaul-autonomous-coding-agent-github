@@ -2354,6 +2354,9 @@ The review of LH-306 found the problems below before the Phase 3 gate. Each was 
 - **Cumulative tests:** `make gate PHASE=4`. That covers phases 0 to 4, including `test_label_to_pr_fake_github`, `chaos_lite` and `test_longlog_many_compactions`.
 - **Manual smoke:**
   ```bash
+  make up && make sandbox-image && make migrate
+  uv sync --extra memory               # or a config with memory.embedder: hash
+  uv run longhaul worker &
   uv run longhaul run --path tests/fixtures/repos/longlog --issue-file tests/fixtures/repos/longlog/ISSUE.md \
       --provider scripted --script tests/fixtures/scripts/longlog.yaml --window 8000
   uv run longhaul status <task_id>     # shows compactions and max_fraction

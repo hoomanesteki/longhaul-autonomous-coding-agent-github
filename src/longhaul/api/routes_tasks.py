@@ -46,13 +46,14 @@ from longhaul.api.schemas import (
 )
 from longhaul.blobs.base import BlobNotFoundError
 from longhaul.contracts import LLMResponse, Message, TaskStatus
+from longhaul.durable import acts
 from longhaul.durable import client as durable
 
 router = APIRouter(prefix="/api/tasks")
 
 # The name every signal of this API is sent under. The workflow keeps it: a hint is shown to the
 # model as "console: <text>" and a cancel says "cancelled by console".
-BY = "console"
+BY = acts.CONSOLE_NAME
 
 DEFAULT_PAGE = 50
 MAX_PAGE = 200

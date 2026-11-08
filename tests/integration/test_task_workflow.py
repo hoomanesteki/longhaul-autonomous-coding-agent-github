@@ -59,7 +59,12 @@ from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
-from longhaul.durable.workflows.task import LOAD_MEMORY_PATCH, OUTCOME_PATCH, TaskWorkflow
+from longhaul.durable.workflows.task import (
+    LOAD_MEMORY_PATCH,
+    MIRROR_PATCH,
+    OUTCOME_PATCH,
+    TaskWorkflow,
+)
 from longhaul.github import lifecycle
 from longhaul.github.inputs import CommentInput, LabelInput
 
@@ -3291,3 +3296,74 @@ async def test_every_run_records_the_marker_of_the_wind_up(
         history = await handle.fetch_history()
 
     assert _patch_markers(history, OUTCOME_PATCH) == [OUTCOME_PATCH]
+
+
+# ---------- LH-805: the mirror of a console action ----------
+def console_posts(stubs: Stubs) -> list[CommentInput]:
+    return [c for c in stubs.payloads(acts.POST_COMMENT.name) if ":console:" in c.idempotency_key]
+
+
+async def test_a_replay_posts_no_console_comment_again(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        await handle.signal(TaskWorkflow.hint, args=["console", "use vendor/"])
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the console comment")
+        stubs.release(acts.LLM_TURN.name)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert _patch_markers(history, MIRROR_PATCH) == [MIRROR_PATCH]
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)  # raises if a replay would change the commands
+
+
+async def test_the_console_count_survives_a_hand_over(env: WorkflowEnvironment) -> None:
+    # The key of a console comment is its number, like the key of a status comment.
+    spec = github_spec()
+    stubs = Stubs(edits_then_finishes(6))
+    stubs.hold_turn(1)
+    stubs.hold_turn(4)  # the second run's second turn
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await wait_until(lambda: stubs.started(1), "turn 1")
+        await handle.signal(TaskWorkflow.hint, args=["console", "first"])
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the first console comment")
+        stubs.release_turn(1)
+
+        await wait_until(lambda: stubs.started(4), "a turn of the second run")
+        assert len(stubs.run_ids) == 2
+        await handle.signal(TaskWorkflow.hint, args=["console", "second"])
+        await wait_until(lambda: len(console_posts(stubs)) == 2, "the second console comment")
+        stubs.release_turn(4)
+        await result_of(handle)
+
+    assert [c.idempotency_key for c in console_posts(stubs)] == [
+        f"{spec.task_id}:console:1",
+        f"{spec.task_id}:console:2",
+    ]
+
+
+async def test_a_console_comment_that_cannot_be_posted_does_not_fail_the_task(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await at_the_first_turn(env, stubs, gh_spec, queue)
+        stubs.fails = {
+            acts.POST_COMMENT.name: ApplicationError(
+                "Resource not accessible", type=acts.GITHUB_FATAL, non_retryable=True
+            )
+        }
+        await handle.signal(TaskWorkflow.hint, args=["console", "use vendor/"])
+        await wait_until(lambda: len(console_posts(stubs)) >= 1, "the console attempt")
+        stubs.release(acts.LLM_TURN.name)
+        outcome = await result_of(handle)
+
+    assert outcome == FINISHED

@@ -190,6 +190,11 @@ OUTCOME_SUMMARY_CHARS = 500
 # after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
 # contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
 STATUS_MEMO_KEY = "status_posts"
+# The same for the comments that repeat a console action on the issue (LH-805).
+CONSOLE_MEMO_KEY = "console_posts"
+# The name the console signals under. The API sends it, and the workflow repeats the actions that
+# carry it on the issue. The signals of a person who commented on the issue are already there.
+CONSOLE_NAME = "console"
 # The workflow memo key that has a stuck task open a draft pull request with its partial work
 # (LH-507, the repo setting `open_draft_on_stuck`). The poller sets it from the repo entry of the
 # config when it starts the task, because the workflow cannot read the config and RepoSettings is

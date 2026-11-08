@@ -224,3 +224,20 @@ def test_status_shows_the_plan_with_the_status_of_each_step(
 @pytest.mark.phase5
 def test_status_is_the_plain_task_status_for_a_task_without_a_plan(wf: TaskWorkflow) -> None:
     assert type(wf.status()) is TaskStatus
+
+
+@pytest.mark.phase8
+@pytest.mark.parametrize("by", ["alice", "Console", "console "])
+def test_a_signal_from_anyone_but_the_console_starts_no_issue_comment(
+    wf: TaskWorkflow, by: str
+) -> None:
+    # The comment of a person on the issue is on the issue already. The checks run before the
+    # workflow memo is read, so this works outside a workflow.
+    wf.hint(by, "go on")
+    wf.add_budget(by, 1.0, 1)
+    wf.approve_plan(by)
+    wf.reject_plan(by, "no")
+
+    assert wf.mirrors == set()
+    assert wf.console_posts is None
+    assert wf._memo_to_carry() is None

@@ -53,6 +53,7 @@ from tests.fakes.fake_github import FakeGitHub
 from longhaul.contracts import MemoryItem, OutcomeKind
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
+from longhaul.durable.activities.memory import LESSONS_NAME
 from longhaul.durable.client import connect, get_task
 from longhaul.durable.workflows.poller import PollerWorkflow
 from longhaul.memory.embedder import HashEmbedder
@@ -208,8 +209,12 @@ async def poison_then_ask_again(stack: Stack) -> None:
 
     # The view and the log of the transcript, the replies, and any other blob of the task say the
     # same. The scan covers more than the block, so a second path into the prompt would show up.
+    # The one blob left out is the answer of B's own extract_lessons, written after its last
+    # prompt (LH-605 keeps it for a retry): the script drafts the same note again there.
     assert any("/turns/" in key for key in blobs), sorted(blobs)
-    leaked = sorted(key for key, data in blobs.items() if POISON.encode() in data)
+    drafted = f"tasks/{task_b}/memory/0000/{LESSONS_NAME}"
+    assert POISON.encode() in blobs[drafted], sorted(blobs)
+    leaked = sorted(k for k, data in blobs.items() if POISON.encode() in data and k != drafted)
     assert leaked == [], f"the poisoned lesson reached {leaked}"
 
     # B drafted the same note again, and the store kept the one row that was rejected.

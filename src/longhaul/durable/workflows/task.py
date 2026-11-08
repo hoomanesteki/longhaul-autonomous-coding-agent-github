@@ -1134,6 +1134,8 @@ class TaskWorkflow:
         state.plan_version = version
         state.transcript_ref = None
         state.notes = None
+        # The coder starts a transcript of its own, so the planner's request size is not its own.
+        state.last_input_tokens = 0
 
     # ---------- the coding phase ----------
     async def _code(self) -> Outcome:
@@ -1432,8 +1434,10 @@ class TaskWorkflow:
         return None
 
     # ---------- the budgets ----------
-    async def _afford(self, role: Role) -> Outcome | None:
+    async def _afford(self, role: Role, *, high_output_cap: bool = False) -> Outcome | None:
         """Check that the next model call fits the budgets, and wait while it does not (LH-702).
+
+        `high_output_cap` is for the retry of a reply cut off at max_tokens, which may use more.
 
         None means the call may go ahead, now or after the waiting. An outcome means the task ends
         here: nobody lifted a limit in time, or the next call can never fit the repo's day. A
@@ -1443,14 +1447,16 @@ class TaskWorkflow:
         if not self.state.enforce_budgets:
             return None
         while True:
-            stop = await self._budget_stop(role)
+            stop = await self._budget_stop(role, high_output_cap)
             if stop is None:
                 return None
             ended = await self._budget_pause(stop)
             if ended is not None:
                 return ended
 
-    async def _budget_stop(self, role: Role) -> budget.BudgetVerdict | None:
+    async def _budget_stop(
+        self, role: Role, high_output_cap: bool = False
+    ) -> budget.BudgetVerdict | None:
         """The limit that the next call would cross, or None when it fits."""
         state = self.state
         limits = state.spec.settings.budgets
@@ -1477,6 +1483,7 @@ class TaskWorkflow:
                 task_id=state.spec.task_id,
                 repo=state.spec.repo,
                 role=role,
+                high_output_cap=high_output_cap,
                 turn_index=state.turn_index,
                 limits=limits,
                 extra_usd=state.extra_budget_usd,
@@ -1738,12 +1745,23 @@ class TaskWorkflow:
         A prompt that is over the window is compacted down to the last two turns, and the turn
         is asked once more (F6). It is asked again only if the compaction changed the view. A
         second overflow, or one with nothing to fold, ends the run with "context limit".
+
+        The caller has checked the budgets for the first call. Every call after it, a retry at the
+        higher output cap, the continuation of a paused turn and the ask after a compaction, is
+        checked here, because each is a model call that costs money (LH-702). A budget that ends
+        the task comes back as the outcome.
         """
         state = self.state
         sampling = rules.Sampling()
         paused_ref: BlobRef | None = None
         compacted = False
+        asked = False
         while True:
+            if asked:
+                ended = await self._afford(role, high_output_cap=sampling.retried)
+                if ended is not None:
+                    return ended
+            asked = True
             try:
                 reply = await self._call(
                     acts.LLM_TURN,
@@ -1780,8 +1798,11 @@ class TaskWorkflow:
             # activity hands back: unchanged when the reply was not stored.
             state.transcript_ref = reply.transcript_ref
             state.cost_usd += reply.cost_usd
-            # The next request holds this one, so it is at least this large (LH-702).
-            state.last_input_tokens = max(reply.request_tokens, reply.input_tokens_total)
+            # The next request holds this one and the results of its calls, so the budget check
+            # prices the larger of what the activity projected and what this one was billed at.
+            state.last_input_tokens = max(
+                reply.next_request_tokens, reply.request_tokens, reply.input_tokens_total
+            )
             verdict = rules.judge(sampling, reply)
             sampling = verdict.sampling
             if verdict.outcome is not None:

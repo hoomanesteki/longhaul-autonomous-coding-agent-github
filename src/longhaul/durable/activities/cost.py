@@ -72,10 +72,10 @@ class BudgetActivities:
     async def check_budget(self, inp: acts.CheckBudgetInput) -> BudgetVerdict:
         inp = small(inp)
         cfg = self._config_for(inp.role)
+        cap = cfg.max_tokens_retry if inp.high_output_cap else cfg.max_tokens_per_turn
         try:
             projected = self._pricing.cost(
-                Usage(input_tokens=inp.last_input_tokens, output_tokens=cfg.max_tokens_per_turn),
-                cfg.model,
+                Usage(input_tokens=inp.last_input_tokens, output_tokens=cap), cfg.model
             )
         except PricingError as exc:
             raise not_retried(exc) from exc

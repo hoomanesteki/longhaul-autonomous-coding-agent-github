@@ -743,6 +743,7 @@ def test_a_model_turn_says_ok_until_it_says_otherwise() -> None:
     out = acts.LlmTurnOutput(transcript_ref=REF, stop_reason="end_turn", usage=Usage())
     assert out.context_decision == "ok"
     assert out.request_tokens == 0
+    assert out.next_request_tokens == 0
 
 
 @pytest.mark.parametrize("decision", ["ok", "compact", "force"])

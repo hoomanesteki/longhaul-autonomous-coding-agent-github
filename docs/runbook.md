@@ -447,7 +447,7 @@ A task has four limits (LH-702). They are the `budgets` of the repo in the confi
 budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
 ```
 
-A task that the poller starts checks them before every model turn. The `check_budget` activity compares each limit with the worst case of the call that is about to be made: the input of the last request at the full input price, plus `loop.max_tokens_per_turn` of output at the output price, both for the model of the role (planner or coder). It is better to pause a little early than to find out after the bill. What the task spent comes from the `cost_ledger`, so a call that was billed and then retried counts twice. The checks run in this order, and the first one that fails names the pause:
+A task that the poller starts checks them before every model turn. The `check_budget` activity compares each limit with the worst case of the call that is about to be made: the input of the next request (the size the last call projected, with room for the results of its tool calls) at the full input price, plus the output cap of that call at the output price, both for the model of the role (planner or coder). The cap is `loop.max_tokens_per_turn`, and `loop.max_tokens_retry` for the retry of a reply that stopped at max_tokens. The retry, the continuation of a paused turn and the ask after a forced compaction are model calls of their own, so each is checked too. It is better to pause a little early than to find out after the bill. What the task spent comes from the `cost_ledger`, so a call that was billed and then retried counts twice. The checks run in this order, and the first one that fails names the pause:
 
 | Reason | The call is held back when | What the task waits for |
 |---|---|---|

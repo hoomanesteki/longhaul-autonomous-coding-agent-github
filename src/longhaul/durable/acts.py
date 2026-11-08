@@ -282,8 +282,9 @@ class RunState(CarryState):
     - `paused_s` is the seconds the task has spent waiting for a person or for midnight. The wall
       clock leaves them out, and a top-up after a wall-clock pause sets it to the whole time the
       task has run, which starts a new window.
-    - `last_input_tokens` is the size of the last request that was sent, which is the floor of
-      the next one and what the budget check prices as input.
+    - `last_input_tokens` is the size the next request is expected to have, from the last
+      llm_turn (`next_request_tokens`, else the size of the request it sent), and what the
+      budget check prices as input. It is 0 again when the transcript is cleared.
     """
 
     memory_ref: BlobRef | None = None
@@ -411,6 +412,10 @@ class LlmTurnOutput(BaseModel):
     projection of the request this call sent, and `context_decision` says what the next turn
     should begin with, from the projection of the request after it: "ok" to go on, "compact" to
     compact the view first, "force" to compact down to FORCED_KEEP_RECENT_TURNS turns.
+
+    `next_request_tokens` is that same projection, with room for the results of the calls just
+    made: the size the next request is expected to have. The budget check prices it as input
+    (LH-702). It is 0 when the activity has no context policy.
     """
 
     transcript_ref: BlobRef
@@ -428,6 +433,7 @@ class LlmTurnOutput(BaseModel):
     paused_ref: BlobRef | None = None  # the text so far of a turn that stopped on pause_turn
     context_decision: Decision = "ok"
     request_tokens: int = Field(default=0, ge=0)  # 0 when the activity has no context policy
+    next_request_tokens: int = Field(default=0, ge=0)  # 0 when there is no context policy
 
 
 class ToolExecInput(BaseModel):
@@ -586,12 +592,16 @@ class CheckBudgetInput(BaseModel):
     when the ledger says less, as a worker with no database does. `now` is `workflow.now()`: the
     day of the repo is judged by the time of the workflow, so a task that waited for midnight
     sees the new day, in a test with a skipped clock as well as in production.
+
+    `high_output_cap` is set for the retry of a reply that stopped at max_tokens, which is sent
+    with the larger cap, so the call is priced with that cap and not the usual one.
     """
 
     task_id: str
     repo: str
     role: Role
     turn_index: int = Field(ge=0)
+    high_output_cap: bool = False
     limits: Budgets
     extra_usd: float = Field(default=0.0, ge=0)
     extra_turns: int = Field(default=0, ge=0)

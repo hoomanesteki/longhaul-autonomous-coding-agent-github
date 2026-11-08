@@ -204,7 +204,8 @@ def render_pr_body(
         return bare
     # The block adds its own tags and blank lines, which the first render shows by difference.
     framed = len(str(template.render(**{**fields, "report": "x"}))) - len(bare) - 1
-    fitted = _fit_report(report, limit - len(bare) - framed)
+    # One character less, so that the body is under the limit and not at it.
+    fitted = _fit_report(report, limit - len(bare) - framed - 1)
     if fitted is None:
         return bare
     return str(template.render(**{**fields, "report": fitted}))

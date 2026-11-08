@@ -11,8 +11,9 @@ The rules this module keeps:
 * **The same bytes every time.** `deliver` puts the report in the body of a pull request, and
   `create_pr` refuses a reused key with other text (github/side_effects.py). Nothing here reads
   a clock, and every list is in the order of the rows.
-* **A short report.** The timeline stops at MAX_TIMELINE_ROWS and says how many entries it left
-  out, the tool table at MAX_TOOL_ROWS, and a text is cut to one line. A task of 500 turns gets a
+* **A short report.** The timeline keeps the start and the end of a long run, up to
+  MAX_TIMELINE_ROWS rows, and says in one row how many entries it left out of the middle, the tool
+  table at MAX_TOOL_ROWS, and a text is cut to one line. A task of 500 turns gets a
   report about as long as a task of 10.
 * **Only the template can mention a person or close an issue.** The title, the hints, the
   reasons and the lessons are written by people and a model. `_text` ends the effect of "@name",
@@ -58,6 +59,8 @@ TEMPLATE = "run_report.md.j2"
 
 # What keeps the report short.
 MAX_TIMELINE_ROWS = 60
+# Of those rows, the last ones are kept for the end of the run: the final checks and how it ended.
+TIMELINE_TAIL_ROWS = 20
 MAX_TOOL_ROWS = 25
 MAX_INTERVENTIONS = 30
 MAX_LESSONS = 10
@@ -86,6 +89,11 @@ SEGMENT_LABELS = {"planner": "Planning", "coder": "Coding", "verifier": "Verifyi
 # A plan in one of these states is not the plan in force.
 GONE = frozenset({"rejected", "superseded"})
 ANSWERS = {"hint": "a hint", "budget": "a budget top-up"}
+BUDGET_VIA = "budget"
+# The outcome kind of a cancel and the start of the summary the workflow writes for it
+# (durable/workflows/task.py cancel_summary).
+CANCELLED_KIND = "cancelled"
+CANCEL_PREFIX = "cancelled by "
 TEN_THOUSANDTH = Decimal("0.0001")
 
 
@@ -333,15 +341,20 @@ def _timeline(data: ReportData, start: datetime | None) -> tuple[list[dict[str, 
     found = [*_segments(data.turns), *_approval(data.plans), *_event_entries(data.events)]
     found.sort(key=lambda entry: entry.ts)  # stable: a tie keeps the order above
     origin = start or (found[0].ts if found else None)
-    shown = [
-        {
-            "at": "+" + _duration((entry.ts - origin).total_seconds() if origin else 0),
-            "label": entry.label,
-            "detail": entry.detail,
-        }
-        for entry in found[:MAX_TIMELINE_ROWS]
-    ]
-    return shown, max(len(found) - MAX_TIMELINE_ROWS, 0)
+
+    def row(entry: _Entry) -> dict[str, str]:
+        seconds = (entry.ts - origin).total_seconds() if origin else 0
+        return {"at": "+" + _duration(seconds), "label": entry.label, "detail": entry.detail}
+
+    if len(found) <= MAX_TIMELINE_ROWS:
+        return [row(entry) for entry in found], 0
+    # The newest entries say how the run ended, so a cut keeps both ends and drops the middle.
+    # The row that says so takes one of the rows, which keeps the table at MAX_TIMELINE_ROWS.
+    head = MAX_TIMELINE_ROWS - TIMELINE_TAIL_ROWS - 1
+    hidden = len(found) - head - TIMELINE_TAIL_ROWS
+    gap = {"at": "...", "label": "Left out", "detail": f"{_plural(hidden, 'entry')} left out"}
+    shown = [*map(row, found[:head]), gap, *map(row, found[-TIMELINE_TAIL_ROWS:])]
+    return shown, hidden
 
 
 # ---------- the tools ----------
@@ -421,26 +434,51 @@ def _decisions(plans: list[PlanVersion]) -> list[_Step]:
     return steps
 
 
+def _cancel(summary: object) -> tuple[str, str | None]:
+    """Who cancelled and why, from the summary: "cancelled by <who>[: <why>]"."""
+    text = str(summary or "")
+    if not text.startswith(CANCEL_PREFIX):
+        return "unknown", None
+    who, _, why = text[len(CANCEL_PREFIX) :].partition(": ")
+    return who.strip() or "unknown", why.strip() or None
+
+
+def _cancelled(who: str, why: object) -> str:
+    return "Cancelled the task" + (f": {why}" if why else "")
+
+
 def _said(events: list[EventInfo]) -> list[_Step]:
-    """The hints, budget top-ups, cancels and answers to a pause, in the order they were made."""
+    """The hints, budget top-ups, cancels and answers to a pause, in the order they were made.
+
+    The text is raw. `_interventions` makes it safe once, because a second pass would escape the
+    backslash of the first.
+    """
     direct = any(e.type in (HINT_EVENT, BUDGET_EVENT) for e in events)
+    # The workflow records a cancel as the kind of its outcome and nothing else. An event of its
+    # own, when a writer adds one, comes first and is not listed twice.
+    own_cancel = any(e.type == CANCELLED_EVENT for e in events)
     steps = []
     for e in events:
         who = str(e.payload.get("by") or "unknown")
         if e.type == HINT_EVENT:
-            steps.append(_Step(e.ts, who, f"Gave a hint: {_text(e.payload.get('text', ''))}"))
+            steps.append(_Step(e.ts, who, f"Gave a hint: {e.payload.get('text', '')}"))
         elif e.type == BUDGET_EVENT:
             steps.append(_Step(e.ts, who, _budget_text(e.payload)))
         elif e.type == CANCELLED_EVENT:
-            why = e.payload.get("reason")
-            steps.append(
-                _Step(e.ts, who, "Cancelled the task" + (f": {_text(why)}" if why else ""))
-            )
-        elif e.type == RESUMED_EVENT and not direct and e.payload.get("by"):
-            via = ANSWERS.get(str(e.payload.get("via")), "an answer")
-            steps.append(
-                _Step(e.ts, who, f"Answered pause {e.payload.get('pause', '?')} with {via}")
-            )
+            steps.append(_Step(e.ts, who, _cancelled(who, e.payload.get("reason"))))
+        elif e.type == OUTCOME_EVENT and e.payload.get("kind") == CANCELLED_KIND and not own_cancel:
+            by, why = _cancel(e.payload.get("summary"))
+            steps.append(_Step(e.ts, by, _cancelled(by, why)))
+        elif e.type == RESUMED_EVENT and not direct:
+            via = str(e.payload.get("via"))
+            pause = e.payload.get("pause", "?")
+            if e.payload.get("by"):
+                steps.append(
+                    _Step(e.ts, who, f"Answered pause {pause} with {ANSWERS.get(via, 'an answer')}")
+                )
+            elif via == BUDGET_VIA:
+                # A top-up has no name on it: the workflow learns of it from a signal count.
+                steps.append(_Step(e.ts, who, f"Added budget to answer pause {pause}"))
     return steps
 
 

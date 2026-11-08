@@ -287,13 +287,16 @@ class DeliveryActivities:
 
         The outcome is `pr_opened` because this is the activity that opens the pull request and
         the workflow records the outcome after it. A task the database does not know has nothing
-        to report, and a retry would find the same, so the body goes without.
+        to report, and a retry would find the same, so the body goes without. So does a report
+        that cannot be built, for the same reason.
         """
         if self._reports is None:
             return None
         try:
             return await self._reports.stored_or_new(task_id, outcome=OutcomeKind.PR_OPENED.value)
-        except LookupError as exc:
+        except (LookupError, ValueError, TemplateError) as exc:
+            # The report is optional. A folder of templates from before it, or a plan row that
+            # fails validation, must not stop a pull request whose branch is already pushed.
             log.warning("no run report for task %s: %s", task_id, exc)
             return None
 

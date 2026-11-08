@@ -277,7 +277,7 @@ A pull request carries a report of how the agent got there, inside a collapsed `
 | Section | What it shows |
 |---|---|
 | Overview | The issue, the outcome, the wall time, the turns by role, the cost, the tokens and the cache ratio. |
-| Timeline | Planning, the wait for approval, coding, pauses, compactions, recoveries (a sandbox that was rebuilt, a hand-over to a new run) and the verifier rounds, in the order they happened. At most 60 entries. A longer timeline is cut, and a line says how many entries were left out. |
+| Timeline | Planning, the wait for approval, coding, pauses, compactions, recoveries (a sandbox that was rebuilt, a hand-over to a new run) and the verifier rounds, in the order they happened. At most 60 entries. A longer timeline keeps its first and last entries, so that the end of the run is always there, and a row says how many entries were left out of the middle. |
 | Tool usage | Calls, errors and time for each tool, busiest first, and a total. |
 | Plan | The version in force, who decided on it, and the status each step ended in. |
 | Interventions | Who did what and when: plan decisions, hints, budget top-ups, answers to a pause and cancels. |

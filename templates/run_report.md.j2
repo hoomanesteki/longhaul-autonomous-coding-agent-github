@@ -16,7 +16,7 @@
 {% endfor %}
 {% if timeline_hidden %}
 
-{{ timeline_hidden }} more {{ "entry" if timeline_hidden == 1 else "entries" }} left out. The `events` table has all of them.
+{{ timeline_hidden }} {{ "entry" if timeline_hidden == 1 else "entries" }} from the middle of the run left out. The tables behind the report have all of them.
 {% endif %}
 {% else %}
 Nothing was recorded.

@@ -48,6 +48,7 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import CheckpointRecord, MemoryRecorder, ToolCallRecord
 from longhaul.durable import acts
+from longhaul.durable.activities.signals import command_label
 from longhaul.durable.activities.tools import (
     READ_ONLY_NOTE,
     SHELL_TOOLS,
@@ -326,6 +327,13 @@ async def test_a_failing_test_run_leaves_its_count_and_its_failure(sandbox: Fake
     # The same run again, with another run time, is the same failure.
     assert again.signal is not None
     assert again.signal.failed_cmd_hash == fact.failed_cmd_hash
+
+
+def test_the_label_of_a_command_names_the_program_and_not_its_path() -> None:
+    deep = "/" + "/".join(["very-long-folder-name"] * 6) + "/.venv/bin/python -m pytest -q"
+    assert command_label(deep) == "python -m pytest -q"
+    assert command_label("pytest -q tests/test_inv.py") == "pytest -q tests/test_inv.py"
+    assert command_label("make test") == "make test"
 
 
 async def test_a_run_that_passes_leaves_a_count_and_no_failure(sandbox: FakeSandbox) -> None:

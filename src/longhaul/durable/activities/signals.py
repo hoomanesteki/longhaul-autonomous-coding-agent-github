@@ -26,6 +26,7 @@ The planning phase is not watched, and tool_exec does not call this for it.
 from __future__ import annotations
 
 import hashlib
+import posixpath
 import re
 
 from longhaul.contracts import ToolCall, ToolResult
@@ -95,6 +96,17 @@ def command_of(call: ToolCall, test_command: str | None) -> str | None:
         return f"{test_command} {target}"
 
 
+def command_label(command: str) -> str:
+    """The command as a person reads it: the program by its name, not by its path.
+
+    A test command often starts with the full path of an interpreter, and that path alone can
+    fill the evidence text, so the part that says what ran would be cut off. The hash still
+    takes the whole command.
+    """
+    program, sep, rest = command.strip().partition(" ")
+    return posixpath.basename(program) + sep + rest if "/" in program else command
+
+
 def passed_count(output: str) -> int | None:
     """The tests that passed according to the closing line of a pytest run, or None.
 
@@ -119,7 +131,7 @@ def _ran(call: ToolCall, result: ToolResult, test_command: str | None) -> CallSi
     return CallSignal(
         tests_passed=tests,
         failed_cmd_hash=failure_hash(command, code, tail),
-        failed_command=short(command),
+        failed_command=short(command_label(command)),
         failed_error=_error_text(tail),
     )
 

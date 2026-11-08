@@ -923,6 +923,101 @@ Things to know:
 - **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
 - **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
 
+## Route tool calls through Keystone
+
+[Keystone](https://github.com/hoomanesteki/keystone-mcp-gateway-ai-agent-security) is a gateway for MCP tool calls: policy decides each call, a person can be asked first, and every call leaves an audit row (LH-909). This is optional. The default is `tools.backend: direct`, which runs each tool in the sandbox as before and needs none of this.
+
+With `tools.backend: keystone` the path of one tool call is:
+
+```
+tool_exec -> Keystone /mcp -> Keystone policy, approval, audit -> the worker's MCP server -> the sandbox
+```
+
+The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
+
+What the agent sees:
+
+| Keystone says | The agent gets |
+|---|---|
+| allow | The tool's own result, as in direct mode |
+| deny, or any other refusal (rate limit, budget, a rejected approval) | A failed result (`ok=False`) with Keystone's text: `[keystone:KS_DENIED] call <id> denied: <reason>` |
+| require approval, and nobody decides within Keystone's hold time (`approvals.wait_seconds`) | A failed result that says the call did not run, and the task pauses. The reason is the question, as in the pause for a hint |
+
+A paused task waits for a hint, a budget top-up or a cancel (see "The pause and the hint"). Approve or reject the request in Keystone's console, then send the hint: `/longhaul hint approved in Keystone, go ahead` on the issue, or `POST /api/tasks/{id}/hint` of the console API for a local task. The model calls the same tool again, and the worker settles the request that Keystone is holding with `keystone__await_approval` and does not ask a second time. If Keystone is down, `tool_exec` raises and Temporal runs the activity again. The worker never falls back to running a tool unchecked.
+
+### Point a worker at Keystone
+
+1. In the config that `LONGHAUL_CONFIG` names, turn the mode on and say where Keystone is:
+
+   ```yaml
+   tools:
+     backend: keystone
+     gateway:
+       url: http://localhost:8080/mcp      # Keystone's MCP endpoint
+       upstream: longhaul_sandbox          # the id the worker's server has in Keystone
+       listen_host: 0.0.0.0                # where the worker serves its tools; see the note below
+       listen_port: 8765
+   ```
+
+   Keystone allows an upstream id of lowercase letters, digits and single underscores, so the id is `longhaul_sandbox` and not the server's name. Keystone then lists the tools as `longhaul_sandbox__run_command` and so on.
+
+2. Set two secrets in the environment of the worker (see `.env.example`):
+
+   ```bash
+   export LONGHAUL_KEYSTONE_TOKEN=$(scripts/get_token.sh olivia ops-agent)   # run in the Keystone checkout
+   export LONGHAUL_SANDBOX_MCP_KEY=$(openssl rand -hex 24)                    # 48 characters
+   ```
+
+   The token signs the worker in to Keystone as a user and an agent. A token from the local Keycloak lasts five minutes, so for more than a short test put it in a file that something keeps fresh and set `LONGHAUL_KEYSTONE_TOKEN_FILE` to it: the worker reads the file again for every request. The key is what Keystone sends to the worker's server. The server refuses a request without it, because the tools run commands. A worker in keystone mode will not start without a token and a key of at least 16 characters, and the message names the variable.
+
+3. Register the upstream in Keystone. Add this to the `upstreams` of its config (`keystone.yaml`, or `deploy/keystone.compose.yaml` for the compose stack) and restart Keystone, which reads the section at every start:
+
+   ```yaml
+   - id: longhaul_sandbox
+     tenant: acme
+     transport: http
+     url: "http://host.docker.internal:8765/mcp"   # an address Keystone can reach the worker at
+     credential_mode: static
+     credential_env: {X-Api-Key: LONGHAUL_SANDBOX_MCP_KEY}
+     tools:
+       run_command: {risk: medium, extract: {path: "$.command | lower"}}
+       run_tests: {risk: medium}
+       read_file: {risk: low}
+       list_dir: {risk: low}
+       search: {risk: low}
+       git_diff: {risk: low}
+       edit_file: {risk: medium}
+       write_file: {risk: medium}
+   ```
+
+   Keystone reads the key from `LONGHAUL_SANDBOX_MCP_KEY` in its own environment at start and keeps it encrypted in its vault. It needs the same value as the worker. Keystone refuses an upstream on a private address unless `KEYSTONE_ALLOW_PRIVATE_UPSTREAMS` is `true`, which its compose file sets. Keystone in Docker reaches this machine as `host.docker.internal`, so the worker has to listen on an address that is not only the loopback (`listen_host: 0.0.0.0`). Do that only on a machine whose network you trust: the key is the only thing that protects the server. A Keystone that runs on the host can use `http://127.0.0.1:8765/mcp` and the default `listen_host`.
+
+   The agent in the token (`azp`) has to be listed under `agents` in Keystone's config, and its user has to be allowed the tools by the access policy. Risk `medium` and below is open to every user of the tenant. `extract` makes the text of a command available to policy as `context.args.path`; `lower` makes a rule independent of upper case.
+
+4. Add a policy that denies `run_command` when the command contains `curl`. Put it in the tenant's own directory of Keystone's policies, for example `policies/acme/access/longhaul.cedar`, and run `uv run keystone policy test policies tests/policy_cases --coverage` and `uv run keystone policy reload` there:
+
+   ```cedar
+   @id("longhaul-no-curl")
+   forbid (principal, action == Keystone::Action::"call_tool", resource == Keystone::Tool::"longhaul_sandbox__run_command")
+   when { context.args has path && context.args.path like "*curl*" };
+   ```
+
+   A rule that asks a person instead goes in the tenant's `approval/` directory and is a `permit` on the same condition, as `policies/acme/approval/mail.cedar` is in Keystone's checkout.
+
+### Check it
+
+Start the worker as usual (`uv run longhaul worker`). It logs `sandbox MCP server on http://<host>:<port>/mcp` before it takes a task. Then run the live test, which starts its own copy of the server on the address Keystone has registered, runs one allowed and one denied command through Keystone, and checks that the denied command never ran:
+
+```bash
+export KEYSTONE_URL=http://localhost:8080/mcp
+export KEYSTONE_TOKEN=$(scripts/get_token.sh olivia ops-agent)   # in the Keystone checkout
+export LONGHAUL_SANDBOX_MCP_KEY=<the same key Keystone has>
+export KEYSTONE_UPSTREAM_HOST=0.0.0.0                            # when Keystone runs in Docker
+uv run pytest tests/integration/test_keystone_backend.py -v
+```
+
+Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check: with an admin token, `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` on Keystone, or `keystone audit export`, must list both calls, the allowed one and the denied one, with the session id of the run.
+
 ## Run the evaluation
 
 `eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.

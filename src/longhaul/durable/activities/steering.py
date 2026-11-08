@@ -22,8 +22,10 @@ task to this module, which does four things:
 A command is sent once. The cursor moves forward after its signal went out, and the poll does it
 comment by comment, so a poll that fails halfway and is retried by Temporal sends the rest and
 nothing it has sent. The window that remains is a worker that dies between the signal and the
-write of the cursor, which sends that one command again. A repeated `approve`, `reject` or
-`cancel` changes nothing, since the first answer wins. A repeated `status` posts another status
+write of the cursor, which sends that one command again. A repeated `cancel` changes
+nothing, since the first request wins. With the plan gate (LH-502) the last `approve` or `reject`
+counts, and one that arrives while the planner writes the next version applies to that version, so
+a repeated rejection costs one more revision. A repeated `status` posts another status
 comment, a repeated `hint` shows the model the hint twice, and a repeated `budget` adds twice,
 which the next status shows and a person can correct.
 

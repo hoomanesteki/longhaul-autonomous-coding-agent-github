@@ -87,12 +87,14 @@ applies to a task that plans: a task without the plan switch has no plan to hold
    no decision in 24 hours". On the timeout the label stays, because a person is still needed.
 4. A decision that arrives before the wait is not lost. The signal handlers keep the last
    decision in `self.plan_decision`, and the gate takes it when it asks for one, without waiting.
-   That covers an approval sent while the planner works, and one sent while it revises. The gate
-   clears the decision when it takes it, so a decision applies to one version, and an approval or
-   a rejection that arrives after the coder started finds nobody to read it. Two decisions that
-   arrive in the same workflow task are one: the later one counts. The poller sends a command a
-   second time only after a crash between the signal and its cursor, and a repeated rejection
-   then costs one more revision.
+   That covers an approval sent while the planner works, and one sent while it revises. Such a
+   decision is taken as it is: the issue gets no request for a decision and no label goes on or
+   off. The gate sets `state.plan_approved` when it takes the decision, and the handlers do not.
+   The gate clears the decision when it takes it, so a decision applies to one version, and an
+   approval or a rejection that arrives after the coder started finds nobody to read it. Two
+   decisions that arrive in the same workflow task are one: the later one counts. The poller sends
+   a command a second time only after a crash between the signal and its cursor, and a repeated
+   rejection then costs one more revision.
 5. Replay (F13). The gate is behind `workflow.patched(PLAN_GATE_PATCH)`, asked only when the
    repo's setting is on, so a history without the gate has no marker and a history from before
    this story replays without it. The marker is in every history that passes the gate. Drop the
@@ -443,12 +445,12 @@ class TaskWorkflow:
 
     @workflow.signal
     def approve_plan(self, by: str) -> None:
-        self.state.plan_approved = True
+        # state.plan_approved is the gate's to set (_review): a late answer, after the coder has
+        # started, must not change what the hand-overs carry.
         self.plan_decision = PlanDecision(approved=True, by=by)
 
     @workflow.signal
     def reject_plan(self, by: str, feedback: str) -> None:
-        self.state.plan_approved = False
         self.plan_decision = PlanDecision(approved=False, by=by, feedback=feedback)
 
     # A task that ends while its status comment is still being posted does not wait for it: the
@@ -820,10 +822,15 @@ class TaskWorkflow:
         decision is recorded by an activity before the label comes off, and the label comes off
         for a rejection too: the person has answered, and the planner is at work on the next
         version. The label stays when the wait runs out, because a person is still needed.
+
+        A decision that arrived while the planner was at work is taken as it is: nobody is asked,
+        so no request is left on the issue and no label goes on or off.
         """
         state = self.state
         state.phase = Phase.AWAITING_PLAN_APPROVAL
-        await self._ask_for_review(version)
+        asked = self.plan_decision is None
+        if asked:
+            await self._ask_for_review(version)
         decision = await self._decision()
         if decision is None:
             return self._end(planner.undecided_outcome(acts.HINT_WAIT_HOURS), Phase.FAILED)
@@ -836,7 +843,8 @@ class TaskWorkflow:
                 by=decision.by,
             ),
         )
-        if lifecycle.is_github_task(state.spec):
+        state.plan_approved = decision.approved
+        if asked and lifecycle.is_github_task(state.spec):
             await self._label(lifecycle.on_plan_decided(state.spec, version))
         return decision
 

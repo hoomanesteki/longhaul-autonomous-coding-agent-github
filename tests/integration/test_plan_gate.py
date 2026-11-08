@@ -506,18 +506,20 @@ async def test_timeout_stuck(env: WorkflowEnvironment, fake: FakeGitHub, tmp_pat
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         await wait_for_version(handle, 1)
 
-        started = await env.get_current_time()
-        await env.sleep(timedelta(hours=23))
+        # The task still waits a minute before the day is up and has ended a minute after it. The
+        # clock of the test server jumps far ahead once the workflow is over, so the end is
+        # looked at between two sleeps and not measured afterwards.
+        await env.sleep(DAY - timedelta(minutes=1))
         assert (await handle.query(TaskWorkflow.status)).phase is Phase.AWAITING_PLAN_APPROVAL
+        await env.sleep(timedelta(minutes=2))
+        await wait_for_status(handle, lambda s: s.outcome is not None, "the end of the wait")
 
         outcome = await result_of(handle)
-        waited = await env.get_current_time() - started
         status = await handle.query(TaskWorkflow.status)
 
     assert outcome.kind is OutcomeKind.STUCK
     assert outcome.summary == "plan not approved: no decision in 24 hours"
     assert outcome.pr_url is None
-    assert waited >= DAY - timedelta(hours=1)
     assert (status.phase, status.outcome) == (Phase.FAILED, outcome)
     # Nobody decided, so the plan is as it was proposed, and the coder never ran.
     assert world.decisions(spec) == [(1, "proposed", None)]
@@ -607,6 +609,69 @@ async def test_a_rejection_sent_during_planning_is_not_lost(
     assert "Name the test file in the second step." in last_text(
         world.provider.of("planner")[1].messages
     )
+
+
+async def test_an_approval_sent_during_planning_does_not_ask_for_one(
+    env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
+) -> None:
+    """The answer is there before the plan is. The issue gets the plan and nothing that asks for
+    a decision, because a request that stays on the issue after the answer would mislead."""
+    number = fake.seed_issue(REPO, "add() subtracts")
+    spec = github_spec(number)
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    holds = {"planner": asyncio.Event(), "coder": asyncio.Event()}
+    async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
+        handle = await start_task(
+            env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
+        )
+        await wait_until(lambda: world.provider.of("planner"), "the first call of the planner")
+        await handle.signal(TaskWorkflow.approve_plan, "alice")
+        holds["planner"].set()
+        await wait_until(lambda: world.provider.of("coder"), "the first model call of the coder")
+
+        assert len(world.plan_comments(number)) == 1
+        assert world.decisions(spec) == [(1, "approved", "alice")]
+        # Nobody was asked, so there is no label to take back and no request to answer.
+        assert world.review_comments(number) == []
+        assert world.review_labels(number) == []
+        assert NEEDS_HUMAN not in fake.label_names(REPO, number)
+
+        outcome = await cancel(handle)
+        await replays(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+
+
+async def test_a_rejection_sent_during_planning_asks_about_the_revision_only(
+    env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
+) -> None:
+    number = fake.seed_issue(REPO, "add() subtracts")
+    spec = github_spec(number)
+    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    holds = {"planner": asyncio.Event(), "coder": asyncio.Event()}
+    async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
+        handle = await start_task(
+            env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
+        )
+        await wait_until(lambda: world.provider.of("planner"), "the first call of the planner")
+        await reject(handle, "alice", "Name the test file in the second step.")
+        holds["planner"].set()
+        await wait_for_version(handle, 2)
+        await wait_until(lambda: world.review_comments(number), "the request for version 2")
+
+        # Version 1 was answered before it was out, so only version 2 asks for a person.
+        (request,) = world.review_comments(number)
+        assert "version 2" in request
+        assert world.review_labels(number) == ["labeled"]
+
+        await handle.signal(TaskWorkflow.approve_plan, "bob")
+        await wait_until(lambda: world.provider.of("coder"), "the first model call of the coder")
+        assert world.decisions(spec) == [(1, "rejected", "alice"), (2, "approved", "bob")]
+        assert world.review_labels(number) == ["labeled", "unlabeled"]
+        outcome = await cancel(handle)
+        await replays(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
 
 
 async def test_an_approval_sent_while_the_planner_revises_counts_for_the_new_version(

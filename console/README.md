@@ -9,3 +9,5 @@ npm run lint && npm run typecheck && npm test && npm run build
 ```
 
 `src/api/schema.ts` is generated from `openapi.json` by `make api-types` at the top of the repo. Do not edit it.
+
+The console asks for `LONGHAUL_ADMIN_TOKEN` at the login screen and sends it as a bearer token with every call. `npm run dev` proxies `/api` to the API, so start `longhaul api` with a token set.

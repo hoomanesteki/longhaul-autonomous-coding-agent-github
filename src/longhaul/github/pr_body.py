@@ -15,7 +15,13 @@ The text comes from templates/pr_body.md.j2. This module fills it in and keeps t
   line of the template. The commit subject, which titles the pull request, gets the same
   treatment in checkpoints/squash.py.
 * **A short body.** GitHub refuses more than 65,536 characters. The summary is cut, the list of
-  files stops at MAX_FILES and a file name is cut, so the body stays far under it.
+  files stops at MAX_FILES and a file name is cut, so the body stays far under it. The run report
+  (LH-705) is the one long part. It is cut to the room that is left under MAX_BODY_CHARS, at the
+  end of a line, with a note, and a report that has no room at all is left out.
+
+The run report goes inside a `<details>` block, above the line that closes the issue. The caller
+passes the finished markdown (reports/render.py has made every text in it safe), and this module
+only fits it into the body.
 
 The test line is built from the last `run_tests` call of the task, which the caller reads from the
 `tool_calls` table and the blob store. Only the closing line of pytest's output goes in, as the
@@ -30,6 +36,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
@@ -37,9 +44,11 @@ from longhaul.checkpoints.squash import FileStat
 from longhaul.github.marks import defuse_marks
 
 __all__ = [
+    "MAX_BODY_CHARS",
     "MAX_FILES",
     "MAX_PATH_CHARS",
     "MAX_SUMMARY_CHARS",
+    "REPORT_CUT_NOTE",
     "TEMPLATE",
     "LastTestRun",
     "defuse",
@@ -51,6 +60,13 @@ MAX_FILES = 100
 MAX_PATH_CHARS = 200
 MAX_SUMMARY_CHARS = 4000
 SUMMARY_CUT = "(summary cut)"
+# The whole body stays under this, a little below the 65,536 that GitHub accepts (LH-705).
+MAX_BODY_CHARS = 60_000
+REPORT_CUT_NOTE = (
+    "(The report is cut here to keep the pull request short. `longhaul report` prints it all.)"
+)
+# The least room worth a report. Less than this leaves a heading and nothing to read.
+MIN_REPORT_CHARS = 400
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
@@ -140,6 +156,22 @@ def _environment(templates: Path) -> Environment:
     )
 
 
+def _fit_report(report: str, room: int) -> str | None:
+    """The report, cut at the end of a line to `room` characters with a note, or None.
+
+    The note is part of the room. A cut inside a table row would show a broken row, so the cut
+    falls on a line break.
+    """
+    report = report.strip()
+    if len(report) <= room:
+        return report
+    allowed = room - len(REPORT_CUT_NOTE) - 2
+    if allowed < MIN_REPORT_CHARS:
+        return None
+    kept = report[:allowed].rsplit("\n", 1)[0].rstrip()
+    return f"{kept}\n\n{REPORT_CUT_NOTE}"
+
+
 def render_pr_body(
     issue_number: int,
     summary: str,
@@ -147,23 +179,32 @@ def render_pr_body(
     tests: LastTestRun | None,
     *,
     templates: Path,
+    report: str | None = None,
+    limit: int = MAX_BODY_CHARS,
 ) -> str:
     """The body for a pull request that closes issue `issue_number`.
 
     `files` is the diff stat of the branch, in the order git gave it. `templates` is the folder
-    that holds pr_body.md.j2 (settings.templates_path).
+    that holds pr_body.md.j2 (settings.templates_path). `report` is the run report (LH-705), put
+    in a `<details>` block. The body stays under `limit` characters by cutting the report.
     """
     listed = [{"path": _path(f.path), "counts": _counts(f)} for f in files[:MAX_FILES]]
-    page = (
-        _environment(templates)
-        .get_template(TEMPLATE)
-        .render(
-            summary=_summary(summary),
-            changes=_changes(files),
-            files=listed,
-            hidden=max(len(files) - MAX_FILES, 0),
-            tested=_tested(tests),
-            issue_number=int(issue_number),
-        )
-    )
-    return str(page)
+    template = _environment(templates).get_template(TEMPLATE)
+    fields: dict[str, Any] = {
+        "summary": _summary(summary),
+        "changes": _changes(files),
+        "files": listed,
+        "hidden": max(len(files) - MAX_FILES, 0),
+        "tested": _tested(tests),
+        "issue_number": int(issue_number),
+        "report": None,
+    }
+    bare = str(template.render(**fields))
+    if not report:
+        return bare
+    # The block adds its own tags and blank lines, which the first render shows by difference.
+    framed = len(str(template.render(**{**fields, "report": "x"}))) - len(bare) - 1
+    fitted = _fit_report(report, limit - len(bare) - framed)
+    if fitted is None:
+        return bare
+    return str(template.render(**{**fields, "report": fitted}))

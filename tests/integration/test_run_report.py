@@ -22,9 +22,6 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
-from longhaul.durable.activities.report import RunReports, sql_reader
-from longhaul.reports.data import read_report_data
-from longhaul.reports.render import LESSONS_EVENT, MAX_TIMELINE_ROWS
 from psycopg import sql
 from sqlalchemy import update
 from sqlalchemy.engine import make_url
@@ -39,7 +36,10 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.models import Event, PlanRow, Task
 from longhaul.db.records import PlanRecord, SqlRecorder, ToolCallRecord, TurnRecord
 from longhaul.db.session import make_engine
+from longhaul.durable.activities.report import RunReports, sql_reader
 from longhaul.github.pr_body import MAX_BODY_CHARS, LastTestRun, render_pr_body
+from longhaul.reports.data import read_report_data
+from longhaul.reports.render import LESSONS_EVENT, MAX_TIMELINE_ROWS
 from longhaul.settings import EnvSettings, get_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase7]
@@ -217,11 +217,12 @@ async def seed_inventory_run(sessions: Sessions) -> None:
         await session.execute(
             update(PlanRow).where(PlanRow.task_id == TASK).values(created_at=at(55))
         )
-    for index, start in enumerate((250, 280, 310, 340, 370, 400)):
+    # A turn index belongs to one turn of the task, whatever its role (the key of `turns`).
+    for index, start in enumerate((250, 280, 310, 340, 370, 400), start=2):
         await add_turn(sessions, "coder", index, start)
-    await add_turn(sessions, "verifier", 6, 500)
-    await add_turn(sessions, "coder", 6, 540)
-    await add_turn(sessions, "verifier", 7, 600)
+    await add_turn(sessions, "verifier", 8, 500)
+    await add_turn(sessions, "coder", 9, 540)
+    await add_turn(sessions, "verifier", 10, 600)
     for n in range(5):
         await add_call(sessions, f"t{n}", "edit_file", ms=40 + n)
     for n in range(3):

@@ -118,6 +118,15 @@ def handle_key(task_id: str, call_id: str) -> str:
     return check_key(f"tasks/{task_id}/outputs/{call_slug(call_id)}.json")
 
 
+def report_key(task_id: str) -> str:
+    """The key of the run report of a task (LH-705), such as tasks/lh-x/report/run-report.md.
+
+    A task has one report, so the key has no turn in it. A newer report replaces the older one.
+    """
+    _require_part("task_id", task_id)
+    return check_key(f"tasks/{task_id}/report/run-report.md")
+
+
 def make_ref(data: bytes, key: str) -> BlobRef:
     """Describe data stored under key. Every BlobRef a store returns comes from here."""
     return BlobRef(key=check_key(key), sha256=hashlib.sha256(data).hexdigest(), size=len(data))

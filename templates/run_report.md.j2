@@ -1,0 +1,84 @@
+### Overview
+
+| Field | Value |
+|---|---|
+{% for row in overview %}
+| {{ row.label }} | {{ row.value }} |
+{% endfor %}
+
+### Timeline
+
+{% if timeline %}
+| At | Phase | Details |
+|---|---|---|
+{% for row in timeline %}
+| {{ row.at }} | {{ row.label }} | {{ row.detail }} |
+{% endfor %}
+{% if timeline_hidden %}
+
+{{ timeline_hidden }} more {{ "entry" if timeline_hidden == 1 else "entries" }} left out. The `events` table has all of them.
+{% endif %}
+{% else %}
+Nothing was recorded.
+{% endif %}
+
+### Tool usage
+
+{% if tools.rows %}
+| Tool | Calls | Errors | Time |
+|---|---|---|---|
+{% for row in tools.rows %}
+| {{ row.name }} | {{ row.calls }} | {{ row.errors }} | {{ row.time }} |
+{% endfor %}
+| Total | {{ tools.total.calls }} | {{ tools.total.errors }} | {{ tools.total.time }} |
+{% if tools.hidden %}
+
+and {{ tools.hidden }} more {{ "tool" if tools.hidden == 1 else "tools" }} left out.
+{% endif %}
+{% else %}
+No tool was called.
+{% endif %}
+
+### Plan
+
+{% if plan %}
+{{ plan.heading }} {{ plan.summary }}
+
+{% for step in plan.steps %}
+- [{{ step.box }}] **{{ step.id }}** ({{ step.status }}): {{ step.description }}
+{% endfor %}
+{% if plan.hidden %}
+- and {{ plan.hidden }} more {{ "step" if plan.hidden == 1 else "steps" }}
+{% endif %}
+{% else %}
+No plan was made for this task.
+{% endif %}
+
+### Interventions
+
+{% if interventions %}
+| When (UTC) | Who | What |
+|---|---|---|
+{% for row in interventions %}
+| {{ row.when }} | {{ row.who }} | {{ row.what }} |
+{% endfor %}
+{% if interventions_hidden %}
+
+and {{ interventions_hidden }} more left out.
+{% endif %}
+{% else %}
+Nobody stepped in on this task.
+{% endif %}
+
+### Candidate lessons
+
+{% if lessons %}
+{% for line in lessons %}
+- {{ line }}
+{% endfor %}
+{% if lessons_hidden %}
+- and {{ lessons_hidden }} more
+{% endif %}
+{% else %}
+No lessons were recorded for this task.
+{% endif %}

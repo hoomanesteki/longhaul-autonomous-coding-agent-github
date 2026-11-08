@@ -54,6 +54,11 @@ non-retryable error kinds of a model call, and a heartbeat timeout. It writes no
 rows of its calls. The comment itself is posted by `post_comment`, so every worker registers the
 first and only a worker with a token the second.
 
+The run report (LH-705) adds `write_run_report`, which is in the table. It reads the tables of the
+task and writes one blob, so every worker registers it. The workflow does not call it yet:
+`deliver` makes the report for the body of the pull request, and a later wind-up can call the
+activity to keep a final copy.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -733,6 +738,17 @@ class JanitorResult(BaseModel):
     failed: int = Field(default=0, ge=0)
 
 
+class RunReportInput(BaseModel):
+    """What write_run_report needs: the task, and how to call its end if the rows do not say.
+
+    `outcome` is an OutcomeKind value. A task that has already recorded its outcome ignores it.
+    The activity returns the BlobRef of the report, never the text (CONTRIBUTING.md rule 5).
+    """
+
+    task_id: str
+    outcome: str | None = None
+
+
 # ---------- activities ----------
 @dataclass(frozen=True)
 class Act[In, Out]:
@@ -1026,6 +1042,18 @@ CLEAN_REPOS = Act(
     retry=RetryPolicy(maximum_attempts=2, non_retryable_error_types=[_OVERSIZED]),
 )
 
+# The run report (LH-705). It reads the tables of the task and writes one blob, so it has the
+# numbers of section 3.7 (2 minutes, 3 attempts) and no heartbeat, and it needs no GitHub token.
+# `deliver` builds the same report inside its own activity to put it in the body of the pull
+# request, and `longhaul report` builds it without any activity at all.
+WRITE_RUN_REPORT = Act(
+    "write_run_report",
+    RunReportInput,
+    BlobRef,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -1042,6 +1070,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     STORE_PLAN,
     RECORD_STEP,
     CLEAN_REPOS,
+    WRITE_RUN_REPORT,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).

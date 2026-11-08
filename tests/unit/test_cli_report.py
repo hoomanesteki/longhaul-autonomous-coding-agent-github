@@ -8,6 +8,8 @@ tests/integration/test_run_report.py.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
@@ -87,14 +89,10 @@ def test_a_database_that_cannot_be_reached_exits_2_with_one_line(
 def test_read_report_without_a_database_url_says_which_setting_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import asyncio
+    def unset(*preferred: str | None) -> str:
+        raise RuntimeError("LONGHAUL_DATABASE_URL is not set")
 
-    monkeypatch.delenv("LONGHAUL_DATABASE_URL", raising=False)
-    monkeypatch.setattr(
-        cli,
-        "database_url",
-        lambda *preferred: (_ for _ in ()).throw(RuntimeError("LONGHAUL_DATABASE_URL is not set")),
-    )
+    monkeypatch.setattr(cli, "database_url", unset)
 
     with pytest.raises(ValueError, match="LONGHAUL_DATABASE_URL"):
         asyncio.run(cli.read_report(TASK))

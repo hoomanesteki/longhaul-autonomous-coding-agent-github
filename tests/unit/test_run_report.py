@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from longhaul.contracts import Plan, PlanStep, Usage
 from longhaul.reports.data import (
     EventInfo,
     PlanVersion,
@@ -28,8 +30,6 @@ from longhaul.reports.render import (
     MAX_TIMELINE_ROWS,
     render_run_report,
 )
-
-from longhaul.contracts import Plan, PlanStep, Usage
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase7]
 
@@ -450,3 +450,26 @@ def test_a_long_text_is_cut_to_a_line() -> None:
 
     assert len(row) < 400
     assert row.rstrip(" |").endswith("...")
+
+
+def test_the_event_types_are_the_ones_the_writers_use() -> None:
+    from longhaul.durable import acts
+    from longhaul.durable.activities import plan, workspace
+    from longhaul.durable.workflows import task
+    from longhaul.reports import render
+
+    assert render.PAUSED_EVENT == task.PAUSED_EVENT
+    assert render.RESUMED_EVENT == task.RESUMED_EVENT
+    assert render.COMPACTION_EVENT == task.COMPACTION_EVENT
+    assert render.STUCK_EVENT == task.STUCK_EVENT
+    assert render.HAND_OVER_EVENT == task.CONTINUE_AS_NEW_EVENT
+    assert render.SANDBOX_EVENT == workspace.SANDBOX_RECREATED
+    assert render.STEP_EVENT == plan.STEP_EVENT
+    assert render.OUTCOME_EVENT == acts.OUTCOME_EVENT
+
+
+def test_the_report_is_not_made_of_anything_that_could_swallow_the_pull_request_body() -> None:
+    text = render()
+
+    assert "```" not in text
+    assert not any(line.startswith(("# ", "## ")) for line in text.splitlines())

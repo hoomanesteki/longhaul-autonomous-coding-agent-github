@@ -18,5 +18,14 @@
 ## How it was tested
 
 {{ tested }}
+{% if report %}
+
+<details>
+<summary>Run report</summary>
+
+{{ report }}
+
+</details>
+{% endif %}
 
 Closes #{{ issue_number }}

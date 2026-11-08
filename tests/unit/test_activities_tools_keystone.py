@@ -125,6 +125,16 @@ async def test_a_call_held_for_approval_carries_the_question(rig: Rig) -> None:
     assert not row.ok
 
 
+async def test_an_upstream_fault_is_raised_for_temporal_to_retry(rig: Rig) -> None:
+    with pytest.raises(Exception) as caught:
+        await rig.exec("run_command", command="explode")
+
+    # Not an ApplicationError marked non-retryable, so the retry policy applies, and no row is
+    # written for a call that did not finish.
+    assert not isinstance(caught.value, ApplicationError)
+    assert rig.recorder.tool_calls == {}
+
+
 async def test_a_direct_result_has_no_question(sandbox: FakeSandbox) -> None:
     blobs = MemoryBlobStore()
     activities = ToolActivities(

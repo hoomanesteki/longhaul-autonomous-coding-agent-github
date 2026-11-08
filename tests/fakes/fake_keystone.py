@@ -35,6 +35,10 @@ UPSTREAM = "longhaul_sandbox"
 AWAIT_TOOL = "keystone__await_approval"
 DENY_WORD = "curl"
 HOLD_WORD = "deploy"
+# A command with this word makes the worker's server fail, and one with that word makes it
+# answer too late: Keystone reports them as KS_UPSTREAM_ERROR and KS_UPSTREAM_TIMEOUT.
+FAULT_WORD = "explode"
+SLOW_WORD = "stall"
 SANDBOX_TOOLS = ("run_command", "read_file", "write_file")
 
 
@@ -55,12 +59,17 @@ class FakeKeystone:
     # Approval ids by what a person decided: "approved", "rejected" or nothing yet.
     decisions: dict[str, str] = field(default_factory=dict)
     held: dict[str, Seen] = field(default_factory=dict)
+    # Approval ids whose time ran out before anyone used them (Keystone's approvals.ttl_seconds).
+    expired: set[str] = field(default_factory=set)
     # Set to make every call fail the way a gateway that is down does.
     broken: bool = False
     _issued: int = 0
 
     def decide(self, approval_id: str, verdict: str) -> None:
         self.decisions[approval_id] = verdict
+
+    def expire(self, approval_id: str) -> None:
+        self.expired.add(approval_id)
 
     def sessions(self) -> list[str | None]:
         return [seen.session for seen in self.calls]
@@ -99,6 +108,18 @@ class FakeKeystone:
             return _refusal(
                 "KS_DENIED", call_id, "denied", "policy block-curl forbids this command", {}
             )
+        if FAULT_WORD in command:
+            return _refusal(
+                "KS_UPSTREAM_ERROR", call_id, "failed", "the upstream server failed: boom", {}
+            )
+        if SLOW_WORD in command:
+            return _refusal(
+                "KS_UPSTREAM_TIMEOUT",
+                call_id,
+                "failed",
+                "the upstream server did not answer within 30 s",
+                {},
+            )
         if HOLD_WORD in command:
             self._issued += 1
             approval_id = f"apr-{self._issued}"
@@ -119,6 +140,23 @@ class FakeKeystone:
         verdict = self.decisions.get(approval_id)
         if held is None:
             return _refusal("KS_DENIED", call_id, "denied", "there is no such approval request", {})
+        # Keystone lets only the session that asked use a request, and only within its time.
+        if held.session != seen.session:
+            return _refusal(
+                "KS_DENIED",
+                call_id,
+                "denied",
+                "there is no such approval request for this session",
+                {},
+            )
+        if approval_id in self.expired:
+            return _refusal(
+                "KS_APPROVAL_EXPIRED",
+                call_id,
+                "expired",
+                "the request expired before it was used",
+                {},
+            )
         if verdict == "approved":
             command = str(held.arguments.get("command", ""))
             return _allowed(f"exit code: 0\nran {command} (approved)")

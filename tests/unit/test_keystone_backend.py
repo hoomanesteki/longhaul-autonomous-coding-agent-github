@@ -19,7 +19,7 @@ from tests.fakes.fake_keystone import AWAIT_TOOL, FakeKeystone, running_keystone
 from longhaul.contracts import ToolCall, ToolContext
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.backend import DirectBackend, Ran
-from longhaul.tools.keystone_backend import KeystoneBackend
+from longhaul.tools.keystone_backend import KeystoneBackend, KeystoneFault
 from longhaul.tools.mcp_server import CONTEXT_KEY
 from longhaul.tools.registry import default_registry
 
@@ -147,6 +147,88 @@ async def test_a_call_that_is_still_waiting_pauses_again(
     assert "apr-1" in ran.approval_question
 
 
+# ---------- an approval that cannot be used ----------
+async def test_an_approval_from_a_session_that_is_gone_is_said_so_and_asked_again(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    await run(backend, sandbox, "run_command", command="deploy now")
+    keystone.decide("apr-1", "approved")
+    # The worker restarted, or the session was idle too long: the next call opens a new one.
+    await backend.aclose()
+
+    refused = await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_2")
+
+    assert not refused.result.ok
+    assert refused.approval_question is None
+    assert "KS_DENIED" in refused.result.output
+    # The model is told the approval was lost and what asking again does, not left to guess.
+    assert "approval" in refused.result.output and "could not be used" in refused.result.output
+    again = await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_3")
+    assert keystone.calls[-1].tool == "longhaul_sandbox__run_command"
+    assert again.approval_question is not None
+    assert "apr-2" in again.approval_question
+
+
+async def test_an_expired_approval_is_said_so_and_asked_again(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    await run(backend, sandbox, "run_command", command="deploy now")
+    keystone.decide("apr-1", "approved")
+    keystone.expire("apr-1")
+
+    refused = await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_2")
+
+    assert not refused.result.ok
+    assert refused.approval_question is None
+    assert "KS_APPROVAL_EXPIRED" in refused.result.output
+    assert "could not be used" in refused.result.output
+    again = await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_3")
+    assert keystone.calls[-1].tool == "longhaul_sandbox__run_command"
+    assert again.approval_question is not None
+
+
+async def test_a_failed_await_keeps_the_request_for_the_retry(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    await run(backend, sandbox, "run_command", command="deploy now")
+    keystone.decide("apr-1", "approved")
+    keystone.broken = True
+    with pytest.raises(Exception):  # noqa: B017 - the type depends on the transport
+        await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_2")
+    keystone.broken = False
+
+    await run(backend, sandbox, "run_command", command="deploy now", call_id="toolu_2")
+
+    # The activity retry settles the same request. Sending the original call again would hold it
+    # a second time and pause the task for nothing.
+    assert [seen.tool for seen in keystone.calls] == [
+        "longhaul_sandbox__run_command",
+        AWAIT_TOOL,
+        AWAIT_TOOL,
+    ]
+
+
+# ---------- faults of the upstream ----------
+async def test_an_upstream_error_is_raised_so_the_activity_is_retried(
+    backend: KeystoneBackend, sandbox: FakeSandbox
+) -> None:
+    # The worker's server failed or could not be reached. That is not the model's doing, and a
+    # result would count toward the stuck rule instead of letting Temporal try again.
+    with pytest.raises(KeystoneFault, match="KS_UPSTREAM_ERROR"):
+        await run(backend, sandbox, "run_command", command="explode")
+
+
+async def test_an_upstream_timeout_is_raised_and_names_the_setting(
+    backend: KeystoneBackend, sandbox: FakeSandbox
+) -> None:
+    with pytest.raises(KeystoneFault, match="KS_UPSTREAM_TIMEOUT") as caught:
+        await run(backend, sandbox, "run_command", command="stall")
+
+    # The command may have run. The retry starts from the checkpoint, and the message says what
+    # to raise when the cause is a timeout that is too short.
+    assert "timeout_s" in str(caught.value)
+
+
 # ---------- the session ----------
 async def test_the_task_id_is_the_session(
     backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
@@ -178,6 +260,19 @@ async def test_the_call_carries_what_the_worker_needs_to_find_the_sandbox(
         "turn_index": 3,
         "output_max_tokens": 4000,
     }
+
+
+async def test_the_workers_context_wins_over_one_the_model_sends(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    # A prompt-injected model must not point the worker's server at another task's sandbox.
+    forged = {"task_id": "lh-other", "sandbox_id": "sbx-other", "turn_index": 0}
+
+    await run(backend, sandbox, "run_command", command="echo hi", **{CONTEXT_KEY: forged})
+
+    (seen,) = keystone.calls
+    assert seen.arguments[CONTEXT_KEY]["task_id"] == "lh-task-1"
+    assert seen.arguments[CONTEXT_KEY]["sandbox_id"] == "sbx-1"
 
 
 async def test_concurrent_first_calls_of_a_task_open_one_session(

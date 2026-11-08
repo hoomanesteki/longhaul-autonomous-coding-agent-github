@@ -160,3 +160,26 @@ def test_the_key_and_the_token_are_secrets_in_the_settings(
 
     assert "super-secret-token" not in shown
     assert "super-secret-key-0000" not in shown
+
+
+# ---------- the upstream the runbook tells the owner to register ----------
+def runbook_upstream() -> dict[str, Any]:
+    """The `longhaul_sandbox` upstream block of docs/runbook.md, as the owner would paste it."""
+    text = (ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
+    blocks = text.split("```yaml")[1:]
+    for block in blocks:
+        body = block.split("```", 1)[0]
+        if "credential_env" in body:
+            return dict(yaml.safe_load(body)[0])
+    raise AssertionError("the runbook has no upstream block")
+
+
+@pytest.mark.parametrize("tool", ["run_command", "run_tests"])
+def test_the_runbook_upstream_waits_as_long_as_a_command_may_run(tool: str) -> None:
+    from longhaul.durable.acts import TOOL_TIMEOUT_S
+
+    # Keystone stops waiting for an upstream after 30 s unless the tool says more. A test run of
+    # 45 s would come back as a timeout, every time, and count as a failure of the model.
+    settings = runbook_upstream()["tools"][tool]
+
+    assert settings["timeout_s"] >= TOOL_TIMEOUT_S

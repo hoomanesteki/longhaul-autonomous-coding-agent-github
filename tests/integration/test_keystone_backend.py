@@ -16,13 +16,22 @@ Settings, all from the environment:
   default to 127.0.0.1 and 8765. Keystone in Docker reaches this machine on host.docker.internal,
   so set the host to 0.0.0.0 then.
 - KEYSTONE_UPSTREAM_ID: the id the upstream has in Keystone. Default longhaul_sandbox.
+- KEYSTONE_ADMIN_TOKEN: a token of an admin of the same tenant. With it the test also reads
+  Keystone's audit log and checks that both calls are in it. Without it that half is skipped.
+  KEYSTONE_ADMIN_URL is the admin API, by default Keystone's address with /admin/api/v1.
+
+`finish` and `read_output` never leave the worker, so Keystone does not audit them.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
+import uuid
 from collections.abc import AsyncIterator
+from typing import Any
 
+import httpx2
 import pytest
 
 from longhaul.contracts import Sandbox, ToolCall, ToolContext
@@ -43,6 +52,30 @@ pytestmark = [
 ]
 
 MARKER = "denied-marker"
+AUDIT_WAIT_S = 15.0  # Keystone writes audit rows from a queue, so they land a moment later
+
+
+def admin_url() -> str:
+    explicit = os.environ.get("KEYSTONE_ADMIN_URL")
+    if explicit:
+        return explicit.rstrip("/")
+    base = os.environ["KEYSTONE_URL"].rstrip("/")
+    return base.removesuffix("/mcp") + "/admin/api/v1"
+
+
+async def audit_rows(tool: str, wanted: int, token: str, needle: str) -> list[dict[str, Any]]:
+    """The audit rows of `tool` whose arguments name `needle`, once there are `wanted` of them."""
+    deadline = asyncio.get_running_loop().time() + AUDIT_WAIT_S
+    async with httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"}) as http:
+        while True:
+            reply = await http.get(
+                f"{admin_url()}/audit", params={"tool": tool, "limit": 200}, timeout=10.0
+            )
+            reply.raise_for_status()
+            rows = [r for r in reply.json()["items"] if needle in str(r.get("args_redacted"))]
+            if len(rows) >= wanted or asyncio.get_running_loop().time() > deadline:
+                return rows
+            await asyncio.sleep(0.5)
 
 
 class Boxes:
@@ -77,7 +110,9 @@ async def backend(sandbox: FakeSandbox) -> AsyncIterator[KeystoneBackend]:
 
 
 async def test_denied_command_surfaces(backend: KeystoneBackend, sandbox: FakeSandbox) -> None:
-    ctx = ToolContext(task_id="lh-keystone-check", turn_index=0, blob_prefix="tasks/lh-keystone")
+    # A new id for every run, so the audit rows of this run are told from those of an earlier one.
+    task_id = f"lh-keystone-check-{uuid.uuid4().hex[:8]}"
+    ctx = ToolContext(task_id=task_id, turn_index=0, blob_prefix=f"tasks/{task_id}")
     registry = default_registry()
 
     async def call(call_id: str, command: str) -> Ran:
@@ -93,3 +128,15 @@ async def test_denied_command_surfaces(backend: KeystoneBackend, sandbox: FakeSa
     assert not denied.result.ok
     assert "KS_DENIED" in denied.result.output
     assert not (sandbox.root / MARKER).exists()
+
+    # The other half of the criterion: Keystone has both calls in its audit log, tied to this run
+    # by the task id the backend sends along and to one session.
+    admin_token = os.environ.get("KEYSTONE_ADMIN_TOKEN")
+    if not admin_token:
+        pytest.skip("LH-909: set KEYSTONE_ADMIN_TOKEN to check Keystone's audit log as well")
+    rows = await audit_rows("longhaul_sandbox__run_command", 2, admin_token, task_id)
+    assert len(rows) == 2, f"expected the allowed and the denied call in the audit log: {rows}"
+    assert len({row["session_id"] for row in rows}) == 1
+    by_outcome = {row["reject_code"]: row for row in rows}
+    assert by_outcome[None]["dispatched"] is True
+    assert by_outcome["KS_DENIED"]["dispatched"] is False

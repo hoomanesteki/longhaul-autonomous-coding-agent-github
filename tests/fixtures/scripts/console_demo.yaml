@@ -13,6 +13,9 @@
 #            stays at coding for longer than the console takes to poll, and a browser test can
 #            see it.
 #
+# Each task that submits its work has it reviewed (LH-504): the pre-check runs the repo's
+# test command, and the verifier, in a transcript of its own, passes it.
+#
 # A script sees the messages of a request and not its system prompt, where the issue text is, so
 # the tasks are told apart by the listing of the repo root that the first coder turn reads. The
 # planner is the same for all three. The steps for `stuck` come before the default steps of the
@@ -144,3 +147,14 @@ steps:
           input: {step_id: s2, status: done, note: "3 passed."}
         - name: submit_for_review
           input: {summary: "Changed add() to return a + b. All tests pass."}
+  # shipped, plan and stuck: the review of the submitted work.
+  - match: {role: verifier, turn_index: 0}
+    respond:
+      text: "The operator is fixed and the suite passes."
+      tool_calls:
+        - name: submit_verdict
+          input:
+            passed: true
+            tests_run: "pytest -q"
+            tests_summary: "3 passed"
+            issues: []

@@ -81,7 +81,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 |---|---|---|---|---|---|
 | LH-501 | Planner role and plan schema | 5 | Done | merge | 2026-11-07 |
 | LH-502 | Human plan gate | 3 | Todo | | |
-| LH-503 | Coder role with step tracking | 5 | Todo | | |
+| LH-503 | Coder role with step tracking | 5 | Done | merge | 2026-11-07 |
 | LH-504 | Verifier role and send-back loop | 5 | Todo | | |
 | LH-505 | Stuck detector | 5 | Todo | | |
 | LH-506 | Pause, ask and hint flow | 3 | Todo | | |
@@ -124,8 +124,8 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-901 | Eval task sets and runner | 5 | Done | merge | 2026-11-07 |
-| LH-902 | SWE-bench Verified adapter and grading | 8 | Todo | | |
-| LH-903 | Baselines: single-shot and naive loop | 5 | Todo | | |
+| LH-902 | SWE-bench Verified adapter and grading | 8 | Done | merge | 2026-11-07 |
+| LH-903 | Baselines: single-shot and naive loop | 5 | Done | merge | 2026-11-07 |
 | LH-904 | Full chaos suite | 5 | Todo | | |
 | LH-905 | Results report | 3 | Todo | | |
 | LH-906 | Security hardening pass | 3 | Todo | | |

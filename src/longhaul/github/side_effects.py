@@ -72,6 +72,7 @@ from longhaul.db.models import SideEffect
 from longhaul.durable.payload_guard import PayloadTooLargeError, assert_small
 from longhaul.github.client import GitHubClient, GitHubFatal, GitHubRetryable, repo_path
 from longhaul.github.inputs import CommentInput, LabelInput, PullRequestInput, key_of
+from longhaul.telemetry.logging import redact
 
 __all__ = [
     "MARKER_PREFIX",
@@ -385,7 +386,13 @@ def _identifier(item: object, field: str) -> str:
 
 
 async def post_comment(client: GitHubClient, ledger: Ledger, request: CommentInput) -> str:
-    """Post a comment once and return its id. The text gets the hidden marker after it."""
+    """Post a comment once and return its id. The text gets the hidden marker after it.
+
+    The text goes through `redact` first, so a key that a person typed in a hint or that a title
+    carried never reaches an issue that others read. The same text always gives the same result,
+    so a retry still has the same hash.
+    """
+    request = request.model_copy(update={"body": redact(request.body)})
     _need(request.body, "a comment needs text")
     path = f"{_issue_path(request.repo, request.number)}/comments"
     tag = marker(request.idempotency_key)

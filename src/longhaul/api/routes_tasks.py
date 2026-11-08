@@ -16,13 +16,14 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import TypeAdapter
 from temporalio.client import Client, WorkflowQueryFailedError
 
 from longhaul.api import paging, queries
-from longhaul.api.deps import ApiContext, Ctx
+from longhaul.api.deps import ApiContext, Ctx, authorize
 from longhaul.api.errors import (
+    PROTECTED,
     STORE_ERRORS,
     TEMPORAL_ERRORS,
     not_found,
@@ -46,13 +47,18 @@ from longhaul.api.schemas import (
 )
 from longhaul.blobs.base import BlobNotFoundError
 from longhaul.contracts import LLMResponse, Message, TaskStatus
+from longhaul.durable import acts
 from longhaul.durable import client as durable
 
-router = APIRouter(prefix="/api/tasks")
+router = APIRouter(
+    prefix="/api/tasks",
+    dependencies=[Depends(authorize)],
+    responses=PROTECTED,
+)
 
 # The name every signal of this API is sent under. The workflow keeps it: a hint is shown to the
 # model as "console: <text>" and a cancel says "cancelled by console".
-BY = "console"
+BY = acts.CONSOLE_NAME
 
 DEFAULT_PAGE = 50
 MAX_PAGE = 200

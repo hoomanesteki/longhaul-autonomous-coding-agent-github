@@ -271,6 +271,14 @@ over a Continue-As-New. The handler is best effort: a status that cannot be post
 does not fail the task, and a cancel does not wait for it, not in a turn and not at a hand-over
 (see `_settle_handlers`). It posts for a task of an issue only.
 
+A hint, a budget top-up or a plan decision that comes from the console (`by` is
+`acts.CONSOLE_NAME`) is repeated on the issue as a short comment (LH-805), so that the issue shows
+every steer. The handlers stay plain methods: `_mirror` builds the comment and starts a task that
+posts it, with the key `console:<n>`. The count is carried in the memo like the status count, the
+posts are given a short while to finish at a hand-over and at the end (`_settle_mirrors`), and a
+post that fails is logged and does not fail the task. A cancel is not repeated, because the final
+comment already names who cancelled. Replay: the mirror is behind `workflow.patched(MIRROR_PATCH)`.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -509,6 +517,7 @@ with workflow.unsafe.imports_passed_through():
     from longhaul.cost import budget
     from longhaul.durable import acts, wind_up
     from longhaul.github import lifecycle
+    from longhaul.github.inputs import CommentInput
     from longhaul.roles import coder, planner, stuck, verifier
 
 
@@ -577,6 +586,9 @@ HINT_KIND = "hint"
 
 # The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
 PAUSE_PATCH = "lh-506-pause-for-hint"
+# The mirror comments of console actions (LH-805). A history from before this story has signals
+# from the console and no activity after them, so it replays without the comment.
+MIRROR_PATCH = "lh-805-console-mirror"
 
 # The event a stuck detection records (plan section 3.5). The payload has the `reason`, which the
 # metrics count (telemetry/metrics.py), the `evidence` lines and the `turn_index`.
@@ -706,6 +718,12 @@ class TaskWorkflow:
         # The status comments posted so far, which a hand-over carries in the memo. None until
         # the first request of this run: only then is the memo read (see _next_status_number).
         self.status_posts: int | None = None
+        # The same for the comments that repeat a console action on the issue (LH-805), and the
+        # posts that are still running. A post is a task of its own, because the handler that
+        # starts it is a plain method: the signals of this class must stay callable without an
+        # event loop (tests/unit/test_task_signals.py).
+        self.console_posts: int | None = None
+        self.mirrors: set[asyncio.Task[None]] = set()
         # The counts a verifier gave when it passed the work, for the pull request. Delivery
         # follows the review in the same run, so a hand-over never has to carry it.
         self.verified_tests: str | None = None
@@ -724,6 +742,7 @@ class TaskWorkflow:
         # Cut here, in the handler, because the hints stay in the state for the whole task and
         # every llm_turn takes all of them as input (agent/hints.py).
         self.state.hints.append(f"{hints.clip_author(by)}: {hints.clip_hint(text)}")
+        self._mirror(by, "hint", text=text)
 
     @workflow.signal
     def add_budget(self, by: str, usd: float, turns: int) -> None:
@@ -732,16 +751,19 @@ class TaskWorkflow:
         self.state.extra_budget_usd += max(usd, 0.0)
         self.state.extra_turns += max(turns, 0)
         self.topped_up_by = by
+        self._mirror(by, "add_budget", usd=max(usd, 0.0), turns=max(turns, 0))
 
     @workflow.signal
     def approve_plan(self, by: str) -> None:
         # state.plan_approved is the gate's to set (_review): a late answer, after the coder has
         # started, must not change what the hand-overs carry.
         self.plan_decision = PlanDecision(approved=True, by=by)
+        self._mirror(by, "approve_plan")
 
     @workflow.signal
     def reject_plan(self, by: str, feedback: str) -> None:
         self.plan_decision = PlanDecision(approved=False, by=by, feedback=feedback)
+        self._mirror(by, "reject_plan", text=feedback)
 
     # A task that ends while its status comment is still being posted does not wait for it: the
     # person asked for the state of a task that is over, and a retry is not worth a delay.
@@ -770,6 +792,70 @@ class TaskWorkflow:
                 number,
                 spec.task_id,
                 err.cause or err,
+            )
+
+    def _mirror(
+        self,
+        by: str,
+        action: lifecycle.ConsoleAction,
+        *,
+        text: str = "",
+        usd: float = 0.0,
+        turns: int = 0,
+    ) -> None:
+        """Repeat an action of the console on the issue, so that the issue shows every steer.
+
+        Only the console needs it: a command typed on the issue is already there, and a task
+        without an issue has nowhere to write. The comment is built here, from the arguments of
+        the signal, and posted by a task of its own so that the handler stays a plain method.
+        """
+        spec = self.state.spec
+        if by != acts.CONSOLE_NAME or not lifecycle.is_github_task(spec):
+            return
+        if not workflow.patched(MIRROR_PATCH):
+            return
+        # The count goes up before anything is awaited, as for a status comment, so two actions
+        # that arrive together get two keys.
+        number = self._next_console_number()
+        comment = lifecycle.console_comment(spec, action, n=number, text=text, usd=usd, turns=turns)
+        post = asyncio.ensure_future(self._post_mirror(comment, number))
+        self.mirrors.add(post)
+        post.add_done_callback(self.mirrors.discard)
+
+    async def _post_mirror(self, comment: CommentInput, number: int) -> None:
+        try:
+            await workflow.execute_activity(
+                acts.POST_COMMENT.name,
+                comment,
+                result_type=acts.POST_COMMENT.result_type,
+                **acts.options(acts.POST_COMMENT, self._tuning()),
+            )
+        except ActivityError as err:
+            # The action itself has been taken. A missing line in the audit trail is no reason
+            # to end the task.
+            workflow.logger.warning(
+                "console comment %d of task %s not posted: %s",
+                number,
+                self.state.spec.task_id,
+                err.cause or err,
+            )
+
+    async def _settle_mirrors(self) -> None:
+        """Give the comments of console actions a short while to be posted before the task ends.
+
+        The wait ends at the first of: every post is done, or the grace (acts.STATUS_GRACE). A
+        post that is still running then is dropped with the run.
+        """
+        if not self.mirrors:
+            return
+        try:
+            await workflow.wait_condition(
+                lambda: not self.mirrors, timeout=acts.status_grace(self._tuning())
+            )
+        except TimeoutError:
+            workflow.logger.warning(
+                "task %s ends with console comments still being posted: they are dropped",
+                self.state.spec.task_id,
             )
 
     @workflow.query
@@ -889,7 +975,8 @@ class TaskWorkflow:
 
         The order is the order of what costs the most when it is left behind. The sandbox goes
         first, because GitHub can be down for twenty minutes and a container must not wait for it.
-        Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
+        Then the console comments that are still being posted get their grace. Then, for a task
+        of an issue: the draft pull request of a stuck task whose repo asked
         for one, the final comment (which links that pull request), and the final labels. The
         repo of a cancelled task goes after them, since the comment reads its diff. The lessons of
         a task that keeps memory come next (LH-605), so nobody waits for a model. The note for the
@@ -911,6 +998,8 @@ class TaskWorkflow:
                 self._cleanup_input(outcome, keep_repo=self._repo_outlives_the_sandbox(outcome)),
             ),
         )
+        # After the cleanup, so that a GitHub that is down does not hold the container.
+        await self._settle_mirrors()
         if lifecycle.is_github_task(state.spec):
             outcome = await self._open_draft(outcome)
             await self._report(outcome)
@@ -1538,25 +1627,29 @@ class TaskWorkflow:
         workflow.continue_as_new(state, memo=self._memo_to_carry())
 
     async def _settle_handlers(self) -> None:
-        """Give a status comment that is being posted a short while to finish before a hand-over.
+        """Give a comment that is being posted a short while to finish before a hand-over.
 
-        The only handler that awaits is report_status, and its activity retries for about twenty
-        minutes when GitHub fails. Waiting for it without a limit would stop the task for that
-        long, and a cancel that came in meanwhile would wait with it. So the wait ends at the
-        first of: every handler is done, a cancel request, or the grace (acts.STATUS_GRACE). In
+        The handler that awaits is report_status, and the posts that the console actions start
+        (`_mirror`) run beside the handlers. Their activity retries for about twenty minutes
+        when GitHub fails. Waiting for it without a limit would stop the task for that long, and
+        a cancel that came in meanwhile would wait with it. So the wait ends at the first of:
+        every handler and post is done, a cancel request, or the grace (acts.STATUS_GRACE). In
         the last case the comment is dropped with this run. Its number is in the memo, so no
         later comment reuses its key.
         """
-        if workflow.all_handlers_finished():
+        if workflow.all_handlers_finished() and not self.mirrors:
             return  # the usual case, and it needs no timer in the history
         try:
             await workflow.wait_condition(
-                lambda: workflow.all_handlers_finished() or self.cancel_request is not None,
+                lambda: (
+                    (workflow.all_handlers_finished() and not self.mirrors)
+                    or self.cancel_request is not None
+                ),
                 timeout=acts.status_grace(self._tuning()),
             )
         except TimeoutError:
             workflow.logger.warning(
-                "task %s hands over with a status comment still being posted: it is dropped",
+                "task %s hands over with a comment still being posted: it is dropped",
                 self.state.spec.task_id,
             )
 
@@ -2660,16 +2753,29 @@ class TaskWorkflow:
         self.status_posts += 1
         return self.status_posts
 
-    def _memo_to_carry(self) -> dict[str, Any] | None:
-        """The memo of the next run: this one, plus the count of status comments if it changed.
+    def _next_console_number(self) -> int:
+        """The number of the next console comment: the count carried in the memo, plus one."""
+        if self.console_posts is None:
+            self.console_posts = workflow.memo_value(acts.CONSOLE_MEMO_KEY, 0, type_hint=int)
+        self.console_posts += 1
+        return self.console_posts
 
-        None keeps the memo as it is, which already holds the count of an earlier run when this
-        run has had no status request. A memo that is passed replaces the whole memo, so it
-        starts from the current one.
+    def _memo_to_carry(self) -> dict[str, Any] | None:
+        """The memo of the next run: this one, plus the counts of comments that changed.
+
+        None keeps the memo as it is, which already holds the counts of an earlier run when this
+        run has had no status request and no console action. A memo that is passed replaces the
+        whole memo, so it starts from the current one.
         """
-        if self.status_posts is None:
-            return None
-        return {**workflow.memo(), acts.STATUS_MEMO_KEY: self.status_posts}
+        counts = {
+            key: count
+            for key, count in (
+                (acts.STATUS_MEMO_KEY, self.status_posts),
+                (acts.CONSOLE_MEMO_KEY, self.console_posts),
+            )
+            if count is not None
+        }
+        return {**workflow.memo(), **counts} if counts else None
 
     def _tuning(self) -> acts.Tuning | None:
         return workflow.memo_value(acts.TUNING_MEMO_KEY, None, type_hint=acts.Tuning)

@@ -30,7 +30,7 @@ Four facts shape the stack:
 | Approve, reject, hint, budget, cancel | A signal, through `durable/client.py`, sent with `by="console"` |
 | Approve and reject a memory item | `PgMemoryStore.promote` and `reject`, which keep the rules of ADR-0010 |
 
-The API sends only the signals that a person can send, and it sends them under the name `console`. The workflow records the name: a hint reaches the model as `console: <text>`, and a cancel ends with "cancelled by console". The API starts no workflow and changes no state of one in any other way. A task therefore behaves the same whether it was steered from the console, an issue comment or the CLI.
+The API sends only the signals that a person can send, and it sends them under the name `console`. The workflow records the name: a hint reaches the model as `console: <text>`, and a cancel ends with "cancelled by console". For a task of an issue the workflow also repeats a hint, a budget top-up and a plan decision from the console as a short comment on the issue (LH-805), so the issue shows every steer. The API starts no workflow and changes no state of one in any other way. A task therefore behaves the same whether it was steered from the console, an issue comment or the CLI.
 
 **The page works without Temporal.** The detail of a task has a `workflow` field (`running`, `closed`, `not_found` or `unreachable`) and a `live` status that is empty when nobody can answer. The list, the timeline, the turns and the memory pages come from the database alone. The actions answer 503 when Temporal is down, 404 for a task that has no workflow and 409 for one that has ended. `/healthz` checks the database only, for the same reason.
 
@@ -38,7 +38,9 @@ The API sends only the signals that a person can send, and it sends them under t
 
 **Lists use keyset pagination.** A cursor holds the sort key of the last row of the page. A running task writes rows between two requests, and an offset would skip or repeat some. The timeline merges the events, turns and tool calls in the database, ordered by time, then by kind, then by a key that is unique inside the kind, so a page can end in the middle of a tie.
 
-**`longhaul api` serves the app with uvicorn.** The address comes from `LONGHAUL_API_HOST` (127.0.0.1 by default) and `LONGHAUL_API_PORT` (8000). The app builds its stores when the server starts. The console has no login until LH-807, so the default keeps it on the machine it runs on.
+**The console is served by the API in a deployment.** With `LONGHAUL_CONSOLE_DIR` set to the build folder, the API also serves the console's files at `/`, and any path that is not a file gets `index.html` so that a reload of a page works. Unknown paths under `/api` stay 404. The compose `full` profile builds both in one image (`docker/api/Dockerfile`), which gives the browser one origin and the console no base URL. In development Vite serves the page and proxies `/api` to the API.
+
+**`longhaul api` serves the app with uvicorn.** The address comes from `LONGHAUL_API_HOST` (127.0.0.1 by default) and `LONGHAUL_API_PORT` (8000). The app builds its stores when the server starts. Every `/api` route needs the bearer token of `LONGHAUL_ADMIN_TOKEN` (LH-807), and the default address keeps `/metrics` open to the machine it runs on and no one else.
 
 ## Consequences
 
@@ -58,7 +60,7 @@ The API sends only the signals that a person can send, and it sends them under t
 **To watch**
 
 - A transcript can be large, and the turn endpoint returns it whole. If the console feels slow on a long task, the answer is a page of messages and not a bigger server.
-- Authentication is not here. LH-807 puts the bearer token of `LONGHAUL_ADMIN_TOKEN` in front of the routes, and until it merges the API must stay on a machine that only the operator can reach.
+- Authentication is one shared token (LH-807), not accounts. Everyone with the token can do everything, and the log does not say who signed a hint (`by` is `console`). The rate limit of 30 actions a minute is counted in the memory of one API process; a second process would need a shared counter. The token travels in a header, so the API needs TLS outside a trusted network.
 
 ## Alternatives
 

@@ -896,18 +896,32 @@ Things to know when you read the numbers:
 `longhaul api` serves the API that the console reads (LH-801, ADR-0011). It needs the stack from `make up` and the `LONGHAUL_DATABASE_URL`, `LONGHAUL_BLOB_*` and `LONGHAUL_TEMPORAL_*` settings of `.env.example`. It does not need a worker to start. The live status of a task and the actions need one.
 
 ```bash
+export LONGHAUL_ADMIN_TOKEN=$(openssl rand -hex 32)    # or put it in .env
 uv run longhaul api                      # http://127.0.0.1:8000
 uv run longhaul api --host 0.0.0.0 --port 8100
-curl -s http://127.0.0.1:8000/api/tasks | head -c 400
+curl -s -H "Authorization: Bearer $LONGHAUL_ADMIN_TOKEN" http://127.0.0.1:8000/api/tasks | head -c 400
 ```
 
-The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. There is no login until LH-807, so leave the host on `127.0.0.1` unless the machine is closed to the network. The interactive docs are at `/docs`.
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. The interactive docs are at `/docs`.
+
+**Token (LH-807).** Every `/api` route needs `Authorization: Bearer <LONGHAUL_ADMIN_TOKEN>`. A missing, malformed or wrong token gets 401, and so does every request when the server has no token, but a server without one does not start: it stops with an error that names the setting. The token is compared with `hmac.compare_digest`. Rotating it means changing the setting and restarting the API, and the console asks for the new one at the next 401.
+
+| Route | Needs the token |
+|---|---|
+| `/api/*` | Always |
+| `/healthz` | Never. A probe has no token. |
+| `/metrics` | Only when the server is not bound to this machine. With `127.0.0.1`, `::1` or `localhost` it is open, so a Prometheus on the same host scrapes it with no secret. With `0.0.0.0` or any other address it needs the token. |
+| The console's own files at `/` | Never. The login page has to load before there is a token. |
+
+A token may send 30 actions (POST routes) a minute. The 31st gets 429 with a `Retry-After` header. The count is a sliding window kept in the memory of the API process, so it is exact for one API process and is not shared between several. Reads are not limited. A request with a wrong token is refused before it is counted.
+
+Keep the token out of shell history and logs, and put the API behind TLS before it leaves a trusted network: a bearer token over plain HTTP can be read by anyone on the path.
 
 | Endpoint | Returns |
 |---|---|
 | `GET /api/tasks?status=&repo=&limit=50&cursor=` | The `tasks` rows, newest first, with `next_cursor` when there are more |
 | `GET /api/tasks/{id}` | The row, the answer of the workflow's `status` query, and the newest plan |
-| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first |
+| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first. A tool call carries its `post_sha` |
 | `GET /api/tasks/{id}/turns/{n}?attempt=` | The request and the reply of a model turn, redacted |
 | `GET /api/tasks/{id}/tool-calls/{call_id}/output?start=&end=` | Lines `start` to `end` of the full output of a tool call, redacted |
 | `POST /api/tasks/{id}/approve-plan`, `reject-plan`, `hint`, `budget`, `cancel` | Send the signal, with `by` set to `console` |
@@ -923,7 +937,32 @@ Things to know:
 - **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
 - **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
 - **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
-- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
+- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json` and `console/src/api/schema.ts`. A unit test fails when `openapi.json` is out of date, and the console job of CI fails when `schema.ts` is.
+
+## The console
+
+The console (LH-802, ADR-0011) is a Vite, React and TypeScript app in `console/`. It reads the API and nothing else. Node 24 or later and npm are the only tools it needs.
+
+```bash
+cd console && npm ci
+npm run dev          # http://localhost:5173, with /api and /healthz proxied to the API
+npm run lint && npm run typecheck && npm test && npm run build   # the checks of the console job
+```
+
+`npm run dev` expects `longhaul api` on `http://127.0.0.1:8000`. Set `LONGHAUL_API_URL` before `npm run dev` for another address. `make console-check` runs the four checks after a clean install.
+
+- **Types.** `console/src/api/schema.ts` is written by `make api-types` from `console/openapi.json`. Never edit it. Every call in `console/src/api/client.ts` names a method and a path of the generated schema, and takes its path parameters, query, body and reply types from it. A renamed or moved path, a renamed parameter, a body or query that became required, or a changed reply stops `npm run typecheck`.
+- **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The login screen keeps it only after the API accepts it (a request to `/api/repos`), and a 401 on any later call clears it and returns to the login. The sign-out button clears it and the cached pages.
+- **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). Set `LONGHAUL_ADMIN_TOKEN` in `.env` or the shell first, or the container stops at start. The container listens on `0.0.0.0`, so `/metrics` needs the token there. The image is built from `docker/api/Dockerfile`.
+- **Tasks page.** `/tasks` lists the tasks newest first and polls every 10 seconds. The status and repo filters go to the API, and "Load more" follows `next_cursor`. The "Needs you" toggle works on the rows already loaded: a task needs you in the `paused` and `awaiting_plan_approval` phases. The filters are kept in the address (`?status=&repo=&needs_you=1`). The phase comes from the `tasks` row, so it lags the live status until the activities write it (see the console API notes above).
+- **Task page.** `/tasks/:id` shows the summary of a task (phase, cost, turns, tokens, cache ratio, pull request, plan with the status of each step) and its timeline. The summary uses the workflow's own answer when there is one and says why when there is not. The timeline loads every page of `/timeline` (500 rows each) and groups the rows by turn, with the tool calls inside. Only the rows in view are in the page (`@tanstack/react-virtual`), so a task of hundreds of turns stays light. Each turn has a Details button that fetches that turn's request and reply, and each tool call with a stored output has a Show output button that fetches 200 lines at a time. The arguments of a tool call come with its turn's reply, so they show once Details is open. Events are coloured by type: compaction, pause (paused, stuck, resumed), hint, verdict, recovery (sandbox recreated, continue as new) and error. A task that has not ended is polled every 10 seconds.
+- **Actions.** The task page has an Actions section under the summary. Approve plan and Reject plan (with a feedback box) show only while the task is in `awaiting_plan_approval`. Send hint, Add budget (dollars, turns or both) and Cancel task show for every phase until the task ends. Cancel stays disabled until the task id is typed in full. Nothing shows for a task that has ended or whose workflow is closed or missing, and the page says so. Each action posts to its route, shows a toast, then fetches the task and its timeline again. A refused action keeps what was typed and shows the API's reason.
+- **Console actions on the issue.** For a task of an issue, the workflow repeats each signal that comes from the console as a short comment, so the issue shows every steer: "Hint from console:" with the text in a code fence, "Plan approved from console.", "Plan rejected from console:" with the feedback, and "Budget added from console: $2.50 and 10 turns." The text is cut to 1,000 characters and fenced so an @name in it notifies nobody. A cancel is not repeated, because the final comment already says "cancelled by console". Hints and commands typed on the issue are not repeated either, and a task without an issue posts nothing. The comments have the keys `<task>:console:<n>`, and the count is carried across a hand-over in the workflow memo (`console_posts`), as it is for `/longhaul status`. A comment that cannot be posted is logged and does not fail the task.
+- **Memory page.** `/memory` shows the notes of one repo in three tabs: Approved, Candidates and Rejected. Pick the repo in the selector; the repo and the tab stay in the address (`/memory?repo=acme/inventory&tab=candidates`). Each item shows its kind, content, source, uses and last used time. A source is a link when it has a known shape: a pull request number goes to the pull request on GitHub, a task id goes to `/tasks/<id>` in the console, and a commit sha goes to the commit. Any other reference is shown as text. Candidates have Approve and Reject, which call the same routes as `longhaul memory approve|reject` and record `console` as the approver. Each tab asks the API for its own status, so a busy repo cannot push new candidates out of view; a tab shows at most 1000 items and says so when it is cut. A repo map folds into a panel and renders as indented JSON in monospace text.
+- **CI.** The `console` job installs with `npm ci`, regenerates `schema.ts` and fails when it differs from the committed file, then runs lint, typecheck, test and build.
+- **Demo stack.** `./scripts/seed_demo.sh` serves the console with data to act on. It needs `make up`, `make sandbox-image` and `npm --prefix console run build`, and a machine with outbound network, because each task sets up a sandbox from PyPI. It creates a scratch database and a FakeGitHub with three repos, starts `longhaul worker` with the scripted model of `tests/fixtures/scripts/console_demo.yaml`, polls once, and waits until the tasks are in their states: `demo/calc-shipped` has opened a pull request, `demo/calc-stuck` is paused for a hint and `demo/calc-plan` waits for a decision on its plan. It adds two lesson candidates to the memory of `demo/calc-shipped`. Then it starts `longhaul api` with the built console and prints the address, `http://127.0.0.1:8765` unless `LH_DEMO_PORT` says otherwise. Log in with `LONGHAUL_ADMIN_TOKEN`, or with `demo-admin-token` when it is unset. The seed takes one to two minutes. Press ctrl-c to stop: the script removes its database, sandboxes, volumes, blobs, open workflows and temporary folder, and touches nothing else. It does not use the compose `api` and `worker` services, because those have no GitHub to poll.
+- **Browser test.** `make console-e2e` (or `npm run e2e` in `console/` after a build and `npx playwright install chromium`) runs `console/e2e/main-path.spec.ts` with Playwright. The test starts `scripts/seed_demo.sh` as its web server and waits for the health check of the API, which comes up only after the seed is done. It then logs in and sees three tasks, sends a hint to the stuck task and sees its phase change to `coding` within 15 seconds, approves the plan of the third task, and approves a lesson. The scripted model waits 20 seconds on the first model call after the hint, so the phase stays at `coding` for longer than the page takes to poll. The steps change the state of the stack, so the test runs once and does not retry. A failure keeps a trace and a screenshot in `console/test-results`, and CI uploads them with the report.
+- **Browser test in CI.** The `console-e2e` job runs on every push and pull request, with the services of the `e2e` job, a built sandbox image and Chromium installed by Playwright. It runs on every event and not only on `dev`, because the `ci` job waits for every job and counts a job that did not run as a failure.
 
 ## Run the evaluation
 

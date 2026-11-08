@@ -342,6 +342,17 @@ async def test_post_comment_writes_once_and_appends_the_marker(
     assert fake.count_comments(REPO, 1) == 1
 
 
+async def test_post_comment_hides_a_key_in_the_text(
+    fake: FakeGitHub, gh: GitHubClient, ledger: MemoryLedger
+) -> None:
+    # A person types a hint in the console, and the issue may be public.
+    key = "ghp_" + "A1b2C3d4E5" * 3 + "xyz"
+    await post_comment(gh, ledger, comment(f"Hint from console:\n\nuse {key} in .npmrc"))
+
+    (body,) = fake.comment_bodies(REPO, 1)
+    assert key not in body and "[redacted]" in body
+
+
 async def test_post_comment_finds_its_comment_when_the_ledger_is_lost(
     fake: FakeGitHub, gh: GitHubClient, ledger: MemoryLedger, caplog: pytest.LogCaptureFixture
 ) -> None:

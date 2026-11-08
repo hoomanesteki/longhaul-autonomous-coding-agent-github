@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types site site-preview gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate
 
 PHASE ?= 0
 
@@ -48,10 +48,29 @@ migrate:
 sandbox-image:
 	docker build -t longhaul-sandbox:py312 docker/sandbox
 
-# The OpenAPI schema of the console API. The console's typed client is generated from the file, so
-# run this after any change to src/longhaul/api and commit the result.
+# The OpenAPI schema of the console API, then the TypeScript types the console builds from it
+# (console/src/api/schema.ts). Run this after any change to src/longhaul/api and commit both
+# files. The second step needs the packages: run `npm ci` in console/ once.
 api-types:
 	uv run python scripts/dump_openapi.py
+	npm --prefix console run api:types
+
+# What the console job of CI runs: lint, typecheck, test and build.
+console-check:
+	npm --prefix console ci
+	npm --prefix console run lint
+	npm --prefix console run typecheck
+	npm --prefix console test
+	npm --prefix console run build
+
+# The browser test of the console (LH-808). Playwright starts scripts/seed_demo.sh itself, which
+# needs `make up` and `make sandbox-image` first and takes a couple of minutes to seed. To look at
+# the seeded console by hand instead, run ./scripts/seed_demo.sh after the build.
+console-e2e:
+	npm --prefix console ci
+	npm --prefix console run build
+	npm --prefix console exec -- playwright install chromium
+	npm --prefix console run e2e
 
 # The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
 # are read from docs/, so there is nothing to copy before a render.

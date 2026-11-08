@@ -62,6 +62,8 @@ from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
+from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github.inputs import CommentInput
 from longhaul.memory.embedder import HashEmbedder
 from longhaul.memory.store import PgMemoryStore
 
@@ -80,6 +82,10 @@ OPENAI_KEY = "sk-" + "a1B2c3D4" * 4
 GITHUB_TOKEN = "ghp_" + "Z9y8X7w6V5" * 4
 REDACTED = "[redacted]"
 HINT = "the tests import the copy in vendor/, edit that one"
+# The routes check a bearer token (LH-807). The tests here are about what the routes answer, so
+# the app is given a token and the client sends it; tests/integration/test_api_auth.py covers
+# the token itself.
+API_TOKEN = "admin-" + "t0K3n" * 6
 
 
 # ---------- the app ----------
@@ -115,9 +121,14 @@ async def serving(sessions: Sessions, temporal: Client | None = None) -> AsyncIt
         blobs=blobs,
         memory=PgMemoryStore(sessions, HashEmbedder()),
         temporal=connect,
+        admin_token=API_TOKEN,
     )
     transport = httpx2.ASGITransport(app=create_app(context))
-    async with httpx2.AsyncClient(transport=transport, base_url="http://api") as client:
+    async with httpx2.AsyncClient(
+        transport=transport,
+        base_url="http://api",
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
+    ) as client:
         yield Stack(client, sessions, blobs)
 
 
@@ -344,9 +355,13 @@ async def seed_timeline(sessions: Sessions) -> None:
     await add_call(sessions, "toolu_b", 12)
     await add_call(sessions, "toolu_a", 12)
     await add_call(sessions, "toolu_c", 25, turn_index=1, ok=False, exit_code=1)
+    await add_call(sessions, "toolu_d", 26, turn_index=1, post_sha=POST_SHA)
     # Rows of another task sit between the times and must not show.
     await add_turn(sessions, 0, 1, 11, task_id="lh-acme-other-1")
     await add_call(sessions, "toolu_other", 13, task_id="lh-acme-other-1")
+
+
+POST_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 # A tie in time is broken by the kind (turn, tool call, event) and then by the key of the row.
@@ -359,6 +374,7 @@ TIMELINE = [
     "turn:1/1",
     "turn:1/2",
     "call:toolu_c",
+    "call:toolu_d",
     "event:paused",
 ]
 
@@ -377,6 +393,9 @@ async def test_timeline_order(api: Stack) -> None:
     assert by_label["call:toolu_c"]["ok"] is False
     assert by_label["call:toolu_c"]["exit_code"] == 1
     assert by_label["call:toolu_c"]["name"] == "run_command"
+    # The console shows the commit a call left behind, and a call that made none has no sha.
+    assert by_label["call:toolu_d"]["post_sha"] == POST_SHA
+    assert by_label["call:toolu_c"]["post_sha"] is None
     assert [i["ts"] for i in full["items"]] == sorted(i["ts"] for i in full["items"])
 
     # The same list, four rows at a time. Nothing repeats and nothing is skipped at a seam, also
@@ -611,6 +630,89 @@ async def test_actions_signal(env: WorkflowEnvironment, sessions: Sessions) -> N
     assert unknown.status_code == 404
 
 
+def console_posts(stubs: Stubs) -> list[CommentInput]:
+    """The mirror comments of console actions, without the pickup and the other comments."""
+    return [c for c in stubs.payloads(acts.POST_COMMENT.name) if ":console:" in c.idempotency_key]
+
+
+async def test_console_hint_mirrored_to_issue(env: WorkflowEnvironment, sessions: Sessions) -> None:
+    spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await wait_for_phase(handle, Phase.PREPARING)
+
+        hinted = await api.post(f"/api/tasks/{spec.task_id}/hint", {"text": HINT})
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the mirror comment")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(handle)
+
+    assert hinted.status_code == 200
+    (mirror,) = console_posts(stubs)
+    assert (mirror.task_id, mirror.repo, mirror.number) == (spec.task_id, "acme/calc", 42)
+    assert mirror.idempotency_key == f"{spec.task_id}:console:1"
+    assert mirror.body.startswith("Hint from console:")
+    assert HINT in mirror.body
+
+
+async def test_console_actions_are_mirrored_one_comment_each(
+    env: WorkflowEnvironment, sessions: Sessions
+) -> None:
+    spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await wait_for_phase(handle, Phase.PREPARING)
+        base = f"/api/tasks/{spec.task_id}"
+
+        await api.post(f"{base}/approve-plan")
+        await api.post(f"{base}/reject-plan", {"feedback": "split step 2"})
+        await api.post(f"{base}/budget", {"usd": 2.5, "turns": 10})
+        await wait_until(lambda: len(console_posts(stubs)) == 3, "three mirror comments")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(handle)
+
+    posts = sorted(console_posts(stubs), key=lambda c: c.idempotency_key)
+    assert [c.idempotency_key for c in posts] == [f"{spec.task_id}:console:{n}" for n in (1, 2, 3)]
+    assert sorted(c.body.split(":")[0].rstrip(".") for c in posts) == [
+        "Budget added from console",
+        "Plan approved from console",
+        "Plan rejected from console",
+    ]
+    budget = next(c for c in posts if c.body.startswith("Budget"))
+    assert "$2.50" in budget.body and "10 turns" in budget.body
+
+
+async def test_only_console_actions_of_an_issue_are_mirrored(
+    env: WorkflowEnvironment, sessions: Sessions
+) -> None:
+    on_issue = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    local = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}")
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        issue_handle = await start_task(env.client, on_issue, task_queue=queue)
+        local_handle = await start_task(env.client, local, task_queue=queue)
+        await wait_for_phase(issue_handle, Phase.PREPARING)
+        await wait_for_phase(local_handle, Phase.PREPARING)
+
+        # A comment on the issue is already on the issue, and a local task has no issue.
+        await issue_handle.signal(TaskWorkflow.hint, args=["maintainer", HINT])
+        await api.post(f"/api/tasks/{local.task_id}/hint", {"text": HINT})
+        # The signal that follows is handled after the two above, so they are not still in flight.
+        await api.post(f"/api/tasks/{on_issue.task_id}/budget", {"usd": 1.0})
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the one mirror comment")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(issue_handle)
+        await result_of(local_handle)
+
+    (mirror,) = console_posts(stubs)
+    assert mirror.task_id == on_issue.task_id
+    assert mirror.body.startswith("Budget added from console")
+
+
 async def test_cancel_action_ends_the_task(env: WorkflowEnvironment, sessions: Sessions) -> None:
     spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}")
     stubs = Stubs()
@@ -653,6 +755,16 @@ async def test_actions_refuse_bad_bodies(env: WorkflowEnvironment, sessions: Ses
 
 async def test_actions_report_unreachable_temporal(api: Stack) -> None:
     response = await api.post(f"/api/tasks/{TASK}/cancel", {"reason": "stop"})
+
+    assert response.status_code == 503
+
+
+async def test_cancel_action_takes_a_null_body_like_the_console_sends(api: Stack) -> None:
+    # The console sends the JSON text `null` when it has no reason to give. Reaching Temporal
+    # (and failing there, 503) means the body passed validation.
+    response = await api.client.post(
+        f"/api/tasks/{TASK}/cancel", content="null", headers={"content-type": "application/json"}
+    )
 
     assert response.status_code == 503
 

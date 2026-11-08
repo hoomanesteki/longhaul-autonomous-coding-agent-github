@@ -415,6 +415,163 @@ jobs:
       - name: Render the docs site
         run: quarto render site
 
+  # The console (console/): lint, typecheck, test and build. The API types are generated from
+  # console/openapi.json, so the job generates them again and fails when the committed file
+  # differs, before the typecheck reads it. A test in the unit job keeps openapi.json itself in
+  # step with the Python app.
+  console:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      - run: npm run api:types
+      - run: git diff --exit-code src/api/schema.ts
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  # The browser test of the console (LH-808): Playwright drives the built console against a real
+  # worker with the scripted model, Docker sandboxes, Temporal, Postgres and MinIO. The web server
+  # of the test is scripts/seed_demo.sh, which seeds three tasks and two lesson candidates in a
+  # scratch database, so the job needs the services of the e2e job and the network for the
+  # sandbox setup. It runs on every push and pull request and not only on dev: the `ci` job waits
+  # for it, and a job that did not run counts as a failure there (tests/unit/test_ci_config.py).
+  console-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        env:
+          MINIO_ROOT_USER: longhaul
+          MINIO_ROOT_PASSWORD: longhaul-secret
+          MINIO_DEFAULT_BUCKETS: longhaul
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      LONGHAUL_DATABASE_URL: postgresql://longhaul:longhaul@localhost:5432/longhaul
+      LONGHAUL_TEMPORAL_ADDRESS: localhost:7233
+      LONGHAUL_BLOB_ENDPOINT: http://localhost:9000
+      LONGHAUL_BLOB_BUCKET: longhaul
+      LONGHAUL_BLOB_ACCESS_KEY: longhaul
+      LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+        working-directory: .
+      # The image docker-compose.yml uses (ADR-0002), pinned by digest. A tag can be moved to
+      # other content and a digest cannot, so CI and `make up` run the same server.
+      - name: Start Temporal dev server
+        env:
+          TEMPORAL_IMAGE: temporalio/temporal:1.5.1@sha256:597a5dbbcc6e7716b326dde4a51622d5ea0879eb0cf06ff8a94381361d0a987d
+        working-directory: .
+        run: |
+          docker run -d --name temporal -p 7233:7233 "$TEMPORAL_IMAGE" \
+            server start-dev --ip 0.0.0.0 --headless
+          for _ in $(seq 1 60); do
+            if docker exec temporal temporal operator cluster health \
+              --address localhost:7233 > /dev/null 2>&1; then
+              echo "temporal is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not start within 60s" >&2
+          docker logs temporal >&2
+          exit 1
+      - name: Ensure the blob bucket exists
+        working-directory: .
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+
+          import boto3
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=os.environ["LONGHAUL_BLOB_ENDPOINT"],
+              aws_access_key_id=os.environ["LONGHAUL_BLOB_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["LONGHAUL_BLOB_SECRET_KEY"],
+              region_name="us-east-1",
+          )
+          bucket = os.environ["LONGHAUL_BLOB_BUCKET"]
+          for _ in range(30):
+              try:
+                  names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+                  if bucket not in names:
+                      s3.create_bucket(Bucket=bucket)
+                  print("bucket ready")
+                  break
+              except (BotoCoreError, ClientError) as exc:
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("minio bucket was not ready in time")
+          PY
+      - name: Build sandbox image
+        working-directory: .
+        run: make sandbox-image
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "26"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci
+      # The API serves the built files (LONGHAUL_CONSOLE_DIR), so the build comes before the test.
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - name: Run the browser test
+        run: npm run e2e
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            console/playwright-report
+            console/test-results
+          if-no-files-found: ignore
+      - name: Show Temporal log on failure
+        if: failure()
+        working-directory: .
+        run: docker logs temporal || true
+
   # Checks the Terraform in deploy/terraform/aws without an AWS account: the format, then
   # `init -backend=false` (the providers, no state) and `validate`. Nothing here makes a plan or
   # applies anything, because CI holds no cloud credentials. Applying is manual and is followed
@@ -468,7 +625,7 @@ jobs:
 
   ci:
     if: always()
-    needs: [lint, types, unit, integration, e2e, security, compose, docs, terraform]
+    needs: [lint, types, unit, integration, e2e, security, compose, docs, console, console-e2e, terraform]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

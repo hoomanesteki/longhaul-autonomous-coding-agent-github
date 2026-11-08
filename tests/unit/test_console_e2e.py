@@ -1,0 +1,417 @@
+"""The browser test of the console and the stack it runs on (LH-808).
+
+The Playwright spec (console/e2e/main-path.spec.ts) needs a browser, a worker, Docker and the
+compose services, so it runs in the console-e2e job and not here. What can go wrong without any
+of that is a name that two files must share: the titles and repos the spec looks for, the lessons
+it approves, the marker that picks the scripted answers of the stuck task, the port and the CI
+job. These tests keep each pair in step, so a rename fails here in a second and not after a
+five-minute stack start.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any
+
+import pytest
+import yaml
+from tests.fakes.scripted_runs import SCRIPTS, without_waits
+
+from longhaul.contracts import (
+    LLMResponse,
+    Message,
+    TextBlock,
+    ToolResultBlock,
+    ToolSpec,
+    ToolUseBlock,
+)
+from longhaul.providers.scripted import ScriptedProvider
+from longhaul.settings import AppConfig, load_config
+
+pytestmark = [pytest.mark.unit, pytest.mark.phase8]
+
+ROOT = Path(__file__).resolve().parents[2]
+SEED = ROOT / "scripts" / "seed_demo.sh"
+DRIVER = ROOT / "scripts" / "demo_stack.py"
+SPEC = ROOT / "console" / "e2e" / "main-path.spec.ts"
+PLAYWRIGHT = ROOT / "console" / "playwright.config.ts"
+SCRIPT = SCRIPTS / "console_demo.yaml"
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+MAKEFILE = ROOT / "Makefile"
+
+
+def load_driver() -> ModuleType:
+    spec = importlib.util.spec_from_file_location("demo_stack", DRIVER)
+    assert spec and spec.loader, "scripts/demo_stack.py is missing"
+    module = importlib.util.module_from_spec(spec)
+    # A dataclass looks its module up by name while the class body runs.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def demo() -> ModuleType:
+    return load_driver()
+
+
+# ---------- the seed script ----------
+def test_the_seed_script_is_a_runnable_bash_script() -> None:
+    assert SEED.is_file(), "scripts/seed_demo.sh is missing"
+    assert os.access(SEED, os.X_OK), "scripts/seed_demo.sh is not executable"
+    assert SEED.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash\n")
+    checked = subprocess.run(["bash", "-n", str(SEED)], capture_output=True, text=True)
+    assert checked.returncode == 0, checked.stderr
+
+
+def test_the_seed_script_hands_over_to_the_driver_with_a_signal_it_can_catch() -> None:
+    text = SEED.read_text(encoding="utf-8")
+    # exec, so the SIGTERM that Playwright sends reaches the driver and not a shell around it.
+    assert re.search(r"^exec .*scripts/demo_stack\.py", text, re.M), text
+    assert "set -euo pipefail" in text
+
+
+def test_the_seed_script_and_the_playwright_config_use_one_port(demo: ModuleType) -> None:
+    config = PLAYWRIGHT.read_text(encoding="utf-8")
+    assert f'process.env.LH_DEMO_PORT ?? "{demo.DEFAULT_PORT}"' in config
+    assert "LH_DEMO_PORT" in SEED.read_text(encoding="utf-8") + DRIVER.read_text(encoding="utf-8")
+
+
+# ---------- the spec and the seed agree ----------
+def test_the_spec_looks_for_the_tasks_the_seed_makes(demo: ModuleType) -> None:
+    spec = SPEC.read_text(encoding="utf-8")
+    assert [s.key for s in demo.SCENARIOS] == ["shipped", "stuck", "plan"]
+    for scenario in demo.SCENARIOS:
+        assert f'title: "{scenario.title}"' in spec, scenario.key
+    shipped = demo.SCENARIOS[0]
+    assert f'repo: "{shipped.repo}"' in spec
+
+
+def test_the_spec_approves_the_lessons_the_seed_makes(demo: ModuleType) -> None:
+    spec = SPEC.read_text(encoding="utf-8")
+    assert len(demo.LESSONS) == 2
+    for lesson in demo.LESSONS:
+        assert f'"{lesson}"' in spec
+
+
+def test_the_spec_logs_in_with_the_token_the_seed_uses(demo: ModuleType) -> None:
+    # The driver uses "or", so an empty LONGHAUL_ADMIN_TOKEN gives the default there. The spec
+    # must treat the empty string the same way, or it types a token the API never accepted.
+    text = SPEC.read_text(encoding="utf-8")
+    assert f'process.env.LONGHAUL_ADMIN_TOKEN || "{demo.DEFAULT_TOKEN}"' in text
+    assert "LONGHAUL_ADMIN_TOKEN ??" not in text
+
+
+def test_the_spec_names_the_four_steps_of_the_plan() -> None:
+    steps = re.findall(r'test\.step\("([^"]+)"', SPEC.read_text(encoding="utf-8"))
+    assert steps == [
+        "log in and see the three tasks",
+        "send a hint to the stuck task and see it code again",
+        "approve the plan",
+        "approve a lesson",
+    ]
+
+
+def test_the_hint_step_waits_at_most_fifteen_seconds_for_coding() -> None:
+    spec = SPEC.read_text(encoding="utf-8")
+    assert "const SEEN = { timeout: 15_000 };" in spec
+    assert re.search(r'toHaveText\("coding", SEEN\)', spec)
+
+
+# ---------- the seed step ----------
+class FakeHandle:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+    async def result(self) -> Any:
+        from longhaul.contracts import OutcomeKind
+
+        return SimpleNamespace(kind=OutcomeKind.PR_OPENED, summary="")
+
+
+def seeded(demo: ModuleType, monkeypatch: pytest.MonkeyPatch, started: int) -> Any:
+    """A Demo whose Temporal client, poller and task table are fakes."""
+    import longhaul.durable.client as client_module
+
+    class FakeClient:
+        async def execute_workflow(self, *args: Any, **kwargs: Any) -> Any:
+            return SimpleNamespace(started=started)
+
+    async def connect(*args: Any, **kwargs: Any) -> FakeClient:
+        return FakeClient()
+
+    monkeypatch.setattr(client_module, "connect", connect)
+    monkeypatch.setattr(client_module, "get_task", lambda _client, task_id: FakeHandle(task_id))
+    run = demo.Demo(port="1", token="t")
+    run.fake = SimpleNamespace(label_names=lambda repo, issue: ["longhaul:needs-human"])
+    return run
+
+
+async def test_the_seed_remembers_the_tasks_when_the_poller_starts_too_few(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # close() removes workflows and sandboxes by task id, so the ids must be known before the
+    # count is checked.
+    run = seeded(demo, monkeypatch, started=2)
+    ids = {s.key: f"{s.repo.replace('/', '-')}-{run.issue_number}" for s in demo.SCENARIOS}
+    monkeypatch.setattr(run, "read_task_ids", lambda: ids)
+    try:
+        with pytest.raises(demo.DemoError, match="started 2 tasks"):
+            await run.seed_tasks()
+        assert run.task_ids == ids
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+async def test_the_seed_remembers_the_tasks_it_finds_when_a_row_is_missing(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = seeded(demo, monkeypatch, started=3)
+    found = {demo.SCENARIOS[0].key: "demo-calc-shipped-1", demo.SCENARIOS[1].key: "stuck-1"}
+    monkeypatch.setattr(run, "read_task_ids", lambda: found)
+    try:
+        with pytest.raises(demo.DemoError, match="plan"):
+            await run.seed_tasks()
+        assert run.task_ids == found
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+def test_read_task_ids_returns_the_rows_it_finds(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import psycopg
+
+    rows = [(demo.SCENARIOS[0].repo, "a-1"), ("other/repo", "x-1")]
+    conn = SimpleNamespace(execute=lambda _sql: SimpleNamespace(fetchall=lambda: rows))
+    monkeypatch.setattr(psycopg, "connect", lambda _url: _Ctx(conn))
+    run = demo.Demo(port="1", token="t")
+    run.database = "postgresql://unused"
+    try:
+        assert run.read_task_ids() == {demo.SCENARIOS[0].key: "a-1"}
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+
+
+class _Ctx:
+    def __init__(self, conn: Any) -> None:
+        self.conn = conn
+
+    def __enter__(self) -> Any:
+        return self.conn
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+
+async def test_a_status_query_that_fails_at_once_is_retried_after_a_pause(
+    demo: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from temporalio.service import RPCError, RPCStatusCode
+
+    import longhaul.durable.client as client_module
+    from longhaul.contracts import Phase
+
+    run = seeded(demo, monkeypatch, started=3)
+    ids = {s.key: f"{s.key}-1" for s in demo.SCENARIOS}
+    monkeypatch.setattr(run, "read_task_ids", lambda: ids)
+    wanted = {ids["stuck"]: Phase.PAUSED, ids["plan"]: Phase.AWAITING_PLAN_APPROVAL}
+    failures = {"left": 5}
+
+    async def read_status(handle: FakeHandle, timeout_s: float = 0) -> Any:
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise RPCError("no worker", RPCStatusCode.DEADLINE_EXCEEDED, b"")
+        return SimpleNamespace(phase=wanted[handle.task_id])
+
+    sleeps: list[float] = []
+    real_sleep = asyncio.sleep
+
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr(client_module, "read_status", read_status)
+    monkeypatch.setattr(demo.asyncio, "sleep", sleep)
+    try:
+        await run.seed_tasks()
+    finally:
+        shutil.rmtree(run.folder, ignore_errors=True)
+    # Five failed queries, each followed by a pause of a second.
+    assert sleeps.count(1) >= 5
+
+
+# ---------- the config the worker runs on ----------
+def test_only_the_plan_task_waits_for_approval(demo: ModuleType) -> None:
+    base = yaml.safe_load((ROOT / "config" / "longhaul.example.yaml").read_text(encoding="utf-8"))
+    config = demo.demo_config(base, ROOT / "config" / "pricing.yaml")
+    waiting = {r["repo"] for r in config["repos"] if r["plan_approval_required"]}
+    assert waiting == {s.repo for s in demo.SCENARIOS if s.key == "plan"}
+    assert {r["repo"] for r in config["repos"]} == {s.repo for s in demo.SCENARIOS}
+    assert all(r["allowlisted"] for r in config["repos"])
+    assert config["memory"]["embedder"] == "hash"
+
+
+def test_the_demo_config_loads_like_any_other(demo: ModuleType, tmp_path: Path) -> None:
+    base = yaml.safe_load((ROOT / "config" / "longhaul.example.yaml").read_text(encoding="utf-8"))
+    path = tmp_path / "longhaul.yaml"
+    path.write_text(
+        yaml.safe_dump(demo.demo_config(base, ROOT / "config" / "pricing.yaml")), encoding="utf-8"
+    )
+    loaded: AppConfig = load_config(path)
+    assert [r.repo for r in loaded.repos] == [s.repo for s in demo.SCENARIOS]
+
+
+def test_only_the_stuck_repo_has_the_file_the_script_keys_on(demo: ModuleType) -> None:
+    marked = {s.key: s.marker_file for s in demo.SCENARIOS if s.marker_file}
+    assert marked == {"stuck": demo.STUCK_MARKER}
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert f'request_contains: "{demo.STUCK_MARKER}"' in script
+
+
+# ---------- the scripted model ----------
+TOOLS = [
+    ToolSpec(name=name, description=f"The {name} tool.", input_schema={"type": "object"})
+    for name in (
+        "list_dir",
+        "read_file",
+        "edit_file",
+        "run_tests",
+        "update_step",
+        "submit_for_review",
+        "submit_plan",
+        "record_stuck_summary",
+    )
+]
+
+
+async def ask(
+    provider: ScriptedProvider, role: str, history: list[str], hint: str | None = None
+) -> LLMResponse:
+    """The answer to a request after `len(history)` turns, each with the given tool result."""
+    messages = [Message(role="user", content=[TextBlock(text="Start.")])]
+    for n, result in enumerate(history):
+        messages.append(
+            Message(role="assistant", content=[ToolUseBlock(id=f"toolu_{n}", name="x", input={})])
+        )
+        messages.append(
+            Message(
+                role="user", content=[ToolResultBlock(tool_use_id=f"toolu_{n}", content=result)]
+            )
+        )
+    if hint is not None:
+        messages[-1].content.append(TextBlock(text=hint))
+    return await provider.complete(
+        model="m",
+        system=f"Role: {role}\nDo the task.",
+        messages=messages,
+        tools=TOOLS,
+        max_tokens=100,
+    )
+
+
+def names(reply: LLMResponse) -> list[str]:
+    return [call.name for call in reply.tool_calls]
+
+
+@pytest.fixture
+def provider(tmp_path: Path) -> ScriptedProvider:
+    return ScriptedProvider(without_waits(SCRIPT, tmp_path))
+
+
+def listing(demo: ModuleType, key: str) -> str:
+    """What list_dir returns for the root of a scenario's repo: the files of the calc fixture."""
+    scenario = next(s for s in demo.SCENARIOS if s.key == key)
+    return "\n".join(["pyproject.toml", "src/", "tests/", scenario.marker_file or ""]).strip()
+
+
+@pytest.mark.parametrize("key", ["shipped", "plan"])
+async def test_a_task_without_the_marker_plans_and_fixes_the_bug(
+    provider: ScriptedProvider, demo: ModuleType, key: str
+) -> None:
+    seen = listing(demo, key)
+    assert names(await ask(provider, "planner", [])) == ["list_dir"]
+    assert names(await ask(provider, "planner", [seen, "ok"])) == ["submit_plan"]
+    assert names(await ask(provider, "coder", [])) == ["list_dir"]
+    assert names(await ask(provider, "coder", [seen])) == ["read_file"]
+    assert names(await ask(provider, "coder", [seen, "ok"])) == ["edit_file"]
+    assert names(await ask(provider, "coder", [seen, "ok", "ok"])) == ["run_tests"]
+    done = await ask(provider, "coder", [seen, "ok", "ok", "3 passed"])
+    assert names(done) == ["update_step", "update_step", "submit_for_review"]
+
+
+async def test_the_task_with_the_marker_lists_the_repo_and_runs_the_suite_until_it_is_stuck(
+    provider: ScriptedProvider, demo: ModuleType
+) -> None:
+    seen = listing(demo, "stuck")
+    assert names(await ask(provider, "coder", [])) == ["list_dir"]
+    for runs in range(3):
+        assert names(await ask(provider, "coder", [seen, *["1 failed"] * runs])) == ["run_tests"]
+
+
+async def test_the_hint_lets_the_stuck_task_fix_the_bug_and_wait_before_it_does(
+    provider: ScriptedProvider, demo: ModuleType
+) -> None:
+    failed = [listing(demo, "stuck"), "1 failed", "1 failed", "1 failed"]
+    hinted = await ask(provider, "coder", failed, hint="Hint from console: use +")
+    assert names(hinted) == ["edit_file"]
+    # The wait is what keeps the phase at coding long enough for the console to show it. The
+    # copy in the provider fixture has it taken out, so read it from the file.
+    steps: list[dict[str, Any]] = yaml.safe_load(SCRIPT.read_text(encoding="utf-8"))["steps"]
+    hint_step = next(s for s in steps if s["match"].get("user_text_contains") == "Hint from")
+    assert hint_step["respond"]["delay_s"] >= 20
+    assert names(await ask(provider, "coder", [*failed, "ok"])) == ["run_tests"]
+    done = await ask(provider, "coder", [*failed, "ok", "3 passed"])
+    assert names(done)[-1] == "submit_for_review"
+
+
+async def test_the_compactor_writes_the_question_of_the_stuck_task(
+    provider: ScriptedProvider,
+) -> None:
+    reply = await ask(provider, "compactor", [], hint="Why the agent is stuck: the same failure.")
+    assert names(reply) == ["record_stuck_summary"]
+
+
+# ---------- the make target and the CI job ----------
+def test_make_has_a_target_that_builds_the_console_and_runs_the_spec() -> None:
+    makefile = MAKEFILE.read_text(encoding="utf-8")
+    recipe = re.search(r"^console-e2e:\n((?:\t.+\n)+)", makefile, re.M)
+    assert recipe, "the Makefile has no console-e2e target"
+    assert "npm --prefix console run build" in recipe.group(1)
+    assert "npm --prefix console run e2e" in recipe.group(1)
+
+
+def test_the_ci_job_runs_the_spec_on_the_services_of_the_e2e_job() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+    job, e2e = jobs["console-e2e"], jobs["e2e"]
+    assert job["services"] == e2e["services"]
+    assert job["env"] == e2e["env"]
+    runs = [" ".join(str(s.get("run", "")).split()) for s in job["steps"]]
+
+    def at(fragment: str) -> int:
+        found = [i for i, run in enumerate(runs) if fragment in run]
+        assert found, f"the console-e2e job never runs {fragment!r}"
+        return found[0]
+
+    assert at("make sandbox-image") < at("npm run e2e")
+    assert at("npm run build") < at("npm run e2e")
+    assert at("playwright install") < at("npm run e2e")
+    assert "chromium" in runs[at("playwright install")]
+    assert job["defaults"]["run"]["working-directory"] == "console"
+
+
+def test_the_ci_job_keeps_the_report_when_the_spec_fails() -> None:
+    job = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]["console-e2e"]
+    uploads = [
+        s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact")
+    ]
+    assert uploads and all(s["if"] == "failure()" for s in uploads)

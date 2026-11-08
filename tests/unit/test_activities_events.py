@@ -178,3 +178,31 @@ async def test_an_outcome_event_with_a_payload_nobody_expected_counts_as_unknown
         "longhaul_tasks_total", {"outcome": "unknown", "repo": "unknown"}
     )
     assert total == 1
+
+
+# ---------- the trace of an error that ended a task (LH-507) ----------
+async def test_the_trace_of_an_error_is_written_without_a_secret() -> None:
+    recorder = MemoryRecorder()
+    token = "ghp_" + "a" * 36
+    trace = f"ApplicationError: push to https://x-access-token:{token}@github.com failed"
+    await record(
+        recorder,
+        acts.RecordEventInput(
+            task_id=TASK,
+            type=acts.ERROR_EVENT,
+            payload={"type": "CheckpointError", "trace": trace},
+        ),
+    )
+
+    (event,) = recorder.events
+    assert token not in event.payload["trace"]
+    assert "[redacted]" in event.payload["trace"]
+    assert event.payload["type"] == "CheckpointError"
+
+
+async def test_other_events_are_written_as_they_are() -> None:
+    # Only the trace of an error is filtered. A hint is the text a person wrote.
+    recorder = MemoryRecorder()
+    payload = {"text": "use ghp_" + "b" * 36}
+    await record(recorder, acts.RecordEventInput(task_id=TASK, type="hint", payload=payload))
+    assert recorder.events == [EventRecord(TASK, "hint", payload)]

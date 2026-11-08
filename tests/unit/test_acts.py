@@ -1244,3 +1244,10 @@ def test_the_draft_on_stuck_switch_rides_in_the_memo_beside_the_others() -> None
         acts.STATUS_MEMO_KEY,
     }
     assert len(keys) == 6
+
+
+def test_a_poll_and_a_sweep_at_their_longest_fit_in_one_run_of_the_poller() -> None:
+    poll = acts.POLL_ONCE.start_to_close * acts.POLL_ONCE.retry.maximum_attempts
+    sweep = acts.CLEAN_REPOS.start_to_close * acts.CLEAN_REPOS.retry.maximum_attempts
+    waits = timedelta(seconds=5 + 10 + 5)
+    assert poll + sweep + waits < acts.POLLER_RUN_TIMEOUT

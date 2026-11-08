@@ -802,8 +802,8 @@ async def submit(options: DurableOptions) -> int:
     final = await try_status(handle)
     typer.echo(outcome_line(outcome.kind, final.turn_index if final else None, outcome.summary))
     await print_task_diff(make_store(blobs, settings), task_id, final)
-    # A finished workflow leaves its sandbox until LH-507 makes it destroy it. The cleanup is
-    # safe to run twice, so this keeps working after that.
+    # The workflow destroys the sandbox of a task when it ends (LH-507). This is for a run that
+    # ended some other way, such as a worker that stopped, and the cleanup is safe to run twice.
     await remove_sandbox(make_manager, task_id)
     return 0 if outcome.kind is OutcomeKind.PR_OPENED else EXIT_ERROR
 

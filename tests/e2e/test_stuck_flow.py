@@ -148,12 +148,15 @@ async def stuck_to_pr(stack: Stack) -> None:
     assert pull["html_url"] == outcome.pr_url
     assert "3 passed" in pull["body"], pull["body"]
 
-    # The issue shows one question, the plan, the pickup and nothing else from the task.
+    # The issue shows one question, the plan, the pickup, the final comment and nothing else from
+    # the task.
     assert fake.count_comments(repo, issue, containing=":stuck:") == 1, shown
     assert fake.count_comments(repo, issue, containing=":stuck:2") == 0, shown
     comments = fake.comment_bodies(repo, issue)
     assert [c for c in comments if c.startswith("Picked up")] != []
-    assert len(comments) == 4, comments  # pickup, plan, question, and the maintainer's hint
+    # pickup, plan, question, the maintainer's hint, and the final comment
+    assert len(comments) == 5, comments
+    assert comments[-1].startswith("## Longhaul opened a draft pull request"), comments[-1]
 
     # The label came with the question, went with the answer, and the pull request label stayed.
     assert [(e.action, e.label) for e in fake.label_events(repo, issue)] == [

@@ -59,7 +59,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from longhaul.contracts import RepoSettings, TaskSpec
 from longhaul.db.models import RepoSetting
-from longhaul.settings import AppConfig, RepoEntry
+from longhaul.settings import WORKER_ONLY_FIELDS, AppConfig, RepoEntry
 
 __all__ = [
     "CUT_NOTE",
@@ -214,7 +214,8 @@ def _check_task_ids(entries: Iterable[RepoEntry]) -> None:
 def repo_rows(config: AppConfig) -> list[dict[str, Any]]:
     """The rows `sync_repo_settings` writes, sorted by repo.
 
-    `settings` holds every field of the entry except the name and the flag, so
+    `settings` holds every field of the entry except the name, the flag and the fields that only the
+    worker reads (settings.WORKER_ONLY_FIELDS), so
     `RepoSettings(repo=row["repo"], **row["settings"])` rebuilds what a task runs with.
 
     Raises ValueError for a config that cannot be a safe allowlist: a name that is neither
@@ -228,7 +229,9 @@ def repo_rows(config: AppConfig) -> list[dict[str, Any]]:
         {
             "repo": entry.repo,
             "allowlisted": entry.allowlisted,
-            "settings": entry.model_dump(mode="json", exclude={"repo", "allowlisted"}),
+            "settings": entry.model_dump(
+                mode="json", exclude={"repo", "allowlisted", *WORKER_ONLY_FIELDS}
+            ),
         }
         for entry in entries
     ]
@@ -386,7 +389,9 @@ def _why_not_a_task(entry: RepoEntry, issue: Mapping[str, Any]) -> str | None:
 def _contract_settings(entry: RepoEntry) -> RepoSettings:
     # The plain contract class. A RepoEntry inside a TaskSpec would come back from Temporal's
     # JSON as a RepoSettings and no longer equal the spec it was built into.
-    return RepoSettings.model_validate(entry.model_dump(exclude={"allowlisted"}))
+    return RepoSettings.model_validate(
+        entry.model_dump(exclude={"allowlisted", *WORKER_ONLY_FIELDS})
+    )
 
 
 def issue_to_spec(

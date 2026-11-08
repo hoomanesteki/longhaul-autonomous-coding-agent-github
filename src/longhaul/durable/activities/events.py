@@ -16,6 +16,9 @@ tasks before the row is written. A run that ends because the database is down is
 dashboard has to show, and its row is the very write that fails. The count is once per workflow
 run: a retry of this activity, or a workflow task that is retried, runs it again for the same run,
 and the second call writes a second row of the log and no second count.
+
+The trace of an error that ended a task (LH-507, acts.ERROR_EVENT) goes through the log filter's
+redaction before it is written, so a key that a message echoed does not reach the table.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from longhaul.db.records import Recorder
 from longhaul.durable import acts
 from longhaul.durable.activities.support import small
 from longhaul.telemetry import metrics
+from longhaul.telemetry.logging import redact
 
 
 class EventActivities:
@@ -55,5 +59,10 @@ class EventActivities:
             )
             await self._recorder.record_event(inp.task_id, inp.type, inp.payload)
             return
-        await self._recorder.record_event(inp.task_id, inp.type, inp.payload)
-        metrics.current().count_event(inp.type, inp.payload)
+        payload = inp.payload
+        if inp.type == acts.ERROR_EVENT:
+            # The trace of an exception can hold a URL with a token or a key in a message. The
+            # logs are redacted (telemetry/logging.py) and so is the copy in the table.
+            payload = {**payload, "trace": redact(str(payload.get("trace", "")))}
+        await self._recorder.record_event(inp.task_id, inp.type, payload)
+        metrics.current().count_event(inp.type, payload)

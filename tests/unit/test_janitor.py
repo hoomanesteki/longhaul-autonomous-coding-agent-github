@@ -12,13 +12,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from longhaul.durable.activities.janitor import JanitorActivities
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
 from longhaul.db.records import OUTCOME_EVENT, MemoryRecorder
 from longhaul.durable import acts
+from longhaul.durable.activities.janitor import JanitorActivities
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase5]
 
@@ -169,3 +169,22 @@ async def test_the_store_lists_the_task_ids_of_its_repos(tmp_path: Path) -> None
     (root / "plain-folder").mkdir()
 
     assert await store.task_ids() == ["lh-a-1", "lh-b-2"]
+
+
+async def test_the_janitor_removes_a_real_repo_folder_and_only_that_one(tmp_path: Path) -> None:
+    store = GitCheckpointStore(MemoryBlobStore(), root=tmp_path / "ckpt")
+    for name in ("lh-old-1.git", "lh-new-2.git", "lh-running-3.git"):
+        folder = store.root / name
+        (folder / "objects").mkdir(parents=True)
+        (folder / "HEAD").write_text("ref: refs/heads/main\n")
+        folder.chmod(0o555)  # git leaves object files read-only too
+    recorder = MemoryRecorder()
+    ended(recorder, "lh-old-1", 8 * DAY)
+    ended(recorder, "lh-new-2", 2 * DAY)
+
+    result = await sweep(JanitorActivities(store, recorder, clock=lambda: NOW))
+
+    assert result.removed == ["lh-old-1"]
+    assert await store.task_ids() == ["lh-new-2", "lh-running-3"]
+    for left in ("lh-new-2.git", "lh-running-3.git"):
+        (store.root / left).chmod(0o755)

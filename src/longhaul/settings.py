@@ -133,6 +133,17 @@ class RepoEntry(RepoSettings):
 
     budgets: BudgetsEntry = Field(default_factory=BudgetsEntry)
     allowlisted: bool = False
+    # A task of this repo that ends stuck opens a draft pull request with the work it has (LH-507,
+    # decision D4). Off by default: a draft nobody asked for is noise on a busy repo. The flag is
+    # a worker setting and not part of RepoSettings, which is a contract. The poller hands it to
+    # the task when it starts it (durable/acts.OPEN_DRAFT_MEMO_KEY).
+    open_draft_on_stuck: bool = False
+
+
+# The fields of a RepoEntry that RepoSettings, the contract a task runs with, does not have. They
+# are read from the config by the worker when it starts a task, so the `repo_settings` rows and
+# the TaskSpec leave them out.
+WORKER_ONLY_FIELDS = frozenset({"open_draft_on_stuck"})
 
 
 class Poller(StrictModel):

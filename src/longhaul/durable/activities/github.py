@@ -260,7 +260,7 @@ class PollerActivities:
             if prepared is None:
                 continue  # issue_to_spec has logged why
             spec, cursor = prepared
-            if await self._start(client, spec):
+            if await self._start(client, spec, entry):
                 tally.started += 1
             else:
                 tally.known += 1
@@ -291,7 +291,7 @@ class PollerActivities:
         if prepared is None:
             return None
         spec, _ = prepared
-        await self._start(client, spec)
+        await self._start(client, spec, entry)
         await self._store.record_pickup(spec, cursor=cursor)
         return spec.task_id
 
@@ -320,12 +320,19 @@ class PollerActivities:
             return None
         return spec, pickup_cursor(issue, comments)
 
-    async def _start(self, client: Client, spec: TaskSpec) -> bool:
+    async def _start(self, client: Client, spec: TaskSpec, entry: RepoEntry) -> bool:
         """Start the workflow of the task. False when it exists already, which is as good."""
         try:
             # A task of the poller plans first: the plan is what a maintainer reads before any
-            # code is written (LH-501).
-            await start_task(client, spec, task_queue=self._task_queue, plan=True)
+            # code is written (LH-501). It opens a draft of its partial work when it ends stuck,
+            # if the repo asks for that (LH-507).
+            await start_task(
+                client,
+                spec,
+                task_queue=self._task_queue,
+                plan=True,
+                open_draft_on_stuck=entry.open_draft_on_stuck,
+            )
         except WorkflowAlreadyStartedError:
             log.info("task %s exists already, so it is not started again", spec.task_id)
             return False

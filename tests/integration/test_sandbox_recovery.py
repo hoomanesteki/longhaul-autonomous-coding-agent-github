@@ -23,7 +23,7 @@ import os
 import shutil
 import subprocess
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -347,22 +347,76 @@ def reference_tree(source: Path, into: Path) -> dict[str, bytes]:
     }
 
 
-class KillsTheSandbox(ScriptedProvider):
+@dataclass
+class Seen:
+    """What a test saw in the sandbox just before the last model call of the task.
+
+    The workflow destroys the sandbox when the task ends (LH-507), so a test that wants to look at
+    the workspace the task finished in has to do it while the task still runs.
+    """
+
+    container_id: str = ""
+    status: str = ""
+    networks: set[str] = field(default_factory=set)
+    git_status: str | None = None
+    module: str = ""
+    tests: Any = None
+
+
+async def look_at_the_sandbox(stack: Stack, seen: Seen, *, run_tests: bool = False) -> None:
+    (container,) = containers_of(stack.task_id, all_states=False)
+    seen.container_id, seen.status, seen.networks = (
+        container.id,
+        container.status,
+        networks(container),
+    )
+    box = await stack.live_sandbox()
+    seen.git_status = (await box.exec("git status --porcelain", timeout_s=60)).stdout
+    seen.module = (await box.read_file(MODULE)).decode()
+    if run_tests:
+        seen.tests = await box.exec(PYTEST, timeout_s=120)
+
+
+class Looks(ScriptedProvider):
+    """A scripted provider that runs `look` before the model call that follows `at` turns."""
+
+    def __init__(self, script: Path, *, at: int, look: Callable[[], Awaitable[None]]) -> None:
+        super().__init__(script)
+        self.at, self.look = at, look
+
+    async def complete(self, **kwargs: Any) -> LLMResponse:
+        turns = sum(1 for m in kwargs["messages"] if m.role == "assistant")
+        if turns == self.at:
+            await self.look()
+        return await super().complete(**kwargs)
+
+
+class KillsTheSandbox(Looks):
     """A scripted provider that removes the task's containers just before it answers a turn.
 
     Turn `at` is the model call after the calls of turn `at - 1` have been answered, so the
     container goes while the workflow is between two tool calls, as it does when someone runs
-    `docker rm -f` on the machine.
+    `docker rm -f` on the machine. It can also look at the sandbox before the last call
+    (`look_at`, see Looks).
     """
 
-    def __init__(self, script: Path, *, at: int, task_id: str, volume: bool = False) -> None:
-        super().__init__(script)
-        self.at, self.task_id, self.volume = at, task_id, volume
+    def __init__(
+        self,
+        script: Path,
+        *,
+        at: int,
+        task_id: str,
+        volume: bool = False,
+        look_at: int,
+        look: Callable[[], Awaitable[None]],
+    ) -> None:
+        super().__init__(script, at=look_at, look=look)
+        self.kill_at, self.task_id, self.volume = at, task_id, volume
         self.killed = False
 
     async def complete(self, **kwargs: Any) -> LLMResponse:
         turns = sum(1 for m in kwargs["messages"] if m.role == "assistant")
-        if turns == self.at and not self.killed:
+        if turns == self.kill_at and not self.killed:
             self.killed = True
             await asyncio.to_thread(remove_containers, self.task_id, volume=self.volume)
         return await super().complete(**kwargs)
@@ -481,7 +535,14 @@ async def test_container_removed_is_recreated_at_head(
 ) -> None:
     """Given a running task, when its container is removed, the next tool call recreates it at
     head_sha and the task finishes with the reference diff."""
-    provider = KillsTheSandbox(SCRIPTS / "calc_fix.yaml", at=3, task_id=stack.task_id)
+    seen = Seen()
+
+    async def look() -> None:
+        await look_at_the_sandbox(stack, seen, run_tests=True)
+
+    provider = KillsTheSandbox(
+        SCRIPTS / "calc_fix.yaml", at=3, task_id=stack.task_id, look_at=4, look=look
+    )
     async with running(env, stack, provider) as queue:
         handle = await start_task(
             env.client, stack.spec(), task_queue=queue, tuning=SHORT_HEARTBEAT
@@ -512,18 +573,17 @@ async def test_container_removed_is_recreated_at_head(
     assert [kind for kind, _ in events] == [SANDBOX_RECREATED, acts.OUTCOME_EVENT]
     payload = events[0][1]
     assert payload["head_sha"] == edit_sha
-    (container,) = containers_of(stack.task_id)
-    assert payload["sandbox_id"] == container.id != payload["previous_sandbox_id"]
+    assert payload["sandbox_id"] == seen.container_id != payload["previous_sandbox_id"]
 
-    # One live container is left, and the work in it is the reference diff: the files at the
-    # final checkpoint are the files of the repo with the reference patch applied.
-    assert container.status == "running" and networks(container) == set()
+    # One live container was left until the task ended, and the work in it was the reference diff:
+    # the files at the final checkpoint are the files of the repo with the reference patch applied.
+    assert seen.status == "running" and seen.networks == set()
     expected = reference_tree(CALC, stack.tmp_path / "reference")
     assert stack.tree_at(stack.head()) == expected
-    box = await stack.live_sandbox()
-    assert (await box.exec("git status --porcelain", timeout_s=60)).stdout == ""
-    tests = await box.exec(PYTEST, timeout_s=120)
-    assert tests.exit_code == 0 and "3 passed" in tests.stdout, tests.stdout
+    assert seen.git_status == ""
+    assert seen.tests.exit_code == 0 and "3 passed" in seen.tests.stdout, seen.tests.stdout
+    # The end of the task destroyed it (LH-507). The bare repo stays for the janitor.
+    assert containers_of(stack.task_id) == []
 
 
 async def test_container_and_volume_removed_is_rebuilt_at_head(
@@ -531,7 +591,19 @@ async def test_container_and_volume_removed_is_rebuilt_at_head(
 ) -> None:
     # F3 at its worst: the workspace volume goes with the container. The new container is a
     # clone of the checkpoint branch, and the setup builds the virtualenv again.
-    provider = KillsTheSandbox(SCRIPTS / "calc_fix.yaml", at=3, task_id=stack.task_id, volume=True)
+    seen = Seen()
+
+    async def look() -> None:
+        await look_at_the_sandbox(stack, seen)
+
+    provider = KillsTheSandbox(
+        SCRIPTS / "calc_fix.yaml",
+        at=3,
+        task_id=stack.task_id,
+        volume=True,
+        look_at=4,
+        look=look,
+    )
     async with running(env, stack, provider) as queue:
         handle = await start_task(
             env.client, stack.spec(), task_queue=queue, tuning=SHORT_HEARTBEAT
@@ -545,8 +617,8 @@ async def test_container_and_volume_removed_is_rebuilt_at_head(
         (acts.OUTCOME_EVENT,),
     ]
     assert stack.tree_at(stack.head()) == reference_tree(CALC, stack.tmp_path / "reference")
-    (container,) = containers_of(stack.task_id)
-    assert container.status == "running"
+    assert seen.status == "running"
+    assert containers_of(stack.task_id) == []
 
 
 # ---------- a tool call that is retried ----------
@@ -577,6 +649,7 @@ class DiesOnce:
         self.store, self.where = store, where
         self.seen_at_death: str | None = None
         self.died = False
+        self.workspace = Seen()  # the workspace before the last model call, set by the test
 
     async def init_task(self, task_id: str, clone_url: str, base_sha: str) -> str:
         return await self.store.init_task(task_id, clone_url, base_sha)
@@ -614,7 +687,14 @@ async def run_edit_once(
     script.write_text(EDIT_ONCE)
     dies = DiesOnce(stack.store, where)
     stack.checkpoints = dies
-    async with running(env, stack, ScriptedProvider(script)) as queue:
+    seen = Seen()
+
+    async def look() -> None:
+        await look_at_the_sandbox(stack, seen)
+
+    # The finish call is the second model call. The task destroys its sandbox when it ends
+    # (LH-507), so the workspace is read before that call.
+    async with running(env, stack, Looks(script, at=1, look=look)) as queue:
         handle = await start_task(
             env.client, stack.spec(setup_command=""), task_queue=queue, tuning=SHORT_HEARTBEAT
         )
@@ -622,6 +702,7 @@ async def run_edit_once(
         history = await handle.fetch_history()
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Edited once.")
     assert dies.died
+    dies.workspace = seen
     base = stack.bare("rev-parse", "refs/tags/base")
     return dies, history, base
 
@@ -650,9 +731,8 @@ async def test_retry_after_partial_edit_applies_once(
     dies, history, base = await run_edit_once(env, stack, "before", database)
 
     check_applied_once(stack, dies, history, base)
-    box = await stack.live_sandbox()
-    assert (await box.read_file(MODULE)).decode().count("+ 1") == 1
-    assert (await box.exec("git status --porcelain", timeout_s=60)).stdout == ""
+    assert dies.workspace.module.count("+ 1") == 1
+    assert dies.workspace.git_status == ""
     # The rows say the same: one checkpoint for the call, and the call that finished is attempt 2.
     head = stack.head()
     assert database.rows("SELECT sha, kind, turn_index FROM checkpoints") == [(head, "tool", 0)]

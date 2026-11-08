@@ -27,7 +27,6 @@ from typing import Any
 import docker
 import pytest
 from docker.errors import NotFound
-from longhaul.durable.activities.outcome import FinalCommentActivities
 from temporalio import activity
 from temporalio.client import WorkflowFailureError, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -75,6 +74,7 @@ from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.outcome import FinalCommentActivities
 from longhaul.durable.activities.plan import PlanActivities, StepActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
@@ -377,9 +377,12 @@ async def test_each_outcome_reports_once(
         assert world.final_comments() == 1
         assert world.final_comment().startswith(ending.heading)
         assert world.labels() == ending.labels
-        # The sandbox is gone once, and the repo is left to the janitor.
+        # The sandbox is gone once. The repo is left to the janitor, unless a person cancelled.
         (cleaned,) = world.stubs.cleanups
-        assert cleaned.task_id == spec.task_id and cleaned.keep_repo is True
+        assert cleaned.task_id == spec.task_id and cleaned.keep_repo is (kind != "cancelled")
+        assert cleaned.reason == (
+            "not worth it" if kind == "cancelled" else f"the task ended: {kind}"
+        )
         assert cleaned.sandbox_id == f"sbx-{spec.task_id}"
         # The note the metrics count from is made once.
         assert [e["kind"] for e in world.events("outcome")] == [ending.kind.value]
@@ -865,8 +868,8 @@ async def test_no_leftover_containers(
     assert outcome.kind is expected
     assert machine.containers() == []
     assert not machine.volume_exists()
-    # What the janitor will remove in a week is still there.
-    assert machine.store.repo_path(machine.task_id).is_dir()
+    # What the janitor will remove in a week is still there, except after a cancel.
+    assert machine.store.repo_path(machine.task_id).is_dir() is (kind != "cancelled")
     noted = [e.payload["kind"] for e in machine.recorder.events if e.type == "outcome"]
     assert noted == [expected.value]
 

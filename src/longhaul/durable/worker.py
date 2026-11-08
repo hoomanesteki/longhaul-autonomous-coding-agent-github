@@ -53,6 +53,11 @@ What it is built from, and why each piece is what it is:
   either, so a worker whose config holds another number stops too. `summarize_for_human`, which
   writes the question for a person, is an activity of the compactor and renders its comment from
   the templates folder.
+* The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers
+  `post_final`, which reads the diff stats from the checkpoint store and posts the final comment
+  through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
+  that PollerWorkflow runs after each poll: it removes the bare repos under LONGHAUL_CKPT_DIR of
+  tasks that ended more than seven days ago. A worker sweeps the repos on its own disk.
 * The coder of a task with a plan (LH-503) gets a list of its own as well: the same tools without
   `finish`, then `update_step`, `submit_for_review` and `ask_human` (roles/coder.py). A coder
   without a plan keeps `finish`. `record_step` writes the events and the `step` checkpoints of
@@ -121,8 +126,10 @@ from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
+from longhaul.durable.activities.janitor import JanitorActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.memory import MemoryActivities
+from longhaul.durable.activities.outcome import FinalCommentActivities, StoreDiffs
 from longhaul.durable.activities.plan import (
     PlanActivities,
     PlanCommentActivities,
@@ -369,6 +376,7 @@ def build_parts(
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
+    janitor = JanitorActivities(store, recorder)
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
@@ -389,6 +397,9 @@ def build_parts(
                 templates=templates_path(settings),
             ).activities,
             *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
+            *FinalCommentActivities(
+                github, effects, StoreDiffs(store), templates=templates_path(settings)
+            ).activities,
         ]
     return WorkerParts(
         activities=[
@@ -400,6 +411,7 @@ def build_parts(
             *events.activities,
             *plans.activities,
             *steps.activities,
+            *janitor.activities,
             *poller.activities,
             *delivery,
         ],

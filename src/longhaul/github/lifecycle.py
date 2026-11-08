@@ -9,9 +9,13 @@ goes:
 | the pull request is open | `longhaul:working` is removed, `longhaul:pr-open` is added |
 | paused for a person | `longhaul:needs-human` is added |
 | resumed | `longhaul:needs-human` is removed |
+| ended, stuck or error | `longhaul:working` is removed, `longhaul:needs-human` is added |
+| ended, cancelled | `longhaul:working` and `longhaul:needs-human` are removed |
 
-The pause for a hint (LH-506) uses the last two rows and `stuck_comment`. The pause for a plan
-or a budget (Phases 5 and 7) will use the same helpers.
+The pause for a hint (LH-506) uses the middle two rows and `stuck_comment`. The pause for a plan
+or a budget (Phases 5 and 7) will use the same helpers. The end of a task (LH-507) uses `on_end`
+and `final_comment`: a task that opened its pull request has its labels already, a task that gave
+up or failed asks for a person, and a task that was cancelled asks for nobody.
 
 The commands of LH-308 add two comments. `status_comment` is what a task posts when a
 maintainer asks `/longhaul status`, and `denied_comment` is the answer to a command from
@@ -31,7 +35,7 @@ The module has no I/O and imports only the pure inputs, so the workflow can impo
 import re
 from typing import NamedTuple
 
-from longhaul.contracts import TaskSpec, TaskStatus
+from longhaul.contracts import OutcomeKind, TaskSpec, TaskStatus
 from longhaul.github.inputs import CommentInput, LabelInput, key_of
 
 __all__ = [
@@ -40,7 +44,9 @@ __all__ = [
     "WORKING",
     "LabelStep",
     "denied_comment",
+    "final_comment",
     "is_github_task",
+    "on_end",
     "on_pause",
     "on_pickup",
     "on_pr_opened",
@@ -134,6 +140,45 @@ def on_pause(spec: TaskSpec, pause: int) -> list[LabelStep]:
 def on_resume(spec: TaskSpec, pause: int) -> list[LabelStep]:
     """The person answered. `pause` is the number that on_pause was given."""
     return [LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off", pause))]
+
+
+def on_end(spec: TaskSpec, kind: OutcomeKind, *, pr_opened: bool) -> list[LabelStep]:
+    """The labels a task ends with, whatever way it ended.
+
+    `longhaul:working` always comes off, with the key that the swap at the pull request used, so a
+    task that ends after it opened its pull request finds the write on the ledger and changes
+    nothing. A task that delivered has its labels already (`on_pr_opened`), so it gets none here.
+    One that gave up or failed asks for a person. A cancelled one asks for nobody, and takes the
+    request back if it was paused when it was cancelled: removing a label the issue does not have
+    is not an error. `pr_opened` says that a pull request exists for a task that did not deliver,
+    which is a draft of the partial work of a stuck task.
+    """
+    if kind is OutcomeKind.PR_OPENED:
+        return []
+    steps = [LabelStep(False, _label(spec, WORKING, "label_working_off"))]
+    if kind is OutcomeKind.CANCELLED:
+        steps.append(LabelStep(False, _label(spec, NEEDS_HUMAN, "label_needs_human_off_end")))
+        return steps
+    steps.append(LabelStep(True, _label(spec, NEEDS_HUMAN, "label_needs_human_on_end")))
+    if pr_opened:
+        steps.append(LabelStep(True, _label(spec, PR_OPEN, "label_pr_open")))
+    return steps
+
+
+def final_comment(spec: TaskSpec, body: str) -> CommentInput:
+    """The report that a task leaves on its issue when it ends, under the key `<task>:final:1`.
+
+    A task ends once, so there is one such comment. The body is rendered by the post_final
+    activity (github/final_comment.py), which builds this input itself, so that a retry sends the
+    same bytes. The key lives here with the others, and a unit test keeps the two equal.
+    """
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=body,
+        idempotency_key=key_of(spec.task_id, "final", 1),
+    )
 
 
 def stuck_comment(spec: TaskSpec, pause: int, body: str) -> CommentInput:

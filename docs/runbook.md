@@ -115,9 +115,9 @@ The notes are stored as `candidate` items with `source = task`. Their `source_re
 uv run longhaul memory list --repo acme/inventory --status candidate
 ```
 
-Before they are stored, the worker cuts a note over 300 characters at a word and drops a note that is only generic advice, such as "write tests" or "read the code", unless it names a file, a command or a name of the repo. A reply that holds no usable note stores nothing and does not fail the task. A task with no plan, no notes and no stuck or verifier events makes no model call.
+Before they are stored, the worker cuts a note over 300 characters at a word and drops a note that is only generic advice, such as "write tests" or "read the code". A note stays when it names a file, a command or a name of the repo, or when it says at least three more words of substance after the phrase is taken out. A reply that holds no usable note stores nothing and does not fail the task. A task with no plan, no notes and no stuck or verifier events makes no model call.
 
-Each call of the compactor is a row on the cost ledger, and the cost is added to the task. The workflow records a `lessons` event with the status, the `source_ref` and the notes, which the run report reads. If the activity fails after its three attempts, the workflow logs it and the task keeps the outcome it had.
+Each call of the compactor is a row on the cost ledger, and the cost is added to the task. The workflow records a `lessons` event with the status, the `source_ref` and the notes, which the run report reads. The answer is kept in a blob before the first write, so an attempt that is retried after a failed write stores the same notes and does not ask the model again. If the activity fails after its three attempts, the workflow logs it and the task keeps the outcome it had.
 
 ## Run the agent on a local folder
 

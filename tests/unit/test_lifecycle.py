@@ -296,3 +296,59 @@ def test_the_final_comment_is_on_the_issue_under_one_key() -> None:
     assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
     assert comment.body == "the report"
     assert comment.idempotency_key == effect_key("lh-acme-calc-42", "final", 1)
+
+
+# ---------- the mirror of a console action (LH-805) ----------
+@pytest.mark.phase8
+def test_a_console_hint_is_quoted_on_the_issue_under_its_own_key() -> None:
+    comment = lifecycle.console_comment(spec(), "hint", n=2, text="edit vendor/, not src/")
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert comment.body.startswith("Hint from console:")
+    assert "edit vendor/, not src/" in comment.body
+    assert comment.idempotency_key == effect_key("lh-acme-calc-42", "console", 2)
+    assert not has_marker(comment.body), "the marker is added by post_comment"
+
+
+@pytest.mark.phase8
+def test_a_quoted_hint_cannot_notify_anyone_or_break_out_of_its_fence() -> None:
+    text = "ask @octocat\n```\nmore"
+
+    body = lifecycle.console_comment(spec(), "hint", n=1, text=text).body
+
+    fence = body.split("\n")[2]
+    assert set(fence) == {"`"} and len(fence) >= 4, "longer than the longest run in the text"
+    assert body.endswith(fence)
+
+
+@pytest.mark.phase8
+def test_a_long_console_hint_is_cut_for_the_issue() -> None:
+    body = lifecycle.console_comment(spec(), "hint", n=1, text="word " * 2_000).body
+
+    assert len(body) < 1_200
+    assert "..." in body
+
+
+@pytest.mark.phase8
+@pytest.mark.parametrize(
+    ("usd", "turns", "said"),
+    [
+        (2.5, 10, "$2.50 and 10 turns"),
+        (2.5, 0, "$2.50"),
+        (0.0, 1, "1 turn"),
+    ],
+)
+def test_a_console_budget_top_up_says_what_was_added(usd: float, turns: int, said: str) -> None:
+    body = lifecycle.console_comment(spec(), "add_budget", n=1, usd=usd, turns=turns).body
+
+    assert body == f"Budget added from console: {said}."
+
+
+@pytest.mark.phase8
+def test_a_console_plan_decision_is_one_short_line() -> None:
+    approved = lifecycle.console_comment(spec(), "approve_plan", n=1).body
+    rejected = lifecycle.console_comment(spec(), "reject_plan", n=2, text="split step 2").body
+
+    assert approved == "Plan approved from console."
+    assert rejected.startswith("Plan rejected from console:")
+    assert "split step 2" in rejected

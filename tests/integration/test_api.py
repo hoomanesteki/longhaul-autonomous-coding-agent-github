@@ -59,6 +59,8 @@ from longhaul.db.session import make_engine
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
+from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.github.inputs import CommentInput
 from longhaul.memory.embedder import HashEmbedder
 from longhaul.memory.store import PgMemoryStore
 
@@ -582,6 +584,89 @@ async def test_actions_signal(env: WorkflowEnvironment, sessions: Sessions) -> N
     # A task that has ended and a task that never existed are told apart from a server error.
     assert after_the_end.status_code == 409
     assert unknown.status_code == 404
+
+
+def console_posts(stubs: Stubs) -> list[CommentInput]:
+    """The mirror comments of console actions, without the pickup and the other comments."""
+    return [c for c in stubs.payloads(acts.POST_COMMENT.name) if ":console:" in c.idempotency_key]
+
+
+async def test_console_hint_mirrored_to_issue(env: WorkflowEnvironment, sessions: Sessions) -> None:
+    spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await wait_for_phase(handle, Phase.PREPARING)
+
+        hinted = await api.post(f"/api/tasks/{spec.task_id}/hint", {"text": HINT})
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the mirror comment")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(handle)
+
+    assert hinted.status_code == 200
+    (mirror,) = console_posts(stubs)
+    assert (mirror.task_id, mirror.repo, mirror.number) == (spec.task_id, "acme/calc", 42)
+    assert mirror.idempotency_key == f"{spec.task_id}:console:1"
+    assert mirror.body.startswith("Hint from console:")
+    assert HINT in mirror.body
+
+
+async def test_console_actions_are_mirrored_one_comment_each(
+    env: WorkflowEnvironment, sessions: Sessions
+) -> None:
+    spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await wait_for_phase(handle, Phase.PREPARING)
+        base = f"/api/tasks/{spec.task_id}"
+
+        await api.post(f"{base}/approve-plan")
+        await api.post(f"{base}/reject-plan", {"feedback": "split step 2"})
+        await api.post(f"{base}/budget", {"usd": 2.5, "turns": 10})
+        await wait_until(lambda: len(console_posts(stubs)) == 3, "three mirror comments")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(handle)
+
+    posts = sorted(console_posts(stubs), key=lambda c: c.idempotency_key)
+    assert [c.idempotency_key for c in posts] == [f"{spec.task_id}:console:{n}" for n in (1, 2, 3)]
+    assert sorted(c.body.split(":")[0].rstrip(".") for c in posts) == [
+        "Budget added from console",
+        "Plan approved from console",
+        "Plan rejected from console",
+    ]
+    budget = next(c for c in posts if c.body.startswith("Budget"))
+    assert "$2.50" in budget.body and "10 turns" in budget.body
+
+
+async def test_only_console_actions_of_an_issue_are_mirrored(
+    env: WorkflowEnvironment, sessions: Sessions
+) -> None:
+    on_issue = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    local = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}")
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        issue_handle = await start_task(env.client, on_issue, task_queue=queue)
+        local_handle = await start_task(env.client, local, task_queue=queue)
+        await wait_for_phase(issue_handle, Phase.PREPARING)
+        await wait_for_phase(local_handle, Phase.PREPARING)
+
+        # A comment on the issue is already on the issue, and a local task has no issue.
+        await issue_handle.signal(TaskWorkflow.hint, args=["maintainer", HINT])
+        await api.post(f"/api/tasks/{local.task_id}/hint", {"text": HINT})
+        # The signal that follows is handled after the two above, so they are not still in flight.
+        await api.post(f"/api/tasks/{on_issue.task_id}/budget", {"usd": 1.0})
+        await wait_until(lambda: len(console_posts(stubs)) == 1, "the one mirror comment")
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(issue_handle)
+        await result_of(local_handle)
+
+    (mirror,) = console_posts(stubs)
+    assert mirror.task_id == on_issue.task_id
+    assert mirror.body.startswith("Budget added from console")
 
 
 async def test_cancel_action_ends_the_task(env: WorkflowEnvironment, sessions: Sessions) -> None:

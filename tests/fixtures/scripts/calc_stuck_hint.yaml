@@ -3,7 +3,8 @@
 # without changing anything, which is the REPEATED_FAILURE rule of the stuck detector (LH-505).
 # The task then pauses, the compactor model writes the question for a person (the last step), and
 # a maintainer answers with `/longhaul hint`. Only a coder turn that follows a hint fixes the
-# bug, so the script cannot finish without one.
+# bug, so the script cannot finish without one. The work is then reviewed (LH-504): the pre-check
+# runs the repo's test command, and the verifier, in a transcript of its own, passes it.
 steps:
   - match: {role: planner, turn_index: 0}
     respond:
@@ -74,6 +75,16 @@ steps:
           input: {step_id: s2, status: done, note: "3 passed."}
         - name: submit_for_review
           input: {summary: "Changed add() to return a + b after a hint. All tests pass."}
+  - match: {role: verifier, turn_index: 0}
+    respond:
+      text: "The operator is fixed and the suite passes."
+      tool_calls:
+        - name: submit_verdict
+          input:
+            passed: true
+            tests_run: "pytest -q"
+            tests_summary: "3 passed"
+            issues: []
   - match:
       role: compactor
       user_text_contains: "Why the agent is stuck"

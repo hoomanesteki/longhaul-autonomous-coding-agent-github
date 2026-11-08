@@ -15,7 +15,10 @@ from typing import Any
 import pytest
 
 from eval import results
+from eval.chaos import results as chaos_results
+from eval.chaos.results import Summary as ChaosSummary
 from eval.report import build_report, runs, sections
+from eval.report.runs import ChaosRun
 from eval.results import TaskResult, Tokens
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
@@ -147,6 +150,38 @@ def test_reason_falls_back_to_the_outcome_summary() -> None:
     assert sections.reason_for(empty) == "Ran out of budget."
 
 
+def test_reason_of_a_task_that_never_reached_the_grader_is_why_it_stopped() -> None:
+    # The shape eval/run.py writes: the grader line only repeats the outcome, stuck_reasons stays
+    # empty, and the stuck report or the error text is in outcome_summary.
+    cases = {
+        "stuck": "stuck, the same failing test came back after six edits; no hint in 24 h",
+        "budget_exhausted": "the task spent its 2.00 dollar cap before it finished",
+        "error": "the sandbox could not start: image not found",
+    }
+    for kind, why in cases.items():
+        ended = result(
+            "r",
+            "t",
+            outcome=kind,
+            resolved=False,
+            grading=f"not graded: the task ended as {kind}",
+            outcome_summary=why,
+            stuck_reasons=[],
+        )
+        assert sections.reason_for(ended) == why
+
+
+def test_reason_of_an_ungraded_pull_request_is_the_runner_message() -> None:
+    ungraded = result(
+        "r",
+        "t",
+        resolved=None,
+        grading="not graded: the grader failed to start",
+        outcome_summary="Opened a pull request.",
+    )
+    assert sections.reason_for(ungraded) == "not graded: the grader failed to start"
+
+
 def test_reason_is_one_line_that_cannot_break_a_table() -> None:
     messy = result("r", "t", resolved=False, grading="a | b\nsecond line " + "x" * 400)
     reason = sections.reason_for(messy)
@@ -229,11 +264,43 @@ def test_no_runs_writes_the_placeholder_that_is_committed(tmp_path: Path) -> Non
     assert not (tmp_path / "img").exists()
 
 
-def test_the_committed_page_is_the_placeholder() -> None:
-    # docs/results.md is generated. Until a real run exists it must be exactly the page that the
-    # builder writes for no runs, so a hand edit shows up here.
+def test_the_committed_page_is_the_placeholder_or_a_page_the_builder_wrote() -> None:
+    # docs/results.md is generated. Until a real run exists it is exactly the page that the builder
+    # writes for no runs. After a real run it is that run's page, which names its runs and its
+    # commit, so the check rebuilds it from the result files and compares.
     committed = (ROOT / "docs" / "results.md").read_text(encoding="utf-8")
-    assert committed == build_report.placeholder_page()
+    if committed == build_report.placeholder_page():
+        return
+    rebuilt = build_report.rebuild(
+        committed,
+        results_dir=ROOT / "eval" / "results",
+        out=ROOT / "docs" / "results.md",
+        img_dir=ROOT / "docs" / "img",
+    )
+    assert committed == rebuilt
+
+
+def test_a_built_page_is_rebuilt_to_the_same_text(tmp_path: Path) -> None:
+    write_run(tmp_path, make_run("r1", ["a", "b"]))
+    out = tmp_path / "out" / "results.md"
+    img = tmp_path / "out" / "img"
+    text = build_report.build(["r1"], results_dir=tmp_path, out=out, img_dir=img, git_sha="c" * 40)
+    assert build_report.rebuild(text, results_dir=tmp_path, out=out, img_dir=img) == text
+    edited = text.replace("# Results", "# Results of my own", 1)
+    assert build_report.rebuild(edited, results_dir=tmp_path, out=out, img_dir=img) != edited
+
+
+def test_the_provenance_of_a_built_page_is_its_run_ids_and_its_commit(tmp_path: Path) -> None:
+    write_run(tmp_path, make_run("r1", ["a", "b"]))
+    write_run(tmp_path, make_run("r2", ["a", "b"], config="naive"))
+    text = build_report.build(
+        ["r1", "r2"],
+        results_dir=tmp_path,
+        out=tmp_path / "out" / "results.md",
+        img_dir=tmp_path / "out" / "img",
+        git_sha="c" * 40,
+    )
+    assert build_report.provenance(text) == (["r1", "r2"], "c" * 40)
 
 
 def test_the_placeholder_gives_the_commands_to_make_the_real_page() -> None:
@@ -241,3 +308,83 @@ def test_the_placeholder_gives_the_commands_to_make_the_real_page() -> None:
     assert "No real run has been made yet" in page
     for command in ("eval/run.py", "eval/chaos/chaos.py", "eval/report/build_report.py"):
         assert command in page
+
+
+def test_the_placeholder_records_the_chaos_tasks_with_a_model_first() -> None:
+    # Without the recording step the suite replays scripts, and the builder refuses its page.
+    page = build_report.placeholder_page()
+    record = page.index("eval/chaos/chaos.py --record --provider anthropic")
+    suite = page.index("eval/chaos/chaos.py --runs")
+    assert record < suite
+    assert "ANTHROPIC_API_KEY" in page
+
+
+def test_the_placeholder_runs_the_memory_ablation_on_a_worker_with_memory_off() -> None:
+    # --memory off is only recorded, so the worker has to be started with memory off.
+    page = build_report.placeholder_page()
+    warm = page.index("--run-id abl-warmup")
+    with_memory = page.index("--run-id abl-full")
+    restart = page.index("memory.enabled: false")
+    without = page.index("--run-id abl-no-memory")
+    assert warm < with_memory < restart < without
+    assert "LONGHAUL_CONFIG" in page
+
+
+# ---------- table 4 ----------
+def chaos_summary(tmp_path: Path) -> ChaosSummary:
+    """The committed suite with one run that did not complete and so has no diff to compare."""
+    source = ROOT / "eval" / "results" / "chaos-2026-11-07" / "summary.json"
+    base = ChaosSummary.model_validate_json(source.read_text(encoding="utf-8"))
+    found = [r.model_copy() for r in base.results]
+    broken = next(r for r in found if r.kills and r.kills[0].landed)
+    broken.completed = False
+    broken.diff_equals_reference = False
+    broken.outcome = "error"
+    return chaos_results.summarize(
+        found,
+        name=base.name,
+        seed=base.seed,
+        git_sha=base.git_sha,
+        tasks=base.tasks,
+        recordings=base.recordings,
+        started_at=base.started_at,
+        ended_at=base.ended_at,
+        clock_offset_s=base.clock_offset_s,
+        compose_project=base.compose_project,
+    )
+
+
+def test_diff_equality_is_counted_over_completed_runs_in_every_row(tmp_path: Path) -> None:
+    summary = chaos_summary(tmp_path)
+    assert summary.completed < summary.runs
+    rows = [
+        [c.strip() for c in line.strip("|").split("|")]
+        for line in sections.chaos_table(summary).splitlines()[2:]
+    ]
+    for row in rows:
+        completed = row[3].split(" / ")
+        diff = row[4].split(" / ")
+        assert diff[1] == completed[0], row  # the denominator is the runs that completed
+        assert int(diff[0]) <= int(diff[1]), row
+    assert rows[-1][4].endswith(f"/ {summary.completed}")
+
+
+def test_the_chaos_section_puts_a_blank_line_after_its_heading() -> None:
+    summary = ChaosSummary.model_validate_json(
+        (ROOT / "eval" / "results" / "chaos-2026-11-07" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    text = sections.chaos_section([ChaosRun("chaos-x", summary)])
+    assert text.startswith("## Table 4: Chaos\n\nSuite ")
+
+
+def test_one_repeated_ledger_row_is_written_in_the_singular() -> None:
+    assert sections.count_of(1, "repeated ledger row") == "1 repeated ledger row"
+    assert sections.count_of(3, "repeated ledger row") == "3 repeated ledger rows"
+    assert sections.count_of(0, "repeated ledger row") == "0 repeated ledger rows"
+
+
+def test_a_median_of_turns_keeps_its_half() -> None:
+    assert sections.half(16.5) == "16.5"
+    assert sections.half(16.0) == "16"

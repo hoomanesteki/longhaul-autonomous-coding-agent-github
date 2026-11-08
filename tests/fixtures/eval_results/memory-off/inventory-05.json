@@ -15,9 +15,9 @@
   "memory": "off",
   "context_mode": null,
   "outcome": "stuck",
-  "outcome_summary": "Stopped and asked for help.",
+  "outcome_summary": "stuck, the same failing test came back after six edits; no hint in 24 h",
   "resolved": false,
-  "grading": "no patch to grade",
+  "grading": "not graded: the task ended as stuck",
   "cost_usd": 0.4845,
   "tokens": {
     "input": 31634,
@@ -32,9 +32,7 @@
   "turns": 30,
   "compactions": 0,
   "verify_rounds": 0,
-  "stuck_reasons": [
-    "the same failing test came back after six edits"
-  ],
+  "stuck_reasons": [],
   "intervention_needed": true,
   "stopped_by_runner": null
 }

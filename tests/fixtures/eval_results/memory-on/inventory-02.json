@@ -15,9 +15,9 @@
   "memory": "on",
   "context_mode": null,
   "outcome": "error",
-  "outcome_summary": "The task ended with an error.",
+  "outcome_summary": "the agent loop failed: the provider returned an error on turn 12",
   "resolved": false,
-  "grading": "no patch to grade",
+  "grading": "not graded: the task ended as error",
   "cost_usd": 0.4411,
   "tokens": {
     "input": 24538,

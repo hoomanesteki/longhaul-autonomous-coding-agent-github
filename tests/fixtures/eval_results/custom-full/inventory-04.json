@@ -15,9 +15,9 @@
   "memory": "on",
   "context_mode": null,
   "outcome": "budget_exhausted",
-  "outcome_summary": "Ran out of budget.",
+  "outcome_summary": "the task spent its dollar cap before it finished",
   "resolved": false,
-  "grading": "no patch to grade",
+  "grading": "not graded: the task ended as budget_exhausted",
   "cost_usd": 0.8382,
   "tokens": {
     "input": 50441,

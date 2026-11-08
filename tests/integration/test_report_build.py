@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from eval.report import build_report
+from eval.report import build_report, sections, stats
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase9]
 
@@ -110,7 +110,8 @@ def test_results_table_has_a_row_per_config_with_intervals(page: tuple[str, Path
         done = sum(solved(f"swe-{config}").values())
         assert f"| {done} / 40 |" in row
         assert f"{100 * done / 40:.1f}%" in row
-        assert " to " in row  # the Wilson interval
+        # The Wilson interval of the counts in the files, not just any interval.
+        assert sections.interval(stats.wilson(done, 40)) in row
 
 
 def test_mcnemar_pairs_come_from_the_files(page: tuple[str, Path]) -> None:
@@ -151,6 +152,9 @@ def test_unresolved_tasks_are_listed_with_a_reason(page: tuple[str, Path]) -> No
     assert len(rows) >= len(unresolved)
     for task in unresolved:
         assert any(f"| {task} |" in row for row in rows), task
+    # The reason says why the task stopped, not the runner's "not graded" line that repeats the
+    # outcome column.
+    assert "the task ended as" not in table
     header = next(line for line in table.splitlines() if line.startswith("| Task |"))
     assert all(row.count("|") == header.count("|") for row in rows)
 

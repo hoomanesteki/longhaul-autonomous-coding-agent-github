@@ -15,9 +15,9 @@
   "memory": "on",
   "context_mode": null,
   "outcome": "stuck",
-  "outcome_summary": "Stopped and asked for help.",
+  "outcome_summary": "stuck, no new file was read or changed for eight turns; no hint in 24 h",
   "resolved": false,
-  "grading": "no patch to grade",
+  "grading": "not graded: the task ended as stuck",
   "cost_usd": 0.4425,
   "tokens": {
     "input": 25244,
@@ -32,9 +32,7 @@
   "turns": 14,
   "compactions": 0,
   "verify_rounds": 0,
-  "stuck_reasons": [
-    "no new file was read or changed for eight turns"
-  ],
+  "stuck_reasons": [],
   "intervention_needed": true,
   "stopped_by_runner": null
 }

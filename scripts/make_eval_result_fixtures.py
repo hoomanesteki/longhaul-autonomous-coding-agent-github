@@ -41,6 +41,7 @@ GIT_SHA = "0123456789abcdef0123456789abcdef01234567"
 START = datetime(2026, 11, 1, 9, 0, tzinfo=UTC)
 LONG_CATEGORIES = {"refactor", "dependency", "flaky"}
 
+NOT_GRADED = "not graded: the task ended as {kind}"  # what eval/run.py writes
 STUCK_REASONS = [
     "the same failing test came back after six edits",
     "no new file was read or changed for eight turns",
@@ -93,7 +94,7 @@ def make_run(
     for index, task_id in enumerate(tasks):
         easy = difficulty[index] / len(tasks)  # the same hidden difficulty in every run
         solved = easy + rng.uniform(-0.2, 0.2) < skill
-        outcome, resolved, grading, reasons, paused = outcome_of(
+        outcome, resolved, grading, stuck_report, paused = outcome_of(
             solved, config, rng, last=index >= len(tasks) - ungraded
         )
         started = START + timedelta(minutes=7 * index)
@@ -123,7 +124,7 @@ def make_run(
                 memory=memory,
                 context_mode=context_mode,
                 outcome=outcome,
-                outcome_summary=summary_of(outcome),
+                outcome_summary=summary_of(outcome, stuck_report),
                 resolved=resolved,
                 grading=grading,
                 cost_usd=spent,
@@ -133,7 +134,8 @@ def make_run(
                 ended_at=started + timedelta(seconds=wall),
                 wall_time_s=wall,
                 turns=1 if config == "single_shot" else max(2, int(turns * rng.uniform(0.6, 1.4))),
-                stuck_reasons=reasons,
+                # The runner leaves this empty until the stuck detector fills it in.
+                stuck_reasons=[],
                 intervention_needed=paused,
             ),
         )
@@ -143,27 +145,40 @@ def make_run(
 def outcome_of(
     solved: bool, config: results.Config, rng: random.Random, *, last: bool
 ) -> tuple[str, bool | None, str, list[str], bool]:
-    """(outcome, resolved, grading, stuck reasons, paused) of one task."""
+    """(outcome, resolved, grading, stuck report, paused) of one task.
+
+    The grading line of a task that ended without a pull request is the one eval/run.py writes.
+    The stuck report is not a result field: it goes into the end summary, where the runner
+    keeps it.
+    """
     if last:
-        return "pr_opened", None, "not graded yet", [], False
+        return "pr_opened", None, "not graded yet", "", False
     if solved:
-        return "pr_opened", True, "all tests passed", [], False
+        return "pr_opened", True, "all tests passed", "", False
     kind = rng.choice(["wrong", "wrong", "stuck", "budget", "error"])
     if kind == "stuck" and config == "full":
-        return "stuck", False, "no patch to grade", [rng.choice(STUCK_REASONS)], True
+        report = rng.choice(STUCK_REASONS)
+        return "stuck", False, NOT_GRADED.format(kind="stuck"), report, True
     if kind == "budget":
-        return "budget_exhausted", False, "no patch to grade", [], config == "full"
+        return (
+            "budget_exhausted",
+            False,
+            NOT_GRADED.format(kind="budget_exhausted"),
+            "",
+            (config == "full"),
+        )
     if kind == "error" and config != "single_shot":
-        return "error", False, "no patch to grade", [], False
-    return "pr_opened", False, f"{rng.randint(1, 4)} tests failed", [], False
+        return "error", False, NOT_GRADED.format(kind="error"), "", False
+    return "pr_opened", False, f"{rng.randint(1, 4)} tests failed", "", False
 
 
-def summary_of(outcome: str) -> str:
+def summary_of(outcome: str, stuck_report: str) -> str:
+    """The end summary, as the roles write it: the stuck report, the cap, or the error text."""
     return {
         "pr_opened": "Opened a pull request.",
-        "stuck": "Stopped and asked for help.",
-        "budget_exhausted": "Ran out of budget.",
-        "error": "The task ended with an error.",
+        "stuck": f"stuck, {stuck_report}; no hint in 24 h",
+        "budget_exhausted": "the task spent its dollar cap before it finished",
+        "error": "the agent loop failed: the provider returned an error on turn 12",
     }.get(outcome, outcome)
 
 

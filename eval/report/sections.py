@@ -73,6 +73,15 @@ def whole(value: float) -> str:
     return f"{round(value):,}"
 
 
+def half(value: float) -> str:
+    """A median of whole counts, which can end in .5: 16.5 stays 16.5 and 16.0 is 16."""
+    return f"{value:g}"
+
+
+def count_of(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
 def table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
     lines = ["| " + " | ".join(header) + " |", "|" + "---|" * len(header)]
     lines += ["| " + " | ".join(row) + " |" for row in rows]
@@ -386,8 +395,8 @@ def ablation_section(layout: Layout) -> str:
                 "Memory",
                 set_cell,
                 "Median turns / task",
-                whole(turns_with),
-                whole(turns_without),
+                half(turns_with),
+                half(turns_without),
                 f"{turns_with - turns_without:+g}",
             ]
         )
@@ -422,6 +431,15 @@ def latency_cell(stat_median: float | None, stat_p95: float | None) -> str:
     return f"{seconds(stat_median)} / {seconds(stat_p95)}"
 
 
+def diff_equal_cell(found: Sequence[RunResult]) -> str:
+    """Runs whose diff equals the reference over the runs that completed (plan section 8.5).
+
+    A run that did not complete has no diff to compare, so it is not in the denominator.
+    """
+    done = [r for r in found if r.completed]
+    return f"{sum(r.diff_equals_reference for r in done)} / {len(done)}"
+
+
 def chaos_table(summary: ChaosSummary) -> str:
     body = []
     for kind in chaos_plan.KILL_TYPES:
@@ -433,7 +451,7 @@ def chaos_table(summary: ChaosSummary) -> str:
                 f"{summary.kills_landed[kind]} / {summary.kills_planned[kind]}",
                 str(len(hit)),
                 f"{sum(r.completed for r in hit)} / {len(hit)}",
-                f"{sum(r.diff_equals_reference for r in hit)} / {len(hit)}",
+                diff_equal_cell(hit),
                 str(sum(r.duplicate_side_effects for r in hit)),
                 latency_cell(latency.median_s, latency.p95_s),
             ]
@@ -444,7 +462,7 @@ def chaos_table(summary: ChaosSummary) -> str:
             f"{sum(summary.kills_landed.values())} / {sum(summary.kills_planned.values())}",
             str(summary.runs),
             f"{summary.completed} / {summary.runs}",
-            f"{summary.diff_matches} / {summary.completed}",
+            diff_equal_cell(summary.results),
             str(summary.duplicate_side_effects),
             latency_cell(summary.resume_latency.median_s, summary.resume_latency.p95_s),
         ]
@@ -497,9 +515,9 @@ def chaos_section(chaos: Sequence[ChaosRun]) -> str:
             f"{s.missing_side_effects}.\n\n"
             f"Retry cost overhead across chaos runs: {percent(overhead)} "
             f"({money(s.extra_cost_usd)} of {money(total_cost)}, from "
-            f"{s.extra_ledger_rows} repeated ledger rows).\n\n" + chaos_failures(s)
+            f"{count_of(s.extra_ledger_rows, 'repeated ledger row')}).\n\n" + chaos_failures(s)
         )
-    return "\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def _recordings(summary: ChaosSummary) -> str:
@@ -509,11 +527,20 @@ def _recordings(summary: ChaosSummary) -> str:
 
 # ---------- table 5 ----------
 def reason_for(result: results.TaskResult) -> str:
-    """One line on why a task is not resolved: the stuck report, else the grader, else the end."""
+    """One line on why a task is not resolved.
+
+    The stuck report comes first when the file has one. A task that ended before the grader saw a
+    patch has only the runner's line "not graded: the task ended as <kind>", which repeats the
+    outcome, so its reason is the end summary: the stuck report, the verifier summary or the error.
+    A task whose patch was graded keeps the grader's line.
+    """
+    grading = result.grading.strip()
     if result.stuck_reasons:
         reason = "stuck: " + "; ".join(result.stuck_reasons)
+    elif result.outcome != "pr_opened" or grading.startswith("not graded: the task ended as"):
+        reason = result.outcome_summary.strip() or grading
     else:
-        reason = result.grading.strip() or result.outcome_summary
+        reason = grading or result.outcome_summary
     flat = cell(reason)
     return flat if len(flat) <= REASON_LIMIT else flat[: REASON_LIMIT - 3].rstrip() + "..."
 

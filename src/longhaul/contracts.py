@@ -22,7 +22,7 @@ from pydantic import (
 )
 from pydantic.json_schema import JsonSchemaValue
 
-contracts_version = "2"
+contracts_version = "3"
 
 EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
 StopReason = Literal[
@@ -299,6 +299,26 @@ class StuckSignal(BaseModel):
     evidence: list[str]
 
 
+class TurnSignal(BaseModel):
+    """What the stuck detector reads about one coder turn (LH-505).
+
+    It is small on purpose: CarryState keeps the last 30 of them across Continue-As-New.
+    `tests_passed` is the count of the last pytest run of the turn, None when no run printed
+    one. `steps_done` is how many plan steps are done at the end of the turn. `failed_cmd_hash`
+    is the sha1 of the last command of the turn that failed: its text, its exit code and the
+    last 20 lines of what it printed. `edited_regions` are the (path, first line, last line)
+    of the files the turn changed. `tool_errors` of the `tool_calls` calls of the turn failed.
+    """
+
+    turn_index: int
+    tests_passed: int | None = None
+    steps_done: int = 0
+    failed_cmd_hash: str | None = None
+    edited_regions: list[tuple[str, int, int]] = Field(default_factory=list)
+    tool_errors: int = 0
+    tool_calls: int = 0
+
+
 class Phase(StrEnum):
     QUEUED = "queued"
     PREPARING = "preparing"
@@ -357,6 +377,8 @@ class CarryState(BaseModel):
     started_at: AwareDatetime
     hints: list[str] = Field(default_factory=list)
     stuck_count: int = 0
+    # The last 30 coder turns as the stuck detector saw them (LH-505), oldest first.
+    stuck_window: list[TurnSignal] = Field(default_factory=list)
 
     @field_validator("started_at")
     @classmethod

@@ -77,6 +77,15 @@ _NOTES = contracts.ProgressNotes(
     tried_and_failed=["f"],
     covers_turns_up_to=3,
 )
+_TURN_SIGNAL = contracts.TurnSignal(
+    turn_index=4,
+    tests_passed=12,
+    steps_done=2,
+    failed_cmd_hash="ab" * 20,
+    edited_regions=[("src/a.py", 10, 20)],
+    tool_errors=1,
+    tool_calls=3,
+)
 _USAGE = Usage(input_tokens=1, output_tokens=2, cache_read_tokens=3, cache_write_tokens=4)
 _OUTCOME = contracts.Outcome(kind=contracts.OutcomeKind.PR_OPENED, pr_url="u", summary="s")
 _TEXT = TextBlock(text="hi")
@@ -136,6 +145,7 @@ SAMPLES: dict[str, BaseModel] = {
     ),
     "ProgressNotes": _NOTES,
     "StuckSignal": contracts.StuckSignal(reason=StuckReason.NO_PROGRESS, evidence=["e"]),
+    "TurnSignal": _TURN_SIGNAL,
     "Outcome": _OUTCOME,
     "TaskStatus": contracts.TaskStatus(
         task_id="t",
@@ -165,6 +175,7 @@ SAMPLES: dict[str, BaseModel] = {
         started_at=_NOW,
         hints=["h"],
         stuck_count=2,
+        stuck_window=[_TURN_SIGNAL],
     ),
     "ExecResult": contracts.ExecResult(
         exit_code=0, stdout="o", stderr="", timed_out=False, duration_ms=3
@@ -584,9 +595,32 @@ def test_defaults_are_not_shared() -> None:
 
 # ---------- version and changelog ----------
 def test_contracts_version() -> None:
-    assert contracts.contracts_version == "2"
+    assert contracts.contracts_version == "3"
 
 
 def test_changelog_has_a_row_for_the_current_version() -> None:
     rows = re.findall(r"^\|\s*(\d+)\s*\|", ARCHITECTURE.read_text(encoding="utf-8"), re.MULTILINE)
     assert contracts.contracts_version in rows
+
+
+# ---------- the stuck window (version 3, LH-505) ----------
+def test_a_carry_state_from_before_version_3_has_an_empty_window() -> None:
+    # Histories and hand-overs written by an older worker have no `stuck_window`.
+    payload = json.loads(_carry().model_dump_json())
+    del payload["stuck_window"]
+    state = contracts.CarryState.model_validate_json(json.dumps(payload))
+    assert state.stuck_window == []
+
+
+def test_the_window_survives_a_json_round_trip() -> None:
+    state = _carry(stuck_window=[_TURN_SIGNAL, _TURN_SIGNAL.model_copy(update={"turn_index": 5})])
+    back = contracts.CarryState.model_validate_json(state.model_dump_json())
+    assert back == state
+    assert back.stuck_window[0].edited_regions == [("src/a.py", 10, 20)]
+
+
+def test_a_turn_signal_needs_only_its_turn() -> None:
+    signal = contracts.TurnSignal(turn_index=3)
+    assert (signal.tests_passed, signal.failed_cmd_hash) == (None, None)
+    assert (signal.steps_done, signal.tool_errors, signal.tool_calls) == (0, 0, 0)
+    assert signal.edited_regions == []

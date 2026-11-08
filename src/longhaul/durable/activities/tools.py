@@ -55,6 +55,11 @@ number, so the three have to agree.
 Each run that reached its tool is timed into longhaul_tool_duration_seconds (LH-704), the failing
 ones too. A call that found its sandbox gone never ran, and is not timed.
 
+The result also carries the few facts that the stuck detector reads (LH-505): the count of passing
+tests of a test run, a hash of a command that failed, and the lines an edit changed. They are read
+from the whole text of the result before it is cut to a preview, because the workflow has only the
+preview (signals.py). A call of the planning phase gets none, since the planner is not watched.
+
 The planning phase (LH-501) changes nothing. A call with `read_only` set runs from `pre_sha` like
 any other, and then the tree is looked at: if the call changed it, `restore(pre_sha)` puts it
 back, and no commit is made, so the result has no `post_sha` and no checkpoint row is written.
@@ -106,9 +111,11 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import CheckpointRecord, Recorder, ToolCallRecord
 from longhaul.durable import acts
+from longhaul.durable.activities.signals import call_signal
 from longhaul.durable.activities.support import heartbeating, not_retried, small
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import tool_span
+from longhaul.tools.exec import RunTests
 from longhaul.tools.output import output_handle, store_output
 from longhaul.tools.registry import ToolRegistry
 
@@ -222,7 +229,7 @@ class ToolActivities:
 
     # ---------- tool_exec ----------
     @activity.defn(name=acts.TOOL_EXEC.name)
-    async def tool_exec(self, inp: acts.ToolExecInput) -> ToolResult:
+    async def tool_exec(self, inp: acts.ToolExecInput) -> acts.ToolExecResult:
         inp = small(inp)
         sandbox = await self._sandbox(inp.sandbox_id)
         call, args_ref = await self._call(inp)
@@ -268,13 +275,15 @@ class ToolActivities:
                 to_json(call.input),
                 key=blob_key(inp.task_id, "turns", inp.turn_index, f"tool-{slug}-args.json"),
             )
-        returned = result.model_copy(
-            update={
-                "output": _preview(result.output, output_ref),
-                "output_ref": output_ref,
-                "pre_sha": inp.pre_sha,
-                "post_sha": post_sha,
-            }
+        # The detector does not watch the planner, so a call of the planning phase gets no facts.
+        signal = None if inp.read_only else call_signal(call, result, self._test_command())
+        returned = acts.ToolExecResult(
+            **result.model_dump(exclude={"output", "output_ref", "pre_sha", "post_sha"}),
+            output=_preview(result.output, output_ref),
+            output_ref=output_ref,
+            pre_sha=inp.pre_sha,
+            post_sha=post_sha,
+            signal=signal,
         )
         await self._recorder.record_tool_call(
             ToolCallRecord(
@@ -300,6 +309,11 @@ class ToolActivities:
                 CheckpointRecord(inp.task_id, post_sha, "tool", inp.turn_index)
             )
         return small(returned)
+
+    def _test_command(self) -> str | None:
+        """The command that run_tests runs, which the facts of a test run name it by."""
+        tool = self._registry.get("run_tests")
+        return tool.test_command if isinstance(tool, RunTests) else None
 
     def _time(self, tool: str, seconds: float) -> None:
         """Add a run to the duration histogram. The model chooses the name of the tool it calls,

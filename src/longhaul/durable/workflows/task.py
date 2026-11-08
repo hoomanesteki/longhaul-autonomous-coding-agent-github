@@ -93,6 +93,18 @@ coder of a planned task calls `update_step`, and the extra input of `build_pr_br
 A task without a plan makes the commands it made before, in the same order, so its histories
 replay as they were.
 
+The stuck detector (LH-505). After each coder turn that does not end the run, `_watch` shows the
+turn to the detector of roles/stuck.py. The detector keeps its window in `state.stuck_window`, so
+it crosses a hand-over. Its facts come from two places: tool_exec returns a `CallSignal` with each
+result (acts.ToolExecResult), and the workflow adds what only it knows, the steps done and which
+calls failed. When a rule fires, the workflow records one `stuck` event with the reason and the
+evidence, and the task goes on. The pause and the question to a person are LH-506's, and `_watch`
+returns the signal for that flow to act on. The planner is not watched: its calls get no facts,
+and the detector is told the phase besides. The thresholds are the `stuck` section of the config,
+copied into roles/stuck.py because the workflow cannot read the config file, and a worker whose
+config differs stops at the start. Replay: the event is the one command this adds, and only on a
+turn where a rule fires, so a history in which none does replays as it was.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -267,7 +279,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -289,12 +301,13 @@ with workflow.unsafe.imports_passed_through():
         Plan,
         ProviderErrorKind,
         Role,
+        StuckSignal,
         TaskStatus,
         ToolResult,
     )
     from longhaul.durable import acts
     from longhaul.github import lifecycle
-    from longhaul.roles import coder, planner
+    from longhaul.roles import coder, planner, stuck
 
 
 @dataclass(frozen=True)
@@ -330,6 +343,10 @@ COMPACTION_EVENT = "compaction"
 # builds the pause.
 PAUSED_EVENT = "paused"
 ASKED_REASON = "agent_asked"
+
+# The event a stuck detection records (plan section 3.5). The payload has the `reason`, which the
+# metrics count (telemetry/metrics.py), the `evidence` lines and the `turn_index`.
+STUCK_EVENT = "stuck"
 
 # The event a hand-over to a new run records (plan section 3.5), and the two reasons it gives.
 CONTINUE_AS_NEW_EVENT = "continue_as_new"
@@ -902,7 +919,8 @@ class TaskWorkflow:
             return await self._idle_turn(index, sampled)
 
         self.idle = 0
-        finished: list[ToolResult] = []  # kept for the transcript if a later call loses the sandbox
+        # Kept for the transcript if a later call loses the sandbox, and for the stuck detector.
+        finished: list[ToolResult] = []
 
         async def run(call: acts.ToolCallSummary) -> ToolResult:
             return await self._run_tool(index, call)
@@ -929,6 +947,7 @@ class TaskWorkflow:
             return self._finish(rules.finished(ran.finish))
         if ran.question is not None:
             return await self._ask_human(ran.question)
+        await self._watch(index, calls, ran.results, finished)
         await self._relieve(index, sampled.context_decision)
         return None
 
@@ -993,6 +1012,40 @@ class TaskWorkflow:
         )
         state.plan = coder.with_status(plan, change)
 
+    async def _watch(
+        self,
+        index: int,
+        calls: list[acts.ToolCallSummary],
+        results: list[ToolResult],
+        ran: Sequence[ToolResult],
+    ) -> StuckSignal | None:
+        """Show the turn to the stuck detector, and record a signal that it gives (LH-505).
+
+        `results` are the results of every call of the turn, and `ran` the answers made as the
+        calls ran. The ones tool_exec made carry the facts, and a step update's answer has none.
+        The window is written back to the state before the event, so a hand-over right after it
+        carries the window. LH-506 acts on the signal that is returned.
+        """
+        state = self.state
+        done = sum(1 for step in state.plan.steps if step.status == "done") if state.plan else 0
+        facts = [
+            r.signal for r in ran if isinstance(r, acts.ToolExecResult) and r.signal is not None
+        ]
+        signal, notes = stuck.read_turn(index, done, facts, results, {c.id: c.name for c in calls})
+        detector = stuck.StuckDetector(stuck.DEFAULT_LIMITS, state.stuck_window)
+        found = detector.observe(signal, notes, phase=state.phase)
+        state.stuck_window = detector.window
+        if found is not None:
+            await self._note(
+                STUCK_EVENT,
+                {
+                    "reason": found.reason.value,
+                    "evidence": found.evidence,
+                    "turn_index": index,
+                },
+            )
+        return found
+
     async def _ask_human(self, question: str) -> Outcome:
         """The coder asked a person. LH-506 replaces this with the pause and the wait.
 
@@ -1015,7 +1068,7 @@ class TaskWorkflow:
         index: int,
         transcript_ref: BlobRef,
         calls: list[acts.ToolCallSummary],
-        finished: list[ToolResult],
+        finished: Sequence[ToolResult],
         lost: _SandboxLost,
     ) -> Outcome:
         """End the run for a sandbox that keeps dying, with every call of the turn answered.
@@ -1188,7 +1241,7 @@ class TaskWorkflow:
 
     async def _run_tool(
         self, index: int, call: acts.ToolCallSummary, *, read_only: bool = False
-    ) -> ToolResult:
+    ) -> acts.ToolExecResult:
         """Run one tool call. `read_only` is for the planning phase: the tree is put back after."""
         state = self.state
         recreated = 0

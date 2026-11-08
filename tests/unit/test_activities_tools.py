@@ -300,6 +300,75 @@ async def test_the_null_checkpoint_store_stores_nothing(sandbox: FakeSandbox) ->
     assert await store.is_at(sandbox, SHA)  # nothing to restore, so it never asks for a restore
 
 
+# ---------- facts for the stuck detector (LH-505) ----------
+async def test_an_edit_leaves_the_region_it_changed_in_the_result(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(
+        exec_input("edit_file", path=MODULE, old_str="    return a - b", new_str="    return a + b")
+    )
+
+    assert isinstance(result, acts.ToolExecResult)
+    assert result.signal is not None
+    assert result.signal.edited_regions == [(MODULE, 6, 6)]
+
+
+async def test_a_failing_test_run_leaves_its_count_and_its_failure(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    first = await rig.exec(exec_input("run_tests"))
+    again = await rig.exec(exec_input("run_tests", "toolu_2"))
+
+    fact = first.signal
+    assert fact is not None
+    assert fact.tests_passed == 2
+    assert fact.failed_cmd_hash is not None
+    assert fact.failed_error == "AssertionError at tests/test_calc.py:5"
+    assert fact.failed_command is not None and "-m pytest -q" in fact.failed_command
+    # The same run again, with another run time, is the same failure.
+    assert again.signal is not None
+    assert again.signal.failed_cmd_hash == fact.failed_cmd_hash
+
+
+async def test_a_run_that_passes_leaves_a_count_and_no_failure(sandbox: FakeSandbox) -> None:
+    await sandbox.write_file(
+        MODULE, b"def add(a, b):\n    return a + b\n\n\ndef multiply(a, b):\n    return a * b\n"
+    )
+    rig = Rig(sandbox, test_command=f"{shlex.quote(sys.executable)} -m pytest -q")
+    result = await rig.exec(exec_input("run_tests"))
+
+    assert result.signal is not None
+    assert result.signal.tests_passed == 3
+    assert result.signal.failed_cmd_hash is None
+
+
+async def test_a_call_that_changes_and_runs_nothing_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    result = await Rig(sandbox).exec(exec_input("read_file", path=MODULE))
+    assert result.ok and result.signal is None
+
+
+async def test_a_call_the_model_got_wrong_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    result = await rig.exec(
+        exec_input("edit_file", path=MODULE, old_str="no such text", new_str="x")
+    )
+    assert not result.ok and result.signal is None
+
+
+async def test_a_call_of_the_planning_phase_leaves_no_facts(sandbox: FakeSandbox) -> None:
+    # The detector never watches the planner, so the activity does not work out facts for it.
+    inp = exec_input("run_command", command="echo KeyError >&2; exit 1")
+    result = await Rig(sandbox).exec(inp.model_copy(update={"read_only": True}))
+    assert result.exit_code == 1 and result.signal is None
+
+
+async def test_the_facts_are_small_next_to_the_output(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox)
+    code = "import sys; print('E' * 50000, file=sys.stderr); sys.exit(1)"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    result = await rig.exec(exec_input("run_command", command=command))
+    assert result.signal is not None
+    assert len(result.signal.model_dump_json()) < 600
+
+
 # ---------- checkpoints (LH-206) ----------
 def host_git(*args: str) -> str:
     """Git on the host, as the tests read a repo: no inherited GIT_* variables."""

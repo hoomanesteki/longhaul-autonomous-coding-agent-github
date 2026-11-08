@@ -383,6 +383,29 @@ An update rewrites the plan block in the first message before the next model cal
 SELECT step_id, sha, turn_index FROM checkpoints WHERE task_id = 'lh-acme-calc-42' AND kind = 'step' ORDER BY id;
 ```
 
+### The stuck detector
+
+The workflow watches the coder for four ways of going in circles (LH-505). It shows each coder turn that does not end the run to the detector in `roles/stuck.py`, and records one `stuck` event when a rule fires. The planner is never watched. The pause and the question to a person are LH-506, so for now the event is the whole reaction and the task goes on.
+
+| Reason | Fires when | Default |
+|---|---|---|
+| `repeated_failure` | The same command failed the same way this many times. Turns with no failing command do not break the streak. | 3 |
+| `tool_errors` | The last this many tool calls all failed. A turn with one good call ends the run. | 5 |
+| `edit_churn` | One region of a file was edited this many times in the last 10 turns and the number of passing tests did not move. Two edits are the same region when they share half or more of the lines of the longer one, so a new file followed by fixes in other places of it is not churn. | 4 |
+| `no_progress` | In this many turns no test run passed more tests than any run before it, and no plan step was finished. The first test count counts as a gain, and so do the steps done when the window starts. | 15 |
+
+When a turn matches more than one rule, the first row that fits is the one recorded. A signal that fires empties the detector's window, so a pattern that goes on is reported again only after it has built up again from nothing. Because the window does not say how many steps were done before it started, `no_progress` can come one turn late after a signal, and never early. The window holds the last 30 turns in `CarryState.stuck_window`, which crosses a hand-over to a new run, and it serializes to under 8 KB, whatever the characters of the file names, since a path is cut to 48 bytes of JSON.
+
+The limits are the `stuck` section of the config. The workflow cannot read the config file and keeps a copy (`roles/stuck.py`, `DEFAULT_LIMITS`), so a worker whose `stuck.no_progress_turns`, `repeated_failure_count`, `churn_edits` or `consecutive_tool_errors` differs from it stops at the start and names the setting. `stuck.hint_wait_hours` is for LH-506 and is not checked.
+
+`tool_exec` works out the facts that the rules need, because only the activity sees the whole text of a result (`durable/activities/signals.py`). The hash of a failed command covers the command, its exit code and the last 20 lines of stderr. When stderr names no error, the last 20 lines of stdout are added, because pytest prints its report there. Run times and memory addresses are taken out first, so the same failure on two runs hashes alike.
+
+```sql
+SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
+```
+
+The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+
 ### Stopping a worker
 
 SIGTERM and Ctrl-C start a graceful stop. The worker takes no new work, waits up to 30 seconds for the activities that are running, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on the next worker, which restores the checkpoint it started from first. Start a worker again and the task goes on. SIGKILL does the same without the waiting.

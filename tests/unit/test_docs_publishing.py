@@ -34,9 +34,9 @@ def run_commands(job: dict[str, Any]) -> list[str]:
 def test_the_docs_job_renders_the_site_with_the_pinned_quarto() -> None:
     ci = workflow("ci.yml")
     job = ci["jobs"]["docs"]
-    (setup,) = steps_using(job, "quarto-dev/quarto-actions/setup")
-    assert re.search(r"@v\d+$", setup["uses"])
-    assert setup["with"]["version"] == QUARTO_VERSION
+    for setup in steps_using(job, "quarto-dev/quarto-actions/setup"):
+        assert re.search(r"@v\d+$", setup["uses"])
+        assert setup["with"]["version"] == QUARTO_VERSION
     assert run_commands(job) == ["quarto render site"]
     assert "docs" in ci["jobs"]["ci"]["needs"]
 
@@ -91,11 +91,15 @@ def test_only_the_pages_deploy_job_can_mint_a_token() -> None:
 
 
 def test_ci_and_pages_render_with_the_same_quarto() -> None:
-    def version(name: str, job: str) -> str:
-        (setup,) = steps_using(workflow(name)["jobs"][job], "quarto-dev/quarto-actions/setup")
-        return str(setup["with"]["version"])
+    def versions(name: str, job: str) -> set[str]:
+        # A job sets Quarto up once and tries again when the first download fails.
+        setups = steps_using(workflow(name)["jobs"][job], "quarto-dev/quarto-actions/setup")
+        assert len(setups) == 2, setups
+        assert setups[0].get("continue-on-error") is True
+        assert setups[1]["if"] == f"steps.{setups[0]['id']}.outcome == 'failure'"
+        return {str(setup["with"]["version"]) for setup in setups}
 
-    assert version("ci.yml", "docs") == version("pages.yml", "build") == QUARTO_VERSION
+    assert versions("ci.yml", "docs") == versions("pages.yml", "build") == {QUARTO_VERSION}
 
 
 def test_the_readme_links_the_docs_site_near_the_top() -> None:

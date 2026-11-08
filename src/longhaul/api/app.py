@@ -1,0 +1,130 @@
+"""The console API as a FastAPI app (LH-801, ADR-0011).
+
+`create_app(context)` builds the app on the stores it is given, which is how the tests use it.
+`create_app()` with no context builds one from the LONGHAUL_* settings when the server starts and
+closes it when the server stops, which is how `longhaul api` runs it (uvicorn's factory mode).
+The app does nothing at import time and nothing until it starts, so `openapi_schema()` can dump
+the schema in CI with no database or Temporal.
+
+Beside the task and memory routes this module has the three that belong to no resource:
+
+* `GET /api/repos`, the repos in `repo_settings` with their task counts;
+* `GET /healthz`, which answers 200 when the database does. Temporal is left out on purpose: the
+  console works from the database without it, and a probe that failed with Temporal would take
+  the whole page down for an outage that only breaks the live status and the actions;
+* `GET /metrics`, in the Prometheus text format.
+
+Operation ids are the names of the route functions, so the generated client (LH-802) has
+`listTasks` and `approvePlan` and not `list_tasks_api_tasks_get`.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.routing import APIRoute
+from prometheus_client.exposition import CONTENT_TYPE_LATEST
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+
+from longhaul.api import metrics, queries, routes_memory, routes_tasks
+from longhaul.api.deps import ApiContext, Ctx, open_context
+from longhaul.api.schemas import Health, RepoView
+from longhaul.settings import EnvSettings
+
+__all__ = ["create_app", "openapi_schema", "render_openapi"]
+
+TITLE = "Longhaul console API"
+DESCRIPTION = (
+    "Tasks, timelines, actions and memory for the Longhaul console. The console reads this API "
+    "and nothing else: it never talks to the database or to Temporal."
+)
+
+
+def operation_id(route: APIRoute) -> str:
+    return route.name
+
+
+@asynccontextmanager
+async def from_settings(app: FastAPI) -> AsyncIterator[None]:
+    """Build the context of a deployment when the server starts, and close it when it stops."""
+    async with open_context(EnvSettings()) as context:
+        app.state.context = context
+        yield
+
+
+def create_app(context: ApiContext | None = None) -> FastAPI:
+    app = FastAPI(
+        title=TITLE,
+        description=DESCRIPTION,
+        version="1.0.0",
+        generate_unique_id_function=operation_id,
+        lifespan=from_settings if context is None else None,
+    )
+    if context is not None:
+        app.state.context = context
+    app.state.api_metrics = metrics.ApiMetrics()
+    app.include_router(routes_tasks.router)
+    app.include_router(routes_memory.router)
+    add_system_routes(app)
+    app.middleware("http")(count_requests)
+    return app
+
+
+async def count_requests(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    started = time.perf_counter()
+    status = 500  # an exception that no handler turned into a response
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        route = request.scope.get("route")
+        template = getattr(route, "path", None)
+        request.app.state.api_metrics.observe(
+            request.method, template, status, time.perf_counter() - started
+        )
+
+
+def add_system_routes(app: FastAPI) -> None:
+    @app.get("/api/repos")
+    async def list_repos(ctx: Ctx) -> list[RepoView]:
+        """The repos Longhaul knows, from `repo_settings`, with how many tasks each has."""
+        return await queries.list_repos(ctx.sessions)
+
+    @app.get("/healthz")
+    async def healthz(ctx: Ctx) -> Health:
+        """200 when the database answers."""
+        try:
+            async with ctx.sessions() as session:
+                await session.execute(text("SELECT 1"))
+        except (SQLAlchemyError, OSError) as exc:
+            raise HTTPException(status_code=503, detail="database unavailable") from exc
+        return Health(status="ok")
+
+    @app.get("/metrics")
+    async def prometheus(request: Request) -> Response:
+        """Prometheus text: the worker metrics of this process and the API's own."""
+        body = metrics.exposition(request.app.state.api_metrics)
+        return Response(body, media_type=CONTENT_TYPE_LATEST)
+
+
+def openapi_schema() -> dict[str, Any]:
+    """The OpenAPI schema of the app. It needs no database, no blob store and no Temporal."""
+    return create_app().openapi()
+
+
+def render_openapi() -> str:
+    """The text of console/openapi.json: sorted keys, two spaces, a newline at the end.
+
+    The same schema always gives the same bytes, so a diff of the file shows only a real change
+    of the API.
+    """
+    return json.dumps(openapi_schema(), indent=2, sort_keys=True, ensure_ascii=False) + "\n"

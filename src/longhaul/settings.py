@@ -90,6 +90,10 @@ class EnvSettings(BaseSettings):
     # 0.0.0.0 (docs/runbook.md). Port 0 lets the system choose a free port.
     metrics_port: int = Field(default=9464, ge=0, le=65535)
     metrics_host: str = "127.0.0.1"
+    # Where `longhaul api` serves the console API (LH-801). The host keeps it on this machine
+    # until the console has a login (LH-807); a container that publishes the port needs 0.0.0.0.
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=0, le=65535)
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.

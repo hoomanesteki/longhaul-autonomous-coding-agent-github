@@ -21,8 +21,6 @@ from typing import Any
 
 import httpx2
 import pytest
-from longhaul.api.app import create_app
-from longhaul.api.deps import ApiContext
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client, WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
@@ -39,6 +37,8 @@ from tests.integration.test_task_workflow import (
     wait_until,
 )
 
+from longhaul.api.app import create_app
+from longhaul.api.deps import ApiContext
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.contracts import (

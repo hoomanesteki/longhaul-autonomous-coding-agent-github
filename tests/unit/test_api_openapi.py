@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import pytest
+
 from longhaul.api.app import create_app, openapi_schema, render_openapi
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase8]
@@ -85,4 +86,5 @@ def test_the_app_builds_without_a_database() -> None:
     # Nothing connects until the app starts. The schema is dumped this way, in CI.
     app = create_app()
 
-    assert {route.path for route in app.routes} >= {"/healthz", "/metrics", "/api/tasks"}
+    assert not hasattr(app.state, "context")
+    assert {"/healthz", "/metrics", "/api/tasks"} <= set(app.openapi()["paths"])

@@ -191,12 +191,17 @@ class PgMemoryStore:
         return [_item_of(row) for row in rows]
 
     async def list_items(
-        self, repo: str, *, status: str | None = None, kind: str | None = None
+        self, repo: str | None = None, *, status: str | None = None, kind: str | None = None
     ) -> list[MemoryEntry]:
-        """Every item of `repo`, oldest first, optionally of one status and one kind."""
+        """The items of `repo`, oldest first, optionally of one status and one kind.
+
+        With no `repo` the items of every repo are listed, which is what the console shows when
+        no repo is picked.
+        """
         # The vector is 384 numbers per row and nothing here shows it.
         stmt = select(MemoryItemRow).options(defer(MemoryItemRow.embedding))
-        stmt = stmt.where(MemoryItemRow.repo == repo)
+        if repo is not None:
+            stmt = stmt.where(MemoryItemRow.repo == repo)
         if status is not None:
             stmt = stmt.where(MemoryItemRow.status == status)
         if kind is not None:
@@ -204,6 +209,19 @@ class PgMemoryStore:
         stmt = stmt.order_by(MemoryItemRow.created_at, MemoryItemRow.id)
         async with self._sessions() as session:
             return [_entry_of(row) for row in await session.scalars(stmt)]
+
+    async def get_item(self, item_id: str) -> MemoryEntry:
+        """One item by id. Raises MemoryItemNotFoundError for an id that no item has."""
+        stmt = (
+            select(MemoryItemRow)
+            .options(defer(MemoryItemRow.embedding))
+            .where(MemoryItemRow.id == _parse_id(item_id))
+        )
+        async with self._sessions() as session:
+            row = (await session.scalars(stmt)).first()
+        if row is None:
+            raise MemoryItemNotFoundError(f"no memory item {item_id!r}")
+        return _entry_of(row)
 
     async def get_verified(self, repo: str, kind: str, source_ref: str) -> MemoryEntry | None:
         """The approved item of the default branch that Longhaul checked at `source_ref`.

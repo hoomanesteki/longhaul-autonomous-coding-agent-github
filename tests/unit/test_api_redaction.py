@@ -7,6 +7,7 @@ the tests check that it reaches every string and leaves everything else as it wa
 from __future__ import annotations
 
 import pytest
+
 from longhaul.api.redaction import redact_json
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase8]

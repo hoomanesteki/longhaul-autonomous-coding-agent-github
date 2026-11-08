@@ -261,12 +261,13 @@ A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (L
 | The agent calls `finish` | The phase is `delivering`. The branch `longhaul-pr/<n>` is pushed and a draft pull request is opened |
 | The pull request is open | `longhaul:working` is removed and `longhaul:pr-open` is added |
 | A pause for a person (Phases 5 and 7) | `longhaul:needs-human` is added, and removed when the task resumes |
+| The task ends without a pull request | `longhaul:working` is removed. A stuck or failed task gets `longhaul:needs-human`, and a cancelled one gets neither (see "How a task ends") |
 
 The pull request branch has one commit on top of the base commit, whatever number of checkpoints the agent made. Its tree is the tree of the last checkpoint, so its diff is the diff of the scratch branch. The commit is titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`, and its author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
 
 The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call) and `Closes #<n>`. The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
 
-Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task that ends in an error or a cancel leaves its labels as they are for now (LH-507). A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
+Every write has an idempotency key, so a retry or a replay changes nothing on GitHub. The pull request is found again by its branch even if the `side_effects` table is lost. A task whose work changes no file ends with the error `nothing to deliver: no file changed`, because GitHub refuses a pull request with no commit.
 
 ### The prompt cache
 
@@ -423,7 +424,7 @@ Answer it with a comment from someone who has write access:
 | `/longhaul budget +$2` | Also unblocks the task, because a top-up may be what it needed. |
 | `/longhaul cancel` | Ends the task as cancelled. |
 
-A hint or a top-up removes the label, records a `resumed` event, empties the detector's window and puts the task back in `coding`. The task waits 24 hours. With no answer it ends as `stuck` in the phase `failed`, and the summary says how long it waited. A task pauses at most three times: a fourth signal ends it as `stuck` and says that three hints did not unblock it. The final comment and the labels of those ends come with LH-507.
+A hint or a top-up removes the label, records a `resumed` event, empties the detector's window and puts the task back in `coding`. The task waits 24 hours. With no answer it ends as `stuck` in the phase `failed`, and the summary says how long it waited. A task pauses at most three times: a fourth signal ends it as `stuck` and says that three hints did not unblock it. Those ends post the final comment and set the final labels like every other end (see "How a task ends").
 
 Each pause has its own comment key, `<task id>:stuck:<n>`, so a retry posts nothing twice. The compactor's calls for the question are on the cost ledger like any others, one row for each call, under the turn that was stuck.
 
@@ -437,6 +438,63 @@ SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = '
 ```
 
 The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+
+### How a task ends
+
+Every task ends in exactly one outcome (LH-507): `pr_opened`, `stuck`, `budget_exhausted`, `cancelled` or `error`. Whatever the way, the workflow winds the task up in the same order:
+
+| Step | What happens |
+|---|---|
+| 1 | The outcome is set. `status()` shows it, and the `outcome` event is recorded last, after the other steps, so it counts a task that has finished them. |
+| 2 | The sandbox is destroyed: the containers and the workspace volume. This comes first because GitHub can be down for twenty minutes and a container must not wait for it. |
+| 3 | A stuck task whose repo sets `open_draft_on_stuck: true` opens a draft pull request with its partial work, if the work changes a file. |
+| 4 | A task of an issue posts one final comment, under the key `<task id>:final:1`. |
+| 5 | The final labels are set. |
+
+The final comment is the pull request link for a task that delivered. For any other end it is a report: the reason, what was done and what is left (from the plan), the diff stats, and what to do next. A stuck report looks like this:
+
+```markdown
+## Longhaul is stuck and has stopped
+
+stuck, repeated failure; no hint in 24 hours
+
+### What was done
+
+- [x] **s1**: Fix the lookup
+
+### What is left
+
+- [ ] **s2**: Test it
+
+### Changes
+
+1 file changed, 3 additions, 1 deletion
+
+- `inv.py`: +3 -1
+
+Comment `/longhaul retry` to start a new attempt, or take over from the checkpoints.
+
+Ran 12 turns, spent $0.43.
+```
+
+| Outcome | Labels at the end |
+|---|---|
+| `pr_opened` | `longhaul:pr-open` (set when the pull request opened) |
+| `stuck`, `budget_exhausted` | `longhaul:needs-human`, and `longhaul:pr-open` if a draft of the partial work was opened |
+| `error` | `longhaul:needs-human` |
+| `cancelled` | none: `longhaul:needs-human` is removed too if the task was paused |
+
+`open_draft_on_stuck` is a setting of the repo entry in the config and is off by default. The poller hands it to the task when it starts it. A stuck task has no verified work, so the pull request is a draft, and its body says `Closes #<n>` like every pull request of a task: close it, or edit that line, if you do not want the merge to close the issue.
+
+Each step is best effort. A step that fails after its retries is logged and the next one still runs, so one failure leaves the outcome as it is. The steps run again safely: the comment, the labels and the pull request have idempotency keys, and a cleanup of a sandbox that is gone changes nothing.
+
+An exception that nobody expected becomes the outcome `error`. The summary names the error type, for example `unexpected error: KeyError` or `workflow failed: CheckpointError`, and nothing else, because the message of a provider error can echo the request. The trace, cut to 3,000 characters and run through the log redaction, is the payload of an `error` event. The workflow still fails after the wind-up, so Temporal shows it as failed:
+
+```sql
+SELECT ts, payload->>'type', payload->>'trace' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'error';
+```
+
+The bare repo of a task that ended on its own is kept for seven days, so that you can read its checkpoints. A cancel removes it at once, as it always did. The janitor deletes the rest: `PollerWorkflow` runs the activity `clean_repos` after each poll, so the poller schedule is its clock, and it removes the repos under `LONGHAUL_CKPT_DIR` of tasks whose `outcome` event is more than seven days old. A repo whose task has no `outcome` event is never touched, because the task may be waiting for a hint. A task that Temporal ended from outside (a terminate) records no outcome, so its repo stays until you remove it. A worker sweeps the repos on its own disk, and a failed sweep is logged and tried again on the next tick.
 
 ### Stopping a worker
 

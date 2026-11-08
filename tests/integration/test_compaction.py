@@ -117,12 +117,21 @@ def config_for(role: Role) -> LoopConfig:
 
 # ---------- the script ----------
 def command(turn: int) -> str:
-    """A command that prints 14 numbered lines, so every turn has an output of its own."""
-    return f"printf 'turn {turn} line %s: output of the test run\\n' $(seq 1 14)"
+    """A command that prints 14 numbered lines, so every turn has an output of its own.
+
+    The closing line is a pytest summary with one more passed test than the turn before. Without
+    it the stuck detector would see 15 turns with no progress and pause the task for a hint
+    (LH-506), and this test is about compaction, not about a task that is stuck.
+    """
+    return (
+        f"printf 'turn {turn} line %s: output of the test run\\n' $(seq 1 14); "
+        f"printf '{turn + 1} passed in 0.01s\\n'"
+    )
 
 
 def printed(turn: int) -> str:
-    return "\n".join(f"turn {turn} line {n}: output of the test run" for n in range(1, 15))
+    lines = [f"turn {turn} line {n}: output of the test run" for n in range(1, 15)]
+    return "\n".join([*lines, f"{turn + 1} passed in 0.01s"])
 
 
 def result_text(turn: int) -> str:

@@ -127,6 +127,9 @@ async def stuck_to_pr(stack: Stack) -> None:
     status = await handle.query(TaskWorkflow.status)
     assert status.phase is Phase.PAUSED, stack.worker_log()
     question = next(c for c in fake.comment_bodies(repo, issue) if key in c)
+    # The planted loop must trip the rule the story names, not another one.
+    (title,) = [line for line in question.splitlines() if line.startswith("## ")]
+    assert "repeated failure" in title, question
     for heading in ("What I'm trying to do", "What I tried", "My current guess", "Question"):
         assert f"### {heading}" in question, question
     assert len(question.split()) < 250 + 20, "the hidden key is the only extra"

@@ -570,6 +570,36 @@ async def test_ask_human_pauses_the_task_and_a_hint_goes_back_to_coding(
     assert "Hint from maintainer: yes, a list of skus" in texts(after)
 
 
+async def test_a_question_then_a_hint_clears_the_failures_that_came_before_it(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The window still holds two failures when the coder asks, and the hint empties it.
+
+    One more failure of the same kind after the hint would be the third in a row if the window
+    were kept, and the task would pause again at once. A window that is empty needs three.
+    """
+    steps = [
+        turn("planner", 0, tool("submit_plan", **PLAN)),
+        turn("coder", 0, FAIL),
+        turn("coder", 1, FAIL),
+        turn("coder", 2, tool("ask_human", question="Which copy of inv do the tests import?")),
+        turn("coder", 3, FAIL),
+        turn("coder", 4, tool("submit_for_review", summary=SUMMARY)),
+        SUMMARY_STEP,
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, world.spec(), task_queue=world.queue, plan=True)
+        await paused(world, handle)
+        await send_hint(handle)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert world.events("stuck") == [], "no rule fired: the question was the only pause"
+    (asked,) = world.events("paused")
+    assert asked["reason"] == "agent_asked"
+    assert len(world.provider.of("coder")) == 5
+
+
 # ---------- the size of a hint ----------
 async def test_a_huge_hint_is_cut_before_it_reaches_the_model(
     env: WorkflowEnvironment, tmp_path: Path

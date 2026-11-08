@@ -30,6 +30,7 @@ from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 from tests.fakes.history import payload_sizes
 
 from longhaul import cli
+from longhaul.agent.hints import CUT_NOTE, MAX_HINT_BYTES
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -212,13 +213,17 @@ async def test_an_activity_input_over_the_limit_fails_the_workflow_and_is_never_
 ) -> None:
     """The case of the gate review: each piece is small, the input that the workflow builds is not.
 
-    Two hints of 200 KB are each under the limit as signals. llm_turn carries every hint, so
-    its input is 400 KB. The workflow cannot schedule it, and the run ends with the guard's error
-    instead of a workflow task that fails and retries without end.
+    The workflow cuts each hint to MAX_HINT_BYTES (LH-506), so no single hint can do this any
+    more. A hundred and fifty hints of that size are each far under the limit as signals.
+    llm_turn carries every hint, so its input is over the limit. The workflow cannot schedule it,
+    and the run ends with the guard's error instead of a workflow task that fails and retries
+    without end.
     """
     handle = await start_task(env.client, make_spec(), task_queue=queue)
-    for who in ("ann", "bob"):
-        await handle.signal(TaskWorkflow.hint, args=[who, "h" * 200_000])
+    texts = ["h" * MAX_HINT_BYTES] * 150
+    assert sum(len(t) for t in texts) > DEFAULT_LIMIT
+    for n, text in enumerate(texts):
+        await handle.signal(TaskWorkflow.hint, args=[f"user{n}", text])
 
     async with task_worker(env, queue):
         with pytest.raises(WorkflowFailureError) as caught:
@@ -233,8 +238,39 @@ async def test_an_activity_input_over_the_limit_fails_the_workflow_and_is_never_
     assert scheduled(history) == [acts.PREPARE_WORKSPACE.name]  # llm_turn was never scheduled
     assert EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED not in event_types(history)
     assert event_types(history)[-1] == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED
-    # The two signals are in the history, which shows the scan reaches payloads of that size.
-    assert_no_big_payload(history, largest_seen_over=200_000)
+    # The signals are in the history, which shows the scan reaches the payloads of the run.
+    assert_no_big_payload(history, largest_seen_over=MAX_HINT_BYTES)
+
+
+async def test_a_hint_over_the_cap_is_cut_before_it_is_kept(
+    env: WorkflowEnvironment, queue: str
+) -> None:
+    """A 200 KB hint is under the limit as a signal, and the state keeps only the cut text.
+
+    Before LH-506 two of them made llm_turn's input 400 KB and failed the task. Now the task
+    runs: the stand-in model stops it at the first turn, and the input it was given is small.
+    """
+    seen: list[acts.LlmTurnInput] = []
+
+    class Spy(Stubs):
+        @activity.defn(name=acts.LLM_TURN.name)
+        async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
+            seen.append(inp)
+            raise ApplicationError("the stand-in model stops here", non_retryable=True)
+
+    handle = await start_task(env.client, make_spec(), task_queue=queue)
+    for who in ("ann", "bob"):
+        await handle.signal(TaskWorkflow.hint, args=[who, "h" * 200_000])
+
+    async with task_worker(env, queue, Spy()):
+        with pytest.raises(WorkflowFailureError):
+            await asyncio.wait_for(handle.result(), WAIT_S)
+
+    assert len(seen) == 1
+    assert len(seen[0].hints) == 2
+    assert all(len(h.encode()) < MAX_HINT_BYTES + 200 for h in seen[0].hints)
+    assert all(h.endswith(CUT_NOTE) for h in seen[0].hints)
+    assert json_size(seen[0]) < 20_000
 
 
 async def test_a_300_kb_issue_file_runs_and_the_history_stays_small(
@@ -321,21 +357,26 @@ async def test_an_activity_result_over_the_limit_fails_the_activity(
     assert_no_big_payload(await handle.fetch_history())
 
 
-def hint_that_fills(spec: TaskSpec) -> str:
-    """Hint text that makes the llm_turn input of turn 0 exactly as big as the limit allows.
+def hints_that_fill(spec: TaskSpec) -> list[str]:
+    """Hint texts that make the llm_turn input of turn 0 exactly as big as the limit allows.
 
-    The state at the hand-over after that turn holds the same hint, the ref of the transcript,
-    the sandbox and the checkpoint, so it is over the limit. The test checks that, so it cannot
-    pass by accident if either model changes.
+    Each hint is cut to MAX_HINT_BYTES, so the texts are as many full-size hints as it takes and
+    one that fills the rest. The state at the hand-over after that turn holds the same hints,
+    the ref of the transcript, the sandbox and the checkpoint, so it is over the limit. The test
+    checks that, so it cannot pass by accident if either model changes.
     """
     plain = acts.LlmTurnInput(
         task_id=spec.task_id, turn_index=0, role=Role.CODER, spec=spec, transcript_ref=None
     )
-    # The hint is stored as "ann: <text>", and a JSON string costs two quotes.
-    room = DEFAULT_LIMIT - json_size(plain) - 2 - len("ann: ")
-    text = "h" * room
-    with_hint = plain.model_copy(update={"hints": [f"ann: {text}"]})
-    assert json_size(with_hint) == DEFAULT_LIMIT
+    # A hint is stored as "ann: <text>".
+    stored: list[str] = []
+    while True:
+        room = DEFAULT_LIMIT - json_size(plain.model_copy(update={"hints": [*stored, "ann: "]}))
+        if room <= MAX_HINT_BYTES:
+            break
+        stored.append("ann: " + "h" * MAX_HINT_BYTES)
+    stored.append("ann: " + "h" * room)
+    assert json_size(plain.model_copy(update={"hints": stored})) == DEFAULT_LIMIT
     handed_over = CarryState(
         spec=spec,
         phase=Phase.CODING,
@@ -344,10 +385,10 @@ def hint_that_fills(spec: TaskSpec) -> str:
         head_sha=BASE,
         sandbox_id="sbx-1",
         started_at=datetime.now(UTC),
-        hints=[f"ann: {text}"],
+        hints=stored,
     )
     assert json_size(handed_over) > DEFAULT_LIMIT
-    return text
+    return [h.removeprefix("ann: ") for h in stored]
 
 
 async def test_a_hand_over_with_a_state_over_the_limit_fails_the_workflow(
@@ -357,15 +398,16 @@ async def test_a_hand_over_with_a_state_over_the_limit_fails_the_workflow(
 
     TaskWorkflow converts its state first, so the run ends with the guard's error. The state of
     a hand-over is a few hundred bytes larger than the llm_turn input that carries the same
-    hints, so a hint can fit in the one and push the other over. This one fits the model call
-    to the byte.
+    hints, so hints can fit in the one and push the other over. These fit the model call to the
+    byte.
     """
     spec = make_spec()
-    hint = hint_that_fills(spec)
+    texts = hints_that_fill(spec)
     handle = await start_task(
         env.client, spec, task_queue=queue, tuning=acts.Tuning(continue_as_new_every_turns=1)
     )
-    await handle.signal(TaskWorkflow.hint, args=["ann", hint])
+    for text in texts:
+        await handle.signal(TaskWorkflow.hint, args=["ann", text])
 
     async with task_worker(env, queue, Stubs(model_stops=False)):
         with pytest.raises(WorkflowFailureError) as caught:

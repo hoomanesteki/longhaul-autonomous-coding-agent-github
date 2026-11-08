@@ -754,6 +754,9 @@ class DeliverInput(BaseModel):
     # verifier passed. A pull request is ready for review exactly when this is set, and its body
     # says "Verified: <this>". It is part of the input, so a retry builds the same request.
     verified_tests: str | None = None
+    # True for the draft of a task that stopped before it finished (LH-507). The body then refers
+    # to the issue and does not close it. Part of the input, so a retry builds the same body.
+    partial: bool = False
 
 
 class PostFinalInput(BaseModel):

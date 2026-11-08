@@ -164,12 +164,15 @@ def render_pr_body(
     *,
     templates: Path,
     verified: str | None = None,
+    partial: bool = False,
 ) -> str:
     """The body for a pull request that closes issue `issue_number`.
 
     `files` is the diff stat of the branch, in the order git gave it. `templates` is the folder
     that holds pr_body.md.j2 (settings.templates_path). `verified` is the counts that a verifier
-    gave when it passed the work; a body without it has no "Verified" line.
+    gave when it passed the work; a body without it has no "Verified" line. `partial` is the work
+    of a task that stopped before it finished (LH-507): the body then refers to the issue with
+    "Refs" and not "Closes", so that merging it does not close an issue that is still open.
     """
     listed = [{"path": _path(f.path), "counts": _counts(f)} for f in files[:MAX_FILES]]
     page = (
@@ -183,6 +186,7 @@ def render_pr_body(
             tested=_tested(tests),
             verified=_verified(verified),
             issue_number=int(issue_number),
+            partial=partial,
         )
     )
     return str(page)

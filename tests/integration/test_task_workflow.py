@@ -2445,7 +2445,7 @@ async def test_a_delivery_that_fails_for_good_swaps_working_for_needs_human(
     assert failed.payload["type"] == "CheckpointError"
 
 
-async def test_a_cancel_while_delivering_cleans_up_and_swaps_no_label(
+async def test_a_cancel_while_delivering_cleans_up_and_takes_the_labels_off(
     env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:
     stubs = Stubs()

@@ -23,4 +23,10 @@
 Verified: {{ verified }}
 {% endif %}
 
+{% if partial %}
+This pull request holds partial work. The task stopped before it finished, so merging it does not close the issue.
+
+Refs #{{ issue_number }}
+{% else %}
 Closes #{{ issue_number }}
+{% endif %}

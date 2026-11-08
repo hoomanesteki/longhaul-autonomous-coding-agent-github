@@ -649,7 +649,11 @@ async def abandon(ctx: RunContext, workflow_id: str) -> None:
 
 
 async def clean_up(ctx: RunContext, workflow_id: str) -> None:
-    """Remove the sandbox and the checkpoint repo of a task. A finished workflow leaves both."""
+    """Remove the sandbox and the checkpoint repo of a task.
+
+    A task that ended destroys its own sandbox and leaves the repo for the janitor, so this is for
+    the repo of a finished task and for both pieces of one that was interrupted.
+    """
     for remove in (ctx.sandboxes.cleanup_task, ctx.store.cleanup_task):
         with contextlib.suppress(Exception):
             await remove(workflow_id)

@@ -269,7 +269,9 @@ way for every end, in `_wind_up`:
    nothing from GitHub, which can be down for twenty minutes. A task that ended on its own keeps
    its bare repo (`CleanupInput.keep_repo`), and the janitor (`clean_repos`, which PollerWorkflow
    runs after each poll) removes it seven days after the `outcome` event. A cancel removes the
-   repo with the sandbox, as it always did, and its reason is the reason of the cancel.
+   repo as it always did. For a task of an issue that happens at the end of the wind-up, with a
+   second `cleanup`, because the final comment reads the diff from the repo. The reason of both
+   is the reason of the cancel.
 3. A task of an issue goes on. A stuck task whose repo asked for it (the memo key
    acts.OPEN_DRAFT_MEMO_KEY, set by the poller from `open_draft_on_stuck`) builds the pull request
    branch and opens a draft with its partial work, through the same two activities as a finished
@@ -819,7 +821,8 @@ class TaskWorkflow:
         first, because GitHub can be down for twenty minutes and a container must not wait for it.
         Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
         for one, the final comment (which links that pull request), and the final labels. The
-        note for the metrics comes last, so it counts a task that has finished all of this.
+        repo of a cancelled task goes after them, since the comment reads its diff. The note for
+        the metrics comes last, so it counts a task that has finished all of this.
 
         Each step is best effort. An activity that fails for good is logged, and the next step
         goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
@@ -830,32 +833,62 @@ class TaskWorkflow:
             await self._note_outcome(outcome)
             return outcome
         state = self.state
-        await self._try("cleanup", self._wind_call(acts.CLEANUP, self._cleanup_input(outcome)))
+        await self._try(
+            "cleanup",
+            self._wind_call(
+                acts.CLEANUP,
+                self._cleanup_input(outcome, keep_repo=self._repo_outlives_the_sandbox(outcome)),
+            ),
+        )
         if lifecycle.is_github_task(state.spec):
             outcome = await self._open_draft(outcome)
             await self._report(outcome)
             await self._end_labels(outcome)
+        await self._remove_repo(outcome)
         await self._note_outcome(outcome)
         return outcome
 
-    def _cleanup_input(self, outcome: Outcome) -> acts.CleanupInput:
-        """What to destroy when the task ends, and whether its repo stays for the janitor.
+    def _cancelled_by_a_person(self, outcome: Outcome) -> bool:
+        return outcome.kind is OutcomeKind.CANCELLED and self.cancel_request is not None
+
+    def _cleanup_input(self, outcome: Outcome, *, keep_repo: bool) -> acts.CleanupInput:
+        """What to destroy when the task ends, and whether its repo stays.
 
         A task that ended on its own keeps its bare repo for a week, so that a person can read
-        its checkpoints. A task that a person cancelled does not: they asked it to stop, and the
-        cancel has always removed the repo with the sandbox. Its reason is the cancel reason.
+        its checkpoints, and the janitor removes it. A task that a person cancelled has its repo
+        removed, as a cancel always did, and its reason is the cancel reason.
         """
-        state = self.state
         request = self.cancel_request
-        cancelled = outcome.kind is OutcomeKind.CANCELLED and request is not None
+        cancelled = self._cancelled_by_a_person(outcome)
         return acts.CleanupInput(
-            task_id=state.spec.task_id,
-            sandbox_id=state.sandbox_id,
+            task_id=self.state.spec.task_id,
+            sandbox_id=self.state.sandbox_id,
             reason=request.reason
             if cancelled and request is not None
             else wind_up.cleanup_reason(outcome.kind),
-            keep_repo=not cancelled,
+            keep_repo=keep_repo,
         )
+
+    def _repo_outlives_the_sandbox(self, outcome: Outcome) -> bool:
+        """Whether the first cleanup leaves the repo, because the final comment reads its diff.
+
+        A task of an issue posts a report that needs the repo, so the sandbox goes first and the
+        repo of a cancelled one goes after the report (`_remove_repo`). A local task has no
+        report, and one cleanup removes both.
+        """
+        return not self._cancelled_by_a_person(outcome) or lifecycle.is_github_task(self.state.spec)
+
+    async def _remove_repo(self, outcome: Outcome) -> None:
+        """Remove the bare repo of a task that a person cancelled, now that its report is out.
+
+        They asked it to stop, so the repo does not wait a week for the janitor. The second
+        cleanup finds no sandbox and removes the repo and the rest of what the task left.
+        """
+        if self._cancelled_by_a_person(outcome) and lifecycle.is_github_task(self.state.spec):
+            await self._try(
+                "repo cleanup",
+                self._wind_call(acts.CLEANUP, self._cleanup_input(outcome, keep_repo=False)),
+            )
 
     async def _open_draft(self, outcome: Outcome) -> Outcome:
         """Open a draft pull request with the partial work of a stuck task, if the repo asked.
@@ -901,6 +934,7 @@ class TaskWorkflow:
                     base_sha=built.base_sha,
                     head_sha=built.head_sha,
                     title=built.title,
+                    partial=True,
                 ),
             )
         except ActivityError as err:
@@ -933,10 +967,19 @@ class TaskWorkflow:
                     head_sha=state.head_sha,
                     turns=state.turn_index,
                     cost_usd=state.cost_usd,
-                    draft=True,  # deliver opens drafts until a verifier has passed the work
+                    draft=not self._verified(outcome),
                 ),
             ),
         )
+
+    def _verified(self, outcome: Outcome) -> bool:
+        """Whether the pull request of the outcome is ready for review and not a draft.
+
+        `deliver` opens a ready pull request exactly when `verified_tests` is set, and only the
+        delivery of a finished task passes it. The draft of a stuck task holds partial work and is
+        always a draft.
+        """
+        return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
 
     async def _end_labels(self, outcome: Outcome) -> None:
         opened = outcome.kind is OutcomeKind.STUCK and outcome.pr_url is not None

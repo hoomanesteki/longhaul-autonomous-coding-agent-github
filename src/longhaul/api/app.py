@@ -60,12 +60,18 @@ async def from_settings(app: FastAPI) -> AsyncIterator[None]:
         yield
 
 
-def create_app(context: ApiContext | None = None, console_dir: Path | None = None) -> FastAPI:
+def create_app(
+    context: ApiContext | None = None,
+    console_dir: Path | None = None,
+    *,
+    with_console: bool = True,
+) -> FastAPI:
     """Build the app. `console_dir` is the built console to serve at `/`.
 
     A deployment (no context) takes the folder from LONGHAUL_CONSOLE_DIR, and the tests that give
-    a context also give the folder or none. `openapi_schema()` passes neither a context nor a
-    folder, and the file routes are left out of the schema in any case.
+    a context also give the folder or none. `with_console=False` serves no console and reads no
+    setting for one, which is what `openapi_schema()` uses: the dump must work on a clone that
+    has no build yet. The file routes are left out of the schema in any case.
     """
     app = FastAPI(
         title=TITLE,
@@ -80,7 +86,9 @@ def create_app(context: ApiContext | None = None, console_dir: Path | None = Non
     app.include_router(routes_tasks.router)
     app.include_router(routes_memory.router)
     add_system_routes(app)
-    folder = console_dir if console_dir is not None else configured_console_dir(context)
+    folder = None
+    if with_console:
+        folder = console_dir if console_dir is not None else configured_console_dir(context)
     if folder is not None:
         mount_console(app, folder)  # last, so that every route above it wins
     app.middleware("http")(count_requests)
@@ -141,7 +149,7 @@ def add_system_routes(app: FastAPI) -> None:
 
 def openapi_schema() -> dict[str, Any]:
     """The OpenAPI schema of the app. It needs no database, no blob store and no Temporal."""
-    return create_app().openapi()
+    return create_app(with_console=False).openapi()
 
 
 def render_openapi() -> str:

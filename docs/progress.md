@@ -84,7 +84,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-503 | Coder role with step tracking | 5 | Done | merge | 2026-11-07 |
 | LH-504 | Verifier role and send-back loop | 5 | Done | merge | 2026-11-08 |
 | LH-505 | Stuck detector | 5 | Done | merge | 2026-11-07 |
-| LH-506 | Pause, ask and hint flow | 3 | Todo | | |
+| LH-506 | Pause, ask and hint flow | 3 | Done | merge | 2026-11-08 |
 | LH-507 | Final outcomes and stuck report | 3 | Todo | | |
 
 ## Phase 6: Memory (tag v0.6.0)
@@ -126,7 +126,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-901 | Eval task sets and runner | 5 | Done | merge | 2026-11-07 |
 | LH-902 | SWE-bench Verified adapter and grading | 8 | Done | merge | 2026-11-07 |
 | LH-903 | Baselines: single-shot and naive loop | 5 | Done | merge | 2026-11-07 |
-| LH-904 | Full chaos suite | 5 | Todo | | |
+| LH-904 | Full chaos suite | 5 | Done | merge | 2026-11-08 |
 | LH-905 | Results report | 3 | Todo | | |
 | LH-906 | Security hardening pass | 3 | Todo | | |
 | LH-907 | Docs, README and demo | 3 | Todo | | |

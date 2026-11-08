@@ -75,7 +75,7 @@ boto3 moves from the dev group to the runtime dependencies, and `types-boto3[s3]
 **To watch**
 
 - The 256 KB cap is enforced twice. `GuardedPayloadConverter` refuses the payload on every encode (LH-292), so it never reaches the history. `assert_small` in the activity wrappers (LH-204) maps `PayloadTooLargeError` to a non-retryable activity error, since retrying cannot make a payload smaller. A process that connects with another data converter has only the second. A test server or a script has to use `guarded_data_converter` to get the first.
-- The hints of a task have no cap of their own. Each signal may carry up to 256 KB, and `llm_turn` carries every hint, so a few large hints end the task with the error above. A limit on the hints belongs to the hint and pause flow (LH-506).
+- A hint is cut to 2,000 bytes when its signal arrives (`agent/hints.py`, LH-506), with a note that says so. `llm_turn` still carries every hint of the task, so a very long task with very many hints would reach the cap in the end; the count of hints is not limited.
 - The upload checksum needs a backend that supports the `x-amz-checksum-sha256` header. S3 and the MinIO build in the compose stack do. A different S3-compatible store has to be tried before it is used.
 - The server limits quoted above are defaults. Check them against the Temporal version in use when it changes.
 

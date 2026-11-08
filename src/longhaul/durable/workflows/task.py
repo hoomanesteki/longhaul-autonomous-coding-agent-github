@@ -281,7 +281,15 @@ way for every end, in `_wind_up`:
    the report with what was done, what is left and the diff stats (github/final_comment.py).
 5. The final labels are set (lifecycle.on_end). A task that delivered has them already from
    `_deliver`.
-6. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
+6. A task that keeps memory asks for its lessons (LH-605): `extract_lessons` drafts up to 5 notes
+   from the plan, the last progress notes, the stuck events and the verifier's issues, and stores
+   them as candidates linked to the pull request number, or to the task id when there is no pull
+   request. The workflow records what came back in a `lessons` event, for the run report, and adds
+   the cost of the call to the task. It runs on every ending path, a cancel and an error too, and
+   after the final comment and the labels, so nobody waits for a model. A task whose worker has no
+   memory store has no `memory_ref` and never asks. A failure here is logged and changes nothing
+   about the outcome.
+7. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
    of the above.
 
 Each step is best effort and runs outside `_call`, so a failed step is logged and the next one
@@ -301,7 +309,9 @@ retried for as long as the code stayed the same, now fails the workflow for good
 Replay. All of it is behind `workflow.patched(OUTCOME_PATCH)`. A history from before this story
 has no marker and replays as it ran: a cancel cleaned up inside `_cancelled`, no other end cleaned
 up, and a failure noted the outcome and raised. Drop the patch with `workflow.deprecate_patch`
-once no run that began before this story is open.
+once no run that began before this story is open. The lessons are behind
+`workflow.patched(LESSONS_PATCH)`, asked only by a task that has a `memory_ref`, so a history that
+ended before LH-605 replays without the call, and a task with no memory records no marker.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -491,6 +501,9 @@ PLAN_GATE_PATCH = "lh-502-plan-gate"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
 # ends" above.
 OUTCOME_PATCH = "lh-507-final-outcome"
+# The patch marker of the extract_lessons call at the end of a task (LH-605). See "How a task
+# ends" above.
+LESSONS_PATCH = "lh-605-lessons"
 # What fails the workflow when it escapes run(): an activity or child that failed for good, and
 # the errors the workflow was told to fail on (acts.FAIL_THE_WORKFLOW).
 FAILS_THE_WORKFLOW: tuple[type[BaseException], ...] = (FailureError, *acts.FAIL_THE_WORKFLOW)
@@ -821,8 +834,9 @@ class TaskWorkflow:
         first, because GitHub can be down for twenty minutes and a container must not wait for it.
         Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
         for one, the final comment (which links that pull request), and the final labels. The
-        repo of a cancelled task goes after them, since the comment reads its diff. The note for
-        the metrics comes last, so it counts a task that has finished all of this.
+        repo of a cancelled task goes after them, since the comment reads its diff. The lessons of
+        a task that keeps memory come next (LH-605), so nobody waits for a model. The note for the
+        metrics comes last, so it counts a task that has finished all of this.
 
         Each step is best effort. An activity that fails for good is logged, and the next step
         goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
@@ -845,6 +859,7 @@ class TaskWorkflow:
             await self._report(outcome)
             await self._end_labels(outcome)
         await self._remove_repo(outcome)
+        await self._lessons(outcome)
         await self._note_outcome(outcome)
         return outcome
 
@@ -980,6 +995,47 @@ class TaskWorkflow:
         always a draft.
         """
         return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
+
+    async def _lessons(self, outcome: Outcome) -> None:
+        """Draft the lessons of the task and record them (LH-605). Best effort, like the rest.
+
+        Only a task that loaded its memory block asks: it ran on a worker with a store, and that
+        worker registers the activity. The patch is checked after that test, so a task with no
+        memory records no marker and its history stays as it was.
+        """
+        state = self.state
+        if state.memory_ref is None or not workflow.patched(LESSONS_PATCH):
+            return
+        try:
+            drafted = await self._wind_call(
+                acts.EXTRACT_LESSONS,
+                acts.ExtractLessonsInput(
+                    task_id=state.spec.task_id,
+                    turn_index=state.turn_index,
+                    spec=state.spec,
+                    outcome=outcome,
+                    plan=state.plan,
+                    notes=state.notes,
+                    script_ref=self._script(),
+                ),
+            )
+        except FailureError as err:
+            workflow.logger.warning(
+                "no lessons for task %s: %s", state.spec.task_id, err.cause or err
+            )
+            return
+        state.cost_usd += drafted.cost_usd
+        if drafted.status == "skipped":
+            return
+        await self._wind_note(
+            acts.LESSONS_EVENT,
+            {
+                "status": drafted.status,
+                "source_ref": drafted.source_ref,
+                "count": drafted.stored,
+                "items": [item.model_dump() for item in drafted.items],
+            },
+        )
 
     async def _end_labels(self, outcome: Outcome) -> None:
         opened = outcome.kind is OutcomeKind.STUCK and outcome.pr_url is not None

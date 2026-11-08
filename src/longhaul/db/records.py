@@ -33,6 +33,10 @@ it does for the cost ledger (cost/ledger.py).
 `ended_before` tells the janitor (LH-507) which tasks ended before a time. A task has ended when
 it has an `outcome` event, and the time of the end is the time of that event. It is not in the
 `Recorder` protocol either: only the janitor asks.
+
+`events_of` reads a task's events of some types back, oldest first. The lessons of a finished task
+(LH-605) are drafted from its stuck events and the verifier's issues, which the workflow wrote to
+the log and no longer holds. It is outside the `Recorder` protocol too: only that activity reads.
 """
 
 from __future__ import annotations
@@ -234,6 +238,9 @@ class MemoryRecorder:
     async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
         return {t for t in task_ids if t in self.ended and self.ended[t] < cutoff}
 
+    async def events_of(self, task_id: str, types: Sequence[str]) -> list[EventRecord]:
+        return [e for e in self.events if e.task_id == task_id and e.type in types]
+
     async def record_plan(self, record: PlanRecord) -> None:
         key = (record.task_id, record.version)
         kept = self.plans.get(key)
@@ -344,6 +351,18 @@ class SqlRecorder:
                 .distinct()
             )
             return {row[0] for row in rows}
+
+    async def events_of(self, task_id: str, types: Sequence[str]) -> list[EventRecord]:
+        if not types:
+            return []
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(Event.task_id, Event.type, Event.payload)
+                .where(Event.task_id == task_id, Event.type.in_(types))
+                # The id breaks a tie between two events written in the same instant.
+                .order_by(Event.ts, Event.id)
+            )
+            return [EventRecord(row[0], row[1], dict(row[2])) for row in rows]
 
     async def record_request_fraction(self, task_id: str, fraction: float) -> None:
         # One statement, so two requests that finish together cannot lower the maximum.

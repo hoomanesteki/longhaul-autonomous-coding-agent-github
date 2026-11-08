@@ -59,7 +59,12 @@ from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
-from longhaul.durable.workflows.task import LOAD_MEMORY_PATCH, OUTCOME_PATCH, TaskWorkflow
+from longhaul.durable.workflows.task import (
+    LESSONS_PATCH,
+    LOAD_MEMORY_PATCH,
+    OUTCOME_PATCH,
+    TaskWorkflow,
+)
 from longhaul.github import lifecycle
 from longhaul.github.inputs import CommentInput, LabelInput
 
@@ -129,6 +134,10 @@ class Stubs:
     of prepare_workspace, such as `memory_enabled=True`, which is what makes the workflow call
     it.
 
+    extract_lessons (LH-605) is kept apart in the same way: each call is in `lessons`, with the
+    names of the activities that had run before it, and the `lessons` event that follows goes in
+    `lesson_events`. `lessons_output` is what the stub answers.
+
     The trace of an error that ended a task goes in `errors`. The report that ends a task of an
     issue (LH-507) goes in `finals`. The cleanup that ends a task
     which was not cancelled goes in `wound_up`. It does not
@@ -169,12 +178,24 @@ class Stubs:
         self.memory_loads: list[tuple[list[str], acts.LoadMemoryInput]] = []
         self.memory_block = ref("memory/memory-block.txt")
         self.prepared_with: dict[str, Any] = {}
+        self.lessons: list[tuple[list[str], acts.ExtractLessonsInput]] = []
+        # The final comment, the lessons and the outcome note in the order they ran. The comment
+        # and the note are kept apart from `every`, so this list shows where the lessons sit.
+        self.wind_up: list[str] = []
+        self.lesson_events: list[acts.RecordEventInput] = []
+        self.lessons_output = acts.ExtractLessonsOutput(
+            status="ok",
+            source_ref="7",
+            items=[acts.LessonNote(kind="lesson", content="calc.add must return a + b.")],
+            cost_usd=0.05,
+        )
 
     @property
     def activities(self) -> list[Callable[..., Any]]:
         return [
             self.prepare_workspace,
             self.load_memory,
+            self.extract_lessons,
             self.ensure_sandbox,
             self.llm_turn,
             self.tool_exec,
@@ -250,6 +271,14 @@ class Stubs:
             raise self.fails[acts.LOAD_MEMORY.name]
         return self.memory_block
 
+    @activity.defn(name=acts.EXTRACT_LESSONS.name)
+    async def extract_lessons(self, inp: acts.ExtractLessonsInput) -> acts.ExtractLessonsOutput:
+        self.lessons.append((list(self.every), inp))
+        self.wind_up.append("lessons")
+        if acts.EXTRACT_LESSONS.name in self.fails:
+            raise self.fails[acts.EXTRACT_LESSONS.name]
+        return self.lessons_output
+
     @activity.defn(name=acts.LLM_TURN.name)
     async def llm_turn(self, inp: acts.LlmTurnInput) -> acts.LlmTurnOutput:
         self.turn_runs[inp.turn_index] = activity.info().workflow_run_id
@@ -321,12 +350,16 @@ class Stubs:
     async def record_event(self, inp: acts.RecordEventInput) -> None:
         if inp.type == acts.OUTCOME_EVENT:
             self.outcomes.append((activity.info().workflow_run_id, inp))
+            self.wind_up.append("outcome note")
             if acts.RECORD_EVENT.name in self.fails:
                 raise self.fails[acts.RECORD_EVENT.name]
             return
         if inp.type == acts.ERROR_EVENT:
             # The trace of the error that ended the task (LH-507). Kept apart with the note.
             self.errors.append(inp)
+            return
+        if inp.type == acts.LESSONS_EVENT:
+            self.lesson_events.append(inp)
             return
         await self._enter(acts.RECORD_EVENT.name, inp)
         if acts.RECORD_EVENT.name in self.fails:
@@ -372,6 +405,7 @@ class Stubs:
         # of a task that ended on its own is, so the lists of GitHub activities below stay what
         # they were. It does not wait at a gate: the wind-up must not hang a test that holds one.
         self.finals.append(inp)
+        self.wind_up.append("final comment")
         return "comment-final"
 
     @activity.defn(name=acts.BUILD_PR_BRANCH.name)
@@ -3299,3 +3333,162 @@ async def test_every_run_records_the_marker_of_the_wind_up(
         history = await handle.fetch_history()
 
     assert _patch_markers(history, OUTCOME_PATCH) == [OUTCOME_PATCH]
+
+
+# ---------- LH-605: the lessons of a finished task ----------
+# tests/integration/test_lessons.py runs the real activity. These show when the workflow calls it
+# and what it does with the answer, with a stub.
+async def test_a_finished_task_with_memory_asks_for_its_lessons_once_after_the_wind_up(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs(reads_then_finishes(1), cost_usd=0.1)
+    stubs.prepared_with = WITH_MEMORY
+    outcome, _ = await play(env, stubs, gh_spec)
+
+    assert outcome == FINISHED
+    ((before, asked),) = stubs.lessons
+    assert asked.task_id == gh_spec.task_id
+    assert asked.outcome == FINISHED
+    # The pull request is open and the labels are set before the lessons are asked, and the note
+    # that the metrics count from comes after them.
+    assert before[-len(DELIVERY) :] == DELIVERY
+    assert stubs.wind_up == ["final comment", "lessons", "outcome note"]
+    assert asked.spec.issue_number == 42
+    assert asked.turn_index == 2
+    assert len(stubs.finals) == 1
+    (event,) = stubs.lesson_events
+    assert event.payload == {
+        "status": "ok",
+        "source_ref": "7",
+        "count": 1,
+        "items": [{"kind": "lesson", "content": "calc.add must return a + b."}],
+    }
+    # The cost of the call is part of the task's cost in the note at its end.
+    ((_, note),) = stubs.outcomes
+    assert note.payload["cost_usd"] == pytest.approx(0.2 + 0.05)
+
+
+async def test_a_local_task_asks_for_its_lessons_too(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.prepared_with = WITH_MEMORY
+    await play(env, stubs, spec)
+
+    ((_, asked),) = stubs.lessons
+    assert asked.spec.issue_number is None
+
+
+async def test_a_task_on_a_worker_without_memory_asks_for_no_lessons(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    await play(env, stubs, spec)
+
+    assert stubs.lessons == []
+    assert stubs.lesson_events == []
+
+
+async def test_a_skipped_extraction_leaves_no_event(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.prepared_with = WITH_MEMORY
+    stubs.lessons_output = acts.ExtractLessonsOutput(status="skipped", source_ref=spec.task_id)
+    await play(env, stubs, spec)
+
+    assert len(stubs.lessons) == 1
+    assert stubs.lesson_events == []
+
+
+async def test_lessons_that_cannot_be_drafted_do_not_change_the_outcome(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.prepared_with = WITH_MEMORY
+    stubs.fails[acts.EXTRACT_LESSONS.name] = ApplicationError(
+        "the store is down", type="OperationalError", non_retryable=True
+    )
+    outcome, final = await play(env, stubs, gh_spec)
+
+    assert outcome == FINISHED
+    assert final.phase is Phase.DONE
+    assert final.outcome == FINISHED
+    assert len(stubs.lessons) == 1
+    assert stubs.lesson_events == []
+    # The task still counts as finished.
+    ((_, note),) = stubs.outcomes
+    assert note.payload["kind"] == "pr_opened"
+
+
+async def test_a_task_that_ends_in_an_error_asks_for_its_lessons(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.prepared_with = WITH_MEMORY
+    stubs.fails[acts.DELIVER.name] = ApplicationError(
+        "push rejected", type="CheckpointError", non_retryable=True
+    )
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+
+    ((_, asked),) = stubs.lessons
+    assert asked.outcome == Outcome(
+        kind=OutcomeKind.ERROR, summary="workflow failed: CheckpointError"
+    )
+
+
+async def test_a_task_that_runs_out_of_turns_asks_for_its_lessons(
+    env: WorkflowEnvironment,
+) -> None:
+    stubs = Stubs(never_finishes)
+    stubs.prepared_with = WITH_MEMORY
+    outcome, _ = await play(env, stubs, make_spec(task_turns=2))
+
+    assert outcome.kind is OutcomeKind.ERROR
+    ((_, asked),) = stubs.lessons
+    assert asked.outcome == outcome
+
+
+async def test_a_cancelled_task_asks_for_its_lessons(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.prepared_with = WITH_MEMORY
+    stubs.hold(acts.LLM_TURN.name)  # never opened: the cancel has to end the run
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=SHORT_HEARTBEAT)
+        await wait_until(lambda: acts.LLM_TURN.name in stubs.names(), "the turn to start")
+        await handle.signal("cancel", args=["alice", "changed my mind"])
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.CANCELLED
+    ((_, asked),) = stubs.lessons
+    assert asked.outcome == outcome
+
+
+async def test_the_lessons_marker_is_recorded_only_by_a_task_that_asks_and_the_history_replays(
+    env: WorkflowEnvironment,
+) -> None:
+    with_memory, without = Stubs(reads_then_finishes(1)), Stubs(reads_then_finishes(1))
+    with_memory.prepared_with = WITH_MEMORY
+    async with running(env, with_memory) as queue:
+        first = await start_task(env.client, make_spec("lh-acme-calc-66"), task_queue=queue)
+        await result_of(first)
+        marked = await first.fetch_history()
+    async with running(env, without) as queue:
+        second = await start_task(env.client, make_spec("lh-acme-calc-67"), task_queue=queue)
+        await result_of(second)
+        plain = await second.fetch_history()
+
+    assert _patch_markers(marked, LESSONS_PATCH) == [LESSONS_PATCH]
+    assert _patch_markers(plain, LESSONS_PATCH) == []
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    for history in (marked, plain):
+        await replayer.replay_workflow(history)

@@ -90,6 +90,9 @@ What it is built from, and why each piece is what it is:
   again before the worker connects, and refuses a table that another embedder wrote. With it off,
   the worker builds no store: no map and no commands are kept, and the memory block of the
   prompt stays empty. load_memory is registered either way, because the workflow names it.
+  The same store takes the lessons of a finished task (LH-605): extract_lessons asks the compactor
+  model for up to 5 notes and writes them as candidates, and a worker with no store answers it
+  with "skipped".
 * The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
@@ -139,7 +142,7 @@ from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.janitor import JanitorActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.memory import MemoryActivities
+from longhaul.durable.activities.memory import LessonActivities, MemoryActivities
 from longhaul.durable.activities.outcome import FinalCommentActivities, StoreDiffs
 from longhaul.durable.activities.plan import (
     PlanActivities,
@@ -398,6 +401,7 @@ def build_parts(
         blobs=blobs,
     )
     notes = MemoryActivities(memory, blobs)
+    lessons = LessonActivities(memory, recorder, provider, blobs, config_for, ledger=ledger)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
@@ -436,6 +440,7 @@ def build_parts(
             *tools.activities,
             *workspace.activities,
             *notes.activities,
+            *lessons.activities,
             *events.activities,
             *plans.activities,
             *steps.activities,

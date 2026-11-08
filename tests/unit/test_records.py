@@ -374,3 +374,21 @@ async def test_storing_a_plan_again_keeps_its_decision() -> None:
     await recorder.record_plan(PlanRecord("lh-x", 1, a_plan()))
     assert recorder.plans[("lh-x", 1)].status == "approved"
     assert recorder.plans[("lh-x", 1)].decided_by == "alice"
+
+
+# ---------- LH-605: the events of a task, read back ----------
+async def test_events_of_a_task_come_back_in_the_order_they_were_written() -> None:
+    recorder = MemoryRecorder()
+    await recorder.record_event("lh-x", "stuck", {"reason": "edit_churn"})
+    await recorder.record_event("lh-y", "stuck", {"reason": "no_progress"})
+    await recorder.record_event("lh-x", "compaction", {"tokens_before": 9})
+    await recorder.record_event("lh-x", "verdict", {"issues": ["a"]})
+
+    got = await recorder.events_of("lh-x", ["stuck", "verdict"])
+
+    assert got == [
+        EventRecord("lh-x", "stuck", {"reason": "edit_churn"}),
+        EventRecord("lh-x", "verdict", {"issues": ["a"]}),
+    ]
+    assert await recorder.events_of("lh-x", []) == []
+    assert await recorder.events_of("lh-none", ["stuck"]) == []

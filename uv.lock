@@ -2152,6 +2152,7 @@ dependencies = [
     { name = "boto3" },
     { name = "cryptography" },
     { name = "docker" },
+    { name = "fastapi" },
     { name = "jinja2" },
     { name = "jsonschema" },
     { name = "openai" },
@@ -2169,6 +2170,7 @@ dependencies = [
     { name = "structlog" },
     { name = "temporalio" },
     { name = "typer" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -2183,7 +2185,6 @@ memory = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "fastapi" },
     { name = "hypothesis" },
     { name = "mypy" },
     { name = "pre-commit" },
@@ -2197,7 +2198,6 @@ dev = [
     { name = "types-docker" },
     { name = "types-jsonschema" },
     { name = "types-pyyaml" },
-    { name = "uvicorn" },
 ]
 eval = [
     { name = "rank-bm25" },
@@ -2212,6 +2212,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=50.0.2" },
     { name = "datasets", marker = "extra == 'eval'", specifier = ">=5.1.0" },
     { name = "docker", specifier = ">=7.2.0" },
+    { name = "fastapi", specifier = ">=0.162.0" },
     { name = "fastembed", marker = "extra == 'memory'", specifier = ">=0.9.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "jsonschema", specifier = ">=4.26.0" },
@@ -2232,12 +2233,12 @@ requires-dist = [
     { name = "swebench", marker = "extra == 'eval'", specifier = "==5.0.2" },
     { name = "temporalio", specifier = ">=1.35.0" },
     { name = "typer", specifier = ">=0.27.3" },
+    { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 provides-extras = ["memory", "eval"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "fastapi", specifier = ">=0.162.0" },
     { name = "hypothesis", specifier = ">=6.170.14" },
     { name = "mypy", specifier = ">=2.4.1" },
     { name = "pre-commit", specifier = ">=4.7.0" },
@@ -2251,7 +2252,6 @@ dev = [
     { name = "types-docker", specifier = ">=7.2.0.20261006" },
     { name = "types-jsonschema", specifier = ">=4.26.0.20261006" },
     { name = "types-pyyaml", specifier = ">=6.0.12.20260906" },
-    { name = "uvicorn", specifier = ">=0.54.0" },
 ]
 eval = [{ name = "rank-bm25", specifier = ">=0.2.2" }]
 

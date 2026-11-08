@@ -889,6 +889,40 @@ Things to know when you read the numbers:
 
 `tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 
+## The console API
+
+`longhaul api` serves the API that the console reads (LH-801, ADR-0011). It needs the stack from `make up` and the `LONGHAUL_DATABASE_URL`, `LONGHAUL_BLOB_*` and `LONGHAUL_TEMPORAL_*` settings of `.env.example`. It does not need a worker to start. The live status of a task and the actions need one.
+
+```bash
+uv run longhaul api                      # http://127.0.0.1:8000
+uv run longhaul api --host 0.0.0.0 --port 8100
+curl -s http://127.0.0.1:8000/api/tasks | head -c 400
+```
+
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. There is no login until LH-807, so leave the host on `127.0.0.1` unless the machine is closed to the network. The interactive docs are at `/docs`.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/tasks?status=&repo=&limit=50&cursor=` | The `tasks` rows, newest first, with `next_cursor` when there are more |
+| `GET /api/tasks/{id}` | The row, the answer of the workflow's `status` query, and the newest plan |
+| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first |
+| `GET /api/tasks/{id}/turns/{n}?attempt=` | The request and the reply of a model turn, redacted |
+| `GET /api/tasks/{id}/tool-calls/{call_id}/output?start=&end=` | Lines `start` to `end` of the full output of a tool call, redacted |
+| `POST /api/tasks/{id}/approve-plan`, `reject-plan`, `hint`, `budget`, `cancel` | Send the signal, with `by` set to `console` |
+| `GET /api/memory?repo=&status=&kind=` | Memory items without their vectors |
+| `POST /api/memory/{id}/approve`, `reject` | Decide on an item, as `longhaul memory approve` does |
+| `GET /api/repos` | The rows of `repo_settings` with a count of tasks |
+| `GET /healthz`, `GET /metrics` | 200 when the database answers; Prometheus text |
+
+Things to know:
+
+- **The row and the live status can differ.** The `tasks` row is written when the poller picks the task up, and the status and phase in it do not follow the task yet. `GET /api/tasks/{id}` therefore has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty.
+- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and a signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
+- **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
+- **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
+- **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
+- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
+
 ## Run the evaluation
 
 `eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.

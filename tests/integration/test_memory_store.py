@@ -437,6 +437,15 @@ async def test_an_approval_names_a_person(
 
 
 # ---------- listing ----------
+async def test_list_items_stops_at_the_limit(store: PgMemoryStore) -> None:
+    first = await store.add_candidate(note(REMOVE_LESSON))
+    second = await store.add_candidate(note(FORMAT_LESSON, kind="pitfall"))
+    await store.add_candidate(note(LAYOUT_LESSON))
+
+    assert [e.id for e in await store.list_items(REPO, limit=2)] == [first, second]
+    assert len(await store.list_items(REPO, limit=10)) == 3
+
+
 async def test_list_items_filters_by_status_and_kind(store: PgMemoryStore) -> None:
     lesson = await store.add_candidate(note(REMOVE_LESSON))
     pitfall = await store.add_candidate(note(FORMAT_LESSON, kind="pitfall"))

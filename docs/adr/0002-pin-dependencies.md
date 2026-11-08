@@ -21,7 +21,8 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | httpx2 | 2.16.0 |
 | httpcore2 | 2.16.0 |
 | docker | 7.2.0 |
-| fastapi | not yet added; pinned when first added |
+| fastapi | 0.162.0 (runtime since LH-801, the console API, see ADR-0011; before that a dev dependency for the FakeGitHub) |
+| uvicorn | 0.54.0 (runtime since LH-801, serves `longhaul api`) |
 | jsonschema | 4.26.0 |
 | typer | 0.27.3 (`typer>=0.27.3`, for the `longhaul` command; it bundles its own Click, so `click` is not installed) |
 | pydantic | 2.14.1 |

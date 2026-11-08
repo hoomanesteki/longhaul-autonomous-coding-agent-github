@@ -23,7 +23,7 @@ DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 RUNBOOK = ROOT / "docs" / "runbook.md"
 TERRAFORM_DIR = ROOT / "deploy" / "terraform" / "aws"
 
-# A minimum. Later stories add jobs (console), and the `ci` job has to wait for each of them,
+# A minimum. Later stories add jobs, and the `ci` job has to wait for each of them,
 # which test_ci_has_required_jobs checks against the real file. chaos-lite runs on its own
 # schedule, so `ci` does not wait for it.
 REQUIRED_JOBS = {
@@ -36,6 +36,7 @@ REQUIRED_JOBS = {
     "compose",
     "docs",
     "terraform",
+    "console",
     "ci",
 }
 
@@ -500,6 +501,51 @@ def test_dependabot_groups_its_updates() -> None:
         groups = update.get("groups", {}).values()
         patterns = [pattern for group in groups for pattern in group.get("patterns", [])]
         assert "*" in patterns, update["package-ecosystem"]
+
+
+# --- console: the npm checks run on every pull request ---------------------------------------
+
+
+def test_the_console_job_runs_the_four_checks_after_a_clean_install() -> None:
+    job = load_workflow()["jobs"]["console"]
+    assert job["defaults"]["run"]["working-directory"] == "console"
+    commands = run_commands(job)
+    order = ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"]
+    positions = [command_index(commands, command) for command in order]
+    assert None not in positions, f"the console job is missing one of {order}"
+    # `npm ci` installs exactly what the lock file says, and fails when package.json disagrees.
+    assert positions == sorted(positions)
+
+
+def test_the_console_job_fails_when_the_generated_types_are_stale() -> None:
+    # The client is typed by src/api/schema.ts. If openapi.json changed and the file did not,
+    # the console would build against the old API, so CI regenerates it and compares.
+    commands = run_commands(load_workflow()["jobs"]["console"])
+    generate = command_index(commands, "npm run api:types")
+    compare = command_index(commands, "git diff --exit-code")
+    assert generate is not None and compare is not None
+    assert generate < compare
+    assert "src/api/schema.ts" in commands[compare]
+    # The types must be fresh before typecheck reads them.
+    typecheck = command_index(commands, "npm run typecheck")
+    assert typecheck is not None and compare < typecheck
+
+
+def test_the_console_job_installs_the_node_the_package_asks_for() -> None:
+    job = load_workflow()["jobs"]["console"]
+    setup = next(step for step in job["steps"] if "setup-node" in str(step.get("uses", "")))
+    package = json.loads((ROOT / "console" / "package.json").read_text(encoding="utf-8"))
+    minimum = re.search(r">=(\d+)", package["engines"]["node"])
+    assert minimum is not None
+    assert int(str(setup["with"]["node-version"]).split(".")[0]) >= int(minimum.group(1))
+    assert setup["with"]["cache"] == "npm"
+    assert setup["with"]["cache-dependency-path"] == "console/package-lock.json"
+
+
+def test_dependabot_watches_the_console_packages() -> None:
+    updates = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))["updates"]
+    npm = [update for update in updates if update["package-ecosystem"] == "npm"]
+    assert [update["directory"] for update in npm] == ["/console"]
 
 
 # --- branch protection ---------------------------------------------------------------------

@@ -4,7 +4,7 @@ acts.py is the one module the workflow and the activity implementations both imp
 these tests pin what each side may rely on.
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import NoneType
 from typing import Any, get_args
@@ -19,6 +19,8 @@ from longhaul.context import compact
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import (
     BlobRef,
+    Budgets,
+    CarryState,
     Outcome,
     OutcomeKind,
     Phase,
@@ -35,6 +37,7 @@ from longhaul.contracts import (
     ToolResult,
     Usage,
 )
+from longhaul.cost.budget import BudgetVerdict
 from longhaul.durable import acts
 from longhaul.durable.payload_guard import DEFAULT_LIMIT, PayloadTooLargeError, assert_small
 from longhaul.github import side_effects
@@ -74,11 +77,13 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
     assert sorted(names) == [
         "append_results",
         "bundle_checkpoint",
+        "check_budget",
         "clean_repos",
         "cleanup",
         "compact",
         "decide_plan",
         "ensure_sandbox",
+        "extract_lessons",
         "llm_turn",
         "load_memory",
         "poll_once",
@@ -109,9 +114,11 @@ def test_activity_names_are_the_ones_in_section_3_7() -> None:
         (acts.STORE_PLAN, acts.StorePlanInput, NoneType),
         (acts.DECIDE_PLAN, acts.DecidePlanInput, NoneType),
         (acts.LOAD_MEMORY, acts.LoadMemoryInput, BlobRef),
+        (acts.EXTRACT_LESSONS, acts.ExtractLessonsInput, acts.ExtractLessonsOutput),
         (acts.RECORD_STEP, acts.RecordStepInput, NoneType),
         (acts.CLEAN_REPOS, NoneType, acts.JanitorResult),
         (acts.WRITE_RUN_REPORT, acts.RunReportInput, BlobRef),
+        (acts.CHECK_BUDGET, acts.CheckBudgetInput, BudgetVerdict),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -155,10 +162,15 @@ def test_each_activity_names_its_payload_types(
         pytest.param(acts.DECIDE_PLAN, 2 * 60, None, 3, id="decide_plan"),
         # Section 3.7: 2 minutes and 3 attempts. One search of the store and one blob write.
         pytest.param(acts.LOAD_MEMORY, 2 * 60, None, 3, id="load_memory"),
+        # Not in the table. One compactor call and a few inserts, after the task has ended. It
+        # has the heartbeat of the other model calls so that a cancel reaches it.
+        pytest.param(acts.EXTRACT_LESSONS, 5 * 60, 30, 3, id="extract_lessons"),
         # Not in the table. A step update is one event and at most one checkpoint row.
         pytest.param(acts.RECORD_STEP, 2 * 60, None, 3, id="record_step"),
         # Section 3.7: 2 minutes and 3 attempts. A few queries and one blob write.
         pytest.param(acts.WRITE_RUN_REPORT, 2 * 60, None, 3, id="write_run_report"),
+        # Section 3.7: 30 seconds and 3 attempts. Two ledger sums and some arithmetic.
+        pytest.param(acts.CHECK_BUDGET, 30, None, 3, id="check_budget"),
     ],
 )
 def test_timeouts_and_attempts_match_section_3_7(
@@ -744,6 +756,7 @@ def test_a_model_turn_says_ok_until_it_says_otherwise() -> None:
     out = acts.LlmTurnOutput(transcript_ref=REF, stop_reason="end_turn", usage=Usage())
     assert out.context_decision == "ok"
     assert out.request_tokens == 0
+    assert out.next_request_tokens == 0
 
 
 @pytest.mark.parametrize("decision", ["ok", "compact", "force"])
@@ -824,6 +837,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         "build_pr_branch",
         "create_pr",
         "deliver",
+        "post_budget",
         "post_comment",
         "post_final",
         "post_plan",
@@ -842,6 +856,7 @@ def test_the_github_activities_are_those_of_section_3_7_and_deliver() -> None:
         (acts.BUILD_PR_BRANCH, acts.BuildPrBranchInput, acts.PrBranchOutput),
         (acts.DELIVER, acts.DeliverInput, str),
         (acts.POST_PLAN, acts.PostPlanInput, str),
+        (acts.POST_BUDGET, acts.PostBudgetInput, str),
     ],
     ids=lambda value: getattr(value, "name", None) or getattr(value, "__name__", ""),
 )
@@ -874,6 +889,8 @@ def test_the_inputs_of_the_writes_are_the_ones_side_effects_uses() -> None:
         pytest.param(acts.POST_PLAN, 2 * 60, None, 10, id="post_plan"),
         # The final comment is a post_comment whose body the activity renders (LH-507).
         pytest.param(acts.POST_FINAL, 2 * 60, None, 10, id="post_final"),
+        # The budget comment is a post_comment whose body the activity renders (LH-702).
+        pytest.param(acts.POST_BUDGET, 2 * 60, None, 10, id="post_budget"),
     ],
 )
 def test_github_timeouts_and_attempts_match_section_3_7(
@@ -893,6 +910,7 @@ def test_github_timeouts_and_attempts_match_section_3_7(
         acts.CREATE_PR,
         acts.POST_PLAN,
         acts.POST_FINAL,
+        acts.POST_BUDGET,
     ],
 )
 def test_github_writes_back_off_to_five_minutes(act: acts.Act) -> None:
@@ -1352,3 +1370,37 @@ def test_the_run_report_input_is_a_task_id_and_an_optional_outcome() -> None:
     inp = acts.RunReportInput(task_id="lh-x")
 
     assert (inp.task_id, inp.outcome) == ("lh-x", None)
+
+
+# ---------- LH-702: the budget activities and the state they need ----------
+def test_a_run_state_enforces_no_budget_unless_it_is_told_to() -> None:
+    # A history that began before LH-702 has no such field and must replay as it ran.
+    state = acts.RunState(
+        spec=SPEC, phase=Phase.QUEUED, started_at=datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    assert state.enforce_budgets is False
+    assert (state.budget_pauses, state.paused_s, state.last_input_tokens) == (0, 0.0, 0)
+
+
+def test_the_json_of_a_carry_state_is_a_run_state_that_enforces_nothing() -> None:
+    carried = CarryState(spec=SPEC, phase=Phase.CODING, started_at=datetime(2026, 1, 1, tzinfo=UTC))
+    state = acts.RunState.model_validate_json(carried.model_dump_json())
+    assert state.enforce_budgets is False
+
+
+def test_check_budget_needs_the_clock_of_the_workflow() -> None:
+    with pytest.raises(ValidationError):
+        acts.CheckBudgetInput.model_validate(
+            {
+                "task_id": "lh-x",
+                "repo": "acme/calc",
+                "role": "coder",
+                "turn_index": 0,
+                "limits": Budgets().model_dump(),
+            }
+        )
+
+
+def test_the_hint_wait_is_the_wait_of_a_budget_pause_too() -> None:
+    # A budget pause waits as long as a stuck pause, and the tuning of a run shortens both.
+    assert acts.hint_wait(acts.Tuning(hint_wait_s=90)) == timedelta(seconds=90)

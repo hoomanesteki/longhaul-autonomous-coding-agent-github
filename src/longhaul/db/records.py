@@ -33,6 +33,10 @@ it does for the cost ledger (cost/ledger.py).
 `ended_before` tells the janitor (LH-507) which tasks ended before a time. A task has ended when
 it has an `outcome` event, and the time of the end is the time of that event. It is not in the
 `Recorder` protocol either: only the janitor asks.
+
+`events_of` reads a task's events of some types back, oldest first. The lessons of a finished task
+(LH-605) are drafted from its stuck events and the verifier's issues, which the workflow wrote to
+the log and no longer holds. It is outside the `Recorder` protocol too: only that activity reads.
 """
 
 from __future__ import annotations
@@ -62,6 +66,10 @@ PROPOSED = "proposed"
 # LH-704). It dates the end of a task, which `ended_before` reads for the janitor (LH-507). A unit
 # test keeps the two names equal.
 OUTCOME_EVENT = "outcome"
+
+# The type of the event that records the lessons a task stored (durable/acts.LESSONS_EVENT,
+# LH-605). Its payload names the pull request or task that the lessons are linked to.
+LESSONS_EVENT = "lessons"
 
 # The kind of the checkpoint that a step leaves when it is done (plan section 3.5).
 STEP_KIND = "step"
@@ -234,6 +242,9 @@ class MemoryRecorder:
     async def ended_before(self, task_ids: Sequence[str], cutoff: datetime) -> set[str]:
         return {t for t in task_ids if t in self.ended and self.ended[t] < cutoff}
 
+    async def events_of(self, task_id: str, types: Sequence[str]) -> list[EventRecord]:
+        return [e for e in self.events if e.task_id == task_id and e.type in types]
+
     async def record_plan(self, record: PlanRecord) -> None:
         key = (record.task_id, record.version)
         kept = self.plans.get(key)
@@ -344,6 +355,39 @@ class SqlRecorder:
                 .distinct()
             )
             return {row[0] for row in rows}
+
+    async def events_of(self, task_id: str, types: Sequence[str]) -> list[EventRecord]:
+        if not types:
+            return []
+        async with self._sessions() as session:
+            rows = await session.execute(
+                select(Event.task_id, Event.type, Event.payload)
+                .where(Event.task_id == task_id, Event.type.in_(types))
+                # The id breaks a tie between two events written in the same instant.
+                .order_by(Event.ts, Event.id)
+            )
+            return [EventRecord(row[0], row[1], dict(row[2])) for row in rows]
+
+    async def lessons_task(self, repo: str, source_ref: str) -> str | None:
+        """The task of `repo` whose `lessons` event names `source_ref`, or None.
+
+        The candidates of a task carry the number of its pull request and not its id (LH-605),
+        so the poller finds the task again through the event that the task recorded when it
+        stored them. The repo is needed because pull request numbers repeat from repo to repo.
+        """
+        stmt = (
+            select(Event.task_id)
+            .join(Task, Task.id == Event.task_id)
+            .where(
+                Task.repo == repo,
+                Event.type == LESSONS_EVENT,
+                Event.payload["source_ref"].astext == source_ref,
+            )
+            .order_by(Event.id.desc())
+            .limit(1)
+        )
+        async with self._sessions() as session:
+            return (await session.execute(stmt)).scalar_one_or_none()
 
     async def record_request_fraction(self, task_id: str, fraction: float) -> None:
         # One statement, so two requests that finish together cannot lower the maximum.

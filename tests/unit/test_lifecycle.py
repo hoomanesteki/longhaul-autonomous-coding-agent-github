@@ -363,3 +363,27 @@ def test_the_final_comment_is_on_the_issue_under_one_key() -> None:
     assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
     assert comment.body == "the report"
     assert comment.idempotency_key == effect_key("lh-acme-calc-42", "final", 1)
+
+
+# ---------- LH-702: the pause for a budget ----------
+def test_a_budget_pause_asks_for_a_person_and_the_top_up_takes_it_back() -> None:
+    (pause,) = lifecycle.on_budget_pause(spec(), 1)
+    (resume,) = lifecycle.on_budget_resume(spec(), 1)
+
+    assert (pause.add, pause.label.label) == (True, "longhaul:needs-human")
+    assert (resume.add, resume.label.label) == (False, "longhaul:needs-human")
+
+
+def test_a_budget_pause_and_a_stuck_pause_with_the_same_number_have_different_keys() -> None:
+    # Both count from 1. A shared key would make the label of the second pause a repeat of the
+    # first, and the issue would never show that a person is needed again.
+    stuck_on = lifecycle.on_pause(spec(), 1)[0].label.idempotency_key
+    stuck_off = lifecycle.on_resume(spec(), 1)[0].label.idempotency_key
+    budget_on = lifecycle.on_budget_pause(spec(), 1)[0].label.idempotency_key
+    budget_off = lifecycle.on_budget_resume(spec(), 1)[0].label.idempotency_key
+    assert len({stuck_on, stuck_off, budget_on, budget_off}) == 4
+
+
+def test_each_budget_pause_has_keys_of_its_own() -> None:
+    first, second = lifecycle.on_budget_pause(spec(), 1)[0], lifecycle.on_budget_pause(spec(), 2)[0]
+    assert first.label.idempotency_key != second.label.idempotency_key

@@ -57,6 +57,12 @@ What it is built from, and why each piece is what it is:
   stops before it takes a task for the same reason. `summarize_for_human`, which writes the
   question for a person, is an activity of the compactor and renders its comment from the
   templates folder.
+* The budgets (LH-702) have two activities. Every worker registers `check_budget`, which the
+  workflow calls before each model turn of a task that enforces them. It reads the sums of the
+  worker's own ledger, and prices the next call with the model and the output cap of the role
+  from the same config as the model activities. With the GitHub token the worker also registers
+  `post_budget`, which tells the issue why a budget stopped the task, through the same ledger as
+  the other writes.
 * The end of a task (LH-507) has two activities on the worker. With the GitHub token it registers
   `post_final`, which reads the diff stats from the checkpoint store and posts the final comment
   through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
@@ -90,6 +96,12 @@ What it is built from, and why each piece is what it is:
   again before the worker connects, and refuses a table that another embedder wrote. With it off,
   the worker builds no store: no map and no commands are kept, and the memory block of the
   prompt stays empty. load_memory is registered either way, because the workflow names it.
+  `memory.mode: off` (LH-607) is the weaker switch: the store stays, so that prepare_workspace
+  still verifies the commands and sets the test command, but load_memory answers with an empty
+  block, no repo map is built and no lessons are drafted. It is how a run goes without notes.
+  The same store takes the lessons of a finished task (LH-605): extract_lessons asks the compactor
+  model for up to 5 notes and writes them as candidates, and a worker with no store answers it
+  with "skipped".
 * The two context tiers follow the `context` section of the config (LH-404): `llm_turn` elides old
   tool outputs and decides when the view must be compacted, and `compact` does it with the
   compactor model. They share one set of token meters, so both count with the ratio that the
@@ -134,12 +146,13 @@ from longhaul.db.session import make_engine
 from longhaul.db.tasks import SqlTaskStore
 from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
+from longhaul.durable.activities.cost import BudgetActivities, BudgetCommentActivities
 from longhaul.durable.activities.delivery import DeliveryActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.github import PollerActivities
 from longhaul.durable.activities.janitor import JanitorActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.memory import MemoryActivities
+from longhaul.durable.activities.memory import LessonActivities, MemoryActivities
 from longhaul.durable.activities.outcome import FinalCommentActivities, StoreDiffs
 from longhaul.durable.activities.plan import (
     PlanActivities,
@@ -160,6 +173,7 @@ from longhaul.github.remote import GitHubRemote, clone_url_under, github_clone_u
 from longhaul.github.side_effects import SideEffectActivities
 from longhaul.github.side_effects import SqlLedger as EffectLedger
 from longhaul.memory.embedder import make_embedder
+from longhaul.memory.promotion import Promoter
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.base import get_provider
 from longhaul.roles import coder, planner, stuck, verifier
@@ -332,8 +346,13 @@ def build_parts(
     engine = make_engine(settings.database_url.get_secret_value())
     sessions = async_sessionmaker[AsyncSession](engine, expire_on_commit=False)
     memory = build_memory(cfg.memory, sessions)
+    # The ablation switch (LH-607). Off leaves the store in the workspace, which verifies the
+    # commands, and takes it away from everything that would put notes in a prompt or add to them.
+    notes_on = cfg.memory.mode == "on"
+    prompt_memory = memory if notes_on else None
     recorder = SqlRecorder(sessions)
-    ledger = SqlLedger(sessions, load_pricing(settings.provider, cfg))
+    pricing = load_pricing(settings.provider, cfg)
+    ledger = SqlLedger(sessions, pricing)
     # read_output reads the handles tool_exec writes, so the tools share the worker's blob store.
     registry = default_registry(
         test_command=DEFAULT_TEST_COMMAND,
@@ -371,6 +390,7 @@ def build_parts(
         meters=meters,
         templates=templates_path(settings),
     )
+    budgets = BudgetActivities(pricing, ledger, config_for)
     tools = ToolActivities(
         registry,
         sandboxes,
@@ -396,8 +416,10 @@ def build_parts(
         memory=memory,
         github=remote,
         blobs=blobs,
+        map_repo=notes_on,
     )
-    notes = MemoryActivities(memory, blobs)
+    notes = MemoryActivities(prompt_memory, blobs)
+    lessons = LessonActivities(prompt_memory, recorder, provider, blobs, config_for, ledger=ledger)
     events = EventActivities(recorder)
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
@@ -407,7 +429,13 @@ def build_parts(
     # The poller reads through the same client that GitHubRemote clones and pushes with, so
     # WorkerParts.close has one connection pool to close.
     poller = PollerActivities(
-        github, SqlTaskStore(sessions), cfg, task_queue=settings.task_queue, ledger=effects
+        github,
+        SqlTaskStore(sessions),
+        cfg,
+        task_queue=settings.task_queue,
+        ledger=effects,
+        # Lessons are promoted only by a worker that keeps memory (LH-606).
+        promoter=None if memory is None else Promoter(memory, recorder),
     )
     delivery: list[Callable[..., Any]] = []
     if github is not None and remote is not None:
@@ -425,6 +453,9 @@ def build_parts(
                 reports=run_reports,
             ).activities,
             *PlanCommentActivities(github, effects, templates=templates_path(settings)).activities,
+            *BudgetCommentActivities(
+                github, effects, templates=templates_path(settings)
+            ).activities,
             *FinalCommentActivities(
                 github, effects, StoreDiffs(store), templates=templates_path(settings)
             ).activities,
@@ -433,9 +464,11 @@ def build_parts(
         activities=[
             *llm.activities,
             *compactor.activities,
+            *budgets.activities,
             *tools.activities,
             *workspace.activities,
             *notes.activities,
+            *lessons.activities,
             *events.activities,
             *plans.activities,
             *steps.activities,

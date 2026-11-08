@@ -104,8 +104,8 @@ from longhaul.contracts import (
 # Above this the reply is streamed. The SDK raises ValueError before sending a plain request
 # that it expects to run past ten minutes (about 21,000 tokens at the default timeout).
 _STREAM_ABOVE_TOKENS = 16_000
-# Models that answer tool_choice "tool" or "any" with a 400 (python/claude-api/tool-use.md,
-# "Tool Choice"). A dated snapshot of one of them rejects it too.
+# Models that answer tool_choice "tool" or "any" with a 400 (API docs, Tool use: Tool
+# choice). A dated snapshot of one of them rejects it too.
 _NO_FORCED_TOOL_CHOICE = (
     "claude-sonnet-5-5",
     "claude-opus-5-5",

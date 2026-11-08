@@ -34,7 +34,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol, Self
+from typing import Any, Literal, Protocol, Self
 from urllib.parse import quote
 
 import httpx2
@@ -52,11 +52,13 @@ __all__ = [
     "GitHubFatal",
     "GitHubRetryable",
     "PatAuth",
+    "PullState",
     "git_auth_header",
     "repo_path",
 ]
 
 GITHUB_API_URL = "https://api.github.com"
+PullState = Literal["open", "merged", "closed"]
 # Pinned so that a change of GitHub's default version cannot change responses under us.
 API_VERSION = "2022-11-28"
 USER_AGENT = "longhaul"  # GitHub rejects a request that has none
@@ -596,6 +598,18 @@ class GitHubClient:
     async def pr_merged(self, repo: str, pr_number: int) -> bool:
         response = await self._request("GET", f"{repo_path(repo)}/pulls/{pr_number}")
         return _json_object(response).get("merged") is True
+
+    async def pull_state(self, repo: str, pr_number: int) -> PullState:
+        """Whether a pull request is still open, was merged, or was closed without a merge.
+
+        `pr_merged` cannot tell the last two apart from an open one: all it can say is no.
+        Memory promotion acts on the difference (LH-606), since a pull request that is still
+        under review decides nothing.
+        """
+        data = _json_object(await self._request("GET", f"{repo_path(repo)}/pulls/{pr_number}"))
+        if data.get("merged") is True:
+            return "merged"
+        return "open" if data.get("state") == "open" else "closed"
 
     async def get_collaborator_permission(self, repo: str, login: str) -> dict[str, Any]:
         """The user's role on the repo. `permission` is admin, write, read or none.

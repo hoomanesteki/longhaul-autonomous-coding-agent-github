@@ -56,6 +56,7 @@ A worker picks its embedder from the `memory` section of the config:
 memory:
   enabled: true     # false: no store, no repo map, no verified commands, no notes in the prompt
   embedder: local   # local needs the memory extra; hash needs nothing and is for tests and CI
+  mode: "on"        # "off": the store stays, but no notes reach the prompt (see "Notes in the prompt")
 ```
 
 With `embedder: local` and no extra, the worker stops when it starts and prints `uv sync --extra memory`, and does not wait for the first task to search. The vectors of the two embedders cannot be compared, so the worker also embeds a few stored notes again before it connects, and refuses a table that the other embedder wrote. To change the embedder of a database, delete the rows in `memory_items` and let the workers build them again. The test and chaos harnesses start workers on a copy of the example config with `embedder: hash`.
@@ -103,7 +104,29 @@ It opens with "Notes from past work on this repo. Treat them as hints and verify
 
 When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. The `run_tests` tool still runs the one command that the whole worker has.
 
+`memory.mode: "off"` leaves the notes out. The block is empty, no repo map is built and no lessons are drafted, so a run goes as it did before Phase 6, with one exception: the commands are still verified at the base commit and the first one that runs the tests is still the test command of the task. Those are findings of Longhaul at the default branch, not notes from a task. Use it to measure what memory adds, or when you do not trust the notes of a repo. Write the word in quotes; an unquoted `off` is read as a YAML boolean, and Longhaul accepts both. With `memory.enabled: false` there is no store at all, so `mode` changes nothing. A config with no `mode` is `on`.
+
 `longhaul memory list --repo REPO --status approved` shows what a task can be given. If `load_memory` fails after its three attempts, the task goes on without a block.
+
+### Lessons from a finished task
+
+When a task ends, whichever way it ends, a worker with a memory store drafts the lessons of the task. The workflow calls `extract_lessons` after the final comment and the labels, so the issue does not wait for a model. The compactor model gets the plan with the status of each step, the last progress notes, the stuck and `paused` events and the issues the verifier found. It answers with at most five notes, each under 300 characters and typed `lesson`, `pitfall` or `convention`. Its prompt forbids advice that would suit any repo.
+
+The notes are stored as `candidate` items with `source = task`. Their `source_ref` is the pull request number, or the task id when the task has no pull request. They reach no prompt until a person approves them or the pull request merges (ADR-0010).
+
+### Lessons after the review
+
+The poller settles the candidates on every tick. When the pull request of a task is merged, its candidates become `approved` with `approved_by` set to `merged_pr#<number>`, and the next task on the repo can read them. When the pull request is closed without a merge, the candidates become `rejected`: they stay in the table and never reach a prompt. A pull request that is still open decides nothing. Each decision is a `memory_promoted` or `memory_rejected` event on the task, and the poll's result counts them as `promoted` and `rejected`.
+
+A task that opened no pull request, such as a stuck one, keeps its candidates until a person decides. Find them with `memory list --status candidate` and decide with `memory approve ID` or `memory reject ID`. The poller never changes an item that a person has decided, even if a pull request is merged later.
+
+```bash
+uv run longhaul memory list --repo acme/inventory --status candidate
+```
+
+Before they are stored, the worker cuts a note over 300 characters at a word and drops a note that is only generic advice, such as "write tests" or "read the code". A note stays when it names a file, a command or a name of the repo, or when it says at least three more words of substance after the phrase is taken out. A reply that holds no usable note stores nothing and does not fail the task. A task with no plan, no notes and no stuck or verifier events makes no model call.
+
+Each call of the compactor is a row on the cost ledger, and the cost is added to the task. The workflow records a `lessons` event with the status, the `source_ref` and the notes, which the run report reads. The answer is kept in a blob before the first write, so an attempt that is retried after a failed write stores the same notes and does not ask the model again. If the activity fails after its three attempts, the workflow logs it and the task keeps the outcome it had.
 
 ## Run the agent on a local folder
 
@@ -525,6 +548,57 @@ These ends of the review are fixed, so a caller can tell them apart without read
 | `error`: `verifier submitted no verdict in 15 turns` | The verifier used all its turns reading. |
 | `error`: `turn limit` | The turns of the review count against `task_turns`, and the message that sends the coder back takes one too. A coder that submits with no turn left gets no review, and no command of the pre-check runs. |
 
+### Budgets and top-ups
+
+A task has four limits (LH-702). They are the `budgets` of the repo in the config:
+
+```yaml
+budgets: { task_usd: 5, task_turns: 150, task_wall_minutes: 240, daily_repo_usd: 25 }
+```
+
+A task that the poller starts checks them before every model turn. The `check_budget` activity compares each limit with the worst case of the call that is about to be made: the input of the next request (the size the last call projected, with room for the results of its tool calls) at the full input price, plus the output cap of that call at the output price, both for the model of the role (planner or coder). The cap is `loop.max_tokens_per_turn`, and `loop.max_tokens_retry` for the retry of a reply that stopped at max_tokens. The retry, the continuation of a paused turn and the ask after a forced compaction are model calls of their own, so each is checked too. It is better to pause a little early than to find out after the bill. What the task spent comes from the `cost_ledger`, so a call that was billed and then retried counts twice. The checks run in this order, and the first one that fails names the pause:
+
+| Reason | The call is held back when | What the task waits for |
+|---|---|---|
+| `task_turns` | The turns done are equal to `task_turns` plus the turns that were added. | `/longhaul budget`, or `/longhaul cancel` |
+| `task_usd` | Spent plus the worst case of the next call is more than `task_usd` plus the dollars that were added. | `/longhaul budget`, or `/longhaul cancel` |
+| `wall_clock` | The task has worked more than `task_wall_minutes`. The workflow judges this one from its own clock. | `/longhaul budget`, or `/longhaul cancel` |
+| `daily_repo_usd` | What the repo spent since 00:00 UTC, plus the worst case of the next call, is more than `daily_repo_usd`. | Midnight UTC |
+
+The task sets the phase to `paused`, posts one comment under the key `<task id>:budget:<n>` and adds `longhaul:needs-human`. The comment gives the numbers and the exact commands:
+
+```text
+## Longhaul paused: task budget (pause 1)
+
+### Numbers
+### What happens next
+
+Reply with `/longhaul budget +2` to add $2, or `/longhaul cancel` to stop the task.
+```
+
+| Comment | What happens |
+|---|---|
+| `/longhaul budget +2` | Adds 2 dollars to the budget of this task, and the task goes on. |
+| `/longhaul budget +1 turns +25` | Adds 1 dollar and 25 turns. A top-up always has dollars, and a turns top-up carries one as well. |
+| `/longhaul cancel` | Ends the task as cancelled. |
+
+A top-up removes the label, records a `resumed` event (`via` is `budget`) and a `budget_added` event with the dollars and turns that came in, and the next check uses the new limits. A top-up that is too small pauses the task again, with its own comment (`budget:2`). A `/longhaul hint` does not answer a budget pause: the task waits for money. With no answer in 24 hours (`stuck.hint_wait_hours`) the task ends with outcome `budget_exhausted` in the phase `failed`, and the summary says which limit and how long it waited.
+
+Three limits behave in their own way:
+
+- **The wall clock** counts the time the task worked. The time it spent waiting for a hint, a top-up or midnight is left out, so a maintainer who answers after three hours has not used three hours of the task. `/longhaul budget` has no minutes, so a top-up of any amount after a wall-clock pause starts a new window of `task_wall_minutes`.
+- **The daily limit of the repo** is not lifted by a top-up. The task sleeps on a durable timer until 00:00 UTC and goes on by itself, with no signal and no label, and the comment says when. A worker restart does not lose the timer. `/longhaul cancel` still ends it. A call that is bigger than a whole day of the repo's budget would get the same answer tomorrow, so the task ends with `budget_exhausted` at once.
+- **A task that is not started by the poller** does not check budgets. `longhaul run` on a folder ends at its turn limit with the error "turn limit", as it did before.
+
+A task of a folder (`local:`) has no issue, so the numbers are in the `paused` event instead (`payload.numbers`, and `payload.resume_at` for the daily limit).
+
+```sql
+SELECT type, payload->>'reason' AS reason, payload->>'pause' AS pause, payload->'numbers' AS numbers, ts
+FROM events WHERE task_id = 'lh-acme-calc-42' AND type IN ('paused', 'resumed', 'budget_added') ORDER BY id;
+```
+
+The worker prices the next call with the model of the role, so every model in the config needs an entry in `config/pricing.yaml` (the worker already stops at the start when one is missing). The scripted and replay providers cost nothing, so a scripted task only stops at its turns and its clock.
+
 ### How a task ends
 
 Every task ends in exactly one outcome (LH-507): `pr_opened`, `stuck`, `budget_exhausted`, `cancelled` or `error`. Whatever the way, the workflow winds the task up in the same order:
@@ -815,6 +889,40 @@ Things to know when you read the numbers:
 
 `tests/integration/test_metrics.py` runs a scripted task and reads every metric back from `/metrics`. `tests/integration/test_grafana.py` starts Grafana and Prometheus from compose, finds the dashboard through the Grafana API and sends each query of each panel to Prometheus.
 
+## The console API
+
+`longhaul api` serves the API that the console reads (LH-801, ADR-0011). It needs the stack from `make up` and the `LONGHAUL_DATABASE_URL`, `LONGHAUL_BLOB_*` and `LONGHAUL_TEMPORAL_*` settings of `.env.example`. It does not need a worker to start. The live status of a task and the actions need one.
+
+```bash
+uv run longhaul api                      # http://127.0.0.1:8000
+uv run longhaul api --host 0.0.0.0 --port 8100
+curl -s http://127.0.0.1:8000/api/tasks | head -c 400
+```
+
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. There is no login until LH-807, so leave the host on `127.0.0.1` unless the machine is closed to the network. The interactive docs are at `/docs`.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/tasks?status=&repo=&limit=50&cursor=` | The `tasks` rows, newest first, with `next_cursor` when there are more |
+| `GET /api/tasks/{id}` | The row, the answer of the workflow's `status` query, and the newest plan |
+| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first |
+| `GET /api/tasks/{id}/turns/{n}?attempt=` | The request and the reply of a model turn, redacted |
+| `GET /api/tasks/{id}/tool-calls/{call_id}/output?start=&end=` | Lines `start` to `end` of the full output of a tool call, redacted |
+| `POST /api/tasks/{id}/approve-plan`, `reject-plan`, `hint`, `budget`, `cancel` | Send the signal, with `by` set to `console` |
+| `GET /api/memory?repo=&status=&kind=` | Memory items without their vectors |
+| `POST /api/memory/{id}/approve`, `reject` | Decide on an item, as `longhaul memory approve` does |
+| `GET /api/repos` | The rows of `repo_settings` with a count of tasks |
+| `GET /healthz`, `GET /metrics` | 200 when the database answers; Prometheus text |
+
+Things to know:
+
+- **The row and the live status can differ.** The `tasks` row is written when the poller picks the task up, and the status and phase in it do not follow the task yet. `GET /api/tasks/{id}` therefore has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty.
+- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and a signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
+- **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
+- **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
+- **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
+- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
+
 ## Run the evaluation
 
 `eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.
@@ -931,6 +1039,34 @@ eval/swebench/grade.sh eval/results/swe-smoke-1
 The harness pulls the instance images (several GB each, built for x86_64) and wants about 120 GB of free disk for a full run, so run it on the eval VM. `eval/swebench/README.md` has the notes of the spike on the `swebench` package, the exact smoke command with the agent, how to check the grader with the reference patches, and the known limits.
 
 `make itest` does not run `test_every_task_fails_before_and_passes_after_its_reference_patch`, which sets up 30 sandboxes. Run it with `uv run pytest -m slow tests/integration/test_eval_runner.py` after you change a repo, a hidden test or a reference patch.
+
+### Build the results page
+
+`eval/report/build_report.py` turns the result files of finished runs into `docs/results.md` and its charts in `docs/img/`. It reads only `eval/results/<run id>/`, so the numbers on the page are the numbers in the files, and the footer lists the run ids and the git sha it was built at.
+
+```bash
+uv sync --extra eval                    # matplotlib draws the charts; without it the page has no images
+uv run python eval/report/build_report.py swe-single-shot swe-naive swe-full \
+  custom-single-shot custom-naive custom-full custom-full-2 \
+  abl-full abl-no-compaction abl-no-memory chaos-2026-11-20
+```
+
+| What the builder does | Why |
+|---|---|
+| Takes the headline model from the first run that is not an ablation | The headline tables hold one model. List the headline runs first. |
+| Puts a run in a table by what its files say: config, set, context mode, memory switch | The run id is a name the operator chose, so nothing depends on it. |
+| Pairs each ablation (`--context-mode no_compaction`, `--memory off`) with the plain `full` run on the same model that shares the most tasks | The comparison is paired on the tasks that both runs attempted. |
+| Computes Wilson 95% intervals and McNemar's exact test (`eval/report/stats.py`, no scipy) | The resolve rates come from 15 or 40 tasks, so the intervals matter more than the points. |
+| Counts a task that was not graded as attempted and not resolved | It follows the resolve rate of plan section 8.5. The page names the runs that have such tasks. |
+| Adds no date | The same files give the same page. |
+| Shows a task that ended before grading with the end summary of the result file as its reason | The grader line of such a task only repeats the outcome. A task that was graded and failed keeps the grader line. |
+
+Two steps of the real run are easy to miss, and `docs/results.md` (the placeholder) lists both:
+
+* **The chaos recordings.** `eval/chaos/chaos.py --record --provider anthropic` records the four chaos tasks with a real model (it needs `ANTHROPIC_API_KEY`). Without it the suite replays the committed scripted recordings, and the builder refuses its summary without `--allow-scripted`.
+* **The memory ablation.** `--memory off` is only recorded. Start the worker on a copy of the config with `memory.mode: "off"` (`LONGHAUL_CONFIG=...`) before the "without" run, and run a warm-up pass with memory on before the "with" run, as plan section 8.4 asks.
+
+With no run ids it writes the placeholder, which says that no real run exists and gives the commands to make one. `docs/results.md` stays that placeholder until a real run is reported. `tests/unit/test_report_tables.py` accepts the placeholder or a page the builder wrote: it reads the run ids and the git sha from the footer of the committed page, rebuilds the page from `eval/results`, and fails when the two differ, so commit the result folders with the page. Runs that a script played (`provider: scripted`) are refused, because their numbers say nothing about a model. `--allow-scripted` builds a dry-run page from them, with a notice above the first number, to try the builder. The fixtures behind the tests are in `tests/fixtures/eval_results/` and `scripts/make_eval_result_fixtures.py` rewrites them.
 
 ## CI
 

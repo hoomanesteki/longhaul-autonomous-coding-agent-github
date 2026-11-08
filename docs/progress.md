@@ -95,15 +95,15 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-602 | Repo map builder | 5 | Done | merge | 2026-11-04 |
 | LH-603 | Memory store API and verified commands | 3 | Done | merge | 2026-11-04 |
 | LH-604 | Retrieval into the prompt | 3 | Done | merge | 2026-11-07 |
-| LH-605 | Lesson extraction | 3 | Todo | | |
-| LH-606 | Promotion on merged PRs and human approval | 3 | Todo | | |
-| LH-607 | Memory poisoning test and ablation flag | 2 | Todo | | |
+| LH-605 | Lesson extraction | 3 | Done | merge | 2026-11-08 |
+| LH-606 | Promotion on merged PRs and human approval | 3 | Done | merge | 2026-11-08 |
+| LH-607 | Memory poisoning test and ablation flag | 2 | Done | merge | 2026-11-08 |
 
 ## Phase 7: Budgets, cost and observability (tag v0.7.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
 | LH-701 | Pricing table and cost ledger | 3 | Done | merge | 2026-11-03 |
-| LH-702 | Budget enforcement and top-ups | 5 | Todo | | |
+| LH-702 | Budget enforcement and top-ups | 5 | Done | merge | 2026-11-08 |
 | LH-703 | OpenTelemetry traces | 5 | Done | merge | 2026-11-04 |
 | LH-704 | Prometheus metrics and Grafana dashboard | 3 | Done | merge | 2026-11-04 |
 | LH-705 | Run report | 3 | Done | merge | 2026-11-08 |
@@ -112,7 +112,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 ## Phase 8: Console (tag v0.8.0)
 | ID | Title | Pts | Status | PR | Merged |
 |---|---|---|---|---|---|
-| LH-801 | Console API | 5 | Todo | | |
+| LH-801 | Console API | 5 | Done | merge | 2026-11-08 |
 | LH-802 | Console scaffold and typed client | 3 | Todo | | |
 | LH-803 | Tasks list page | 3 | Todo | | |
 | LH-804 | Task timeline page | 5 | Todo | | |
@@ -128,7 +128,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-902 | SWE-bench Verified adapter and grading | 8 | Done | merge | 2026-11-07 |
 | LH-903 | Baselines: single-shot and naive loop | 5 | Done | merge | 2026-11-07 |
 | LH-904 | Full chaos suite | 5 | Done | merge | 2026-11-08 |
-| LH-905 | Results report | 3 | Todo | | |
+| LH-905 | Results report | 3 | Done | merge | 2026-11-08 |
 | LH-906 | Security hardening pass | 3 | Todo | | |
 | LH-907 | Docs, README and demo | 3 | Todo | | |
 | LH-908 | Terraform for AWS (Could) | 5 | Done | merge | 2026-11-04 |

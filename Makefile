@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image site site-preview gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types site site-preview gate
 
 PHASE ?= 0
 
@@ -47,6 +47,11 @@ migrate:
 
 sandbox-image:
 	docker build -t longhaul-sandbox:py312 docker/sandbox
+
+# The OpenAPI schema of the console API. The console's typed client is generated from the file, so
+# run this after any change to src/longhaul/api and commit the result.
+api-types:
+	uv run python scripts/dump_openapi.py
 
 # The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
 # are read from docs/, so there is nothing to copy before a render.

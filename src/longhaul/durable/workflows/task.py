@@ -202,6 +202,42 @@ has no marker and replays as it ran: a stuck signal was only recorded, and `ask_
 a `paused` event and ended the task as stuck in phase PAUSED. Drop the patch with
 `workflow.deprecate_patch` once no run that began before this story is open.
 
+Budgets (LH-702). A task started with `enforce_budgets` (the poller starts every task so) checks
+its limits before each model turn, in `_afford`: a turn of the planner, of the coder and of the
+verifier alike. A task without the switch makes no check and ends at its turn limit with ERROR
+"turn limit", as every task did before.
+
+1. The wall clock is judged here, from `workflow.now()`, `state.started_at` and the time the task
+   spent in pauses (`state.paused_s`): a person who answers after three hours has not used three
+   hours of the task. The wait for a decision on a plan (LH-502) counts as a pause. The other
+   limits are judged by the `check_budget` activity, which reads the ledger. It is given the turn
+   index, the top-ups, the running cost, the size of the last request and `workflow.now()`, so the
+   workflow reads no database and no clock of its own.
+2. A limit that would be crossed pauses the task in `_budget_pause`. The phase becomes PAUSED,
+   `post_budget` writes the comment under the key `budget:<n>` (a task of an issue), the label
+   `longhaul:needs-human` goes on, and a `paused` event records the reason and the numbers. A
+   local task has no issue, so the event is all it has. `n` is `state.budget_pauses`, which
+   crosses a hand-over.
+3. A limit of the task (dollars, turns, minutes) waits for `add_budget` or `cancel` up to
+   `stuck.hint_wait_hours`. A top-up resumes the task with a `resumed` event and a `budget_added`
+   event, and the next check uses the new limits. One that is too small pauses the task again,
+   with the next number. A wait that runs out ends the task with outcome BUDGET_EXHAUSTED. A
+   `hint` does not answer a budget pause: money is what the task waits for. After a wall-clock
+   pause a top-up of any amount starts a new window of the same length, because `add_budget`
+   has no minutes, and the task would otherwise stop again at once.
+4. The daily limit of the repo is the one a person cannot lift. The task sleeps on a durable
+   timer until 00:00 UTC, the comment says so and no label asks for anyone, and then it checks
+   again with no signal. A call that is bigger than a whole day of the repo's budget would find
+   the same answer tomorrow, so the task ends with BUDGET_EXHAUSTED at once.
+5. No `llm_turn` is scheduled while the task waits: the check comes before the call, and the wait
+   is inside the check.
+6. A budget that ends the task ends it like any other end: the outcome goes through `_wind_up`,
+   with the cleanup, the final comment, the labels and the lessons.
+
+Replay. The check and the pause are behind `state.enforce_budgets`, which is part of the state
+the run started with. A history from before this story has no such field, decodes it as False and
+replays as it ran. A task that enforces budgets adds commands only where it checks or pauses.
+
 A task of an issue (LH-306) is one whose repo is owner/name and whose spec has an issue number
 (lifecycle.is_github_task). It differs from a local task in three places and nowhere else:
 
@@ -256,10 +292,11 @@ review: ..." for a task whose rounds ran out.
 The pause for a hint adds two: STUCK with the reason, the evidence or the question, and "no hint in
 24 hours" or "3 hints did not unblock the task" (roles/stuck.py).
 
-Not here yet, in its own story: budget enforcement and pauses (Phase 7). An activity that fails
-for good, after its retries, ends the task with ERROR and then fails the workflow with that error
-(see "How a task ends" below). A prompt over the context window is the exception, and it is
-handled as described next.
+The budgets add one: BUDGET_EXHAUSTED, with the summary of budget.exhausted_outcome.
+
+An activity that fails for good, after its retries, ends the task with ERROR and then fails the
+workflow with that error (see "How a task ends" below). A prompt over the context window is the
+exception, and it is handled as described next.
 
 How a task ends (LH-507). Every task ends in exactly one Outcome, and `run()` winds it up the same
 way for every end, in `_wind_up`:
@@ -281,7 +318,15 @@ way for every end, in `_wind_up`:
    the report with what was done, what is left and the diff stats (github/final_comment.py).
 5. The final labels are set (lifecycle.on_end). A task that delivered has them already from
    `_deliver`.
-6. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
+6. A task that keeps memory asks for its lessons (LH-605): `extract_lessons` drafts up to 5 notes
+   from the plan, the last progress notes, the stuck events and the verifier's issues, and stores
+   them as candidates linked to the pull request number, or to the task id when there is no pull
+   request. The workflow records what came back in a `lessons` event, for the run report, and adds
+   the cost of the call to the task. It runs on every ending path, a cancel and an error too, and
+   after the final comment and the labels, so nobody waits for a model. A task whose worker has no
+   memory store has no `memory_ref` and never asks. A failure here is logged and changes nothing
+   about the outcome.
+7. The `outcome` event is recorded, as before (LH-704), so it counts a task that has done all
    of the above.
 
 Each step is best effort and runs outside `_call`, so a failed step is logged and the next one
@@ -301,7 +346,9 @@ retried for as long as the code stayed the same, now fails the workflow for good
 Replay. All of it is behind `workflow.patched(OUTCOME_PATCH)`. A history from before this story
 has no marker and replays as it ran: a cancel cleaned up inside `_cancelled`, no other end cleaned
 up, and a failure noted the outcome and raised. Drop the patch with `workflow.deprecate_patch`
-once no run that began before this story is open.
+once no run that began before this story is open. The lessons are behind
+`workflow.patched(LESSONS_PATCH)`, asked only by a task that has a `memory_ref`, so a history that
+ended before LH-605 replays without the call, and a task with no memory records no marker.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -430,6 +477,7 @@ import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, NoReturn, Protocol
 
 from temporalio import workflow
@@ -456,6 +504,7 @@ with workflow.unsafe.imports_passed_through():
         ToolResult,
         VerifierVerdict,
     )
+    from longhaul.cost import budget
     from longhaul.durable import acts, wind_up
     from longhaul.github import lifecycle
     from longhaul.roles import coder, planner, stuck, verifier
@@ -491,6 +540,9 @@ PLAN_GATE_PATCH = "lh-502-plan-gate"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
 # ends" above.
 OUTCOME_PATCH = "lh-507-final-outcome"
+# The patch marker of the extract_lessons call at the end of a task (LH-605). See "How a task
+# ends" above.
+LESSONS_PATCH = "lh-605-lessons"
 # What fails the workflow when it escapes run(): an activity or child that failed for good, and
 # the errors the workflow was told to fail on (acts.FAIL_THE_WORKFLOW).
 FAILS_THE_WORKFLOW: tuple[type[BaseException], ...] = (FailureError, *acts.FAIL_THE_WORKFLOW)
@@ -508,6 +560,13 @@ RESUMED_EVENT = "resumed"
 ASKED_REASON = StuckReason.AGENT_ASKED.value
 HINT_VIA = "hint"
 BUDGET_VIA = "budget"
+
+# The events of a budget pause. It records the `paused` and `resumed` events of a pause for a hint,
+# with the limit that stopped the task as the `reason` and the `numbers` behind it; the `resumed`
+# event says `via` "budget" for a top-up and "midnight" for the daily limit. A top-up also records
+# `budget_added` with the dollars and turns that came in since the pause began (plan section 3.5).
+BUDGET_ADDED_EVENT = "budget_added"
+MIDNIGHT_VIA = "midnight"
 
 # The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
 PAUSE_PATCH = "lh-506-pause-for-hint"
@@ -630,6 +689,9 @@ class TaskWorkflow:
         self.cancel_request: CancelRequest | None = None
         # The last decision a person sent about the plan, until the gate takes it (LH-502).
         self.plan_decision: PlanDecision | None = None
+        # Who sent the last add_budget, for the `budget_added` event of a budget pause (LH-702)
+        # and the run report. A pause does not cross a hand-over, so it is not carried.
+        self.topped_up_by: str | None = None
         # What the planner is told about rejected versions of its plan. Not carried: planning
         # ends before any hand-over.
         self.revision_hints: list[str] = []
@@ -662,6 +724,7 @@ class TaskWorkflow:
         # on its own, so the valid half of a mixed top-up still counts.
         self.state.extra_budget_usd += max(usd, 0.0)
         self.state.extra_turns += max(turns, 0)
+        self.topped_up_by = by
 
     @workflow.signal
     def approve_plan(self, by: str) -> None:
@@ -821,8 +884,9 @@ class TaskWorkflow:
         first, because GitHub can be down for twenty minutes and a container must not wait for it.
         Then, for a task of an issue: the draft pull request of a stuck task whose repo asked
         for one, the final comment (which links that pull request), and the final labels. The
-        repo of a cancelled task goes after them, since the comment reads its diff. The note for
-        the metrics comes last, so it counts a task that has finished all of this.
+        repo of a cancelled task goes after them, since the comment reads its diff. The lessons of
+        a task that keeps memory come next (LH-605), so nobody waits for a model. The note for the
+        metrics comes last, so it counts a task that has finished all of this.
 
         Each step is best effort. An activity that fails for good is logged, and the next step
         goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
@@ -845,6 +909,7 @@ class TaskWorkflow:
             await self._report(outcome)
             await self._end_labels(outcome)
         await self._remove_repo(outcome)
+        await self._lessons(outcome)
         await self._note_outcome(outcome)
         return outcome
 
@@ -980,6 +1045,47 @@ class TaskWorkflow:
         always a draft.
         """
         return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
+
+    async def _lessons(self, outcome: Outcome) -> None:
+        """Draft the lessons of the task and record them (LH-605). Best effort, like the rest.
+
+        Only a task that loaded its memory block asks: it ran on a worker with a store, and that
+        worker registers the activity. The patch is checked after that test, so a task with no
+        memory records no marker and its history stays as it was.
+        """
+        state = self.state
+        if state.memory_ref is None or not workflow.patched(LESSONS_PATCH):
+            return
+        try:
+            drafted = await self._wind_call(
+                acts.EXTRACT_LESSONS,
+                acts.ExtractLessonsInput(
+                    task_id=state.spec.task_id,
+                    turn_index=state.turn_index,
+                    spec=state.spec,
+                    outcome=outcome,
+                    plan=state.plan,
+                    notes=state.notes,
+                    script_ref=self._script(),
+                ),
+            )
+        except FailureError as err:
+            workflow.logger.warning(
+                "no lessons for task %s: %s", state.spec.task_id, err.cause or err
+            )
+            return
+        state.cost_usd += drafted.cost_usd
+        if drafted.status == "skipped":
+            return
+        await self._wind_note(
+            acts.LESSONS_EVENT,
+            {
+                "status": drafted.status,
+                "source_ref": drafted.source_ref,
+                "count": drafted.stored,
+                "items": [item.model_dump() for item in drafted.items],
+            },
+        )
 
     async def _end_labels(self, outcome: Outcome) -> None:
         opened = outcome.kind is OutcomeKind.STUCK and outcome.pr_url is not None
@@ -1143,6 +1249,9 @@ class TaskWorkflow:
         for _ in range(acts.PLANNER_MAX_TURNS):
             if self._out_of_turns():
                 return self._end(rules.turn_limit_outcome(), Phase.FAILED)
+            ended = await self._afford(Role.PLANNER)
+            if ended is not None:
+                return ended
             index = state.turn_index
             sampled = await self._sample(index, Role.PLANNER)
             if isinstance(sampled, Outcome):
@@ -1284,6 +1393,8 @@ class TaskWorkflow:
         """The plan is final. The coder starts a transcript of its own, with no planner notes."""
         self.state.transcript_ref = None
         self.state.notes = None
+        # The planner's request size is not the coder's (LH-702).
+        self.state.last_input_tokens = 0
 
     # ---------- the plan gate ----------
     def _gated(self) -> bool:
@@ -1347,6 +1458,7 @@ class TaskWorkflow:
         """
         self._stop_if_cancelled()
         if self.plan_decision is None:
+            began = workflow.now()
             try:
                 await workflow.wait_condition(
                     lambda: self.plan_decision is not None or self.cancel_request is not None,
@@ -1356,6 +1468,8 @@ class TaskWorkflow:
                 self._stop_if_cancelled()
                 return None
             self._stop_if_cancelled()
+            # The wall clock leaves out the time a person took to decide, as in a pause (LH-702).
+            self.state.paused_s += (workflow.now() - began).total_seconds()
         decision, self.plan_decision = self.plan_decision, None
         return decision
 
@@ -1376,6 +1490,8 @@ class TaskWorkflow:
     def _out_of_turns(self) -> bool:
         # add_budget can raise the limit while the task runs, so it is read each time.
         state = self.state
+        if state.enforce_budgets:
+            return False  # check_budget judges the turns, and pauses instead of ending the task
         return state.turn_index >= state.spec.settings.budgets.task_turns + state.extra_turns
 
     def _hand_over_reason(self) -> str | None:
@@ -1472,6 +1588,9 @@ class TaskWorkflow:
     async def _turn(self) -> Outcome | None:
         """One model turn and what follows it. Returns the outcome when the turn ends the run."""
         state = self.state
+        ended = await self._afford(Role.CODER)
+        if ended is not None:
+            return ended
         index = state.turn_index
         sampled = await self._sample(index)
         if isinstance(sampled, Outcome):
@@ -1643,14 +1762,14 @@ class TaskWorkflow:
             return self._end(rules.turn_limit_outcome(), Phase.FAILED)
         state.phase = Phase.VERIFYING
         number = state.verify_rounds + 1
-        coder_view = (state.transcript_ref, state.notes)
+        coder_view = (state.transcript_ref, state.notes, state.last_input_tokens)
         try:
             brief = await self._gather(number, plan)
             if isinstance(brief, Outcome):
                 return brief
             got = await self._run_verifier(plan, brief)
         finally:
-            state.transcript_ref, state.notes = coder_view
+            state.transcript_ref, state.notes, state.last_input_tokens = coder_view
         if isinstance(got, Outcome):
             return got
         review = verifier.judge_review(brief.checks, got)
@@ -1717,16 +1836,23 @@ class TaskWorkflow:
         invalid verdict gets one repair turn (F14), and a second one ends the task with ERROR
         "verifier submitted an invalid verdict twice: ...". A verifier that has not submitted after
         verifier.MAX_TURNS turns ends it with ERROR "verifier submitted no verdict in 15 turns".
-        The turn budget of the task applies to these turns as to any other.
+        The turn budget of the task applies to these turns as to any other, and so do the budgets
+        of a task that enforces them (LH-702): each turn is checked first, and a limit pauses the
+        task in the review.
         """
         state = self.state
         state.transcript_ref = None
         state.notes = None
+        # The coder's request size is not the verifier's (LH-702). `_verify` puts it back.
+        state.last_input_tokens = 0
         failures = 0  # verdicts that were not valid so far, for the one repair turn
         idle = 0  # replies in a row that ended without a tool call
         for _ in range(verifier.MAX_TURNS):
             if self._out_of_turns():
                 return self._end(rules.turn_limit_outcome(), Phase.FAILED)
+            ended = await self._afford(Role.VERIFIER)
+            if ended is not None:
+                return ended
             index = state.turn_index
             sampled = await self._sample(index, Role.VERIFIER, review=brief)
             if isinstance(sampled, Outcome):
@@ -1817,6 +1943,7 @@ class TaskWorkflow:
         seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
         state.phase = Phase.PAUSED
         self.paused_reason = f"waiting for a hint after {signal.reason.value.replace('_', ' ')}"
+        began = workflow.now()
         await self._ask(signal, pause)
         try:
             await workflow.wait_condition(
@@ -1827,8 +1954,202 @@ class TaskWorkflow:
             self._stop_if_cancelled()
             return self._end(stuck.unanswered_outcome(signal, wait), Phase.FAILED)
         self._stop_if_cancelled()
+        # The wall clock leaves out the time a person took to answer (LH-702).
+        state.paused_s += (workflow.now() - began).total_seconds()
         await self._resume(pause, seen)
         return None
+
+    # ---------- the budgets ----------
+    async def _afford(self, role: Role, *, high_output_cap: bool = False) -> Outcome | None:
+        """Check that the next model call fits the budgets, and wait while it does not (LH-702).
+
+        `high_output_cap` is for the retry of a reply cut off at max_tokens, which may use more.
+
+        None means the call may go ahead, now or after the waiting. An outcome means the task ends
+        here: nobody lifted a limit in time, or the next call can never fit the repo's day. A
+        cancel during the wait unwinds to the cancel path. A task that does not enforce budgets
+        returns at once, and adds nothing to its history.
+        """
+        if not self.state.enforce_budgets:
+            return None
+        while True:
+            stop = await self._budget_stop(role, high_output_cap)
+            if stop is None:
+                return None
+            ended = await self._budget_pause(stop)
+            if ended is not None:
+                return ended
+
+    async def _budget_stop(
+        self, role: Role, high_output_cap: bool = False
+    ) -> budget.BudgetVerdict | None:
+        """The limit that the next call would cross, or None when it fits."""
+        state = self.state
+        limits = state.spec.settings.budgets
+        now = workflow.now()
+        worked = budget.elapsed(state.started_at, now, paused_s=state.paused_s)
+        minutes = worked.total_seconds() / 60
+        if budget.wall_clock_exceeded(worked, limits.task_wall_minutes):
+            # The clock is judged here and not by the activity, so a replay sees the same time.
+            numbers = budget.BudgetNumbers(
+                spent_task_usd=state.cost_usd,
+                task_usd_limit=limits.task_usd + state.extra_budget_usd,
+                turns_done=state.turn_index,
+                turns_limit=limits.task_turns + state.extra_turns,
+                daily_repo_usd_limit=limits.daily_repo_usd,
+                elapsed_minutes=minutes,
+                wall_clock_minutes_limit=limits.task_wall_minutes,
+            )
+            return budget.BudgetVerdict(
+                ok=False, reason=budget.BudgetReason.WALL_CLOCK, numbers=numbers
+            )
+        verdict = await self._call(
+            acts.CHECK_BUDGET,
+            acts.CheckBudgetInput(
+                task_id=state.spec.task_id,
+                repo=state.spec.repo,
+                role=role,
+                high_output_cap=high_output_cap,
+                turn_index=state.turn_index,
+                limits=limits,
+                extra_usd=state.extra_budget_usd,
+                extra_turns=state.extra_turns,
+                spent_task_usd=state.cost_usd,
+                last_input_tokens=state.last_input_tokens,
+                now=now,
+            ),
+        )
+        if verdict.ok:
+            return None
+        clock = {"elapsed_minutes": minutes, "wall_clock_minutes_limit": limits.task_wall_minutes}
+        return verdict.model_copy(update={"numbers": verdict.numbers.model_copy(update=clock)})
+
+    async def _budget_pause(self, stop: budget.BudgetVerdict) -> Outcome | None:
+        """Tell people the budget stopped the task, wait, and resume. None when it goes on.
+
+        An outcome ends the task: the wait for a top-up ran out, or the daily limit is smaller
+        than the call, which tomorrow would not change.
+        """
+        state = self.state
+        if stop.reason is None:  # _budget_stop gives only verdicts that are not ok
+            raise ApplicationError("a budget pause without a reason", non_retryable=True)
+        daily = stop.reason is budget.BudgetReason.DAILY_REPO_USD
+        if daily and not stop.can_wait:
+            return self._end(budget.unfit_outcome(stop), Phase.FAILED)
+        state.budget_pauses += 1
+        pause = state.budget_pauses
+        before = state.phase
+        wait = acts.hint_wait(self._tuning())
+        # Counted before the first await, as in _pause: a top-up that arrives while the comment
+        # is posted is an answer to it.
+        seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
+        began = workflow.now()
+        midnight = budget.next_midnight(began)
+        state.phase = Phase.PAUSED
+        self.paused_reason = budget.pause_reason(stop)
+        await self._announce_budget(stop, pause, wait, midnight)
+        if daily:
+            via = MIDNIGHT_VIA
+            await self._wait_for_midnight(midnight)
+        else:
+            via = BUDGET_VIA
+            try:
+                await workflow.wait_condition(
+                    lambda: self._topped_up(seen) or self.cancel_request is not None, timeout=wait
+                )
+            except TimeoutError:
+                self._stop_if_cancelled()
+                return self._end(budget.exhausted_outcome(stop, wait), Phase.FAILED)
+        self._stop_if_cancelled()
+        await self._budget_resume(stop, pause, before, began, seen, via)
+        return None
+
+    async def _announce_budget(
+        self, stop: budget.BudgetVerdict, pause: int, wait: timedelta, midnight: datetime
+    ) -> None:
+        """Say why the task waits: on the issue for a task of one, and in the `paused` event."""
+        state = self.state
+        spec = state.spec
+        reason = stop.reason
+        if reason is None:
+            return
+        daily = reason is budget.BudgetReason.DAILY_REPO_USD
+        payload: dict[str, Any] = {
+            "reason": reason.value,
+            "pause": pause,
+            "turn_index": state.turn_index,
+            "numbers": stop.numbers.model_dump(mode="json"),
+        }
+        if daily:
+            payload["resume_at"] = midnight.isoformat()
+        if lifecycle.is_github_task(spec) and spec.issue_number is not None:
+            await self._call(
+                acts.POST_BUDGET,
+                acts.PostBudgetInput(
+                    task_id=spec.task_id,
+                    repo=spec.repo,
+                    number=spec.issue_number,
+                    pause=pause,
+                    reason=reason,
+                    numbers=stop.numbers,
+                    wait_s=None if daily else wait.total_seconds(),
+                    resume_at=midnight if daily else None,
+                ),
+            )
+            if not daily:  # nobody needs to act on the daily limit, it ends by itself
+                await self._label(lifecycle.on_budget_pause(spec, pause))
+        # The event comes last, so that whoever sees it can rely on the comment and the label.
+        await self._note(PAUSED_EVENT, payload)
+
+    async def _wait_for_midnight(self, midnight: datetime) -> None:
+        """Sleep on a durable timer until 00:00 UTC. A cancel wakes it, and nothing else does."""
+        left = midnight - workflow.now()
+        if left <= timedelta(0):
+            return
+        try:
+            await workflow.wait_condition(lambda: self.cancel_request is not None, timeout=left)
+        except TimeoutError:
+            return  # the day has changed, which is what the task waited for
+
+    def _topped_up(self, seen: _Unanswered) -> bool:
+        state = self.state
+        return state.extra_budget_usd > seen.usd or state.extra_turns > seen.turns
+
+    async def _budget_resume(
+        self,
+        stop: budget.BudgetVerdict,
+        pause: int,
+        before: Phase,
+        began: datetime,
+        seen: _Unanswered,
+        via: str,
+    ) -> None:
+        """Go back to the phase the task was in, with the time of the pause not counted."""
+        state = self.state
+        now = workflow.now()
+        state.paused_s += (now - began).total_seconds()
+        if stop.reason is budget.BudgetReason.WALL_CLOCK:
+            # A new window: the task has worked no time at all as of now.
+            whole = budget.elapsed(state.started_at, now, paused_s=0).total_seconds()
+            state.paused_s = max(state.paused_s, whole)
+        state.phase = before
+        self.paused_reason = None
+        if via == BUDGET_VIA and lifecycle.is_github_task(state.spec):
+            await self._label(lifecycle.on_budget_resume(state.spec, pause))
+        reason = stop.reason.value if stop.reason is not None else None
+        await self._note(
+            RESUMED_EVENT,
+            {"pause": pause, "via": via, "reason": reason, "turn_index": state.turn_index},
+        )
+        if via == BUDGET_VIA:
+            added: dict[str, Any] = {
+                "pause": pause,
+                "usd": state.extra_budget_usd - seen.usd,
+                "turns": state.extra_turns - seen.turns,
+            }
+            if self.topped_up_by is not None:
+                added["by"] = self.topped_up_by  # who the run report names for the top-up
+            await self._note(BUDGET_ADDED_EVENT, added)
 
     async def _asked_before_the_pause(self, signal: StuckSignal) -> Outcome | None:
         """What a run did before the pause existed, for the histories that recorded it.
@@ -1961,12 +2282,23 @@ class TaskWorkflow:
         A prompt that is over the window is compacted down to the last two turns, and the turn
         is asked once more (F6). It is asked again only if the compaction changed the view. A
         second overflow, or one with nothing to fold, ends the run with "context limit".
+
+        The caller has checked the budgets for the first call. Every call after it, a retry at the
+        higher output cap, the continuation of a paused turn and the ask after a compaction, is
+        checked here, because each is a model call that costs money (LH-702). A budget that ends
+        the task comes back as the outcome.
         """
         state = self.state
         sampling = rules.Sampling()
         paused_ref: BlobRef | None = None
         compacted = False
+        asked = False
         while True:
+            if asked:
+                ended = await self._afford(role, high_output_cap=sampling.retried)
+                if ended is not None:
+                    return ended
+            asked = True
             try:
                 reply = await self._call(
                     acts.LLM_TURN,
@@ -2004,6 +2336,11 @@ class TaskWorkflow:
             # activity hands back: unchanged when the reply was not stored.
             state.transcript_ref = reply.transcript_ref
             state.cost_usd += reply.cost_usd
+            # The next request holds this one and the results of its calls, so the budget check
+            # prices the larger of what the activity projected and what this one was billed at.
+            state.last_input_tokens = max(
+                reply.next_request_tokens, reply.request_tokens, reply.input_tokens_total
+            )
             verdict = rules.judge(sampling, reply)
             sampling = verdict.sampling
             if verdict.outcome is not None:

@@ -20,8 +20,8 @@ uv.lock do not change. Other flags:
 A full run should cost about 0.3 to 0.6 USD. Every call prints its usage and an
 estimated cost. Before each paid call the script adds that call's worst case
 (all of max_tokens as output) to the spend so far and skips the call if the sum
-would pass the cap. The prices below come from the API docs snapshot of
-2026-10-06 and are not checked live; they only drive the estimate and the cap.
+would pass the cap. The prices below come from the API docs (Models overview)
+as dated 2026-10-06 and are not checked live; they only drive the estimate and the cap.
 
 Each run writes to its own folder, spikes/out/run-<UTC time>/ (gitignored), so a
 second run never overwrites a paid first one. The folder holds summary.json,

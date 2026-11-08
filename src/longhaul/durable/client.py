@@ -10,10 +10,11 @@ pydantic v1 methods, warns on every encode, and returns plain dicts where a mode
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import Client, WorkflowExecutionStatus, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
+from temporalio.service import RPCError, RPCStatusCode
 
 from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, Outcome, Phase, TaskSpec, TaskStatus
@@ -34,6 +35,14 @@ from longhaul.telemetry import otel
 # The default of the task_queue setting (longhaul.settings.EnvSettings). A unit test keeps the
 # two equal.
 DEFAULT_TASK_QUEUE = "longhaul"
+
+# A workflow in one of these states can still change. CONTINUED_AS_NEW is the end of a run and
+# the start of the next one in the same workflow id, so the task is not over yet.
+OPEN_STATES = frozenset({WorkflowExecutionStatus.RUNNING, WorkflowExecutionStatus.CONTINUED_AS_NEW})
+
+# Where a task's workflow stands, as far as a reader can tell: open, ended, or not known to the
+# server. A closed workflow is forgotten when the namespace retention runs out.
+WorkflowState = Literal["running", "closed", "not_found"]
 
 
 async def connect(address: str, *, namespace: str = "default") -> Client:
@@ -66,6 +75,7 @@ async def start_task(
     context_mode: ContextMode | None = None,
     plan: bool = False,
     open_draft_on_stuck: bool = False,
+    enforce_budgets: bool = False,
 ) -> WorkflowHandle[TaskWorkflow, Outcome]:
     """Start the workflow for a task. Its id is the task id.
 
@@ -82,13 +92,24 @@ async def start_task(
     its partial work (LH-507). The poller passes the repo's setting. It is in the memo for the
     same reasons, and a task started without it opens no such draft.
 
+    `enforce_budgets` has the task check its budgets before every model turn and pause when a
+    limit would be crossed (LH-702). The poller asks for it, because a task nobody watches must not
+    run up a bill. A task started without it ends at its turn limit with ERROR "turn limit", and a
+    local run keeps that. The switch is in the state and not in the memo: the state is what a
+    hand-over carries, and a history that began before the story has no such field.
+
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run
     once the old one closed, and the poller would rerun a finished task for as long as the
     label stays on the issue. Namespace retention bounds the second case, so the `tasks`
     table stays the record of what ran.
     """
-    state = RunState(spec=spec, phase=Phase.QUEUED, started_at=datetime.now(UTC))
+    state = RunState(
+        spec=spec,
+        phase=Phase.QUEUED,
+        started_at=datetime.now(UTC),
+        enforce_budgets=enforce_budgets,
+    )
     memo: dict[str, Any] = {}
     if tuning is not None:
         memo[TUNING_MEMO_KEY] = tuning
@@ -133,3 +154,37 @@ async def read_status(
 async def cancel_task(client: Client, task_id: str, *, by: str, reason: str) -> None:
     """Send the cancel signal. The workflow cleans up and ends with the CANCELLED outcome."""
     await get_task(client, task_id).signal(TaskWorkflow.cancel, args=[by, reason])
+
+
+async def workflow_state(client: Client, task_id: str) -> WorkflowState:
+    """Whether the workflow of a task is open, has ended, or is unknown to the server."""
+    try:
+        description = await get_task(client, task_id).describe()
+    except RPCError as exc:
+        if exc.status is RPCStatusCode.NOT_FOUND:
+            return "not_found"
+        raise
+    return "running" if description.status in OPEN_STATES else "closed"
+
+
+# The signals below are the ones a person can send. `by` names who sent it and is kept in the
+# workflow (a hint is shown to the model with its author, a cancel names its author in the
+# outcome), so every caller says who it is: "cli", "console", or a GitHub login.
+async def send_hint(client: Client, task_id: str, *, by: str, text: str) -> None:
+    """Send the hint signal. The next model call of the task shows the text to the model."""
+    await get_task(client, task_id).signal(TaskWorkflow.hint, args=[by, text])
+
+
+async def add_budget(client: Client, task_id: str, *, by: str, usd: float, turns: int) -> None:
+    """Send the add_budget signal: more dollars and more turns for a task that ran out."""
+    await get_task(client, task_id).signal(TaskWorkflow.add_budget, args=[by, usd, turns])
+
+
+async def approve_plan(client: Client, task_id: str, *, by: str) -> None:
+    """Send the approve_plan signal for a task that waits for a decision on its plan."""
+    await get_task(client, task_id).signal(TaskWorkflow.approve_plan, args=[by])
+
+
+async def reject_plan(client: Client, task_id: str, *, by: str, feedback: str) -> None:
+    """Send the reject_plan signal. The planner reads the feedback and writes a new plan."""
+    await get_task(client, task_id).signal(TaskWorkflow.reject_plan, args=[by, feedback])

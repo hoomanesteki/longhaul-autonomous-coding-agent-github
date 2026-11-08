@@ -197,7 +197,9 @@ class WorkspaceActivities:
     commands of a repo are kept, and the parsed structure of its default branch. `blobs` is where
     the repo map of each task goes. Without `memory`, prepare_workspace does not look for the
     commands, which is how a run or a test without a database works, and without both it does
-    not build the map, since a map with nowhere to go is work for nothing.
+    not build the map, since a map with nowhere to go is work for nothing. `map_repo` false does
+    the same for a worker whose memory mode is off (LH-607): it keeps the commands, and the map
+    would go into a block that stays empty.
     `github` is how the host reaches GitHub. Without it a worker prepares local folders only, and
     it can still recover the sandbox of a GitHub task, because ensure_sandbox reads nothing but the
     bare repo.
@@ -215,6 +217,7 @@ class WorkspaceActivities:
         memory: WorkspaceMemory | None = None,
         github: GitHubRemote | None = None,
         blobs: BlobStore | None = None,
+        map_repo: bool = True,
     ) -> None:
         self._sandboxes = sandboxes
         self._store = checkpoints
@@ -226,7 +229,8 @@ class WorkspaceActivities:
         self._github = github
         self._blobs = blobs
         # Public, so that a test can read repo_maps.script_runs and tell a cache hit from a parse.
-        self.repo_maps = RepoMapCache(memory) if memory is not None and blobs is not None else None
+        keeps_maps = memory is not None and blobs is not None and map_repo
+        self.repo_maps = RepoMapCache(memory) if keeps_maps and memory is not None else None
 
     @property
     def activities(self) -> list[Callable[..., Any]]:

@@ -551,6 +551,9 @@ def test_the_event_types_are_the_ones_the_writers_use() -> None:
     assert render.SANDBOX_EVENT == workspace.SANDBOX_RECREATED
     assert render.STEP_EVENT == plan.STEP_EVENT
     assert render.OUTCOME_EVENT == acts.OUTCOME_EVENT
+    assert render.LESSONS_EVENT == acts.LESSONS_EVENT
+    assert render.BUDGET_EVENT == task.BUDGET_ADDED_EVENT
+    assert render.BUDGET_VIA == task.BUDGET_VIA
 
 
 def test_the_report_is_not_made_of_anything_that_could_swallow_the_pull_request_body() -> None:

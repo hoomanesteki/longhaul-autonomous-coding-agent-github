@@ -13,6 +13,7 @@ dependencies = [
     "boto3>=1.43.120",
     "cryptography>=50.0.2",
     "docker>=7.2.0",
+    "fastapi>=0.162.0",
     "jinja2>=3.1.6",
     "jsonschema>=4.26.0",
     "openai>=3.41.0",
@@ -30,6 +31,7 @@ dependencies = [
     "structlog>=26.1.0",
     "temporalio>=1.35.0",
     "typer>=0.27.3",
+    "uvicorn>=0.54.0",
 ]
 
 [project.scripts]
@@ -39,10 +41,12 @@ longhaul = "longhaul.cli:app"
 memory = [
     "fastembed>=0.9.1",
 ]
-# The SWE-bench set (eval/swebench): `uv sync --extra eval`. It is large, so CI and the worker
-# image leave it out. What every eval run needs is the `eval` dependency group below.
+# The SWE-bench set (eval/swebench) and the charts of the results report (eval/report):
+# `uv sync --extra eval`. It is large, so CI and the worker image leave it out. What every eval
+# run needs is the `eval` dependency group below.
 eval = [
     "datasets>=5.1.0",
+    "matplotlib>=3.10",
     "swebench==5.0.2",
 ]
 
@@ -52,7 +56,6 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "fastapi>=0.162.0",
     "hypothesis>=6.170.14",
     "mypy>=2.4.1",
     "pre-commit>=4.7.0",
@@ -66,7 +69,6 @@ dev = [
     "types-docker>=7.2.0.20261006",
     "types-jsonschema>=4.26.0.20261006",
     "types-pyyaml>=6.0.12.20260906",
-    "uvicorn>=0.54.0",
 ]
 # What the evaluation harness (eval/) needs on every run and the product does not. The worker
 # image leaves the group out (docker/worker/Dockerfile), so numpy stays out of it. The SWE-bench
@@ -135,6 +137,12 @@ disallow_untyped_calls = false
 # eval/swebench imports it inside the functions that need it.
 [[tool.mypy.overrides]]
 module = ["datasets"]
+ignore_missing_imports = true
+
+# matplotlib is in the same extra. eval/report/charts.py imports it inside the function that
+# draws, and the report builder runs without it.
+[[tool.mypy.overrides]]
+module = ["matplotlib", "matplotlib.*"]
 ignore_missing_imports = true
 
 # rank_bm25 ships no type information.

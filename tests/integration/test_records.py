@@ -536,3 +536,23 @@ async def test_the_outcome_event_dates_the_end_of_a_task(
     assert await recorder.ended_before([], datetime.now(UTC)) == set()
     # Only the ids asked about come back.
     assert await recorder.ended_before(["lh-new-2"], T1) == set()
+
+
+# ---------- the events of a task, for the lessons (LH-605) ----------
+async def test_events_of_a_task_come_back_in_the_order_they_were_written(
+    recorder: SqlRecorder,
+) -> None:
+    await recorder.record_event("lh-a-1", "stuck", {"reason": "edit_churn", "evidence": ["x"]})
+    await recorder.record_event("lh-b-2", "stuck", {"reason": "no_progress"})
+    await recorder.record_event("lh-a-1", "compaction", {"tokens_before": 9})
+    await recorder.record_event("lh-a-1", "verdict", {"issues": ["remove still raises KeyError"]})
+
+    got = await recorder.events_of("lh-a-1", ["stuck", "verdict"])
+
+    assert [(e.type, e.payload) for e in got] == [
+        ("stuck", {"reason": "edit_churn", "evidence": ["x"]}),
+        ("verdict", {"issues": ["remove still raises KeyError"]}),
+    ]
+    assert {e.task_id for e in got} == {"lh-a-1"}
+    assert await recorder.events_of("lh-a-1", []) == []
+    assert await recorder.events_of("lh-unknown-9", ["stuck"]) == []

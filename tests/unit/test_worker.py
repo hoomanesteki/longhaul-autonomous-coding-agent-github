@@ -759,6 +759,13 @@ def loader_of(parts: worker.WorkerParts) -> Any:
     return found
 
 
+def lessons_of(parts: worker.WorkerParts) -> Any:
+    (found,) = [
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "extract_lessons"
+    ]
+    return found
+
+
 def with_memory(**fields: Any) -> AppConfig:
     values = {"enabled": True, "embedder": "hash", **fields}
     return CONFIG.model_copy(update={"memory": Memory(**values)})
@@ -789,6 +796,8 @@ def test_a_worker_with_memory_shares_one_store_between_the_workspace_and_the_pro
     loader = loader_of(parts)
     assert loader._memory is parts.memory
     assert loader._blobs is parts.blobs
+    # extract_lessons writes its candidates to the same store (LH-605).
+    assert lessons_of(parts)._sink is parts.memory
 
 
 @pytest.mark.phase6
@@ -806,6 +815,30 @@ def test_a_worker_with_memory_off_builds_no_store_and_keeps_the_activity(tmp_pat
     # The workflow names load_memory, so the worker keeps answering it: with an empty block.
     assert names_of(parts) == sorted(act.name for act in acts.ALL)
     assert loader_of(parts)._memory is None
+    # The workflow asks only a task that loaded a block, and the activity still answers.
+    assert lessons_of(parts)._sink is None
+
+
+@pytest.mark.phase6
+def test_a_worker_in_off_mode_keeps_the_commands_and_leaves_out_the_prompt_and_the_lessons(
+    tmp_path: Path,
+) -> None:
+    parts = worker.build_parts(
+        make_settings(tmp_path),
+        with_memory(mode="off"),
+        FakeManager(),  # type: ignore[arg-type]
+    )
+
+    # The store stays, because the verified commands set the test command of a task (LH-603).
+    assert isinstance(parts.memory, PgMemoryStore)
+    workspace = _workspace_of(parts)
+    assert workspace._memory is parts.memory
+    # The map goes into the block only, so a run that leaves the block out does not build it.
+    assert workspace.repo_maps is None
+    # load_memory still answers, with an empty block, and nothing is drafted at the end of a task.
+    assert loader_of(parts)._memory is None
+    assert lessons_of(parts)._sink is None
+    assert names_of(parts) == sorted(act.name for act in acts.ALL)
 
 
 @pytest.mark.phase6
@@ -930,3 +963,42 @@ def test_a_verify_round_limit_the_workflow_cannot_follow_stops_the_worker(tmp_pa
     config = CONFIG.model_copy(update={"loop": loop})
     with pytest.raises(ValueError, match=r"loop\.max_verify_rounds.*5.*3"):
         worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
+
+
+# ---------- LH-702: budgets ----------
+def test_every_worker_checks_budgets_against_its_own_ledger(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    checking = activity_object(parts, "check_budget")
+    assert checking._spending is activity_object(parts, "llm_turn")._ledger
+    assert isinstance(checking._spending, SqlLedger)
+
+
+def test_the_budget_check_prices_a_role_with_the_model_of_that_role(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    checking = activity_object(parts, "check_budget")
+    assert checking._config_for(Role.PLANNER).model == CONFIG.models.planner
+    assert checking._config_for(Role.CODER).model == CONFIG.models.coder
+
+
+async def test_a_worker_with_a_token_posts_the_budget_comment_through_the_writes_ledger(
+    tmp_path: Path,
+) -> None:
+    templates = tmp_path / "templates"
+    parts = worker.build_parts(
+        make_settings(tmp_path, github_token="github-token-for-tests", templates_dir=templates),
+        CONFIG,
+        FakeManager(),  # type: ignore[arg-type]
+    )
+    try:
+        posting = activity_object(parts, "post_budget")
+        writes = activity_object(parts, "post_comment")
+        assert posting._ledger is writes._ledger
+        assert posting._templates == templates
+    finally:
+        await parts.close()
+
+
+def test_a_worker_without_a_token_still_checks_budgets_but_posts_nothing(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    names = names_of(parts)
+    assert "check_budget" in names and "post_budget" not in names

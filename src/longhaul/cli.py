@@ -1,6 +1,6 @@
 """The `longhaul` command line.
 
-Six commands and two groups, `memory` and `poller`. `run-local` copies a folder into a Docker
+Seven commands and two groups, `memory` and `poller`. `run-local` copies a folder into a Docker
 sandbox, lets the agent work on the issue in a text file, and prints what it did. No Temporal
 and no database are involved, so it is the quickest way to watch the agent work.
 
@@ -8,6 +8,10 @@ The other four use the durable stack that `make up` starts. `worker` runs the pr
 the work (durable/worker.py). `run` starts a task for a folder on that stack and follows it
 until it ends. `status` and `cancel` ask about a task by its id, or stop it. They are separate
 commands because a task outlives `run`: Ctrl-C ends the command and the task goes on.
+
+`api` serves the console API with uvicorn (LH-801, src/longhaul/api). It needs the same stack as
+`worker` and no worker to start. The address and port come from LONGHAUL_API_HOST and
+LONGHAUL_API_PORT, or from `--host` and `--port`.
 
 `report TASK_ID` prints the run report of a task (LH-705): how it went, what it cost, which tools
 it used, its plan, who stepped in and the lessons drafted from it. It reads the database of
@@ -70,7 +74,6 @@ from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import (
     Client,
-    WorkflowExecutionStatus,
     WorkflowFailureError,
     WorkflowHandle,
     WorkflowQueryFailedError,
@@ -108,7 +111,14 @@ from longhaul.contracts import (
 from longhaul.db.context_totals import ContextTotals, read_context_totals
 from longhaul.db.session import database_url, make_engine
 from longhaul.durable import acts, schedule
-from longhaul.durable.client import cancel_task, connect, get_task, read_status, start_task
+from longhaul.durable.client import (
+    OPEN_STATES,
+    cancel_task,
+    connect,
+    get_task,
+    read_status,
+    start_task,
+)
 from longhaul.durable.scripts import upload_script
 from longhaul.github.intake import FILE_CUT_NOTE, MAX_BODY_BYTES, clip_text
 from longhaul.memory.embedder import LocalEmbedder
@@ -129,10 +139,6 @@ EXIT_ERROR = 2
 # limit, and `run` would show nothing for that long.
 POLL_S = 2.0
 STATUS_TIMEOUT_S = 5.0
-
-# A workflow in one of these states can still change. CONTINUED_AS_NEW is the end of a run and
-# the start of the next one in the same workflow id, so the task is not over yet.
-OPEN_STATES = frozenset({WorkflowExecutionStatus.RUNNING, WorkflowExecutionStatus.CONTINUED_AS_NEW})
 
 # Failures of the machine, the config or the run, which the command reports in one line. Any
 # other exception is a bug and keeps its traceback.
@@ -313,6 +319,39 @@ def worker_command() -> None:
     except DURABLE_ERRORS as exc:
         typer.echo(f"error: {describe(exc)}", err=True)
         raise typer.Exit(EXIT_ERROR) from None
+
+
+@app.command("api")
+def api_command(
+    host: Annotated[
+        str | None,
+        typer.Option("--host", help="The address to listen on. Default: LONGHAUL_API_HOST."),
+    ] = None,
+    port: Annotated[
+        int | None,
+        typer.Option("--port", min=0, max=65535, help="The port. Default: LONGHAUL_API_PORT."),
+    ] = None,
+) -> None:
+    """Serve the console API: tasks, timelines, actions and memory over HTTP (LH-801).
+
+    It reads the database and the blob store and sends signals through Temporal, so it needs the
+    stack from `make up` and the LONGHAUL_* settings of .env.example. It does not need a worker
+    to start, but the live status of a task and the actions do. The address defaults to this
+    machine only: the console has no login until LH-807.
+    """
+    # Imported here: the server pulls in FastAPI and the stores, which the other commands do not
+    # need.
+    import uvicorn
+
+    settings = EnvSettings()
+    # The app builds its stores when it starts (create_app with no argument), so that a bad
+    # setting is reported by the server's start-up and not by an import.
+    uvicorn.run(
+        "longhaul.api.app:create_app",
+        factory=True,
+        host=host if host is not None else settings.api_host,
+        port=port if port is not None else settings.api_port,
+    )
 
 
 @app.command("run")

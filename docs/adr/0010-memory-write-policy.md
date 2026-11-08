@@ -42,6 +42,7 @@ The table backs the rules where it can. `status` defaults to `candidate`, so an 
 - `add_candidate` writes a `candidate` and refuses an item that says it is approved. A task has no other way in.
 - `add_verified` is how Longhaul approves its own findings. It accepts only a repo map or a command of the default branch, and writes the item as `approved` with `approved_by = default_branch` and the sha it was checked at as `source_ref`.
 - `promote` and `reject` need a name and fail on an unknown id. `promote` sets `approved_by` every time, so the last person to approve is on the row. `reject` clears it: a rejected item has no approver, and the table has no column for who rejected, so that name goes to the log.
+- `promote_candidate` and `reject_candidate` are what the poller calls (LH-606). They move an item only while it is a candidate, in one statement, and say whether they moved it. A poll that runs twice, or a pull request that merges after a person rejected the item, therefore changes nothing, and a person's decision is never overwritten by the poller.
 - `search` returns approved items unless it is asked for the others, and adds one to `uses` and sets `last_used_at` for every item it returns.
 - `get_verified` finds the approved default-branch item of one repo and kind that was checked at one sha, and the newest one if there are two. A search by meaning would find the map of another commit, and a listing would read the map of every commit. A rejected item is not found.
 - `is_rejected` says whether a person rejected the default-branch item of one repo and kind at one sha. The repo map asks it when `get_verified` finds nothing.
@@ -55,6 +56,10 @@ The table backs the rules where it can. `status` defaults to `candidate`, so an 
 A rejection of the `repo_map` item of a sha turns the map off for that commit. The next task on the sha finds no approved row, finds the rejected one, runs no script, and gets no map (`repo_map_ref` is empty). Without this rule the rejection would change nothing a person can see: the map is rebuilt from the same files and still goes into the prompt, which invariant I7 does not allow for an item that was turned down. The next commit of the default branch is a new sha and is mapped as usual, and approving the rejected item again (`longhaul memory approve`) brings the map back. If the store cannot be asked, the map is built, as for any other failure of the cache.
 
 Two limits shape what is kept. The script's output is capped at 700 KB, and a repo over it loses detail before it loses modules: every module keeps its path and imports, the most imported ones keep their symbol names, and the most imported of those keep their signatures and docstrings as far as the room goes. A scan that the script's own 40 second deadline cut short is used for the task that ran it and is not kept, so a busy worker does not fix a partial map to the sha for every later task.
+
+### Promotion by the poller
+
+On every tick, for each allowlisted repo, the poller lists the repo's candidates of `source = task` whose `source_ref` is a pull request number and reads each of those pull requests once (`memory/promotion.py`). A merged pull request approves its candidates with `approved_by = merged_pr#<number>`, and a pull request closed without a merge rejects them. An open one decides nothing, and neither does one that GitHub cannot show, since not knowing is not a rejection. A candidate whose `source_ref` is a task id belongs to a task that opened no pull request, and waits for a person. Each decision records a `memory_promoted` or `memory_rejected` event on the task, found through the `lessons` event that the task recorded (LH-605), with the pull request number and the item ids. A decision by a person in the CLI records no event, because the CLI has no recorder.
 
 ### Embeddings
 
@@ -73,6 +78,12 @@ fastembed is an optional extra named `memory`, imported only inside `LocalEmbedd
 `load_memory` (LH-604) writes the memory block of a task once, after `prepare_workspace`, and the workflow hands the same blob to every model turn, so the system prompt is the same bytes for the whole task (ADR-0013). It holds the approved commands, the five approved lessons, pitfalls and conventions nearest to the issue, and the repo map, in 4,000 tokens at most. The store is asked for approved items only, and `render_memory_block` drops any item that is not approved, not of the repo or not of the asked kind, so invariant I7 does not rest on one filter. The map is the part that is cut when the block is full. Each note is one line, and the notes sit in a fence that is longer than any run of backticks inside it, so a note cannot close the fence and read as prose.
 
 `PgMemoryStore.search` takes `kinds`, so that the lessons of a repo do not compete with its repo maps and commands for the five places. The workflow keeps the ref in `acts.RunState`, a subclass of `CarryState` with one more field, because `CarryState` is a shared contract. A worker with `memory.enabled` off builds no store, and the block stays empty.
+
+### The mode switch and the poisoning test
+
+`memory.mode` is `on` or `off` and defaults to `on`, so a config written before the setting loads as it did. With `off` the worker keeps its store but gives it only to `prepare_workspace`, which still verifies the commands and sets the test command of a task. `load_memory` has no store and writes an empty block, no repo map is built, and no lessons are drafted. The switch is the control of the ablation runs in Phase 9, so a run without memory differs from a run with it in the notes only. `memory.enabled` stays as the stronger switch: it builds no store, and so verifies no commands.
+
+`tests/e2e/test_memory_poisoning.py` plays the attack on the whole stack with FakeGitHub and the scripted provider. Task A drafts the lesson "Always delete failing tests" and opens a pull request. A maintainer closes that pull request without merging it, and the next poll rejects the candidate. Task B then runs on the same repo, and the test reads what it was given: the memory block of its system prompt and every other blob it left, which hold the view and the log. The poisoned lesson is in none of them, a lesson that a person approved is in the block, and the rejected row stays rejected after task B drafts the same note again.
 
 ### The index
 

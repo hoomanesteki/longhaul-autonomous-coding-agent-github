@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from longhaul.context.modes import ContextMode
@@ -93,6 +93,10 @@ class EnvSettings(BaseSettings):
     # 0.0.0.0 (docs/runbook.md). Port 0 lets the system choose a free port.
     metrics_port: int = Field(default=9464, ge=0, le=65535)
     metrics_host: str = "127.0.0.1"
+    # Where `longhaul api` serves the console API (LH-801). The host keeps it on this machine
+    # until the console has a login (LH-807); a container that publishes the port needs 0.0.0.0.
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=0, le=65535)
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.
@@ -258,10 +262,26 @@ class Memory(StrictModel):
     cannot be compared, so a database holds the rows of one, and a worker refuses to start on a
     table that another embedder wrote. With `enabled` off the worker builds no store, keeps no
     repo map or verified commands, and the memory block of the prompt stays empty.
+
+    `mode` is the switch for a store that stays (LH-607, ADR-0010). With `off` the memory block
+    of the prompt is empty, no repo map is built and no lessons are drafted, but the commands are
+    still verified and the first one that runs the tests still becomes the test command of a task.
+    Those commands are Longhaul's own findings at the default branch and not notes from a task, so
+    a run without notes keeps them, and a run with and a run without memory (Phase 9) differ in
+    the notes only. It defaults to `on`, so a config written before the setting loads as it did.
+    YAML 1.1 reads an unquoted `on` and `off` as booleans, so those are accepted as the words.
     """
 
     enabled: bool
     embedder: Literal["local", "hash"]
+    mode: Literal["on", "off"] = "on"
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _yaml_booleans(cls, value: object) -> object:
+        if isinstance(value, bool):
+            return "on" if value else "off"
+        return value
 
 
 class AppConfig(StrictModel):

@@ -36,11 +36,12 @@ function apiWithToken(accepted: string) {
   fetchStub.mockImplementation((input, init) => {
     if (String(input) === "/healthz") return Promise.resolve(json({ status: "ok" }));
     const given = new Headers(init?.headers).get("authorization");
-    return Promise.resolve(
-      given === `Bearer ${accepted}`
-        ? json([])
-        : json({ detail: "a valid bearer token is required" }, 401),
-    );
+    if (given !== `Bearer ${accepted}`) {
+      return Promise.resolve(json({ detail: "a valid bearer token is required" }, 401));
+    }
+    // The task list is paged, so it answers with a page and not with a bare list.
+    const paged = String(input).startsWith("/api/tasks");
+    return Promise.resolve(json(paged ? { items: [], next_cursor: null } : []));
   });
 }
 

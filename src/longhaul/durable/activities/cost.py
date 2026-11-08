@@ -56,7 +56,7 @@ from longhaul.agent.prompts import (
     with_plan,
 )
 from longhaul.agent.turns import append_user_text
-from longhaul.context.tokens import count_request_chars
+from longhaul.context.tokens import DEFAULT_CHARS_PER_TOKEN, count_request_chars
 from longhaul.contracts import Message, Role, ToolSpec, Usage
 from longhaul.cost import budget
 from longhaul.cost.budget import BudgetVerdict
@@ -154,16 +154,23 @@ class BudgetActivities:
         return tokens
 
 
+# Room for the truncation marker of a cut output and the line that names its command.
+SHOWN_EXTRA_CHARS = 200
+
+
 def _review_tokens(review: acts.ReviewBrief, cfg: LoopConfig, per_token: float) -> int:
     """The most that the pre-check and the diff add to the first message of the verifier.
 
-    llm_turn cuts each output to a number of tokens before the model sees it, so a blob larger
-    than the cap counts as the cap.
+    llm_turn cuts each output before the model sees it (shape_output), and the cut is in
+    characters: the cap times DEFAULT_CHARS_PER_TOKEN. The task's meter can have learned fewer
+    characters per token than that, so the cut text is counted at the task's ratio and not as
+    the cap.
     """
 
     def shown(run: acts.CheckRun, cap: int) -> int:
         size = run.output_ref.size if run.output_ref is not None else 0
-        return min(math.ceil(size / per_token), cap)
+        kept = min(size, math.floor(cap * DEFAULT_CHARS_PER_TOKEN) + SHOWN_EXTRA_CHARS)
+        return math.ceil(kept / per_token)
 
     total = sum(shown(run, verifier.CHECK_OUTPUT_TOKENS) for run in review.checks)
     if review.diff is not None:

@@ -1053,3 +1053,11 @@ def test_the_status_line_shows_the_version_of_the_plan() -> None:
         "status: coding, 4 turns done, cost $0.0000, plan v1, checkpoint 1a2b3c4"
     )
     assert "plan" not in cli.status_line(status(Phase.CODING, 4))
+
+
+def test_the_status_line_of_a_paused_run_says_what_it_waits_for() -> None:
+    reason = "waiting for a budget top-up: task usd"
+    paused = status(Phase.PAUSED, 2).model_copy(update={"paused_reason": reason})
+    assert cli.status_line(paused) == (
+        "status: paused, 2 turns done, cost $0.0000, checkpoint 1a2b3c4, " + reason
+    )

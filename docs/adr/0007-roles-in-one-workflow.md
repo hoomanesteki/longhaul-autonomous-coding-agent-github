@@ -53,6 +53,11 @@ LH-504 adds the third role, the verifier. A coder with a plan no longer ends the
 - **A failed review sends the coder back.** It adds one to `CarryState.verify_rounds`, which crosses hand-overs, records a `verdict` event and puts "Review failed: <issues>. Fix step <id>." at the end of the coder's transcript, after the answers to its last calls. The coder goes on with the plan and the transcript it had. At `max_verify_rounds` the task ends as `stuck` with the reason and the last issues in the summary ("the work failed review 3 times"): the third failure sends nobody back, so the coder was sent back twice. The workflow cannot read the config, so `acts.MAX_VERIFY_ROUNDS` copies the number, a unit test keeps the two equal and a worker whose config holds another number stops at the start.
 - **A verified pull request is ready for review.** `DeliverInput.verified_tests` carries the counts of the verdict. `deliver` opens the pull request as ready when it is set and as a draft when it is not, and the body says "Verified: <counts>". The workflow sets it only when the pre-check ran at least one command. The value is part of the input, so a retry builds the same body and the same request under the same key.
 
+LH-507 gives every task one way to end:
+
+- **One wind-up for every outcome.** `run()` ends a task the same way whether it delivered, got stuck, was cancelled or raised: the sandbox is destroyed, a stuck task may open a draft pull request with its partial work, one final comment is posted under the key `final:1`, the final labels are set, and the `outcome` event is recorded. The sandbox goes first, since it needs nothing from GitHub. Each step is best effort, so one failure leaves the rest done. An exception becomes the outcome `error` with the error type as its summary, the trace goes to the `events` table, and the workflow still fails, so Temporal shows it as failed.
+- **The janitor deletes the bare repo after a week.** A task that ended keeps its repo for seven days so that a person can read its checkpoints. `PollerWorkflow` runs `clean_repos` after each poll, which removes the repos of tasks whose `outcome` event is older than that, and never a repo whose task has no outcome.
+
 ## Consequences
 
 Easier:

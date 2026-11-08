@@ -341,9 +341,13 @@ async def seed_timeline(sessions: Sessions) -> None:
     await add_call(sessions, "toolu_b", 12)
     await add_call(sessions, "toolu_a", 12)
     await add_call(sessions, "toolu_c", 25, turn_index=1, ok=False, exit_code=1)
+    await add_call(sessions, "toolu_d", 26, turn_index=1, post_sha=POST_SHA)
     # Rows of another task sit between the times and must not show.
     await add_turn(sessions, 0, 1, 11, task_id="lh-acme-other-1")
     await add_call(sessions, "toolu_other", 13, task_id="lh-acme-other-1")
+
+
+POST_SHA = "0123456789abcdef0123456789abcdef01234567"
 
 
 # A tie in time is broken by the kind (turn, tool call, event) and then by the key of the row.
@@ -356,6 +360,7 @@ TIMELINE = [
     "turn:1/1",
     "turn:1/2",
     "call:toolu_c",
+    "call:toolu_d",
     "event:paused",
 ]
 
@@ -374,6 +379,9 @@ async def test_timeline_order(api: Stack) -> None:
     assert by_label["call:toolu_c"]["ok"] is False
     assert by_label["call:toolu_c"]["exit_code"] == 1
     assert by_label["call:toolu_c"]["name"] == "run_command"
+    # The console shows the commit a call left behind, and a call that made none has no sha.
+    assert by_label["call:toolu_d"]["post_sha"] == POST_SHA
+    assert by_label["call:toolu_c"]["post_sha"] is None
     assert [i["ts"] for i in full["items"]] == sorted(i["ts"] for i in full["items"])
 
     # The same list, four rows at a time. Nothing repeats and nothing is skipped at a seam, also

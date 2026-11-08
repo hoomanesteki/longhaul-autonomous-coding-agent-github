@@ -3,9 +3,12 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import { listRepos, listTasks } from "../api/client";
 import PhaseBadge from "../components/PhaseBadge";
+import { useNow } from "../hooks/useNow";
 import { formatAge, formatCost, issueUrl, needsYou } from "../util/tasks";
 
 const POLL_MS = 10_000;
+// Ages are written in whole minutes at the finest, so a tick twice a minute is enough.
+const AGE_TICK_MS = 30_000;
 
 // The statuses a task row can have. A status the API returns that is not in the list is added to
 // the dropdown, so a new one can still be picked.
@@ -17,6 +20,7 @@ const HEAD = "py-2 pr-4 font-medium";
 /** Every task in one table, with the filters that decide which ones, and the ones that need a person. */
 export default function TasksPage() {
   const [params, setParams] = useSearchParams();
+  const now = useNow(AGE_TICK_MS);
   // The filters live in the address, so a filtered list can be bookmarked and survives a reload.
   const status = params.get("status") ?? "";
   const repo = params.get("repo") ?? "";
@@ -64,10 +68,10 @@ export default function TasksPage() {
       <h1 className="text-lg font-semibold">Tasks</h1>
 
       <div className="mt-3 flex flex-wrap items-end gap-x-4 gap-y-2 text-sm">
-        <label className="flex flex-col gap-1">
+        <label className="flex min-w-0 max-w-full flex-col gap-1">
           <span className="text-slate-600">Status</span>
           <select
-            className="rounded border border-slate-300 px-2 py-1"
+            className="w-full max-w-full rounded border border-slate-300 px-2 py-1"
             value={status}
             onChange={(event) => setFilter("status", event.target.value)}
           >
@@ -79,10 +83,10 @@ export default function TasksPage() {
             ))}
           </select>
         </label>
-        <label className="flex flex-col gap-1">
+        <label className="flex min-w-0 max-w-full flex-col gap-1">
           <span className="text-slate-600">Repo</span>
           <select
-            className="max-w-full rounded border border-slate-300 px-2 py-1"
+            className="w-full max-w-full rounded border border-slate-300 px-2 py-1"
             value={repo}
             onChange={(event) => setFilter("repo", event.target.value)}
           >
@@ -127,6 +131,11 @@ export default function TasksPage() {
           {tasks.hasNextPage
             ? "Nothing that needs you in the tasks loaded so far."
             : "Nothing needs you right now."}
+        </p>
+      )}
+      {tasks.isSuccess && onlyNeedsYou && rows.length > 0 && tasks.hasNextPage && (
+        <p className="mt-3 text-sm text-slate-600">
+          Only the tasks loaded so far are checked. Load more to check the rest.
         </p>
       )}
 
@@ -181,7 +190,7 @@ export default function TasksPage() {
                     <td className={CELL}>{task.outcome}</td>
                     <td className={`${CELL} text-right tabular-nums`}>{task.turns}</td>
                     <td className={`${CELL} text-right tabular-nums`}>{formatCost(task.cost_usd)}</td>
-                    <td className={CELL}>{formatAge(task.created_at)}</td>
+                    <td className={CELL}>{formatAge(task.created_at, now)}</td>
                     <td className="py-2 align-top font-medium text-amber-900">{waiting}</td>
                   </tr>
                 );

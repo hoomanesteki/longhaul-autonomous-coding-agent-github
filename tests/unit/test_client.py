@@ -365,3 +365,23 @@ async def test_start_task_leaves_the_switch_out_when_it_is_off(spec: TaskSpec) -
     fake = FakeClient()
     await start_task(cast(Client, fake), spec, open_draft_on_stuck=False)
     assert fake.calls[0][1]["memo"] is None
+
+
+# ---------- LH-702: budget enforcement ----------
+async def test_start_task_keeps_the_budget_switch_in_the_state_and_not_in_the_memo(
+    spec: TaskSpec,
+) -> None:
+    # The state crosses every Continue-As-New, and a history that began without the field
+    # replays as a task with no enforcement.
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec, enforce_budgets=True)
+    (state, *_), kwargs = fake.calls[0]
+    assert state.enforce_budgets is True
+    assert kwargs["memo"] is None
+
+
+async def test_start_task_does_not_enforce_budgets_unless_asked(spec: TaskSpec) -> None:
+    fake = FakeClient()
+    await start_task(cast(Client, fake), spec)
+    (state, *_), _ = fake.calls[0]
+    assert state.enforce_budgets is False

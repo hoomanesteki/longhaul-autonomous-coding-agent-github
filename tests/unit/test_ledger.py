@@ -4,6 +4,7 @@ tests/integration/test_cost_ledger.py runs the SQL ledger against Postgres. The 
 stands in for it in the unit tests of the activities, so it must price and round the same way.
 """
 
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -83,3 +84,47 @@ async def test_the_ledger_that_does_nothing_costs_nothing() -> None:
 def test_the_ledgers_without_a_database_fit_the_protocol() -> None:
     ledgers: list[Ledger] = [memory(), NoLedger()]
     assert len(ledgers) == 2
+
+
+# ---------- what was spent (LH-702) ----------
+# The budget check reads the ledger: a task's total, and a repo's total since a moment.
+async def test_the_memory_ledger_adds_up_a_task() -> None:
+    ledger = memory()
+    usage = Usage(input_tokens=1_000_000)  # 2.00 dollars on sonnet
+    await ledger.record("lh-a", "acme/calc", SONNET, 0, 1, usage)
+    await ledger.record("lh-a", "acme/calc", SONNET, 1, 1, usage)
+    await ledger.record("lh-b", "acme/calc", SONNET, 0, 1, usage)
+
+    assert await ledger.spent_by_task("lh-a") == Decimal("4.000000")
+    assert await ledger.spent_by_task("lh-nobody") == Decimal(0)
+
+
+async def test_the_memory_ledger_adds_up_a_repo_since_a_moment() -> None:
+    ledger = memory()
+    usage = Usage(input_tokens=1_000_000)
+    await ledger.record("lh-a", "acme/calc", SONNET, 0, 1, usage)
+    await ledger.record("lh-b", "acme/other", SONNET, 0, 1, usage)
+    # A row from before midnight, which the day of the repo leaves out.
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    ledger.entries.append(
+        LedgerEntry("lh-c", "acme/calc", SONNET, 0, 1, usage, Decimal("2.000000"), at=yesterday)
+    )
+    start = datetime.now(UTC) - timedelta(hours=1)
+
+    assert await ledger.spent_by_repo_since("acme/calc", start) == Decimal("2.000000")
+    assert await ledger.spent_by_repo_since("acme/calc", yesterday) == Decimal("4.000000")
+    assert await ledger.spent_by_repo_since("acme/none", start) == Decimal(0)
+
+
+async def test_the_time_of_a_row_does_not_take_part_in_its_equality() -> None:
+    first = LedgerEntry("t", "r", SONNET, 0, 1, Usage(), Decimal(0))
+    later = LedgerEntry(
+        "t", "r", SONNET, 0, 1, Usage(), Decimal(0), at=datetime(2030, 1, 1, tzinfo=UTC)
+    )
+    assert first == later
+
+
+async def test_a_ledger_with_no_database_says_nothing_was_spent() -> None:
+    ledger = NoLedger()
+    assert await ledger.spent_by_task("lh-a") == Decimal(0)
+    assert await ledger.spent_by_repo_since("acme/calc", datetime.now(UTC)) == Decimal(0)

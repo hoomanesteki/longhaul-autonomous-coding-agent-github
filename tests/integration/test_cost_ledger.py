@@ -16,6 +16,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, LiteralString
@@ -567,3 +568,61 @@ async def test_the_memory_ledger_prices_and_rounds_like_the_sql_ledger(
         assert await ledger.record("lh-x", "r", model, 0, 1, usage) == await memory.record(
             "lh-x", "r", model, 0, 1, usage
         )
+
+
+# ---------- what was spent: the sums behind the budget check (LH-702) ----------
+async def test_the_spend_of_a_task_is_the_sum_of_its_rows(
+    database: Scratch, ledger: SqlLedger
+) -> None:
+    for turn in (0, 1):
+        await ledger.record("lh-a", "acme/calc", SONNET, turn, 1, Usage(input_tokens=1_000))
+    await ledger.record("lh-b", "acme/calc", SONNET, 0, 1, Usage(input_tokens=5_000))
+
+    assert await ledger.spent_by_task("lh-a") == Decimal("0.004000")
+    assert await ledger.spent_by_task("lh-nobody") == Decimal(0)
+
+
+async def test_the_spend_of_a_task_counts_a_billed_call_that_was_retried(
+    database: Scratch, ledger: SqlLedger
+) -> None:
+    # Both attempts were billed, and the budget has to see both.
+    for attempt in (1, 2):
+        await ledger.record("lh-a", "acme/calc", SONNET, 0, attempt, Usage(input_tokens=1_000))
+
+    assert await ledger.spent_by_task("lh-a") == Decimal("0.004000")
+
+
+async def test_the_spend_of_a_repo_starts_at_the_moment_it_is_asked_for(
+    database: Scratch, ledger: SqlLedger
+) -> None:
+    await ledger.record("lh-a", "acme/calc", SONNET, 0, 1, Usage(input_tokens=1_000))
+    await ledger.record("lh-b", "acme/calc", SONNET, 0, 1, Usage(input_tokens=2_000))
+    await ledger.record("lh-c", "acme/other", SONNET, 0, 1, Usage(input_tokens=9_000))
+    # A row from the day before: the time of the call is `ts`, which the insert leaves to the
+    # server, so the test moves it back.
+    database.execute(
+        "UPDATE cost_ledger SET ts = now() - interval '30 hours' WHERE task_id = 'lh-a'"
+    )
+    midnight = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    assert await ledger.spent_by_repo_since("acme/calc", midnight) == Decimal("0.004000")
+    assert await ledger.spent_by_repo_since("acme/calc", midnight - timedelta(days=2)) == Decimal(
+        "0.006000"
+    )
+    assert await ledger.spent_by_repo_since("acme/none", midnight) == Decimal(0)
+
+
+async def test_the_memory_ledger_sums_as_the_sql_ledger_does(
+    database: Scratch, ledger: SqlLedger
+) -> None:
+    memory = MemoryLedger(Pricing.load(PRICING))
+    start = datetime.now(UTC) - timedelta(minutes=5)
+    for target in (ledger, memory):
+        await target.record("lh-a", "acme/calc", SONNET, 0, 1, Usage(input_tokens=70))
+        await target.record("lh-a", "acme/calc", SONNET, 1, 1, Usage(input_tokens=70))
+        await target.record("lh-b", "acme/calc", SONNET, 0, 1, Usage(input_tokens=70))
+
+    assert await ledger.spent_by_task("lh-a") == await memory.spent_by_task("lh-a")
+    assert await ledger.spent_by_repo_since("acme/calc", start) == (
+        await memory.spent_by_repo_since("acme/calc", start)
+    )

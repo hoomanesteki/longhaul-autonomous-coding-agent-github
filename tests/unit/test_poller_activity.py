@@ -600,3 +600,16 @@ async def test_an_item_that_intake_declines_is_skipped_without_a_row(
 
     assert temporal.started == [] and store.rows == {}
     assert result == acts.PollResult(repos=1, issues=1, started=0, known=0)
+
+
+async def test_a_task_of_the_poller_has_its_budgets_enforced(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    # Hard limits that pause the task and ask are what makes an unattended task safe (LH-702).
+    fake.seed_issue(REPO, "add() is wrong", labels=[LABEL])
+
+    await poll(poller(github, store), temporal)
+
+    ((state, kwargs),) = temporal.started
+    assert isinstance(state, acts.RunState) and state.enforce_budgets is True
+    assert kwargs["memo"] == {acts.PLAN_MEMO_KEY: True}, "the switch is in the state"

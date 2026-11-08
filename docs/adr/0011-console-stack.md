@@ -38,6 +38,8 @@ The API sends only the signals that a person can send, and it sends them under t
 
 **Lists use keyset pagination.** A cursor holds the sort key of the last row of the page. A running task writes rows between two requests, and an offset would skip or repeat some. The timeline merges the events, turns and tool calls in the database, ordered by time, then by kind, then by a key that is unique inside the kind, so a page can end in the middle of a tie.
 
+**The console is served by the API in a deployment.** With `LONGHAUL_CONSOLE_DIR` set to the build folder, the API also serves the console's files at `/`, and any path that is not a file gets `index.html` so that a reload of a page works. Unknown paths under `/api` stay 404. The compose `full` profile builds both in one image (`docker/api/Dockerfile`), which gives the browser one origin and the console no base URL. In development Vite serves the page and proxies `/api` to the API.
+
 **`longhaul api` serves the app with uvicorn.** The address comes from `LONGHAUL_API_HOST` (127.0.0.1 by default) and `LONGHAUL_API_PORT` (8000). The app builds its stores when the server starts. The console has no login until LH-807, so the default keeps it on the machine it runs on.
 
 ## Consequences

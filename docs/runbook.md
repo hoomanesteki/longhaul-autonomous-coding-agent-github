@@ -741,7 +741,24 @@ Things to know:
 - **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and a signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
 - **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
 - **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not.
-- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
+- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json` and `console/src/api/schema.ts`. A unit test fails when `openapi.json` is out of date, and the console job of CI fails when `schema.ts` is.
+
+## The console
+
+The console (LH-802, ADR-0011) is a Vite, React and TypeScript app in `console/`. It reads the API and nothing else. Node 24 or later and npm are the only tools it needs.
+
+```bash
+cd console && npm ci
+npm run dev          # http://localhost:5173, with /api and /healthz proxied to the API
+npm run lint && npm run typecheck && npm test && npm run build   # the checks of the console job
+```
+
+`npm run dev` expects `longhaul api` on `http://127.0.0.1:8000`. Set `LONGHAUL_API_URL` before `npm run dev` for another address. `make console-check` runs the four checks after a clean install.
+
+- **Types.** `console/src/api/schema.ts` is written by `make api-types` from `console/openapi.json`. Never edit it. The functions in `console/src/api/client.ts` take their query, body and reply types from it by operation id, so a renamed parameter or a changed reply stops `npm run typecheck`.
+- **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The API checks it from LH-807 on.
+- **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). The image is built from `docker/api/Dockerfile`.
+- **CI.** The `console` job installs with `npm ci`, regenerates `schema.ts` and fails when it differs from the committed file, then runs lint, typecheck, test and build.
 
 ## Run the evaluation
 

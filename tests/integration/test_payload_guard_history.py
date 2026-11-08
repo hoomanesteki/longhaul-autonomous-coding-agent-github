@@ -109,6 +109,7 @@ class Stubs:
             self.append_results,
             self.bundle_checkpoint,
             self.record_event,
+            self.cleanup,
         ]
 
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
@@ -143,6 +144,10 @@ class Stubs:
 
     @activity.defn(name=acts.RECORD_EVENT.name)
     async def record_event(self, inp: acts.RecordEventInput) -> None:
+        return None
+
+    @activity.defn(name=acts.CLEANUP.name)
+    async def cleanup(self, inp: acts.CleanupInput) -> None:
         return None
 
 
@@ -235,7 +240,8 @@ async def test_an_activity_input_over_the_limit_fails_the_workflow_and_is_never_
     assert "blob store" in cause.message
 
     history = await handle.fetch_history()
-    assert scheduled(history) == [acts.PREPARE_WORKSPACE.name]  # llm_turn was never scheduled
+    # llm_turn was never scheduled. The task still winds up (LH-507), so its sandbox goes.
+    assert scheduled(history) == [acts.PREPARE_WORKSPACE.name, acts.CLEANUP.name]
     assert EventType.EVENT_TYPE_WORKFLOW_TASK_FAILED not in event_types(history)
     assert event_types(history)[-1] == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED
     # The signals are in the history, which shows the scan reaches the payloads of the run.
@@ -292,7 +298,12 @@ async def test_a_300_kb_issue_file_runs_and_the_history_stays_small(
     assert isinstance(caught.value.cause.cause, ApplicationError)
     assert caught.value.cause.cause.type is None  # the stand-in's error, not the guard's
     history = await handle.fetch_history()
-    assert scheduled(history) == [acts.PREPARE_WORKSPACE.name, acts.LLM_TURN.name]
+    # The wind-up of the failed task (LH-507) destroys its sandbox last.
+    assert scheduled(history) == [
+        acts.PREPARE_WORKSPACE.name,
+        acts.LLM_TURN.name,
+        acts.CLEANUP.name,
+    ]
     assert_no_big_payload(history, largest_seen_over=MAX_BODY_BYTES)
     assert max(payload_sizes(history)) < 20_000
 

@@ -770,6 +770,45 @@ async def test_the_first_coder_turn_is_not_priced_with_the_planners_last_request
     assert verifier_check.last_input_tokens == 0, "and so does the transcript of the verifier"
 
 
+async def test_the_check_of_a_first_request_carries_what_the_request_is_made_from(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    # A transcript that has not started has no last request to price, so the activity prices the
+    # system prompt, the task, the plan and the review brief itself, and needs them in the input.
+    steps = [
+        {"match": {"role": "planner", "turn_index": 0}, "respond": {"tool_calls": [READ]}},
+        {
+            "match": {"role": "planner", "turn_index": 1},
+            "respond": {"tool_calls": [{"name": "submit_plan", "input": PLAN}]},
+        },
+        {
+            "match": {"role": "coder", "turn_index": 0},
+            "respond": {
+                "tool_calls": [{"name": "submit_for_review", "input": {"summary": SUMMARY}}]
+            },
+        },
+        VERDICT_STEP,
+    ]
+    limits = Budgets(task_usd=50.0, task_turns=60, task_wall_minutes=240, daily_repo_usd=500.0)
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(
+            env.client,
+            world.spec(limits),
+            task_queue=world.queue,
+            plan=True,
+            enforce_budgets=True,
+        )
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    for seen in world.checks:
+        assert seen.spec is not None and seen.spec.task_id == seen.task_id
+    (coder_check,) = [seen for seen in world.checks if seen.role is Role.CODER]
+    assert coder_check.plan is not None
+    (verifier_check,) = [seen for seen in world.checks if seen.role is Role.VERIFIER]
+    assert verifier_check.plan is not None and verifier_check.review is not None
+
+
 # ---------- the wall clock ----------
 async def start_in_the_past(
     env: WorkflowEnvironment, world: World, spec: TaskSpec, minutes_ago: int

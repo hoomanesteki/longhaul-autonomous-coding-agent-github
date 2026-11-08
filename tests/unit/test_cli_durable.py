@@ -143,6 +143,7 @@ class FakeTemporal:
     def __init__(self, handle: FakeHandle) -> None:
         self.handle = handle
         self.started: list[tuple[TaskSpec, dict[str, Any]]] = []
+        self.states: list[Any] = []
         self.signals: list[tuple[Any, Any]] = []
         self.looked_up: list[str] = []
         self.lookup_error: Exception | None = None
@@ -150,6 +151,7 @@ class FakeTemporal:
     async def start_workflow(self, workflow: Any, state: Any, **kwargs: Any) -> FakeHandle:
         assert workflow == TaskWorkflow.run
         self.started.append((state.spec, kwargs))
+        self.states.append(state)
         return self.handle
 
     def get_workflow_handle_for(self, workflow: Any, workflow_id: str) -> "FakeTemporal":
@@ -428,6 +430,27 @@ def test_without_a_context_mode_the_worker_config_decides(
     stack = stack_for(happy())
     assert invoke(run_args()).exit_code == 0
     assert acts.CONTEXT_MODE_MEMO_KEY not in stack.start_kwargs["memo"]
+
+
+def test_a_run_enforces_the_budgets_of_the_task_unless_told_not_to(
+    stack_for: Callable[..., Stack],
+) -> None:
+    # A real provider costs money, and nobody watches a long run for the bill.
+    stack = stack_for(happy())
+    assert invoke(run_args()).exit_code == 0
+    assert [state.enforce_budgets for state in stack.temporal.states] == [True]
+
+    stack = stack_for(happy())
+    assert invoke(run_args("--no-budgets")).exit_code == 0
+    assert [state.enforce_budgets for state in stack.temporal.states] == [False]
+
+
+def test_the_header_says_when_the_budgets_are_off(stack_for: Callable[..., Stack]) -> None:
+    stack_for(happy())
+    assert "budgets off" in invoke(run_args("--no-budgets")).output
+
+    stack_for(happy())
+    assert "budgets off" not in invoke(run_args()).output
 
 
 def test_the_header_names_the_mode_the_run_asked_for(stack_for: Callable[..., Stack]) -> None:

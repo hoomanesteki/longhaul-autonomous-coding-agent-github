@@ -33,6 +33,8 @@ from tests.fakes.worker_config import hash_embedder_config
 
 from eval import custom_tasks, grade_custom, results, run
 from longhaul.agent.workspace import prepare_local_workspace
+from longhaul.contracts import Budgets
+from longhaul.cost.pricing import Pricing
 from longhaul.durable import worker
 from longhaul.durable.client import connect, get_task
 from longhaul.sandbox.docker_manager import DockerSandboxManager
@@ -130,8 +132,18 @@ class EvalStack:
 
 
 @pytest.fixture
-async def stack(tmp_path: Path, database: str) -> AsyncIterator[EvalStack]:
+def worker_prices() -> Pricing | None:
+    """The prices the worker runs on. None leaves it with the free prices of a scripted run."""
+    return None
+
+
+@pytest.fixture
+async def stack(
+    tmp_path: Path, database: str, worker_prices: Pricing | None, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[EvalStack]:
     require_image()
+    if worker_prices is not None:
+        monkeypatch.setattr(worker, "load_pricing", lambda provider, cfg: worker_prices)
     queue = f"lh-eval-{uuid.uuid4().hex[:8]}"
     settings = service_settings(database_url=database, task_queue=queue, ckpt_dir=tmp_path / "ckpt")
     # The example config names the local embedder, which needs the memory extra (LH-604).
@@ -260,6 +272,30 @@ async def test_dry_run_writes_results(stack: EvalStack) -> None:
     assert summary.tasks == ["calc-01", "calc-02"]
     assert (summary.provider, summary.scripted) == ("scripted", True)
     assert summary.intervention_needed == 0
+
+
+# ---------- the budget ----------
+@pytest.mark.parametrize("worker_prices", [Pricing.load(ROOT / "config" / "pricing.yaml")])
+async def test_a_task_over_its_dollar_cap_stops_on_the_budget(
+    stack: EvalStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan section 8.4 caps a task in dollars, and the cap only works when the task checks it.
+
+    The scripted provider costs nothing, so the worker runs on the checked-in prices as it would
+    with a paid provider. The cap is smaller than the next call could cost, which holds the task
+    at its first call. Nobody answers, so the runner ends it after the pause timeout.
+    """
+    monkeypatch.setattr(run, "CUSTOM_BUDGETS", Budgets(task_usd=0.001, task_turns=150))
+    options = stack.options("--limit", "1", "--script", str(SCRIPTS), "--pause-timeout-s", "3")
+
+    await run.run_eval(options, stack.settings)
+
+    (result,) = results.read_results(stack.results_dir / stack.run_id)
+    assert result.intervention_needed is True
+    assert result.stopped_by_runner is not None and "task usd" in result.stopped_by_runner
+    assert result.outcome == "cancelled"
+    assert result.turns == 0
+    assert result.resolved is False
 
 
 # ---------- the grader ----------

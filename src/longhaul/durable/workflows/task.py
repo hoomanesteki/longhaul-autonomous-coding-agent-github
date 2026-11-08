@@ -570,9 +570,10 @@ BUDGET_VIA = "budget"
 BUDGET_ADDED_EVENT = "budget_added"
 MIDNIGHT_VIA = "midnight"
 # Both counters of pauses start at 1, so the number of a pause is not enough to tell which
-# `resumed` event answers which `paused` event. The events of a budget pause say `kind` "budget",
-# and those of a pause for a hint say nothing, which the run report reads as the other family.
+# `resumed` event answers which `paused` event. The events of a budget pause say `kind` "budget"
+# and those of a pause for a hint say "hint", even when a budget top-up is what answers it.
 BUDGET_KIND = "budget"
+HINT_KIND = "hint"
 
 # The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
 PAUSE_PATCH = "lh-506-pause-for-hint"
@@ -2216,6 +2217,7 @@ class TaskWorkflow:
         )
         state.cost_usd += asked.cost_usd
         payload: dict[str, Any] = {
+            "kind": HINT_KIND,
             "reason": signal.reason.value,
             "pause": pause,
             "question": asked.question,
@@ -2247,7 +2249,12 @@ class TaskWorkflow:
         """
         state = self.state
         via = self._answered(seen)
-        payload: dict[str, Any] = {"pause": pause, "via": via, "turn_index": state.turn_index}
+        payload: dict[str, Any] = {
+            "kind": HINT_KIND,
+            "pause": pause,
+            "via": via,
+            "turn_index": state.turn_index,
+        }
         if via == HINT_VIA:
             payload["by"] = state.hints[seen.hints].split(": ", 1)[0]
         state.stuck_count += 1

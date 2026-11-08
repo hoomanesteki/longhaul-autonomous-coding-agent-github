@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError, approvePlan, hint, listTasks, rejectPlan } from "../api/client";
-import { clearToken, setToken } from "../api/token";
+import { clearToken, getToken, setToken } from "../api/token";
 
 // The client talks to `fetch` and to nothing else, so a stub of it sees every request.
 const fetchStub = vi.fn<typeof fetch>();
@@ -46,6 +46,24 @@ describe("api client", () => {
     await listTasks();
 
     expect(lastRequest().headers.has("authorization")).toBe(false);
+  });
+
+  it("forgets the token when the API refuses it", async () => {
+    fetchStub.mockResolvedValue(reply({ detail: "a valid bearer token is required" }, 401));
+    setToken("stale");
+
+    await expect(listTasks()).rejects.toMatchObject({ status: 401 });
+
+    expect(getToken()).toBeNull();
+  });
+
+  it("keeps the token when the API fails for another reason", async () => {
+    fetchStub.mockResolvedValue(reply({ detail: "Temporal is not reachable" }, 503));
+    setToken("good");
+
+    await expect(listTasks()).rejects.toMatchObject({ status: 503 });
+
+    expect(getToken()).toBe("good");
   });
 
   it("puts the filters in the query string and leaves out the empty ones", async () => {

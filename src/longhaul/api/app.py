@@ -14,6 +14,10 @@ Beside the task and memory routes this module has the three that belong to no re
   the whole page down for an outage that only breaks the live status and the actions;
 * `GET /metrics`, in the Prometheus text format.
 
+Everything under `/api` needs the bearer token (LH-807), and so does `/metrics` unless the server
+listens on this machine. `/healthz` and the console's own files are open: the login page has to
+load before there is a token to send, and a probe has none.
+
 Operation ids are the names of the route functions, so the generated client (LH-802) has
 `listTasks` and `approvePlan` and not `list_tasks_api_tasks_get`.
 """
@@ -27,7 +31,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.routing import APIRoute
 from prometheus_client.exposition import CONTENT_TYPE_LATEST
 from sqlalchemy import text
@@ -35,7 +39,8 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from longhaul.api import metrics, queries, routes_memory, routes_tasks
 from longhaul.api.console import mount_console
-from longhaul.api.deps import ApiContext, Ctx, open_context
+from longhaul.api.deps import ApiContext, Ctx, authorize, authorize_metrics, open_context
+from longhaul.api.errors import PROTECTED
 from longhaul.api.schemas import Health, RepoView
 from longhaul.settings import EnvSettings, get_settings
 
@@ -125,7 +130,7 @@ async def count_requests(
 
 
 def add_system_routes(app: FastAPI) -> None:
-    @app.get("/api/repos")
+    @app.get("/api/repos", dependencies=[Depends(authorize)], responses=PROTECTED)
     async def list_repos(ctx: Ctx) -> list[RepoView]:
         """The repos Longhaul knows, from `repo_settings`, with how many tasks each has."""
         return await queries.list_repos(ctx.sessions)
@@ -140,7 +145,7 @@ def add_system_routes(app: FastAPI) -> None:
             raise HTTPException(status_code=503, detail="database unavailable") from exc
         return Health(status="ok")
 
-    @app.get("/metrics")
+    @app.get("/metrics", dependencies=[Depends(authorize_metrics)], responses=PROTECTED)
     async def prometheus(request: Request) -> Response:
         """Prometheus text: the worker metrics of this process and the API's own."""
         body = metrics.exposition(request.app.state.api_metrics)

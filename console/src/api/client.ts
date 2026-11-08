@@ -9,7 +9,7 @@
  */
 
 import type { paths } from "./schema";
-import { getToken } from "./token";
+import { clearToken, getToken } from "./token";
 import type { Args, BodyOf, Method, PathsWith, QueryOf, Reply } from "./typed";
 
 /** A reply that was not a success. `detail` is the message the API gave, or the status text. */
@@ -55,10 +55,10 @@ async function detailOf(response: Response): Promise<string> {
 async function request<T>(
   method: "GET" | "POST",
   path: string,
-  options: { query?: Params; body?: unknown } = {},
+  options: { query?: Params; body?: unknown; token?: string } = {},
 ): Promise<T> {
   const headers = new Headers({ Accept: "application/json" });
-  const token = getToken();
+  const token = options.token ?? getToken();
   if (token !== null) headers.set("Authorization", `Bearer ${token}`);
   const init: RequestInit = { method, headers };
   if (options.body !== undefined) {
@@ -66,7 +66,12 @@ async function request<T>(
     init.body = JSON.stringify(options.body);
   }
   const response = await fetch(`${path}${queryString(options.query)}`, init);
-  if (!response.ok) throw new ApiError(response.status, await detailOf(response));
+  if (!response.ok) {
+    // A token the API refuses is of no use again: drop it, and the console shows the login. A
+    // token that is only being tried (the login screen) is not the stored one, so it stays out.
+    if (response.status === 401 && options.token === undefined) clearToken();
+    throw new ApiError(response.status, await detailOf(response));
+  }
   return (await response.json()) as T;
 }
 
@@ -152,3 +157,18 @@ export const rejectMemory = (itemId: string) =>
 export const listRepos = () => call("get", "/api/repos");
 
 export const healthz = () => call("get", "/healthz");
+
+// The login screen asks an ordinary route whether it takes the token. `satisfies` keeps the path
+// tied to the generated schema, as every other call here is.
+const CHECK_PATH = "/api/repos" satisfies keyof paths;
+
+/** Whether the API accepts `token`: true for yes, false for a 401, and an ApiError otherwise. */
+export async function tokenWorks(token: string): Promise<boolean> {
+  try {
+    await request("GET", CHECK_PATH, { token });
+    return true;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 401) return false;
+    throw error;
+  }
+}

@@ -12,13 +12,23 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from temporalio.client import Client
 
 from longhaul.api.app import create_app, openapi_schema
+from longhaul.api.deps import ApiContext
+from longhaul.blobs.memory import MemoryBlobStore
+from longhaul.memory.embedder import HashEmbedder
+from longhaul.memory.store import PgMemoryStore
 from longhaul.settings import EnvSettings, get_settings
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase8]
 
 INDEX = "<!doctype html><title>Longhaul console</title><div id=root></div>"
+
+
+async def unreachable() -> Client:
+    raise ConnectionError("no Temporal in this test")
 
 
 @pytest.fixture
@@ -76,7 +86,17 @@ def test_an_unknown_api_address_is_a_404_and_not_the_page(console: Path) -> None
 
 
 def test_the_api_routes_come_before_the_files(console: Path) -> None:
-    client = TestClient(create_app(console_dir=console))
+    # /metrics checks the token setting of the context (LH-807), so this app is given one. The
+    # stores are never touched: /metrics reads no database.
+    sessions = async_sessionmaker[AsyncSession]()
+    context = ApiContext(
+        sessions=sessions,
+        blobs=MemoryBlobStore(),
+        memory=PgMemoryStore(sessions, HashEmbedder()),
+        temporal=unreachable,
+        metrics_public=True,
+    )
+    client = TestClient(create_app(context, console_dir=console))
 
     response = client.get("/metrics")
 

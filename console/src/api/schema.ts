@@ -981,6 +981,13 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryItemView"][];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1011,6 +1018,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MemoryItemView"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1043,6 +1057,13 @@ export interface operations {
                     "application/json": components["schemas"]["MemoryItemView"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1072,6 +1093,13 @@ export interface operations {
                     "application/json": components["schemas"]["RepoView"][];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     list_tasks: {
@@ -1096,6 +1124,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TaskPage"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1128,6 +1163,13 @@ export interface operations {
                     "application/json": components["schemas"]["TaskDetail"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1158,6 +1200,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1194,6 +1243,13 @@ export interface operations {
                     "application/json": components["schemas"]["ActionResult"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1228,6 +1284,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1264,6 +1327,13 @@ export interface operations {
                     "application/json": components["schemas"]["ActionResult"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1299,6 +1369,13 @@ export interface operations {
                     "application/json": components["schemas"]["ActionResult"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1332,6 +1409,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TimelinePage"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1368,6 +1452,13 @@ export interface operations {
                     "application/json": components["schemas"]["ToolOutput"];
                 };
             };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Validation Error */
             422: {
                 headers: {
@@ -1401,6 +1492,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["TurnDetail"];
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -1450,6 +1548,13 @@ export interface operations {
                 content: {
                     "application/json": unknown;
                 };
+            };
+            /** @description The bearer token is missing or wrong. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

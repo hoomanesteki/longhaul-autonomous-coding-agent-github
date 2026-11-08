@@ -6,6 +6,7 @@ tests/integration/test_api.py.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -26,7 +27,9 @@ def served(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
 
     def run(app: Any, **options: Any) -> None:
-        calls.append({"app": app, **options})
+        # The app reads the address it listens on from the settings when it starts, which is
+        # after this call, so what the environment holds now is what the app will see.
+        calls.append({"app": app, "env_host": os.environ.get("LONGHAUL_API_HOST"), **options})
 
     monkeypatch.setattr(uvicorn, "run", run)
     monkeypatch.delenv("LONGHAUL_API_HOST", raising=False)
@@ -56,6 +59,28 @@ def test_api_options_win_over_the_settings(served: list[dict[str, Any]]) -> None
 
     assert result.exit_code == 0, result.output
     assert (served[0]["host"], served[0]["port"]) == ("0.0.0.0", 9001)
+
+
+def test_the_app_is_told_the_host_it_listens_on(served: list[dict[str, Any]]) -> None:
+    # /metrics is open only on a server bound to this machine (LH-807), and the app decides that
+    # from LONGHAUL_API_HOST. A --host option has to reach it, or an API started with
+    # --host 0.0.0.0 would still think it was local.
+    RUNNER.invoke(cli.app, ["api", "--host", "0.0.0.0"])
+
+    assert served[0]["env_host"] == "0.0.0.0"
+    assert "LONGHAUL_API_HOST" not in os.environ
+
+
+def test_the_environment_is_restored_after_the_server_stops(
+    served: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LONGHAUL_API_HOST", "127.0.0.1")
+    get_settings.cache_clear()
+
+    RUNNER.invoke(cli.app, ["api", "--host", "0.0.0.0"])
+
+    assert served[0]["env_host"] == "0.0.0.0"
+    assert os.environ["LONGHAUL_API_HOST"] == "127.0.0.1"
 
 
 def test_api_is_listed_in_the_help() -> None:

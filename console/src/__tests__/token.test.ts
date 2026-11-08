@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { clearToken, getToken, setToken } from "../api/token";
+import { clearToken, getToken, setToken, subscribeToken } from "../api/token";
 
 beforeEach(() => {
   clearToken();
@@ -39,5 +39,30 @@ describe("token storage", () => {
 
   it("gives null when nothing is stored", () => {
     expect(getToken()).toBeNull();
+  });
+});
+
+describe("token changes", () => {
+  it("tells a subscriber when the token is set and when it is cleared", () => {
+    const seen = vi.fn();
+    const unsubscribe = subscribeToken(seen);
+
+    setToken("abc");
+    clearToken();
+    unsubscribe();
+    setToken("def");
+
+    expect(seen).toHaveBeenCalledTimes(2);
+  });
+
+  it("tells a subscriber when another tab changes the stored token", () => {
+    const seen = vi.fn();
+    const unsubscribe = subscribeToken(seen);
+
+    window.dispatchEvent(new StorageEvent("storage", { key: "longhaul.token" }));
+    window.dispatchEvent(new StorageEvent("storage", { key: "something.else" }));
+    unsubscribe();
+
+    expect(seen).toHaveBeenCalledTimes(1);
   });
 });

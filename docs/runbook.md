@@ -715,12 +715,26 @@ Things to know when you read the numbers:
 `longhaul api` serves the API that the console reads (LH-801, ADR-0011). It needs the stack from `make up` and the `LONGHAUL_DATABASE_URL`, `LONGHAUL_BLOB_*` and `LONGHAUL_TEMPORAL_*` settings of `.env.example`. It does not need a worker to start. The live status of a task and the actions need one.
 
 ```bash
+export LONGHAUL_ADMIN_TOKEN=$(openssl rand -hex 32)    # or put it in .env
 uv run longhaul api                      # http://127.0.0.1:8000
 uv run longhaul api --host 0.0.0.0 --port 8100
-curl -s http://127.0.0.1:8000/api/tasks | head -c 400
+curl -s -H "Authorization: Bearer $LONGHAUL_ADMIN_TOKEN" http://127.0.0.1:8000/api/tasks | head -c 400
 ```
 
-The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. There is no login until LH-807, so leave the host on `127.0.0.1` unless the machine is closed to the network. The interactive docs are at `/docs`.
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. The interactive docs are at `/docs`.
+
+**Token (LH-807).** Every `/api` route needs `Authorization: Bearer <LONGHAUL_ADMIN_TOKEN>`. A missing, malformed or wrong token gets 401, and so does every request when the server has no token, but a server without one does not start: it stops with an error that names the setting. The token is compared with `hmac.compare_digest`. Rotating it means changing the setting and restarting the API, and the console asks for the new one at the next 401.
+
+| Route | Needs the token |
+|---|---|
+| `/api/*` | Always |
+| `/healthz` | Never. A probe has no token. |
+| `/metrics` | Only when the server is not bound to this machine. With `127.0.0.1`, `::1` or `localhost` it is open, so a Prometheus on the same host scrapes it with no secret. With `0.0.0.0` or any other address it needs the token. |
+| The console's own files at `/` | Never. The login page has to load before there is a token. |
+
+A token may send 30 actions (POST routes) a minute. The 31st gets 429 with a `Retry-After` header. The count is a sliding window kept in the memory of the API process, so it is exact for one API process and is not shared between several. Reads are not limited. A request with a wrong token is refused before it is counted.
+
+Keep the token out of shell history and logs, and put the API behind TLS before it leaves a trusted network: a bearer token over plain HTTP can be read by anyone on the path.
 
 | Endpoint | Returns |
 |---|---|
@@ -756,8 +770,8 @@ npm run lint && npm run typecheck && npm test && npm run build   # the checks of
 `npm run dev` expects `longhaul api` on `http://127.0.0.1:8000`. Set `LONGHAUL_API_URL` before `npm run dev` for another address. `make console-check` runs the four checks after a clean install.
 
 - **Types.** `console/src/api/schema.ts` is written by `make api-types` from `console/openapi.json`. Never edit it. Every call in `console/src/api/client.ts` names a method and a path of the generated schema, and takes its path parameters, query, body and reply types from it. A renamed or moved path, a renamed parameter, a body or query that became required, or a changed reply stops `npm run typecheck`.
-- **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The API checks it from LH-807 on.
-- **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). The image is built from `docker/api/Dockerfile`.
+- **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The login screen keeps it only after the API accepts it (a request to `/api/repos`), and a 401 on any later call clears it and returns to the login. The sign-out button clears it and the cached pages.
+- **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). Set `LONGHAUL_ADMIN_TOKEN` in `.env` or the shell first, or the container stops at start. The container listens on `0.0.0.0`, so `/metrics` needs the token there. The image is built from `docker/api/Dockerfile`.
 - **Tasks page.** `/tasks` lists the tasks newest first and polls every 10 seconds. The status and repo filters go to the API, and "Load more" follows `next_cursor`. The "Needs you" toggle works on the rows already loaded: a task needs you in the `paused` and `awaiting_plan_approval` phases. The filters are kept in the address (`?status=&repo=&needs_you=1`). The phase comes from the `tasks` row, so it lags the live status until the activities write it (see the console API notes above).
 - **Task page.** `/tasks/:id` shows the summary of a task (phase, cost, turns, tokens, cache ratio, pull request, plan with the status of each step) and its timeline. The summary uses the workflow's own answer when there is one and says why when there is not. The timeline loads every page of `/timeline` (500 rows each) and groups the rows by turn, with the tool calls inside. Only the rows in view are in the page (`@tanstack/react-virtual`), so a task of hundreds of turns stays light. Each turn has a Details button that fetches that turn's request and reply, and each tool call with a stored output has a Show output button that fetches 200 lines at a time. The arguments of a tool call come with its turn's reply, so they show once Details is open. Events are coloured by type: compaction, pause (paused, stuck, resumed), hint, verdict, recovery (sandbox recreated, continue as new) and error. A task that has not ended is polled every 10 seconds.
 - **Actions.** The task page has an Actions section under the summary. Approve plan and Reject plan (with a feedback box) show only while the task is in `awaiting_plan_approval`. Send hint, Add budget (dollars, turns or both) and Cancel task show for every phase until the task ends. Cancel stays disabled until the task id is typed in full. Nothing shows for a task that has ended or whose workflow is closed or missing, and the page says so. Each action posts to its route, shows a toast, then fetches the task and its timeline again. A refused action keeps what was typed and shows the API's reason.

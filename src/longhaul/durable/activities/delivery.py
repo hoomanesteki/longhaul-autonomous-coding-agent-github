@@ -257,6 +257,7 @@ class DeliveryActivities:
             tests,
             templates=self._templates,
             verified=inp.verified_tests,
+            partial=inp.partial,
         )
         return PullRequestInput(
             task_id=inp.task_id,

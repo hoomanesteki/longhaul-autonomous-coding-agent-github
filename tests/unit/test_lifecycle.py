@@ -296,3 +296,70 @@ def test_each_pause_has_a_question_key_of_its_own() -> None:
     assert first.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 1)
     assert second.idempotency_key == effect_key("lh-acme-calc-42", "stuck", 2)
     assert not has_marker(first.body), "the marker is added by post_comment"
+
+
+# ---------- LH-507: the labels a task ends with ----------
+def ending(kind: OutcomeKind, *, draft: bool = False) -> list[tuple[bool, str]]:
+    steps = lifecycle.on_end(spec(), kind, pr_opened=draft)
+    return [(step.add, step.label.label) for step in steps]
+
+
+def test_a_task_that_opened_its_pull_request_has_its_labels_already() -> None:
+    # on_pr_opened ran when the pull request opened, with the same keys.
+    assert ending(OutcomeKind.PR_OPENED) == []
+
+
+@pytest.mark.parametrize("kind", [OutcomeKind.STUCK, OutcomeKind.BUDGET_EXHAUSTED])
+def test_a_task_that_gave_up_asks_for_a_person(kind: OutcomeKind) -> None:
+    assert ending(kind) == [(False, lifecycle.WORKING), (True, lifecycle.NEEDS_HUMAN)]
+
+
+def test_a_stuck_task_with_a_partial_draft_also_shows_the_pull_request() -> None:
+    assert ending(OutcomeKind.STUCK, draft=True) == [
+        (False, lifecycle.WORKING),
+        (True, lifecycle.NEEDS_HUMAN),
+        (True, lifecycle.PR_OPEN),
+    ]
+
+
+def test_a_task_that_failed_asks_for_a_person() -> None:
+    assert ending(OutcomeKind.ERROR) == [(False, lifecycle.WORKING), (True, lifecycle.NEEDS_HUMAN)]
+
+
+def test_a_cancelled_task_asks_for_nobody() -> None:
+    # A task that was paused when it was cancelled still carries needs-human.
+    assert ending(OutcomeKind.CANCELLED) == [
+        (False, lifecycle.WORKING),
+        (False, lifecycle.NEEDS_HUMAN),
+    ]
+
+
+def test_the_working_label_comes_off_with_the_key_it_always_had() -> None:
+    # The label was taken off when the pull request opened, so a task that ends later asks the
+    # ledger for the same write and gets the answer it recorded.
+    (first, *_) = lifecycle.on_end(spec(), OutcomeKind.STUCK, pr_opened=False)
+    (swap, *_) = lifecycle.on_pr_opened(spec())
+    assert first.label.idempotency_key == swap.label.idempotency_key
+
+
+def test_every_ending_label_key_is_valid_and_distinct() -> None:
+    keys = [
+        step.label.idempotency_key
+        for kind in OutcomeKind
+        for step in lifecycle.on_end(spec(), kind, pr_opened=True)
+    ]
+    for key in set(keys):
+        workflow_id, purpose, seq = key.split(":")
+        assert effect_key(workflow_id, purpose, int(seq)) == key
+    # needs-human on and off must not share a key, or the second write would be skipped.
+    on = lifecycle.on_end(spec(), OutcomeKind.STUCK, pr_opened=False)[1].label.idempotency_key
+    off = lifecycle.on_end(spec(), OutcomeKind.CANCELLED, pr_opened=False)[1].label.idempotency_key
+    assert on != off
+
+
+def test_the_final_comment_is_on_the_issue_under_one_key() -> None:
+    comment = lifecycle.final_comment(spec(), "the report")
+
+    assert (comment.task_id, comment.repo, comment.number) == ("lh-acme-calc-42", "acme/calc", 42)
+    assert comment.body == "the report"
+    assert comment.idempotency_key == effect_key("lh-acme-calc-42", "final", 1)

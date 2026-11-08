@@ -623,7 +623,7 @@ def test_a_repo_that_is_gone_is_reported_and_does_not_change_the_exit_code(
 def test_the_sandbox_of_the_task_is_removed_when_the_run_ends(
     stack_for: Callable[..., Stack],
 ) -> None:
-    # The workflow does not destroy the sandbox of a task that finished yet (LH-507).
+    # The workflow destroys it too (LH-507). The command makes sure, and the cleanup is safe twice.
     stack = stack_for(happy())
     invoke(run_args())
     assert stack.manager.cleaned == [stack.spec.task_id]

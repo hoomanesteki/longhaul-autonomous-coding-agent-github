@@ -19,6 +19,7 @@ from longhaul.context.modes import ContextMode
 from longhaul.contracts import BlobRef, Outcome, Phase, TaskSpec, TaskStatus
 from longhaul.durable.acts import (
     CONTEXT_MODE_MEMO_KEY,
+    OPEN_DRAFT_MEMO_KEY,
     PLAN_MEMO_KEY,
     SCRIPT_MEMO_KEY,
     TUNING_MEMO_KEY,
@@ -64,6 +65,7 @@ async def start_task(
     script: BlobRef | None = None,
     context_mode: ContextMode | None = None,
     plan: bool = False,
+    open_draft_on_stuck: bool = False,
 ) -> WorkflowHandle[TaskWorkflow, Outcome]:
     """Start the workflow for a task. Its id is the task id.
 
@@ -75,6 +77,10 @@ async def start_task(
     `plan` has the planner write a plan before the coder starts (LH-501). A task started without
     it goes straight to coding. The poller and `longhaul run --plan` ask for it. It rides in the
     memo as well, so it holds for every run of the Continue-As-New chain.
+
+    `open_draft_on_stuck` has a task of an issue that ends stuck open a draft pull request with
+    its partial work (LH-507). The poller passes the repo's setting. It is in the memo for the
+    same reasons, and a task started without it opens no such draft.
 
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run
@@ -92,6 +98,8 @@ async def start_task(
         memo[CONTEXT_MODE_MEMO_KEY] = context_mode
     if plan:
         memo[PLAN_MEMO_KEY] = True
+    if open_draft_on_stuck:
+        memo[OPEN_DRAFT_MEMO_KEY] = True
     # Each task is one trace. The poller starts tasks from an activity, where a current span
     # would otherwise make every task of a poll a child of that activity.
     with otel.detached():

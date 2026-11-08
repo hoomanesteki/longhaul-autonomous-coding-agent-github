@@ -370,6 +370,28 @@ async def test_a_pull_request_whose_work_was_verified_is_ready_and_says_so(
     assert request.idempotency_key == f"{TASK}:pr:1"
 
 
+async def test_a_pull_request_of_partial_work_refers_to_the_issue_and_stays_a_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Merging it must not close an issue that the task did not finish.
+    patch_ready(monkeypatch)
+    seen: list[Any] = []
+
+    async def create(client: Any, ledger: Any, request: Any) -> str:
+        seen.append(request)
+        return PR_URL
+
+    monkeypatch.setattr(delivery, "create_pr", create)
+    inp = deliver_input().model_copy(update={"partial": True})
+
+    await run(make().deliver, inp)
+
+    (request,) = seen
+    assert request.draft is True
+    assert request.body.rstrip().endswith("Refs #42")
+    assert "Closes" not in request.body
+
+
 async def test_the_body_of_a_verified_pull_request_is_the_same_on_a_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

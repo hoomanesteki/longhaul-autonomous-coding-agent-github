@@ -92,6 +92,7 @@ from longhaul.context.tokens import Decision
 from longhaul.contracts import (
     BlobRef,
     CarryState,
+    Outcome,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
@@ -193,6 +194,26 @@ OUTCOME_SUMMARY_CHARS = 500
 # after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
 # contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
 STATUS_MEMO_KEY = "status_posts"
+# The workflow memo key that has a stuck task open a draft pull request with its partial work
+# (LH-507, the repo setting `open_draft_on_stuck`). The poller sets it from the repo entry of the
+# config when it starts the task, because the workflow cannot read the config and RepoSettings is
+# a contract that this story does not change. A task started without it opens no such draft.
+OPEN_DRAFT_MEMO_KEY = "open_draft_on_stuck"
+
+# How a task ends (LH-507). The purpose part of the idempotency key of the final comment, which
+# is `<task>:final:1`: a task ends once, so there is one such comment.
+FINAL_COMMENT = "final"
+# The `type` of the record_event call that keeps the trace of an exception that ended a task. The
+# payload holds the error `type` and the `trace`, cut to ERROR_TRACE_CHARS. The cut leaves the
+# event far under the 16 KB that CONTRIBUTING.md rule 5 allows across an activity boundary even
+# when every character is four bytes of JSON.
+ERROR_EVENT = "error"
+ERROR_TRACE_CHARS = 3000
+# How long the bare repo of a task that has ended is kept. The checkpoints in it are how a person
+# looks at what a stuck or failed task did, and the janitor (clean_repos) deletes the repo after
+# this long. A repo whose task has no outcome belongs to a task that is still running and is
+# never deleted.
+REPO_RETENTION = timedelta(days=7)
 
 # The error type of a tool call that found its sandbox gone. tool_exec raises it as a
 # non-retryable ApplicationError, because asking again finds the same empty place. The workflow
@@ -218,8 +239,9 @@ POLLER_CONFIG = "PollerConfigError"
 # runs it starts are named "<schedule id>-run" and a time.
 POLLER_SCHEDULE_ID = "longhaul-poller"
 # The longest one run of PollerWorkflow may last. All attempts of poll_once at their longest
-# come to 3 x 180 s and two waits of 5 s and 10 s, which is under 10 minutes. A run that lasts
-# longer has lost its worker, and the Schedule skips ticks for as long as a run is open.
+# come to 3 x 180 s and two waits of 5 s and 10 s, which is under 10 minutes, and the sweep of
+# the janitor after it (clean_repos) adds at most 2 x 120 s and a wait. A run that lasts longer
+# has lost its worker, and the Schedule skips ticks for as long as a run is open.
 POLLER_RUN_TIMEOUT = timedelta(minutes=15)
 # What the Schedule does about ticks it missed while the server was away: it catches up on those
 # of the last two minutes and drops the rest. A poll is a full scan, so one poll after an outage
@@ -567,11 +589,19 @@ class SummarizeOutput(BaseModel):
 
 
 class CleanupInput(BaseModel):
+    """What cleanup needs: the task, and whether its bare repo stays.
+
+    A task that has ended on its own keeps its repo for REPO_RETENTION, so it sends
+    `keep_repo=True` and the janitor deletes the repo later. The default removes it, which is what
+    a workflow from before LH-507 asked for and what a cancel still asks for.
+    """
+
     task_id: str
     # None when the workflow stopped before it learned the id. The activity then finds the
     # task's containers by their task label.
     sandbox_id: str | None
     reason: str
+    keep_repo: bool = False
 
 
 class RecordEventInput(BaseModel):
@@ -724,6 +754,40 @@ class DeliverInput(BaseModel):
     # verifier passed. A pull request is ready for review exactly when this is set, and its body
     # says "Verified: <this>". It is part of the input, so a retry builds the same request.
     verified_tests: str | None = None
+    # True for the draft of a task that stopped before it finished (LH-507). The body then refers
+    # to the issue and does not close it. Part of the input, so a retry builds the same body.
+    partial: bool = False
+
+
+class PostFinalInput(BaseModel):
+    """What post_final needs: how the task ended, and what the report says about the work.
+
+    The activity renders the comment from this and from the diff stats it reads itself. It builds
+    the key from the task id, so a retry and a run after a Continue-As-New send the same one.
+    `base_sha` and `head_sha` are the ends of the work, and either is None for a task that never
+    made a checkpoint. `draft` says whether the pull request of the outcome, if there is one, is
+    still a draft. The verifier (Phase 5) is what makes it ready.
+    """
+
+    task_id: str
+    repo: str
+    number: int  # the issue
+    outcome: Outcome
+    plan: Plan | None = None
+    base_sha: str | None = None
+    head_sha: str | None = None
+    turns: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0)
+    draft: bool = True
+
+
+class JanitorResult(BaseModel):
+    """What one sweep of the janitor did: the task ids whose repos it removed, how many repos it
+    left, and how many it could not remove."""
+
+    removed: list[str] = Field(default_factory=list)
+    kept: int = Field(default=0, ge=0)
+    failed: int = Field(default=0, ge=0)
 
 
 # ---------- activities ----------
@@ -1003,6 +1067,30 @@ DECIDE_PLAN = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+# The report on the issue when a task ends (LH-507). It is a post_comment whose body the activity
+# renders from the diff stats and a template, so it has the policy of post_comment and sits in
+# GITHUB with the other writes.
+POST_FINAL = Act(
+    "post_final",
+    PostFinalInput,
+    str,  # the id of the comment
+    start_to_close=timedelta(minutes=2),
+    retry=_github_write(10, _GITHUB_ERRORS),
+)
+
+# The janitor (LH-507). PollerWorkflow calls it after each poll, so the poller schedule is its
+# clock. It lists the bare repos on the disk of the worker, asks the database which of their
+# tasks ended more than REPO_RETENTION ago and removes those repos. A sweep that fails is run
+# again by the next tick, so it gets two attempts of two minutes, which keeps a poll and a sweep
+# at their longest inside POLLER_RUN_TIMEOUT.
+CLEAN_REPOS = Act(
+    "clean_repos",
+    NoneType,
+    JanitorResult,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=2, non_retryable_error_types=[_OVERSIZED]),
+)
+
 ALL: tuple[Act[Any, Any], ...] = (
     PREPARE_WORKSPACE,
     ENSURE_SANDBOX,
@@ -1019,6 +1107,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     STORE_PLAN,
     RECORD_STEP,
     DECIDE_PLAN,
+    CLEAN_REPOS,
 )
 
 # What a worker with a GitHub token registers in addition to ALL (LH-306).
@@ -1030,6 +1119,7 @@ GITHUB: tuple[Act[Any, Any], ...] = (
     BUILD_PR_BRANCH,
     DELIVER,
     POST_PLAN,
+    POST_FINAL,
 )
 
 

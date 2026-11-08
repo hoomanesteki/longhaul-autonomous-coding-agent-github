@@ -11,9 +11,9 @@ The workspace setup builds a venv and installs pytest and calc from PyPI, so the
 outbound network.
 
 The poller runs once, as the Schedule would start it. The test then follows the task to its end
-and checks what the issue shows: one "Picked up" comment, one comment with the plan, one pull
-request that a verifier passed and is ready for review, and the label `longhaul:pr-open` where
-`longhaul:working` was.
+and checks what the issue shows: one "Picked up" comment, one comment with the plan, one final
+comment with the link to the pull request, one pull request that a verifier passed and is ready
+for review, and the label `longhaul:pr-open` where `longhaul:working` was.
 
 Nothing here touches what other work on the machine uses. The test has its own task queue, its
 own scratch database (migrated to head, then dropped), its own checkpoint folder, and a repo with
@@ -368,13 +368,17 @@ async def label_to_pr(stack: Stack) -> None:
     assert "3 passed" in pull["body"], pull["body"]
     assert set(fake.branches(repo)) == {"main", f"longhaul-pr/{issue}"}, "main was not pushed to"
 
-    # The issue shows one "Picked up" comment, then the plan once, and nothing else from us.
+    # The issue shows one "Picked up" comment, the plan once, and the final comment with the link
+    # to the pull request (LH-507), and nothing else from us.
     comments = fake.comment_bodies(repo, issue)
-    assert len(comments) == 2, comments
+    assert len(comments) == 3, comments
     assert comments[0].startswith("Picked up"), comments[0]
     assert task_id in comments[0]
     assert "## Plan, version 1" in comments[1], comments[1]
     assert f"<!-- longhaul:key={task_id}:plan_comment:1 -->" in comments[1], comments[1]
+    assert comments[2].startswith("## Longhaul opened a pull request\n"), comments[2]
+    assert str(outcome.pr_url) in comments[2], comments[2]
+    assert f"<!-- longhaul:key={task_id}:final:1 -->" in comments[2], comments[2]
 
     # `longhaul:working` came and went, and the pull request label stayed.
     assert sorted(fake.label_names(repo, issue)) == [LABEL, "longhaul:pr-open"]
@@ -392,7 +396,7 @@ async def label_to_pr(stack: Stack) -> None:
     )
     assert again == acts.PollResult(repos=1, issues=1, started=0, known=1), shown
     assert fake.count_pulls(repo) == 1
-    assert fake.count_comments(repo, issue) == 2
+    assert fake.count_comments(repo, issue) == 3
 
     with psycopg.connect(stack.database) as conn:
         rows = conn.execute("SELECT id, repo, issue_number FROM tasks").fetchall()

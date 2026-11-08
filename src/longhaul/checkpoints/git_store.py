@@ -669,6 +669,25 @@ class GitCheckpointStore(CheckpointStore):
         finally:
             await asyncio.to_thread(_remove_tree, path)
 
+    async def task_ids(self) -> list[str]:
+        """The ids of the tasks that have a bare repo here, sorted. For the janitor (LH-507).
+
+        A folder counts when it is named `<task id>.git`. Half-built clones start with a dot and
+        end in `.tmp`, so they do not count, and neither does a name that is not a safe task id,
+        which `cleanup_task` would refuse anyway.
+        """
+        return await asyncio.to_thread(self._task_ids)
+
+    def _task_ids(self) -> list[str]:
+        if not self.root.is_dir():
+            return []
+        found = []
+        for path in self.root.glob("*.git"):
+            task_id = path.name[: -len(".git")]
+            if path.is_dir() and _TASK_ID.fullmatch(task_id) and ".." not in task_id:
+                found.append(task_id)
+        return sorted(found)
+
     async def cleanup_task(self, task_id: str) -> None:
         """Remove the bare repo, and any half-built clone, of a task. Safe to call twice."""
         repo = self.repo_path(task_id)

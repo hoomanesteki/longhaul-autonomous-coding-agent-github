@@ -8,7 +8,7 @@ Temporal test server runs the workflow, so a retry's backoff costs no real time.
 prepare_workspace and cleanup are test stand-ins here. The test makes its own sandbox, which is
 not a clone of a bare repo, so the tool activities run with NoCheckpoints. The real
 prepare_workspace, ensure_sandbox and checkpoints are run by test_sandbox_recovery.py (LH-206),
-and the real cleanup arrives with the worker (LH-208). The worker runs under the same sandbox
+and the real cleanup by test_outcomes.py (LH-507). The worker runs under the same sandbox
 settings as a production worker.
 """
 
@@ -187,6 +187,11 @@ class Workspace:
 
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
+        if inp.keep_repo:
+            # The end of a task that was not cancelled (LH-507). The tests below read the
+            # workspace the task finished in, so the stand-in leaves it. test_outcomes.py runs
+            # the real cleanup and looks for leftovers.
+            return
         await self._discard(inp.task_id)
 
 
@@ -401,7 +406,13 @@ async def test_workflow_fixes_calc_via_activities(
 
     # Every turn and every tool call was an activity: four tool turns, then the finish turn.
     turn = ["llm_turn", "tool_exec", "append_results"]
-    assert scheduled(history) == ["prepare_workspace", *turn * 4, "llm_turn", "append_results"]
+    assert scheduled(history) == [
+        "prepare_workspace",
+        *turn * 4,
+        "llm_turn",
+        "append_results",
+        "cleanup",  # the end of every task (LH-507)
+    ]
 
     turns = database.rows(
         "SELECT turn_index, attempt, stop_reason, input_tokens > 0 FROM turns ORDER BY turn_index"

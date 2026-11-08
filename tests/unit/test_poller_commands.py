@@ -685,6 +685,21 @@ async def test_retry_on_a_finished_task_starts_the_next_attempt_of_the_same_issu
     assert row.cursor is not None and row.cursor.comment_id == comment
 
 
+async def test_a_retry_keeps_the_draft_on_stuck_switch_of_the_repo(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    config = config_with(entry(open_draft_on_stuck=True))
+    activities = PollerActivities(github, store, config, task_queue=QUEUE, ledger=MemoryLedger())
+    number, first = await picked_up(fake, activities, temporal)
+    temporal.finish(first, WorkflowExecutionStatus.FAILED)
+    fake.seed_comment(REPO, number, "/longhaul retry", user="maintainer")
+
+    await poll(activities, temporal)
+
+    (_, kwargs) = temporal.started[1]
+    assert kwargs["memo"] == {acts.PLAN_MEMO_KEY: True, acts.OPEN_DRAFT_MEMO_KEY: True}
+
+
 async def test_the_new_attempt_reads_the_issue_as_it_is_now(
     fake: FakeGitHub, poller: PollerActivities, temporal: FakeTemporal
 ) -> None:

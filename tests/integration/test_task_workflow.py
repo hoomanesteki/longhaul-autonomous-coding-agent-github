@@ -59,7 +59,7 @@ from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
-from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.durable.workflows.task import LOAD_MEMORY_PATCH, OUTCOME_PATCH, TaskWorkflow
 from longhaul.github import lifecycle
 from longhaul.github.inputs import CommentInput, LabelInput
 
@@ -129,6 +129,11 @@ class Stubs:
     of prepare_workspace, such as `memory_enabled=True`, which is what makes the workflow call
     it.
 
+    The trace of an error that ended a task goes in `errors`. The report that ends a task of an
+    issue (LH-507) goes in `finals`. The cleanup that ends a task
+    which was not cancelled goes in `wound_up`. It does not
+    wait at a gate and is not in `log`, for the reason the next paragraph gives.
+
     The note that a run makes at its end (acts.OUTCOME_EVENT, LH-704) goes in `outcomes`, with
     the run that made it. It does not wait at a gate and is not in `log`, so the order of the
     other calls stays what each test below says. An error in `fails` for record_event is raised
@@ -158,6 +163,9 @@ class Stubs:
         self.overflow: dict[int, int] = {}
         self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
         self.outcomes: list[tuple[str, acts.RecordEventInput]] = []
+        self.wound_up: list[acts.CleanupInput] = []
+        self.finals: list[acts.PostFinalInput] = []
+        self.errors: list[acts.RecordEventInput] = []
         self.memory_loads: list[tuple[list[str], acts.LoadMemoryInput]] = []
         self.memory_block = ref("memory/memory-block.txt")
         self.prepared_with: dict[str, Any] = {}
@@ -181,6 +189,7 @@ class Stubs:
             self.remove_label,
             self.build_pr_branch,
             self.deliver,
+            self.post_final,
         ]
 
     def hold(self, name: str) -> None:
@@ -293,6 +302,12 @@ class Stubs:
 
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
+        if inp.keep_repo:
+            # The sandbox of a task that ended on its own (LH-507). Like the note at the end, it is
+            # logged apart, so the lists of the loop's own activities below stay what they were.
+            # The cleanup of a cancel removes the repo too and is in `log`.
+            self.wound_up.append(inp)
+            return
         await self._enter(acts.CLEANUP.name, inp)
 
     @activity.defn(name=acts.BUNDLE_CHECKPOINT.name)
@@ -308,6 +323,10 @@ class Stubs:
             self.outcomes.append((activity.info().workflow_run_id, inp))
             if acts.RECORD_EVENT.name in self.fails:
                 raise self.fails[acts.RECORD_EVENT.name]
+            return
+        if inp.type == acts.ERROR_EVENT:
+            # The trace of the error that ended the task (LH-507). Kept apart with the note.
+            self.errors.append(inp)
             return
         await self._enter(acts.RECORD_EVENT.name, inp)
         if acts.RECORD_EVENT.name in self.fails:
@@ -346,6 +365,14 @@ class Stubs:
     async def remove_label(self, inp: LabelInput) -> str:
         await self._github(acts.REMOVE_LABEL.name, inp)
         return inp.label
+
+    @activity.defn(name=acts.POST_FINAL.name)
+    async def post_final(self, inp: acts.PostFinalInput) -> str:
+        # The report that ends a task of an issue (LH-507). It is kept apart, as the cleanup
+        # of a task that ended on its own is, so the lists of GitHub activities below stay what
+        # they were. It does not wait at a gate: the wind-up must not hang a test that holds one.
+        self.finals.append(inp)
+        return "comment-final"
 
     @activity.defn(name=acts.BUILD_PR_BRANCH.name)
     async def build_pr_branch(self, inp: acts.BuildPrBranchInput) -> acts.PrBranchOutput:
@@ -1051,6 +1078,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "llm_turn": (10 * 60, 30),
         "tool_exec": (660, 15),
         "append_results": (2 * 60, None),
+        "cleanup": (2 * 60, None),  # the end of every task (LH-507)
     }
     attempts = {
         name: attributes.retry_policy.maximum_attempts for name, attributes in sched.items()
@@ -1060,6 +1088,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "llm_turn": 8,
         "tool_exec": 3,
         "append_results": 3,
+        "cleanup": 3,
     }
     llm = sched["llm_turn"].retry_policy
     assert llm.initial_interval.ToTimedelta() == timedelta(seconds=2)
@@ -1098,6 +1127,7 @@ async def test_tuning_shortens_the_heartbeat_timeouts_of_one_run(
         "llm_turn": (10 * 60, 2),
         "tool_exec": (660, 2),
         "append_results": (2 * 60, None),
+        "cleanup": (2 * 60, None),
     }
 
 
@@ -2198,6 +2228,10 @@ async def test_histories_with_a_compaction_replay(env: WorkflowEnvironment) -> N
 
 # ---------- LH-306: a task of an issue is delivered as a pull request ----------
 PICKUP = [acts.POST_COMMENT.name, acts.ADD_LABEL.name]
+# How a task of an issue ends without a pull request (LH-507): "working" comes off and, for an
+# end that needs a person, "needs-human" goes on. A cancel takes both off.
+ENDED_WITH_AN_ERROR = [acts.REMOVE_LABEL.name, acts.ADD_LABEL.name]
+ENDED_CANCELLED = [acts.REMOVE_LABEL.name, acts.REMOVE_LABEL.name]
 DELIVERY = [
     acts.BUILD_PR_BRANCH.name,
     acts.DELIVER.name,
@@ -2343,10 +2377,11 @@ async def test_a_task_that_cannot_be_picked_up_does_no_work(
         with pytest.raises(WorkflowFailureError) as caught:
             await result_of(handle)
 
-    # No model money is spent on a task that could not say it had begun.
+    # No model money is spent on a task that could not say it had begun. It still ends the way
+    # every task does (LH-507): the labels are set, even though it never added the first one.
     assert isinstance(caught.value.cause, ActivityError)
     assert stubs.names() == []
-    assert stubs.github_names() == [acts.POST_COMMENT.name]
+    assert stubs.github_names() == [acts.POST_COMMENT.name, *ENDED_WITH_AN_ERROR]
 
 
 async def test_the_github_writes_are_retried_by_the_policy_of_section_3_7(
@@ -2361,7 +2396,10 @@ async def test_the_github_writes_are_retried_by_the_policy_of_section_3_7(
         with pytest.raises(WorkflowFailureError):
             await result_of(handle)
 
-    assert stubs.github_names().count(acts.ADD_LABEL.name) == acts.ADD_LABEL.retry.maximum_attempts
+    # The first label fails for good after its attempts. The task then ends (LH-507) and asks
+    # for a person with another label, which fails the same way.
+    attempts = acts.ADD_LABEL.retry.maximum_attempts
+    assert stubs.github_names().count(acts.ADD_LABEL.name) == 2 * attempts
     assert stubs.names() == []
 
 
@@ -2378,10 +2416,10 @@ async def test_a_task_that_changed_nothing_ends_with_an_error_and_no_pull_reques
 
     assert outcome == Outcome(kind=OutcomeKind.ERROR, summary="nothing to deliver: no file changed")
     assert (final.phase, final.outcome) == (Phase.FAILED, outcome)
-    assert stubs.github_names() == [*PICKUP, acts.BUILD_PR_BRANCH.name]
+    assert stubs.github_names() == [*PICKUP, acts.BUILD_PR_BRANCH.name, *ENDED_WITH_AN_ERROR]
 
 
-async def test_a_delivery_that_fails_for_good_leaves_the_working_label(
+async def test_a_delivery_that_fails_for_good_swaps_working_for_needs_human(
     env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:
     stubs = Stubs()
@@ -2395,11 +2433,19 @@ async def test_a_delivery_that_fails_for_good_leaves_the_working_label(
         with pytest.raises(WorkflowFailureError):
             await result_of(handle)
 
-    # The labels follow the pull request: without one, the issue still says "working".
-    assert stubs.github_names() == [*PICKUP, acts.BUILD_PR_BRANCH.name, acts.DELIVER.name]
+    # The labels follow the pull request, and there is none: the task ends with an error, which
+    # takes "working" off and asks for a person (LH-507).
+    assert stubs.github_names() == [
+        *PICKUP,
+        acts.BUILD_PR_BRANCH.name,
+        acts.DELIVER.name,
+        *ENDED_WITH_AN_ERROR,
+    ]
+    (failed,) = stubs.errors
+    assert failed.payload["type"] == "CheckpointError"
 
 
-async def test_a_cancel_while_delivering_cleans_up_and_swaps_no_label(
+async def test_a_cancel_while_delivering_cleans_up_and_takes_the_labels_off(
     env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:
     stubs = Stubs()
@@ -2420,6 +2466,7 @@ async def test_a_cancel_while_delivering_cleans_up_and_swaps_no_label(
         acts.BUILD_PR_BRANCH.name,
         acts.DELIVER.name,
         "deliver:cancelled",
+        *ENDED_CANCELLED,
     ]
     assert stubs.names()[-1] == acts.CLEANUP.name
 
@@ -3135,13 +3182,19 @@ async def test_a_history_in_which_old_code_saw_the_memory_flag_replays(
     await replayer.replay_workflow(seen)
 
 
-def _patch_markers(history: WorkflowHistory) -> list[str]:
-    return [
-        event.marker_recorded_event_attributes.marker_name
-        for event in history.events
-        if event.HasField("marker_recorded_event_attributes")
-        and event.marker_recorded_event_attributes.marker_name == "core_patch"
-    ]
+def _patch_markers(history: WorkflowHistory, patch: str = LOAD_MEMORY_PATCH) -> list[str]:
+    """The markers of one patch in a history. Every run records the one of LH-507 (see below)."""
+    found = []
+    for event in history.events:
+        if not event.HasField("marker_recorded_event_attributes"):
+            continue
+        attributes = event.marker_recorded_event_attributes
+        if attributes.marker_name != "core_patch":
+            continue
+        data = attributes.details["patch-data"].payloads[0].data.decode()
+        if json.loads(data)["id"] == patch:
+            found.append(patch)
+    return found
 
 
 async def test_a_task_with_memory_records_the_patch_marker_and_one_without_does_not(
@@ -3163,3 +3216,86 @@ async def test_a_task_with_memory_records_the_patch_marker_and_one_without_does_
 
     assert len(_patch_markers(marked)) == 1
     assert _patch_markers(plain) == []
+
+
+# ---------- LH-507: how a task ends ----------
+# tests/integration/test_outcomes.py runs each outcome against a FakeGitHub and on real Docker.
+# These show the calls the workflow makes with stub activities.
+async def test_a_finished_task_destroys_its_sandbox_once_and_keeps_the_repo_for_the_janitor(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert stubs.wound_up == [
+        acts.CleanupInput(
+            task_id=spec.task_id,
+            sandbox_id="sbx-1",
+            reason="the task ended: pr_opened",
+            keep_repo=True,
+        )
+    ]
+    assert stubs.names() == [
+        "prepare_workspace",
+        "llm_turn",
+        "append_results",
+    ]
+
+
+async def test_a_task_of_an_issue_posts_one_report_with_its_outcome(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    outcome, _ = await play(env, stubs, gh_spec)
+
+    (report,) = stubs.finals
+    assert (report.task_id, report.repo, report.number) == (gh_spec.task_id, "acme/calc", 42)
+    assert report.outcome == outcome == FINISHED
+    assert (report.base_sha, report.head_sha) == (BASE, BASE)
+    assert report.draft is True
+
+
+async def test_a_local_task_posts_no_report(env: WorkflowEnvironment, spec: TaskSpec) -> None:
+    stubs = Stubs()
+    await play(env, stubs, spec)
+    assert stubs.finals == []
+
+
+async def test_an_error_is_noted_with_its_type_and_a_trace_before_the_outcome(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails = {
+        acts.DELIVER.name: ApplicationError(
+            "push rejected", type="CheckpointError", non_retryable=True
+        )
+    }
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, gh_spec, task_queue=queue)
+        with pytest.raises(WorkflowFailureError):
+            await result_of(handle)
+        final = await handle.query(TaskWorkflow.status)
+
+    assert final.outcome == Outcome(
+        kind=OutcomeKind.ERROR, summary="workflow failed: CheckpointError"
+    )
+    (error,) = stubs.errors
+    assert error.payload["type"] == "CheckpointError"
+    assert "push rejected" in error.payload["trace"]
+    assert len(error.payload["trace"]) <= acts.ERROR_TRACE_CHARS
+    ((_, note),) = stubs.outcomes
+    assert note.payload["kind"] == "error"
+    (report,) = stubs.finals
+    assert report.outcome.kind is OutcomeKind.ERROR
+
+
+async def test_every_run_records_the_marker_of_the_wind_up(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    async with running(env, Stubs()) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert _patch_markers(history, OUTCOME_PATCH) == [OUTCOME_PATCH]

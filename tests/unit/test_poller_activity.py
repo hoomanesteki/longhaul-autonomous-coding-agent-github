@@ -181,6 +181,25 @@ async def test_a_task_of_the_poller_plans_before_it_codes(
     assert kwargs["memo"] == {acts.PLAN_MEMO_KEY: True}
 
 
+async def test_a_repo_that_wants_a_draft_on_stuck_starts_its_tasks_with_the_switch(
+    fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
+) -> None:
+    fake.seed_issue(REPO, "add() is wrong", labels=[LABEL])
+    config = config_with(entry(open_draft_on_stuck=True))
+
+    await poll(poller(github, store, config), temporal)
+
+    ((state, kwargs),) = temporal.started
+    assert kwargs["memo"] == {acts.PLAN_MEMO_KEY: True, acts.OPEN_DRAFT_MEMO_KEY: True}
+    # The switch is the worker's business and not part of the shared RepoSettings contract.
+    assert "open_draft_on_stuck" not in state.spec.settings.model_dump()
+
+
+async def test_the_draft_on_stuck_switch_is_off_unless_the_repo_sets_it() -> None:
+    assert entry().open_draft_on_stuck is False
+    assert all(not repo.open_draft_on_stuck for repo in load_config(EXAMPLE).repos)
+
+
 async def test_a_task_that_finished_is_not_started_again_while_the_label_stays(
     fake: FakeGitHub, github: GitHubClient, store: MemoryTaskStore, temporal: FakeTemporal
 ) -> None:

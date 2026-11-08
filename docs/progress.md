@@ -86,6 +86,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-505 | Stuck detector | 5 | Done | merge | 2026-11-07 |
 | LH-506 | Pause, ask and hint flow | 3 | Done | merge | 2026-11-08 |
 | LH-507 | Final outcomes and stuck report | 3 | Done | merge | 2026-11-08 |
+| LH-591 | Stuck evidence names the command, and the demo repo | 1 | Done | merge | 2026-11-08 |
 
 ## Phase 6: Memory (tag v0.6.0)
 | ID | Title | Pts | Status | PR | Merged |

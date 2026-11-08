@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,9 +54,11 @@ from tests.integration.test_pause_flow import (
     turn,
     write_script,
 )
+from tests.integration.test_verifier import HAS_ADD, clean_run, stuck_run
+from tests.integration.test_verifier import Boxes as CalcBoxes
 
 from longhaul.blobs.memory import MemoryBlobStore
-from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.checkpoints.git_store import GitCheckpointStore, RepoNotFoundError
 from longhaul.checkpoints.squash import FileStat
 from longhaul.contracts import (
     Budgets,
@@ -75,7 +77,11 @@ from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
 from longhaul.durable.activities.outcome import FinalCommentActivities
-from longhaul.durable.activities.plan import PlanActivities, StepActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
@@ -87,6 +93,7 @@ from longhaul.github import lifecycle
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import coder, planner
+from longhaul.roles import verifier as verifier_role
 from longhaul.sandbox.docker_manager import TASK_LABEL, DockerSandboxManager, volume_name
 from longhaul.tools.registry import default_registry
 
@@ -113,14 +120,21 @@ SHORT_HEARTBEAT = acts.Tuning(heartbeat_timeout_s=3)
 
 # ---------- the stubs: delivery, the sandbox and the diff ----------
 class Diffs:
-    """The diff reader of the final comment: a fixed list of files, and what it was asked."""
+    """The diff reader of the final comment: a fixed list of files, and what it was asked.
+
+    `gone` says whether the bare repo of a task has been removed. The real reader finds no repo
+    then, and so does this one.
+    """
 
     def __init__(self, files: list[FileStat]) -> None:
         self.files = files
         self.asked: list[tuple[str, str, str]] = []
+        self.gone: Callable[[str], bool] = lambda task_id: False
 
     async def stats(self, task_id: str, base_sha: str, head_sha: str) -> list[FileStat]:
         self.asked.append((task_id, base_sha, head_sha))
+        if self.gone(task_id):
+            raise RepoNotFoundError(f"task {task_id} has no checkpoint repo")
         return self.files
 
 
@@ -181,6 +195,18 @@ class Refusing(FinalCommentActivities):
         )
 
 
+class CalcStubs(Stubs):
+    """The stubs, with the sandbox of the verifier tests: a git repo with calc in it.
+
+    The verifier reads the diff with `git_diff`, which needs a repo, and the pre-check runs the
+    test command of the task in the box.
+    """
+
+    @activity.defn(name=acts.PREPARE_WORKSPACE.name)
+    async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
+        return await CalcBoxes.prepare_workspace(self, spec)  # type: ignore[arg-type]
+
+
 @dataclass
 class Rig:
     queue: str
@@ -194,7 +220,7 @@ class Rig:
     def events(self, kind: str) -> list[dict[str, Any]]:
         return [e.payload for e in self.recorder.events if e.type == kind]
 
-    def spec(self, *, local: bool = False) -> TaskSpec:
+    def spec(self, *, local: bool = False, test_command: str | None = None) -> TaskSpec:
         if local:
             repo = "local:/work/inv"
             return TaskSpec(
@@ -211,7 +237,7 @@ class Rig:
             issue_number=self.number,
             title="lookup fails",
             body="`inv.lookup` raises KeyError for a sku that exists.",
-            settings=RepoSettings(repo=REPO, budgets=Budgets()),
+            settings=RepoSettings(repo=REPO, budgets=Budgets(), test_command=test_command),
         )
 
     def final_comments(self) -> int:
@@ -233,7 +259,9 @@ async def rig(
     *,
     posting: type[FinalCommentActivities] = FinalCommentActivities,
     files: list[FileStat] | None = None,
+    reviewed: bool = False,
 ) -> AsyncIterator[Rig]:
+    """A worker for the tests below. `reviewed` adds what a plan and a verifier need."""
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     costs = CostLedger(PRICES)
@@ -250,7 +278,10 @@ async def rig(
         registry.specs(),
         config_for,
         ledger=costs,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier_role.tool_specs(registry.specs()),
+        },
         planned_tools=coder.tool_specs(registry.specs()),
     )
     questions = ContextActivities(
@@ -262,7 +293,7 @@ async def rig(
         ledger=costs,
         templates=TEMPLATES,
     )
-    stubs = Stubs()
+    stubs = CalcStubs() if reviewed else Stubs()
     tools = ToolActivities(registry, stubs, blobs, recorder, checkpoints=NoCheckpoints())
     fake = FakeGitHub()
     seed_calc(fake, tmp_path / "gh")
@@ -270,6 +301,9 @@ async def rig(
     github: Github = github_for(fake)
     ledger = MemoryLedger()
     diffs = Diffs(files if files is not None else [FileStat("inv.py", 3, 1)])
+    diffs.gone = lambda task_id: any(
+        c.task_id == task_id and not c.keep_repo for c in stubs.cleanups
+    )
     final = posting(github.client, ledger, diffs, templates=TEMPLATES)
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
@@ -285,6 +319,7 @@ async def rig(
                 *PlanActivities(recorder).activities,
                 *StepActivities(recorder).activities,
                 *SideEffectActivities(github.client, ledger).activities,
+                *PlanCommentActivities(github.client, ledger, templates=TEMPLATES).activities,
                 *final.activities,
                 stubs.prepare_workspace,
                 stubs.cleanup,
@@ -377,13 +412,21 @@ async def test_each_outcome_reports_once(
         assert world.final_comments() == 1
         assert world.final_comment().startswith(ending.heading)
         assert world.labels() == ending.labels
-        # The sandbox is gone once. The repo is left to the janitor, unless a person cancelled.
-        (cleaned,) = world.stubs.cleanups
-        assert cleaned.task_id == spec.task_id and cleaned.keep_repo is (kind != "cancelled")
+        # The sandbox goes first and the repo stays for the report. A task that ended on its own
+        # leaves the repo to the janitor. A person who cancelled has it removed once the report
+        # is posted.
+        cleaned, *later = world.stubs.cleanups
+        assert cleaned.task_id == spec.task_id and cleaned.keep_repo is True
         assert cleaned.reason == (
             "not worth it" if kind == "cancelled" else f"the task ended: {kind}"
         )
         assert cleaned.sandbox_id == f"sbx-{spec.task_id}"
+        if kind == "cancelled":
+            (removal,) = later
+            assert removal.task_id == spec.task_id and removal.keep_repo is False
+            assert removal.reason == "not worth it"
+        else:
+            assert later == []
         # The note the metrics count from is made once.
         assert [e["kind"] for e in world.events("outcome")] == [ending.kind.value]
 
@@ -395,8 +438,58 @@ async def test_a_delivered_task_links_its_pull_request_in_the_comment(
         outcome = await end_the_task(env, world, world.spec(), "pr_opened")
 
         assert outcome.pr_url == PR_URL
+        (delivery,) = world.stubs.deliveries
+        assert delivery.partial is False
         assert PR_URL in world.final_comment()
         assert SUMMARY in world.final_comment()
+
+
+async def test_a_verified_pull_request_is_reported_as_ready(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    # A command backed the verdict, so deliver opens a ready pull request. The comment must not
+    # call it a draft.
+    async with rig(env, clean_run(), tmp_path, reviewed=True) as world:
+        spec = world.spec(test_command=HAS_ADD)
+        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+
+        assert outcome.kind is OutcomeKind.PR_OPENED
+        (delivered,) = world.stubs.deliveries
+        assert delivered.verified_tests == "2 passed"
+        body = world.final_comment()
+        assert body.startswith("## Longhaul opened a pull request\n")
+        assert PR_URL in body
+        assert "draft" not in body.lower()
+        assert world.labels() == {lifecycle.PR_OPEN}
+
+
+async def test_a_pull_request_nobody_verified_is_reported_as_a_draft(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, DELIVERS, tmp_path) as world:
+        await end_the_task(env, world, world.spec(), "pr_opened")
+
+        (delivered,) = world.stubs.deliveries
+        assert delivered.verified_tests is None
+        assert world.final_comment().startswith("## Longhaul opened a draft pull request")
+
+
+async def test_a_task_whose_review_rounds_ran_out_is_wound_up(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, stuck_run(), tmp_path, reviewed=True) as world:
+        spec = world.spec(test_command=HAS_ADD)
+        handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+
+        assert outcome.kind is OutcomeKind.STUCK
+        assert "failed review 3 times" in outcome.summary
+        assert world.final_comments() == 1
+        assert world.final_comment().startswith("## Longhaul is stuck and has stopped")
+        assert world.labels() == {lifecycle.NEEDS_HUMAN}
+        (cleaned,) = world.stubs.cleanups
+        assert cleaned.keep_repo is True
 
 
 async def test_a_stuck_report_says_what_was_done_and_left_and_the_diff(
@@ -420,6 +513,20 @@ async def test_a_cancelled_task_names_who_cancelled_it(
         await end_the_task(env, world, world.spec(), "cancelled")
 
         assert "cancelled by maintainer: not worth it" in world.final_comment()
+
+
+async def test_a_cancelled_task_reports_the_diff_before_its_repo_is_removed(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, FAILS, tmp_path) as world:
+        spec = world.spec()
+        await end_the_task(env, world, spec, "cancelled")
+
+        body = world.final_comment()
+        assert "1 file changed, 3 additions, 1 deletion" in body
+        assert "could not be read" not in body
+        # The repo of a cancelled task is still removed, after the comment.
+        assert [c.keep_repo for c in world.stubs.cleanups] == [True, False]
 
 
 async def test_a_cancelled_task_that_was_paused_lets_go_of_needs_human(
@@ -556,6 +663,7 @@ async def test_a_stuck_task_opens_a_draft_when_the_repo_asks_for_one(
         (delivery,) = world.stubs.deliveries
         assert delivery.issue_number == world.number
         assert delivery.summary.startswith("Partial work. The task is stuck:")
+        assert delivery.partial is True, "merging the draft must not close the issue"
         body = world.final_comment()
         assert PR_URL in body and "draft pull request" in body
         assert world.labels() == {lifecycle.NEEDS_HUMAN, lifecycle.PR_OPEN}

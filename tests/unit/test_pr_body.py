@@ -36,9 +36,12 @@ def render(
     tests: LastTestRun | None = PASSED,
     issue: int = 42,
     verified: str | None = None,
+    partial: bool = False,
 ) -> str:
     stats = files if files is not None else [FileStat("src/calc.py", 1, 1)]
-    return render_pr_body(issue, summary, stats, tests, templates=TEMPLATES, verified=verified)
+    return render_pr_body(
+        issue, summary, stats, tests, templates=TEMPLATES, verified=verified, partial=partial
+    )
 
 
 def test_the_template_is_in_the_repo() -> None:
@@ -233,3 +236,21 @@ def test_a_very_long_verified_line_is_cut() -> None:
 
 def test_a_blank_verified_line_is_left_out() -> None:
     assert "Verified" not in render(verified="   ")
+
+
+# ---------- partial work (LH-507) ----------
+def test_a_body_of_partial_work_refers_to_the_issue_and_does_not_close_it() -> None:
+    body = render(partial=True)
+
+    assert body.rstrip().splitlines()[-1] == "Refs #42"
+    assert not re.search(r"(?i)\bcloses\s+#\d+", body)
+    assert "partial work" in body.lower()
+
+
+def test_a_body_of_finished_work_is_the_same_with_or_without_the_flag() -> None:
+    assert render(partial=False) == render()
+    assert "partial work" not in render().lower()
+
+
+def test_a_body_of_partial_work_is_the_same_bytes_every_time() -> None:
+    assert render(partial=True).encode() == render(partial=True).encode()

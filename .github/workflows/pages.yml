@@ -31,7 +31,14 @@ jobs:
       pages: write
     steps:
       - uses: actions/checkout@v7
-      - uses: quarto-dev/quarto-actions/setup@v2
+      # The setup downloads Quarto from GitHub; one failed download should not fail the run.
+      - id: quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+        continue-on-error: true
+        with:
+          version: 1.10.18
+      - if: steps.quarto.outcome == 'failure'
+        uses: quarto-dev/quarto-actions/setup@v2
         with:
           version: 1.10.18
       - name: Render the docs site

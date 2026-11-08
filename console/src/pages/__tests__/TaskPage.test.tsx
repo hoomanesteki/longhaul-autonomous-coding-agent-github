@@ -207,13 +207,16 @@ function renderPage() {
   );
 }
 
-function rowOf(text: string): HTMLElement {
-  return screen.getByText(text).closest("[data-testid='timeline-row']") as HTMLElement;
+function rowOf(label: string | HTMLElement): HTMLElement {
+  const element = typeof label === "string" ? screen.getByText(label) : label;
+  return element.closest("[data-testid='timeline-row']") as HTMLElement;
 }
 
 beforeEach(() => {
   fetchStub.mockReset();
   vi.stubGlobal("fetch", fetchStub);
+  // The virtualizer scrolls the window when the list moves, and jsdom does not implement that.
+  vi.stubGlobal("scrollTo", vi.fn());
 });
 
 afterEach(() => {

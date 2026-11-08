@@ -62,7 +62,13 @@ function api(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   if (url.pathname === "/api/repos") return Promise.resolve(json(REPOS));
   if (url.pathname === "/api/memory" && init?.method !== "POST") {
     const repo = url.searchParams.get("repo");
-    return Promise.resolve(json(items.filter((entry) => entry.repo === repo)));
+    const status = url.searchParams.get("status");
+    const limit = Number(url.searchParams.get("limit") ?? 100);
+    // Like the API: oldest first, cut at the limit.
+    const found = items.filter(
+      (entry) => entry.repo === repo && (status === null || entry.status === status),
+    );
+    return Promise.resolve(json(found.slice(0, limit)));
   }
   if (decision !== null && init?.method === "POST") {
     const entry = items.find((candidate) => candidate.id === decodeURIComponent(decision[1]!));
@@ -244,6 +250,63 @@ describe("memory page", () => {
     expect(screen.getByRole("tab", { name: "Candidates (2)" })).toBeInTheDocument();
   });
 
+  it("still shows a candidate when the repo has more older items than one page holds", async () => {
+    const user = userEvent.setup();
+    const old = Array.from({ length: 1_000 }, (_, index) =>
+      item({
+        id: `old-${index}`,
+        kind: "repo_map",
+        status: "approved",
+        created_at: "2026-10-01T10:00:00Z",
+        content: `map ${index}`,
+      }),
+    );
+    items = [...old, item({ id: "new-1", status: "candidate", content: "the newest lesson" })];
+    renderPage("/memory?tab=candidates");
+
+    expect(await screen.findByText("the newest lesson")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Candidates (1)" })).toBeInTheDocument();
+    expect(screen.queryByText("No candidates for this repo.")).not.toBeInTheDocument();
+
+    await user.click(within(screen.getByRole("listitem")).getByRole("button", { name: "Approve" }));
+    expect(await screen.findByText("No candidates for this repo.")).toBeInTheDocument();
+  });
+
+  it("refreshes the tab an item moves to after a decision", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole("tab", { name: /^Candidates/ }));
+    await user.click(
+      within(await screen.findByRole("listitem", { name: /avoid the global cache/ })).getByRole(
+        "button",
+        { name: "Approve" },
+      ),
+    );
+    await screen.findByRole("tab", { name: "Candidates (1)" });
+
+    await user.click(screen.getByRole("tab", { name: /^Approved/ }));
+    expect(await screen.findByText("avoid the global cache")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Approved (2)" })).toBeInTheDocument();
+  });
+
+  it("drops the error of a failed decision when another repo is chosen", async () => {
+    const user = userEvent.setup();
+    fetchStub.mockImplementation((input, init) =>
+      String(input).endsWith("/approve")
+        ? Promise.resolve(json({ detail: "memory item not found" }, 404))
+        : api(input, init),
+    );
+    renderPage("/memory?tab=candidates");
+    const row = await screen.findByRole("listitem", { name: /avoid the global cache/ });
+    await user.click(within(row).getByRole("button", { name: "Approve" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("memory item not found");
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "Repo" }), "acme/gadgets");
+
+    expect(await screen.findByRole("combobox", { name: "Repo" })).toHaveValue("acme/gadgets");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   describe("source links", () => {
     it("sends a pull request number to the pull request on GitHub", async () => {
       items = [item({ id: "m-1", status: "approved", source: "task", source_ref: "42" })];
@@ -322,6 +385,35 @@ describe("memory page", () => {
       const text = within(panel!).getByText((_, element) => element?.tagName === "PRE");
       expect(text).toHaveTextContent("src/ app.py util.py");
       expect(text.className).toContain("font-mono");
+    });
+
+    it("lays out the stored structure over several lines", async () => {
+      // What the agent stores: the minified JSON of RepoStructure.
+      const stored = JSON.stringify({
+        version: 1,
+        sha: "0123456",
+        modules: [{ path: "src/app.py", symbols: ["main"] }],
+        skipped: [],
+        omitted: 0,
+        out_of_time: false,
+      });
+      items = [item({ id: "map-1", kind: "repo_map", status: "approved", content: stored })];
+      renderPage();
+
+      const summary = await screen.findByText("Repo map");
+      const text = within(summary.closest("details")!).getByText(
+        (_, element) => element?.tagName === "PRE",
+      );
+      expect(text.textContent).toBe(JSON.stringify(JSON.parse(stored), null, 2));
+      expect(text.textContent?.split("\n").length).toBeGreaterThan(5);
+    });
+
+    it("shows content that is not JSON as it is stored", async () => {
+      items = [item({ id: "map-1", kind: "repo_map", status: "approved", content: "not {json" })];
+      renderPage();
+
+      const summary = await screen.findByText("Repo map");
+      expect(within(summary.closest("details")!).getByText("not {json")).toBeInTheDocument();
     });
 
     it("opens when the operator clicks the summary", async () => {

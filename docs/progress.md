@@ -121,6 +121,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-806 | Memory viewer | 3 | Todo | | |
 | LH-807 | Console auth | 2 | Todo | | |
 | LH-808 | Console e2e with Playwright | 3 | Todo | | |
+| LH-891 | The console shows each task as it is | 3 | Done | merge | 2026-11-08 |
 
 ## Phase 9: Evaluation, chaos, hardening and release (tag v1.0.0)
 | ID | Title | Pts | Status | PR | Merged |

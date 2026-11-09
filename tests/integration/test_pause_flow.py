@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -277,11 +277,13 @@ async def light(
     tmp_path: Path | None = None,
     tasks: MemoryTaskStore | None = None,
     backend: ToolBackend | None = None,
+    activities: Sequence[Callable[..., Any]] = (),
 ) -> AsyncIterator[World]:
     """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue.
 
     The worker keeps the task row (LH-891) in `tasks`, a store of its own when none is given.
     `backend` is the tool backend of tool_exec (LH-909). Without one the tools run in the sandbox.
+    `activities` are registered next to the others, such as stand-ins for the delivery.
     """
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
@@ -349,6 +351,7 @@ async def light(
                 *StepActivities(recorder).activities,
                 *writes,
                 *TaskRowActivities(rows).activities,
+                *activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,

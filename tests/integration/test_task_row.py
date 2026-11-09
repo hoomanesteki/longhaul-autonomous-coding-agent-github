@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from temporalio import activity
 from temporalio.testing import WorkflowEnvironment
 from tests.integration import test_pause_flow as pause_tests
 from tests.integration import test_run_report as report_tests
@@ -232,6 +233,65 @@ async def test_a_cancelled_task_ends_its_row_as_cancelled(
     assert outcome.kind is OutcomeKind.CANCELLED
     assert (row.status, row.phase, row.outcome) == ("cancelled", "cancelled", "cancelled")
     assert row.ended_at is not None
+
+
+class Delivery:
+    """build_pr_branch, deliver and post_final for a task of an issue on the light worker.
+
+    The fake sandbox has no git, so the branch and the pull request are stand-ins. The labels
+    still go to the FakeGitHub.
+    """
+
+    def __init__(self) -> None:
+        self.reports: list[acts.PostFinalInput] = []
+
+    @property
+    def activities(self) -> list[Any]:
+        return [self.build_pr_branch, self.deliver, self.post_final]
+
+    @activity.defn(name=acts.BUILD_PR_BRANCH.name)
+    async def build_pr_branch(self, inp: acts.BuildPrBranchInput) -> acts.PrBranchOutput:
+        return acts.PrBranchOutput(
+            branch=f"longhaul-pr/{inp.task_id}",
+            head_sha=inp.head_sha,
+            base_sha=inp.base_sha,
+            base_branch="main",
+            title="fix(inv): find a sku that exists",
+        )
+
+    @activity.defn(name=acts.DELIVER.name)
+    async def deliver(self, inp: acts.DeliverInput) -> str:
+        return f"https://github.com/{inp.repo}/pull/{inp.issue_number + 100}"
+
+    @activity.defn(name=acts.POST_FINAL.name)
+    async def post_final(self, inp: acts.PostFinalInput) -> str:
+        self.reports.append(inp)
+        return "1"
+
+
+async def test_the_row_of_a_task_of_an_issue_names_its_pull_request(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    delivery = Delivery()
+    script = write_script(tmp_path, [turn("coder", 0, FINISH)])
+    async with light(env, script, tmp_path=tmp_path, activities=delivery.activities) as world:
+        assert world.fake is not None and world.number is not None
+        spec = world.spec()
+        handle = await start_task(env.client, spec, task_queue=world.queue)
+        outcome = await result_of(handle)
+
+    row = world.tasks.rows[spec.task_id]
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert outcome.pr_url == f"https://github.com/{spec.repo}/pull/{world.number + 100}"
+    assert (row.repo, row.issue_number) == (spec.repo, world.number)
+    assert row.pr_url == outcome.pr_url
+    assert (row.status, row.phase, row.outcome) == ("done", "done", "pr_opened")
+    assert row.ended_at is not None and row.ended_at >= row.started_at
+    assert "delivering" in collapsed(world)
+    # The pull request is known once the task is done, and not before.
+    assert {w.pr_url for w in world.tasks.written if w.phase != "done"} == {None}
+    assert world.tasks.written[-1].pr_url == outcome.pr_url
+    assert [r.outcome.pr_url for r in delivery.reports] == [outcome.pr_url]
 
 
 # ---------- the SQL upsert behind it ----------

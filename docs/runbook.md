@@ -902,7 +902,7 @@ uv run longhaul api --host 0.0.0.0 --port 8100
 curl -s -H "Authorization: Bearer $LONGHAUL_ADMIN_TOKEN" http://127.0.0.1:8000/api/tasks | head -c 400
 ```
 
-The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. The interactive docs are at `/docs`.
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. The interactive docs (`/docs`, `/redoc` and `/openapi.json`) are off: they need no token, and `/docs` loads Swagger UI from a CDN on the origin where the console keeps its token. `LONGHAUL_API_DOCS=true` turns them on for local development. `make api-types` does not need them.
 
 **Token (LH-807).** Every `/api` route needs `Authorization: Bearer <LONGHAUL_ADMIN_TOKEN>`. A missing, malformed or wrong token gets 401, and so does every request when the server has no token, but a server without one does not start: it stops with an error that names the setting. The token is compared with `hmac.compare_digest`. Rotating it means changing the setting and restarting the API, and the console asks for the new one at the next 401.
 
@@ -932,8 +932,8 @@ Keep the token out of shell history and logs, and put the API behind TLS before 
 
 Things to know:
 
-- **The row and the live status can differ.** The `tasks` row is written when the poller picks the task up, and the status and phase in it do not follow the task yet. `GET /api/tasks/{id}` therefore has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty.
-- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and a signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
+- **The row and the live status.** The `tasks` row is written by the poller at pickup and then kept current by the workflow (`record_task_state`): at every change of phase, every three turns while the task codes, and at the end with the outcome, the pull request URL and the end time. The list reads only the row, so it follows the task within a few turns, and a task started with `longhaul run` has a row from its first write. The workflow's write is best effort, so the row can still lag when the database was down. `GET /api/tasks/{id}` therefore also has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty. The plan in the detail shows each step as the coder last set it, and a plan that nobody decided on is `approved` once the task works from it.
+- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and so does `approve-plan` or `reject-plan` for a task whose live phase is not `awaiting_plan_approval`: the workflow would ignore it, and the issue must not show it as taken. A signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
 - **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
 - **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
 - **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
@@ -1147,6 +1147,8 @@ A test with no phase marker, or a test file outside a layer directory, fails col
 Some tests run only on request: `live` (paid model calls), `slow`, and the full `chaos` suite. `make gate`, `make itest`, `make e2e` and the `integration` and `e2e` jobs all leave them out. `chaos_lite` stays in, because gates run it. To run the others, name the marker, for example `uv run pytest -m slow`.
 
 `make gate PHASE=N` runs `make check`, then pytest with the markers `phase0` to `phaseN`. It stops with an error if `scripts/markers.py` rejects `N`, so a typo cannot select every test.
+
+For `PHASE=8` and `PHASE=9` the gate then runs the console as well: `make console-check` (install, lint, typecheck, unit tests and build) and `make console-e2e` (the Playwright main path). Integration checkpoint 8 asks for both, and phase 9 includes phase 8. The browser test starts the demo stack, so it needs `make up`. Its target builds the sandbox image first, which is quick when the image is already there. `PHASE=7` and below leave the console out. `CONSOLE_PHASES` in the `Makefile` lists the phases.
 
 ### Branch protection
 

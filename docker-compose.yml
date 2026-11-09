@@ -177,8 +177,9 @@ services:
   # The console API and the built console, in one process: http://127.0.0.1:8000 shows the pages
   # and answers /api. It is in the profile `full` with the worker:
   #   docker compose --profile full up -d --build api
-  # The console has no login until LH-807, so the port is published on 127.0.0.1 only. The
-  # server inside listens on every interface, which the published port needs.
+  # The console asks for LONGHAUL_ADMIN_TOKEN, but the token travels over plain HTTP, so the port
+  # is published on 127.0.0.1 only. The server inside listens on every interface, which the
+  # published port needs.
   api:
     profiles: ["full"]
     build:

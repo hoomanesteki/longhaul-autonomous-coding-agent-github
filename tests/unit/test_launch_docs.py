@@ -97,11 +97,17 @@ def test_readme_quickstart_is_three_commands_with_no_key() -> None:
     assert "scripted" in quickstart
 
 
-def test_readme_names_the_gif_path_without_embedding_a_missing_image() -> None:
+def test_readme_embeds_the_gif_only_once_the_file_exists() -> None:
+    # Before the recording the section names the path and embeds nothing. The recording checklist
+    # tells the owner to save the file and add the image, and this check must accept that step.
     text = read(README)
+    demo = section(text, "Demo")
     assert "docs/media/demo.gif" in text
-    assert not (ROOT / "docs" / "media" / "demo.gif").exists()
-    assert "![" not in section(text, "Demo")
+    if (ROOT / "docs" / "media" / "demo.gif").exists():
+        assert "![" in demo
+        assert "docs/media/demo.gif" in demo.split("![", 1)[1]
+    else:
+        assert "![" not in demo
 
 
 def test_readme_diagram_is_mermaid_with_the_four_ideas_beside_it() -> None:
@@ -150,6 +156,78 @@ def test_readme_quotes_the_chaos_results_as_the_summary_has_them() -> None:
     # The recordings were scripted, and the README says so next to the numbers.
     assert set(summary["recordings"].values()) == {"scripted"}
     assert "scripted" in section(text, "Headline numbers")
+
+
+KILL_TYPES = {
+    "worker": "Worker SIGKILL",
+    "sandbox": "Sandbox kill",
+    "temporal": "Temporal restart",
+    "postgres": "Postgres restart",
+}
+
+
+def seconds(value: float) -> str:
+    return f"{value:.1f} s"
+
+
+def chaos_table_rows(summary: dict[str, object], *, runs_hit: bool) -> list[str]:
+    """The rows of the per-kill-type table, built from the summary and its per-run results.
+
+    The README table has a "Runs hit" column and the case study table does not.
+    """
+    results = summary["results"]
+    assert isinstance(results, list)
+    rows: list[str] = []
+    for kind, label in KILL_TYPES.items():
+        hit = [r for r in results if any(k["type"] == kind and k["landed"] for k in r["kills"])]
+        landed = summary["kills_landed"][kind]  # type: ignore[index]
+        planned = summary["kills_planned"][kind]  # type: ignore[index]
+        latency = summary["resume_latency_by_type"][kind]  # type: ignore[index]
+        cells = [label, f"{landed} / {planned}"]
+        if runs_hit:
+            cells.append(str(len(hit)))
+        cells += [
+            f"{sum(1 for r in hit if r['completed'])} / {len(hit)}",
+            f"{sum(1 for r in hit if r['diff_equals_reference'])} / {len(hit)}",
+            str(sum(r["duplicate_side_effects"] for r in hit)),
+            f"{seconds(latency['median_s'])} / {seconds(latency['p95_s'])}",
+        ]
+        rows.append("| " + " | ".join(cells) + " |")
+    total = summary["runs"]
+    overall = summary["resume_latency"]
+    cells = [
+        "All",
+        f"{sum(summary['kills_landed'].values())} / {sum(summary['kills_planned'].values())}",  # type: ignore[attr-defined]
+    ]
+    if runs_hit:
+        cells.append(str(total))
+    cells += [
+        f"{summary['completed']} / {total}",
+        f"{summary['diff_matches']} / {total}",
+        str(summary["duplicate_side_effects"]),
+        f"{seconds(overall['median_s'])} / {seconds(overall['p95_s'])}",  # type: ignore[index]
+    ]
+    rows.append("| " + " | ".join(cells) + " |")
+    return rows
+
+
+def table_lines(text: str) -> list[str]:
+    """The table rows of a page with the bold marks removed, so a bold total row compares equal."""
+    return [line.replace("**", "") for line in text.splitlines() if line.startswith("|")]
+
+
+def test_readme_chaos_table_matches_the_summary_row_by_row() -> None:
+    summary = json.loads(read(CHAOS_SUMMARY))
+    lines = table_lines(section(read(README), "Results"))
+    for row in chaos_table_rows(summary, runs_hit=True):
+        assert row in lines, row
+
+
+def test_case_study_chaos_table_matches_the_summary_row_by_row() -> None:
+    summary = json.loads(read(CHAOS_SUMMARY))
+    lines = table_lines(section(read(DOCS / "case-study.md"), "Proof"))
+    for row in chaos_table_rows(summary, runs_hit=False):
+        assert row in lines, row
 
 
 def test_readme_says_where_the_eval_numbers_will_come_from() -> None:

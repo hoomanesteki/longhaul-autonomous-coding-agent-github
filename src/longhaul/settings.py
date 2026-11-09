@@ -71,6 +71,13 @@ class EnvSettings(BaseSettings):
     github_web_url: str | None = None
     github_clone_base: str | None = None
     admin_token: SecretStr | None = None
+    # With tools.backend: keystone (LH-909). The token signs the worker in to Keystone. A token
+    # lasts minutes, so a file is read again for every request and wins over the plain value. The
+    # key is what Keystone sends to the worker's own MCP server, which refuses a request without
+    # it (tools/mcp_server.py).
+    keystone_token: SecretStr | None = None
+    keystone_token_file: Path | None = None
+    sandbox_mcp_key: SecretStr | None = None
     config: Path = Path("config/longhaul.example.yaml")
     # Script file for the scripted provider; the provider factory reads it (LH-197).
     script: Path | None = None
@@ -284,6 +291,35 @@ class Memory(StrictModel):
         return value
 
 
+class GatewayEntry(StrictModel):
+    """Where Keystone is and how the worker offers its tools to it (LH-909).
+
+    `url` is Keystone's MCP endpoint. `upstream` is the id the worker's server has in Keystone:
+    Keystone allows lowercase letters, digits and single underscores, so it cannot be the server's
+    own name (longhaul-sandbox). The worker listens on `listen_host` and `listen_port`, and
+    Keystone has to be able to reach that address. The loopback address is the safe default.
+    """
+
+    url: str
+    upstream: str = "longhaul_sandbox"
+    listen_host: str = "127.0.0.1"
+    listen_port: int = Field(default=8765, ge=0, le=65535)
+
+
+class Tools(StrictModel):
+    """Where tool calls run. `direct` runs them in the sandbox. `keystone` sends each one through
+    a Keystone gateway, which decides and audits it first."""
+
+    backend: Literal["direct", "keystone"] = "direct"
+    gateway: GatewayEntry | None = None
+
+    @model_validator(mode="after")
+    def _keystone_needs_an_address(self) -> Self:
+        if self.backend == "keystone" and self.gateway is None:
+            raise ValueError("tools.backend is keystone, so tools.gateway.url is required")
+        return self
+
+
 class AppConfig(StrictModel):
     poller: Poller
     repos: list[RepoEntry]
@@ -295,6 +331,7 @@ class AppConfig(StrictModel):
     stuck: Stuck
     telemetry: Telemetry
     memory: Memory
+    tools: Tools = Field(default_factory=Tools)
     pricing_file: Path
 
 

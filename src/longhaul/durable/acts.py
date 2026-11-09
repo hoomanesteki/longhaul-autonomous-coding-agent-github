@@ -511,6 +511,10 @@ class ToolExecResult(ToolResult):
     """
 
     signal: CallSignal | None = None
+    # Set when a gateway holds the call for a person (LH-909). It is the question for them, and
+    # the workflow pauses the task with it as it does for `ask_human`. A result stored before this
+    # field existed reads back without one.
+    approval_question: str | None = None
 
 
 class ToolResultSummary(BaseModel):

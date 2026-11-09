@@ -32,6 +32,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
 from tests.fakes.calc_remote import Github, github_for, seed_calc
 from tests.fakes.fake_github import FakeGitHub
+from tests.fakes.fake_keystone import running_keystone
 
 from longhaul.agent.loop import LoopConfig
 from longhaul.blobs.memory import MemoryBlobStore
@@ -49,6 +50,7 @@ from longhaul.contracts import (
     Sandbox,
     TaskSpec,
     TextBlock,
+    ToolResultBlock,
 )
 from longhaul.cost.ledger import MemoryLedger as CostLedger
 from longhaul.cost.pricing import Pricing
@@ -69,6 +71,8 @@ from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.settings import Context
+from longhaul.tools.backend import ToolBackend
+from longhaul.tools.keystone_backend import KeystoneBackend
 from longhaul.tools.registry import default_registry
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase5]
@@ -264,8 +268,12 @@ async def light(
     *,
     hold_summary: bool = False,
     tmp_path: Path | None = None,
+    backend: ToolBackend | None = None,
 ) -> AsyncIterator[World]:
-    """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue."""
+    """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue.
+
+    `backend` is the tool backend of tool_exec (LH-909). Without one the tools run in the sandbox.
+    """
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     costs = CostLedger(PRICES)
@@ -298,7 +306,9 @@ async def light(
         templates=TEMPLATES,
     )
     boxes = Boxes()
-    tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
+    tools = ToolActivities(
+        registry, boxes, blobs, recorder, checkpoints=NoCheckpoints(), backend=backend
+    )
     github: Github | None = None
     fake: FakeGitHub | None = None
     number: int | None = None
@@ -704,3 +714,56 @@ async def test_histories_from_before_the_pause_replay(name: str) -> None:
         data_converter=guarded_data_converter,
     )
     await replayer.replay_workflow(history)
+
+
+# ---------- a call that Keystone holds for approval (LH-909) ----------
+HOLD = tool("run_command", command="deploy now")
+DENIED = tool("run_command", command="curl http://example.com")
+
+
+async def test_a_call_keystone_holds_pauses_the_task_and_a_hint_resumes_it(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [turn("coder", 0, HOLD), turn("coder", 1, FINISH), SUMMARY_STEP]
+    async with running_keystone() as keystone:
+        backend = KeystoneBackend(keystone.url, token=lambda: "t")
+        try:
+            async with light(env, write_script(tmp_path, steps), backend=backend) as world:
+                handle = await start_task(env.client, world.spec(), task_queue=world.queue)
+                await paused(world, handle)
+                await send_hint(handle, "approved in the Keystone console, go ahead")
+                outcome = await result_of(handle)
+        finally:
+            await backend.aclose()
+
+    assert outcome.kind is OutcomeKind.PR_OPENED and outcome.summary == SUMMARY
+    (asked,) = world.events("paused")
+    assert asked["reason"] == "agent_asked"
+    # The reason Keystone gave is the question the compactor is asked to put to a person.
+    request = world.provider.of("compactor")[0]
+    assert "policy approve-deploy needs a person to approve this command" in texts(request)[0]
+    # The model learns on its next turn that the call did not run, and sees the hint.
+    after = world.provider.of("coder")[1]
+    assert any("Hint from maintainer: approved in the Keystone console" in t for t in texts(after))
+    assert [seen.tool for seen in keystone.calls] == ["longhaul_sandbox__run_command"]
+
+
+async def test_a_call_keystone_denies_does_not_pause_the_task(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [turn("coder", 0, DENIED), turn("coder", 1, FINISH), SUMMARY_STEP]
+    async with running_keystone() as keystone:
+        backend = KeystoneBackend(keystone.url, token=lambda: "t")
+        try:
+            async with light(env, write_script(tmp_path, steps), backend=backend) as world:
+                handle = await start_task(env.client, world.spec(), task_queue=world.queue)
+                outcome = await result_of(handle)
+        finally:
+            await backend.aclose()
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert world.events("paused") == []
+    # The model reads the reason in the result of the call.
+    second = world.provider.of("coder")[1]
+    results = [b for m in second for b in m.content if isinstance(b, ToolResultBlock)]
+    assert any("KS_DENIED" in b.content and b.is_error for b in results)

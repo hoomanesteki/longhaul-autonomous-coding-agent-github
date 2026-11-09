@@ -33,8 +33,10 @@ from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
 from longhaul.roles import coder, planner, verifier
-from longhaul.settings import AppConfig, EnvSettings, Memory, load_config
+from longhaul.settings import AppConfig, EnvSettings, Memory, Tools, load_config
 from longhaul.telemetry import metrics
+from longhaul.tools.backend import DirectBackend
+from longhaul.tools.keystone_backend import KeystoneBackend
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase2]
 
@@ -203,6 +205,47 @@ def test_the_model_turns_and_the_compactor_follow_the_context_settings(tmp_path:
     # Both estimate with one meter per task, so the tokens in a compaction event and the
     # projections of the model turns come from the same ratio.
     assert compactor._meters is llm._meters
+
+
+def test_a_direct_worker_serves_no_tools_and_runs_them_itself(tmp_path: Path) -> None:
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    (tools,) = [
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "tool_exec"
+    ]
+    assert isinstance(tools._backend, DirectBackend)
+    assert parts.tool_app is None and parts.tool_address is None
+
+
+async def test_a_keystone_worker_calls_its_tools_through_keystone_and_serves_them(
+    tmp_path: Path,
+) -> None:
+    tools = Tools.model_validate(
+        {"backend": "keystone", "gateway": {"url": "http://127.0.0.1:1/mcp", "listen_port": 0}}
+    )
+    config = CONFIG.model_copy(update={"tools": tools})
+    settings = make_settings(
+        tmp_path, keystone_token="a-token", sandbox_mcp_key="a-key-of-enough-characters"
+    )
+
+    parts = worker.build_parts(settings, config, FakeManager())  # type: ignore[arg-type]
+
+    (exec_,) = [
+        fn.__self__ for fn in parts.activities if getattr(fn, "__name__", "") == "tool_exec"
+    ]
+    assert isinstance(exec_._backend, KeystoneBackend)
+    assert parts.backend is exec_._backend
+    assert parts.tool_address == ("127.0.0.1", 0)
+    async with worker.tool_server(parts) as port:
+        assert port is not None and port > 0
+    await parts.close()
+
+
+def test_a_keystone_worker_without_its_key_stops_before_it_starts(tmp_path: Path) -> None:
+    tools = Tools.model_validate({"backend": "keystone", "gateway": {"url": "http://k/mcp"}})
+    config = CONFIG.model_copy(update={"tools": tools})
+
+    with pytest.raises(ValueError, match="LONGHAUL_KEYSTONE_TOKEN"):
+        worker.build_parts(make_settings(tmp_path), config, FakeManager())  # type: ignore[arg-type]
 
 
 def test_a_model_without_a_price_stops_the_worker_before_it_starts(tmp_path: Path) -> None:

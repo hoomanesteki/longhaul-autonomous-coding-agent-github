@@ -58,4 +58,15 @@ memory:
   enabled: true            # false: no store at all, so no repo map, no verified commands, no notes
   mode: "on"               # "off": nothing from memory in the prompt except the verified test command
   embedder: local          # local needs `uv sync --extra memory`; hash is for tests and CI
+tools:
+  backend: direct          # direct runs a tool in the sandbox; keystone sends each call through a Keystone gateway first
+  # With backend: keystone, say where Keystone is and where the worker offers its tools to it.
+  # The token to sign in and the key that protects the worker's server are set in the environment
+  # (LONGHAUL_KEYSTONE_TOKEN, LONGHAUL_SANDBOX_MCP_KEY). See "Route tool calls through Keystone"
+  # in docs/runbook.md.
+  # gateway:
+  #   url: http://localhost:8080/mcp
+  #   upstream: longhaul_sandbox   # the id the worker's server has in Keystone
+  #   listen_host: 127.0.0.1
+  #   listen_port: 8765
 pricing_file: config/pricing.yaml   # fill from the provider's pricing page; never hardcode in code

@@ -121,6 +121,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-806 | Memory viewer | 3 | Done | merge | 2026-11-08 |
 | LH-807 | Console auth | 2 | Done | merge | 2026-11-08 |
 | LH-808 | Console e2e with Playwright | 3 | Done | merge | 2026-11-08 |
+| LH-891 | The console shows each task as it is | 3 | Done | merge | 2026-11-08 |
 
 ## Phase 9: Evaluation, chaos, hardening and release (tag v1.0.0)
 | ID | Title | Pts | Status | PR | Merged |
@@ -133,4 +134,4 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-906 | Security hardening pass | 3 | Done | merge | 2026-11-08 |
 | LH-907 | Docs, README and demo | 3 | Todo | | |
 | LH-908 | Terraform for AWS (Could) | 5 | Done | merge | 2026-11-04 |
-| LH-909 | Route tool calls through Keystone (Could) | 3 | Todo | | |
+| LH-909 | Route tool calls through Keystone (Could) | 3 | Done | merge | 2026-11-08 |

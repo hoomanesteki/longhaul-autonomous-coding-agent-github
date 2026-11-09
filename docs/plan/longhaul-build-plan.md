@@ -3090,6 +3090,25 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 2. **Why generated API types?** The backend and frontend are built in different stories. Generated types turn an API drift into a build error instead of a runtime bug.
 3. **Why mirror console actions to the issue?** One audit trail. Anyone reading the issue sees every human intervention, wherever it came from.
 
+#### LH-891 · The console shows each task as it is
+- **Epic:** E13 · **Points:** 3 · **Branch:** `fix/lh-891-phase8-gate` · **Depends on:** LH-801, LH-803, LH-808
+- **Story:** As an operator, I want the tasks list to show each task's real phase, turns, cost and outcome, so that the console tells me which tasks need me.
+- **Build:**
+  - The workflow keeps its `tasks` row current through `record_task_state`, behind the patch marker `lh-891-task-row`: at every phase change, every few turns, after a pause question and at the wind-up (outcome, PR url, end time). The write is an upsert, so a task started with `longhaul run` gets a row too, and a failed write never fails the task.
+  - `make gate PHASE=8` and `PHASE=9` also run the console checks and the Playwright main path.
+  - The plan view follows step updates and the plan decision.
+  - The cost sparkline has a label, and draws nothing when the cost is zero.
+  - The API refuses a plan decision (409) unless the task waits for one, so a late decision is never mirrored to the issue.
+  - `/docs`, `/redoc` and `/openapi.json` are off unless `LONGHAUL_API_DOCS` turns them on.
+  - The demo script prints the admin token only when it is the demo default.
+  - Recorded histories from before the console mirror and before the task row replay in the test suite.
+- **Acceptance criteria:**
+  - [ ] The list row of a paused, an awaiting-approval and a shipped task says what the detail page says.
+  - [ ] The Playwright main path checks the list rows and the Needs you filter.
+  - [ ] Histories recorded before the patch replay.
+- **Tests:** `tests/integration/test_task_row.py`, `tests/integration/test_api.py::test_the_list_says_what_the_detail_page_says_for_each_task`, `tests/unit/test_makefile_gate.py`, `console/e2e/main-path.spec.ts`
+- **Files:** `src/longhaul/durable/activities/task_row.py`, `src/longhaul/db/tasks.py`, `src/longhaul/durable/workflows/task.py`, `src/longhaul/api/`, `console/src/components/timeline/Sparkline.tsx`, `Makefile`, `scripts/demo_stack.py`, tests
+
 ---
 
 ## Phase 9: Evaluation, chaos, hardening and release (tag v1.0.0)

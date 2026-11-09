@@ -896,18 +896,32 @@ Things to know when you read the numbers:
 `longhaul api` serves the API that the console reads (LH-801, ADR-0011). It needs the stack from `make up` and the `LONGHAUL_DATABASE_URL`, `LONGHAUL_BLOB_*` and `LONGHAUL_TEMPORAL_*` settings of `.env.example`. It does not need a worker to start. The live status of a task and the actions need one.
 
 ```bash
+export LONGHAUL_ADMIN_TOKEN=$(openssl rand -hex 32)    # or put it in .env
 uv run longhaul api                      # http://127.0.0.1:8000
 uv run longhaul api --host 0.0.0.0 --port 8100
-curl -s http://127.0.0.1:8000/api/tasks | head -c 400
+curl -s -H "Authorization: Bearer $LONGHAUL_ADMIN_TOKEN" http://127.0.0.1:8000/api/tasks | head -c 400
 ```
 
-The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. There is no login until LH-807, so leave the host on `127.0.0.1` unless the machine is closed to the network. The interactive docs are at `/docs`.
+The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_API_PORT` (default `8000`), and `--host` and `--port` win over both. The interactive docs (`/docs`, `/redoc` and `/openapi.json`) are off: they need no token, and `/docs` loads Swagger UI from a CDN on the origin where the console keeps its token. `LONGHAUL_API_DOCS=true` turns them on for local development. `make api-types` does not need them.
+
+**Token (LH-807).** Every `/api` route needs `Authorization: Bearer <LONGHAUL_ADMIN_TOKEN>`. A missing, malformed or wrong token gets 401, and so does every request when the server has no token, but a server without one does not start: it stops with an error that names the setting. The token is compared with `hmac.compare_digest`. Rotating it means changing the setting and restarting the API, and the console asks for the new one at the next 401.
+
+| Route | Needs the token |
+|---|---|
+| `/api/*` | Always |
+| `/healthz` | Never. A probe has no token. |
+| `/metrics` | Only when the server is not bound to this machine. With `127.0.0.1`, `::1` or `localhost` it is open, so a Prometheus on the same host scrapes it with no secret. With `0.0.0.0` or any other address it needs the token. |
+| The console's own files at `/` | Never. The login page has to load before there is a token. |
+
+A token may send 30 actions (POST routes) a minute. The 31st gets 429 with a `Retry-After` header. The count is a sliding window kept in the memory of the API process, so it is exact for one API process and is not shared between several. Reads are not limited. A request with a wrong token is refused before it is counted.
+
+Keep the token out of shell history and logs, and put the API behind TLS before it leaves a trusted network: a bearer token over plain HTTP can be read by anyone on the path.
 
 | Endpoint | Returns |
 |---|---|
 | `GET /api/tasks?status=&repo=&limit=50&cursor=` | The `tasks` rows, newest first, with `next_cursor` when there are more |
 | `GET /api/tasks/{id}` | The row, the answer of the workflow's `status` query, and the newest plan |
-| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first |
+| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first. A tool call carries its `post_sha` |
 | `GET /api/tasks/{id}/turns/{n}?attempt=` | The request and the reply of a model turn, redacted |
 | `GET /api/tasks/{id}/tool-calls/{call_id}/output?start=&end=` | Lines `start` to `end` of the full output of a tool call, redacted |
 | `POST /api/tasks/{id}/approve-plan`, `reject-plan`, `hint`, `budget`, `cancel` | Send the signal, with `by` set to `console` |
@@ -918,12 +932,140 @@ The address comes from `LONGHAUL_API_HOST` (default `127.0.0.1`) and `LONGHAUL_A
 
 Things to know:
 
-- **The row and the live status can differ.** The `tasks` row is written when the poller picks the task up, and the status and phase in it do not follow the task yet. `GET /api/tasks/{id}` therefore has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty.
-- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and a signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
+- **The row and the live status.** The `tasks` row is written by the poller at pickup and then kept current by the workflow (`record_task_state`): at every change of phase, every three turns while the task codes, and at the end with the outcome, the pull request URL and the end time. The list reads only the row, so it follows the task within a few turns, and a task started with `longhaul run` has a row from its first write. The workflow's write is best effort, so the row can still lag when the database was down. `GET /api/tasks/{id}` therefore also has a `live` field with the answer of the workflow, and a `workflow` field that says why `live` is empty: `not_found` (Temporal has forgotten the workflow), `unreachable` (Temporal does not answer) or, for a workflow with no worker, `running` with `live` empty. The plan in the detail shows each step as the coder last set it, and a plan that nobody decided on is `approved` once the task works from it.
+- **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and so does `approve-plan` or `reject-plan` for a task whose live phase is not `awaiting_plan_approval`: the workflow would ignore it, and the issue must not show it as taken. A signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
 - **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
 - **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
 - **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
-- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json`. A unit test fails when the file is out of date.
+- **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json` and `console/src/api/schema.ts`. A unit test fails when `openapi.json` is out of date, and the console job of CI fails when `schema.ts` is.
+
+## The console
+
+The console (LH-802, ADR-0011) is a Vite, React and TypeScript app in `console/`. It reads the API and nothing else. Node 24 or later and npm are the only tools it needs.
+
+```bash
+cd console && npm ci
+npm run dev          # http://localhost:5173, with /api and /healthz proxied to the API
+npm run lint && npm run typecheck && npm test && npm run build   # the checks of the console job
+```
+
+`npm run dev` expects `longhaul api` on `http://127.0.0.1:8000`. Set `LONGHAUL_API_URL` before `npm run dev` for another address. `make console-check` runs the four checks after a clean install.
+
+- **Types.** `console/src/api/schema.ts` is written by `make api-types` from `console/openapi.json`. Never edit it. Every call in `console/src/api/client.ts` names a method and a path of the generated schema, and takes its path parameters, query, body and reply types from it. A renamed or moved path, a renamed parameter, a body or query that became required, or a changed reply stops `npm run typecheck`.
+- **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The login screen keeps it only after the API accepts it (a request to `/api/repos`), and a 401 on any later call clears it and returns to the login. The sign-out button clears it and the cached pages.
+- **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). Set `LONGHAUL_ADMIN_TOKEN` in `.env` or the shell first, or the container stops at start. The container listens on `0.0.0.0`, so `/metrics` needs the token there. The image is built from `docker/api/Dockerfile`.
+- **Tasks page.** `/tasks` lists the tasks newest first and polls every 10 seconds. The status and repo filters go to the API, and "Load more" follows `next_cursor`. The "Needs you" toggle works on the rows already loaded: a task needs you in the `paused` and `awaiting_plan_approval` phases. The filters are kept in the address (`?status=&repo=&needs_you=1`). The phase comes from the `tasks` row, which the workflow keeps current (see the console API notes above).
+- **Task page.** `/tasks/:id` shows the summary of a task (phase, cost, turns, tokens, cache ratio, pull request, plan with the status of each step) and its timeline. The summary uses the workflow's own answer when there is one and says why when there is not. The timeline loads every page of `/timeline` (500 rows each) and groups the rows by turn, with the tool calls inside. Only the rows in view are in the page (`@tanstack/react-virtual`), so a task of hundreds of turns stays light. Each turn has a Details button that fetches that turn's request and reply, and each tool call with a stored output has a Show output button that fetches 200 lines at a time. The arguments of a tool call come with its turn's reply, so they show once Details is open. Events are coloured by type: compaction, pause (paused, stuck, resumed), hint, verdict, recovery (sandbox recreated, continue as new) and error. A task that has not ended is polled every 10 seconds.
+- **Actions.** The task page has an Actions section under the summary. Approve plan and Reject plan (with a feedback box) show only while the task is in `awaiting_plan_approval`. Send hint, Add budget (dollars, turns or both) and Cancel task show for every phase until the task ends. Cancel stays disabled until the task id is typed in full. Nothing shows for a task that has ended or whose workflow is closed or missing, and the page says so. Each action posts to its route, shows a toast, then fetches the task and its timeline again. A refused action keeps what was typed and shows the API's reason.
+- **Console actions on the issue.** For a task of an issue, the workflow repeats each signal that comes from the console as a short comment, so the issue shows every steer: "Hint from console:" with the text in a code fence, "Plan approved from console.", "Plan rejected from console:" with the feedback, and "Budget added from console: $2.50 and 10 turns." The text is cut to 1,000 characters and fenced so an @name in it notifies nobody. A cancel is not repeated, because the final comment already says "cancelled by console". Hints and commands typed on the issue are not repeated either, and a task without an issue posts nothing. The comments have the keys `<task>:console:<n>`, and the count is carried across a hand-over in the workflow memo (`console_posts`), as it is for `/longhaul status`. A comment that cannot be posted is logged and does not fail the task.
+- **Memory page.** `/memory` shows the notes of one repo in three tabs: Approved, Candidates and Rejected. Pick the repo in the selector; the repo and the tab stay in the address (`/memory?repo=acme/inventory&tab=candidates`). Each item shows its kind, content, source, uses and last used time. A source is a link when it has a known shape: a pull request number goes to the pull request on GitHub, a task id goes to `/tasks/<id>` in the console, and a commit sha goes to the commit. Any other reference is shown as text. Candidates have Approve and Reject, which call the same routes as `longhaul memory approve|reject` and record `console` as the approver. Each tab asks the API for its own status, so a busy repo cannot push new candidates out of view; a tab shows at most 1000 items and says so when it is cut. A repo map folds into a panel and renders as indented JSON in monospace text.
+- **CI.** The `console` job installs with `npm ci`, regenerates `schema.ts` and fails when it differs from the committed file, then runs lint, typecheck, test and build.
+- **Demo stack.** `./scripts/seed_demo.sh` serves the console with data to act on. It needs `make up`, `make sandbox-image` and `npm --prefix console run build`, and a machine with outbound network, because each task sets up a sandbox from PyPI. It creates a scratch database and a FakeGitHub with three repos, starts `longhaul worker` with the scripted model of `tests/fixtures/scripts/console_demo.yaml`, polls once, and waits until the tasks are in their states: `demo/calc-shipped` has opened a pull request, `demo/calc-stuck` is paused for a hint and `demo/calc-plan` waits for a decision on its plan. It adds two lesson candidates to the memory of `demo/calc-shipped`. Then it starts `longhaul api` with the built console and prints the address, `http://127.0.0.1:8765` unless `LH_DEMO_PORT` says otherwise. Log in with `LONGHAUL_ADMIN_TOKEN`, or with `demo-admin-token` when it is unset. The seed takes one to two minutes. Press ctrl-c to stop: the script removes its database, sandboxes, volumes, blobs, open workflows and temporary folder, and touches nothing else. It does not use the compose `api` and `worker` services, because those have no GitHub to poll.
+- **Browser test.** `make console-e2e` (or `npm run e2e` in `console/` after a build and `npx playwright install chromium`) runs `console/e2e/main-path.spec.ts` with Playwright. The test starts `scripts/seed_demo.sh` as its web server and waits for the health check of the API, which comes up only after the seed is done. It then logs in and sees three tasks, sends a hint to the stuck task and sees its phase change to `coding` within 15 seconds, approves the plan of the third task, and approves a lesson. The scripted model waits 20 seconds on the first model call after the hint, so the phase stays at `coding` for longer than the page takes to poll. The steps change the state of the stack, so the test runs once and does not retry. A failure keeps a trace and a screenshot in `console/test-results`, and CI uploads them with the report.
+- **Browser test in CI.** The `console-e2e` job runs on every push and pull request, with the services of the `e2e` job, a built sandbox image and Chromium installed by Playwright. It runs on every event and not only on `dev`, because the `ci` job waits for every job and counts a job that did not run as a failure.
+
+## Route tool calls through Keystone
+
+[Keystone](https://github.com/hoomanesteki/keystone-mcp-gateway-ai-agent-security) is a gateway for MCP tool calls: policy decides each call, a person can be asked first, and every call leaves an audit row (LH-909). This is optional. The default is `tools.backend: direct`, which runs each tool in the sandbox as before and needs none of this.
+
+With `tools.backend: keystone` the path of one tool call is:
+
+```
+tool_exec -> Keystone /mcp -> Keystone policy, approval, audit -> the worker's MCP server -> the sandbox
+```
+
+The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. Those two never leave the worker, so Keystone does not audit them. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
+
+What the agent sees:
+
+| Keystone says | The agent gets |
+|---|---|
+| allow | The tool's own result, as in direct mode |
+| deny, or any other refusal (rate limit, budget, a rejected approval) | A failed result (`ok=False`) with Keystone's text: `[keystone:KS_DENIED] call <id> denied: <reason>` |
+| require approval, and nobody decides within Keystone's hold time (`approvals.wait_seconds`) | A failed result that says the call did not run, and the task pauses. The reason is the question, as in the pause for a hint |
+| the worker's tool server failed or did not answer (`KS_UPSTREAM_ERROR`, `KS_UPSTREAM_TIMEOUT`) | Nothing: `tool_exec` raises and Temporal runs the activity again from the checkpoint, as it does when direct mode meets a Docker error. A timeout means the upstream's `timeout_s` is too short for the command, see step 3 |
+
+A paused task waits for a hint, a budget top-up or a cancel (see "The pause and the hint"). Approve or reject the request in Keystone's console, then send the hint: `/longhaul hint approved in Keystone, go ahead` on the issue, or `POST /api/tasks/{id}/hint` of the console API for a local task. The model calls the same tool again, and the worker settles the request that Keystone is holding with `keystone__await_approval` and does not ask a second time.
+
+That works only while Keystone still has the request and the session that made it. Keystone lets a request be used once, by the session that asked, within `approvals.ttl_seconds` (900 seconds unless you change it), and it drops a session that has been idle for 30 minutes. A pause can wait up to a day for a hint, and the worker keeps the request id in memory. So approve in Keystone and send the hint within that time, and raise `ttl_seconds` in Keystone's config if your reviewers are slower. If the time ran out, the worker restarted, or another worker takes the call, Keystone refuses the old request. The agent is told the approval could not be used and that the call did not run. Its next call makes a new request, which a person has to approve again and which pauses the task a second time.
+
+If Keystone is down, `tool_exec` raises and Temporal runs the activity again. The worker never falls back to running a tool unchecked.
+
+### Point a worker at Keystone
+
+1. In the config that `LONGHAUL_CONFIG` names, turn the mode on and say where Keystone is:
+
+   ```yaml
+   tools:
+     backend: keystone
+     gateway:
+       url: http://localhost:8080/mcp      # Keystone's MCP endpoint
+       upstream: longhaul_sandbox          # the id the worker's server has in Keystone
+       listen_host: 0.0.0.0                # where the worker serves its tools; see the note below
+       listen_port: 8765
+   ```
+
+   Keystone allows an upstream id of lowercase letters, digits and single underscores, so the id is `longhaul_sandbox` and not the server's name. Keystone then lists the tools as `longhaul_sandbox__run_command` and so on.
+
+2. Set two secrets in the environment of the worker (see `.env.example`):
+
+   ```bash
+   export LONGHAUL_KEYSTONE_TOKEN=$(scripts/get_token.sh olivia ops-agent)   # run in the Keystone checkout
+   export LONGHAUL_SANDBOX_MCP_KEY=$(openssl rand -hex 24)                    # 48 characters
+   ```
+
+   The token signs the worker in to Keystone as a user and an agent. A token from the local Keycloak lasts five minutes, so for more than a short test put it in a file that something keeps fresh and set `LONGHAUL_KEYSTONE_TOKEN_FILE` to it: the worker reads the file again for every request. The key is what Keystone sends to the worker's server. The server refuses a request without it, because the tools run commands. A worker in keystone mode will not start without a token and a key of at least 16 characters, and the message names the variable.
+
+3. Register the upstream in Keystone. Add this to the `upstreams` of its config (`keystone.yaml`, or `deploy/keystone.compose.yaml` for the compose stack) and restart Keystone, which reads the section at every start:
+
+   ```yaml
+   - id: longhaul_sandbox
+     tenant: acme
+     transport: http
+     url: "http://host.docker.internal:8765/mcp"   # an address Keystone can reach the worker at
+     credential_mode: static
+     credential_env: {X-Api-Key: LONGHAUL_SANDBOX_MCP_KEY}
+     tools:
+       run_command: {risk: medium, timeout_s: 660, extract: {path: "$.command | lower"}}
+       run_tests: {risk: medium, timeout_s: 660}
+       read_file: {risk: low}
+       list_dir: {risk: low}
+       search: {risk: low}
+       git_diff: {risk: low}
+       edit_file: {risk: medium}
+       write_file: {risk: medium}
+   ```
+
+   Set `timeout_s` on `run_command` and `run_tests`. Keystone stops waiting for an upstream after 30 seconds unless the tool says more, while a command in the sandbox may run for 600 seconds (`TOOL_TIMEOUT_S`, with `sandbox.command_timeout_s` as the default of the call). With the default, a test run of 45 seconds comes back as `KS_UPSTREAM_TIMEOUT`, `tool_exec` retries it, and the worker's server may still be running the first attempt. Keep `timeout_s` above the longest command the sandbox allows: 660 covers the 600 seconds and a margin. Keystone's own client also gives up on an upstream that sends nothing for 300 seconds, so a quiet command that runs longer than that can still be cut short. The worker does not check this setting, because it cannot see Keystone's config.
+
+   Keystone reads the key from `LONGHAUL_SANDBOX_MCP_KEY` in its own environment at start and keeps it encrypted in its vault. It needs the same value as the worker. Keystone refuses an upstream on a private address unless `KEYSTONE_ALLOW_PRIVATE_UPSTREAMS` is `true`, which its compose file sets. Keystone in Docker reaches this machine as `host.docker.internal`, so the worker has to listen on an address that is not only the loopback (`listen_host: 0.0.0.0`). Do that only on a machine whose network you trust: the key is the only thing that protects the server. A Keystone that runs on the host can use `http://127.0.0.1:8765/mcp` and the default `listen_host`.
+
+   The agent in the token (`azp`) has to be listed under `agents` in Keystone's config, and its user has to be allowed the tools by the access policy. Risk `medium` and below is open to every user of the tenant. `extract` makes the text of a command available to policy as `context.args.path`; `lower` makes a rule independent of upper case.
+
+4. Add a policy that denies `run_command` when the command contains `curl`. Put it in the tenant's own directory of Keystone's policies, for example `policies/acme/access/longhaul.cedar`, and run `uv run keystone policy test policies tests/policy_cases --coverage` and `uv run keystone policy reload` there:
+
+   ```cedar
+   @id("longhaul-no-curl")
+   forbid (principal, action == Keystone::Action::"call_tool", resource == Keystone::Tool::"longhaul_sandbox__run_command")
+   when { context.args has path && context.args.path like "*curl*" };
+   ```
+
+   A rule that asks a person instead goes in the tenant's `approval/` directory and is a `permit` on the same condition, as `policies/acme/approval/mail.cedar` is in Keystone's checkout.
+
+### Check it
+
+Start the worker as usual (`uv run longhaul worker`). It logs `sandbox MCP server on http://<host>:<port>/mcp` before it takes a task. Then run the live test, which starts its own copy of the server on the address Keystone has registered, runs one allowed and one denied command through Keystone, and checks that the denied command never ran:
+
+```bash
+export KEYSTONE_URL=http://localhost:8080/mcp
+export KEYSTONE_TOKEN=$(scripts/get_token.sh olivia ops-agent)   # in the Keystone checkout
+export LONGHAUL_SANDBOX_MCP_KEY=<the same key Keystone has>
+export KEYSTONE_UPSTREAM_HOST=0.0.0.0                            # when Keystone runs in Docker
+export KEYSTONE_ADMIN_TOKEN=<a token of an admin of the tenant>  # optional: also checks the audit log
+uv run pytest tests/integration/test_keystone_backend.py -v
+```
+
+Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check. With `KEYSTONE_ADMIN_TOKEN` set, the test reads `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` itself and checks that the allowed call and the denied one are both there, with the task id of the run in their arguments and one session id. Without the token it skips that half and says so. You can read the same rows with `keystone audit export`.
 
 ## Run the evaluation
 
@@ -1108,6 +1250,8 @@ A test with no phase marker, or a test file outside a layer directory, fails col
 Some tests run only on request: `live` (paid model calls), `slow`, and the full `chaos` suite. `make gate`, `make itest`, `make e2e` and the `integration` and `e2e` jobs all leave them out. `chaos_lite` stays in, because gates run it. To run the others, name the marker, for example `uv run pytest -m slow`.
 
 `make gate PHASE=N` runs `make check`, then pytest with the markers `phase0` to `phaseN`. It stops with an error if `scripts/markers.py` rejects `N`, so a typo cannot select every test.
+
+For `PHASE=8` and `PHASE=9` the gate then runs the console as well: `make console-check` (install, lint, typecheck, unit tests and build) and `make console-e2e` (the Playwright main path). Integration checkpoint 8 asks for both, and phase 9 includes phase 8. The browser test starts the demo stack, so it needs `make up`. Its target builds the sandbox image first, which is quick when the image is already there. `PHASE=7` and below leave the console out. `CONSOLE_PHASES` in the `Makefile` lists the phases.
 
 ### Branch protection
 

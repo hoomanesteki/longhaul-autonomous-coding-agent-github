@@ -1,7 +1,8 @@
 """What the plan gate leaves in the carried state, and what it asks of the issue (LH-502).
 
 The gate takes a decision that is already there without a timer, so `TaskWorkflow._review` runs
-here as a plain coroutine, with the two methods that start activities replaced by recorders. The
+here as a plain coroutine, with the three methods that start activities replaced by recorders (the
+third writes the row of the task, LH-891). The
 wait itself and the replay are in tests/integration/test_plan_gate.py.
 """
 
@@ -38,13 +39,21 @@ def wf(state: CarryState) -> TaskWorkflow:
 
 
 class Calls:
-    """What the gate asked the workflow to run: activity names, and label steps as +/- labels."""
+    """What the gate asked the workflow to run: activity names, and label steps as +/- labels.
+
+    The writes of the row are counted apart, so the lists of activities below stay what they were.
+    """
 
     def __init__(self, wf: TaskWorkflow) -> None:
         self.activities: list[str] = []
         self.labels: list[str] = []
+        self.rows = 0
         wf._call = self._call  # type: ignore[method-assign]
         wf._label = self._label  # type: ignore[method-assign]
+        wf._save_row = self._save_row  # type: ignore[method-assign]
+
+    async def _save_row(self, ended: object = None) -> None:
+        self.rows += 1
 
     async def _call(self, act: acts.Act, arg: object) -> None:
         self.activities.append(act.name)

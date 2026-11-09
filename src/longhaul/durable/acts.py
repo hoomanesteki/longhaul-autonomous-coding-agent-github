@@ -72,6 +72,12 @@ sums over the ledger and some arithmetic, which every worker registers. `post_bu
 comment that says why a budget stopped the task and posts it under the key `<task>:budget:<n>`. It
 is a `post_comment` with a rendered body, so it has that policy and sits in `GITHUB`.
 
+The row of the task in `tasks` (LH-891) is kept by `record_task_state`. The poller writes the row
+once at pickup and the console lists tasks from it, so the workflow writes it again at every
+phase change, every few turns and when the task ends. It is an upsert of one row, so it is sized
+like `store_plan` and every worker registers it. A worker that predates it answers NotFoundError,
+which no retry fixes, so that error is not retried and the workflow carries on without the write.
+
 The fields of the payloads follow section 3.7 as well. LH-204 implemented `llm_turn`,
 `tool_exec` and `append_results` against them and added fields. The workflow reads only the
 ones it uses.
@@ -109,9 +115,12 @@ from longhaul.contracts import (
     Budgets,
     CarryState,
     Outcome,
+    OutcomeKind,
+    Phase,
     Plan,
     ProgressNotes,
     ProviderErrorKind,
+    RepoSettings,
     Role,
     StopDetails,
     StopReason,
@@ -211,6 +220,11 @@ OUTCOME_SUMMARY_CHARS = 500
 # after a hand-over would reuse the key of an earlier comment that had other text. CarryState is a
 # contract and has no field for it, and the memo is carried over Continue-As-New like the tuning.
 STATUS_MEMO_KEY = "status_posts"
+# The same for the comments that repeat a console action on the issue (LH-805).
+CONSOLE_MEMO_KEY = "console_posts"
+# The name the console signals under. The API sends it, and the workflow repeats the actions that
+# carry it on the issue. The signals of a person who commented on the issue are already there.
+CONSOLE_NAME = "console"
 # The workflow memo key that has a stuck task open a draft pull request with its partial work
 # (LH-507, the repo setting `open_draft_on_stuck`). The poller sets it from the repo entry of the
 # config when it starts the task, because the workflow cannot read the config and RepoSettings is
@@ -511,6 +525,10 @@ class ToolExecResult(ToolResult):
     """
 
     signal: CallSignal | None = None
+    # Set when a gateway holds the call for a person (LH-909). It is the question for them, and
+    # the workflow pauses the task with it as it does for `ask_human`. A result stored before this
+    # field existed reads back without one.
+    approval_question: str | None = None
 
 
 class ToolResultSummary(BaseModel):
@@ -761,6 +779,33 @@ class RecordEventInput(BaseModel):
     task_id: str
     type: str  # one of the event types in plan section 3.5
     payload: dict[str, Any] = Field(default_factory=dict)  # JSON, and small
+
+
+# The longest title the row keeps. The title of an issue is short, but `longhaul run` takes any
+# text, and a write that carries it must not come near the payload cap.
+ROW_TITLE_CHARS = 300
+
+
+class RecordTaskStateInput(BaseModel):
+    """One write of the row of a task in `tasks` (LH-891).
+
+    `repo`, `issue_number`, `title` and `settings` are for a task with no row yet, such as one
+    started with `longhaul run`: the row is created from them and never changed by them. `turns`
+    and `cost_usd` are the workflow's own count. `outcome` and `pr_url` are set only by the
+    write that ends the task, together with `ended_at`.
+    """
+
+    task_id: str
+    repo: str
+    issue_number: int | None = None
+    title: str
+    settings: RepoSettings
+    phase: Phase
+    turns: int = Field(ge=0)
+    cost_usd: float = Field(ge=0)
+    outcome: OutcomeKind | None = None
+    pr_url: str | None = None
+    ended_at: datetime | None = None
 
 
 class BundleCheckpointInput(BaseModel):
@@ -1247,6 +1292,16 @@ RECORD_STEP = Act(
     retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED]),
 )
 
+# The row of the task in `tasks` (LH-891): one upsert, so it has the policy of store_plan. A worker
+# that does not have the activity answers NotFoundError, and asking again cannot change that.
+RECORD_TASK_STATE = Act(
+    "record_task_state",
+    RecordTaskStateInput,
+    NoneType,
+    start_to_close=timedelta(minutes=2),
+    retry=RetryPolicy(maximum_attempts=3, non_retryable_error_types=[_OVERSIZED, "NotFoundError"]),
+)
+
 DECIDE_PLAN = Act(
     "decide_plan",
     DecidePlanInput,
@@ -1329,6 +1384,7 @@ ALL: tuple[Act[Any, Any], ...] = (
     STORE_PLAN,
     RECORD_STEP,
     DECIDE_PLAN,
+    RECORD_TASK_STATE,
     CLEAN_REPOS,
     WRITE_RUN_REPORT,
     CHECK_BUDGET,

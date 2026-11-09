@@ -6,6 +6,13 @@ signal, sent through durable/client.py with `by="console"`. The API never starts
 never touches the workflow's state in any other way, so a task behaves the same whether a person
 steered it from the console, from an issue comment or from the CLI.
 
+A plan decision is refused with 409 unless the task is waiting for one. The workflow ignores a
+decision it is not waiting for, but it repeats a decision from the console on the issue when the
+signal arrives, so a late approval would show on the issue as if it had counted. The check reads
+the live phase and so cannot be exact: a task that leaves the wait between the query and the
+signal still gets the signal, which the workflow ignores as before. Doing it here and not in the
+workflow keeps every recorded history replaying as it was.
+
 A turn or an output is read from the blob store and redacted on the way out (redaction.py). The
 tool output is redacted whole before it is cut into a page, so a secret cannot be split by the
 edge of a page, and the line numbers of a page are those of the redacted text.
@@ -16,13 +23,14 @@ from __future__ import annotations
 import json
 from typing import Annotated, Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import TypeAdapter
 from temporalio.client import Client, WorkflowQueryFailedError
 
 from longhaul.api import paging, queries
-from longhaul.api.deps import ApiContext, Ctx
+from longhaul.api.deps import ApiContext, Ctx, authorize
 from longhaul.api.errors import (
+    PROTECTED,
     STORE_ERRORS,
     TEMPORAL_ERRORS,
     not_found,
@@ -45,14 +53,19 @@ from longhaul.api.schemas import (
     TurnDetail,
 )
 from longhaul.blobs.base import BlobNotFoundError
-from longhaul.contracts import LLMResponse, Message, TaskStatus
+from longhaul.contracts import LLMResponse, Message, Phase, TaskStatus
+from longhaul.durable import acts
 from longhaul.durable import client as durable
 
-router = APIRouter(prefix="/api/tasks")
+router = APIRouter(
+    prefix="/api/tasks",
+    dependencies=[Depends(authorize)],
+    responses=PROTECTED,
+)
 
 # The name every signal of this API is sent under. The workflow keeps it: a hint is shown to the
 # model as "console: <text>" and a cancel says "cancelled by console".
-BY = "console"
+BY = acts.CONSOLE_NAME
 
 DEFAULT_PAGE = 50
 MAX_PAGE = 200
@@ -247,16 +260,32 @@ def sent(task_id: str, signal: Signal) -> ActionResult:
     return ActionResult(task_id=task_id, signal=signal, by=BY)
 
 
+async def require_plan_review(ctx: ApiContext, task_id: str) -> None:
+    """Refuse a plan decision for a task that is not waiting for one.
+
+    A task whose live phase cannot be read (Temporal is down, the workflow is gone or has no
+    worker) is let through: the signal then fails with its own, clearer answer.
+    """
+    _, live = await live_status(ctx, task_id)
+    if live is not None and live.phase is not Phase.AWAITING_PLAN_APPROVAL:
+        raise HTTPException(
+            status_code=409,
+            detail=f"the task is not waiting for a decision on its plan: it is {live.phase.value}",
+        )
+
+
 @router.post("/{task_id}/approve-plan")
 async def approve_plan(task_id: str, ctx: Ctx) -> ActionResult:
-    """Approve the plan the task is waiting on."""
+    """Approve the plan the task is waiting on. 409 when it is not waiting for one."""
+    await require_plan_review(ctx, task_id)
     await with_client(ctx.temporal, lambda c: durable.approve_plan(c, task_id, by=BY))
     return sent(task_id, "approve_plan")
 
 
 @router.post("/{task_id}/reject-plan")
 async def reject_plan(task_id: str, body: RejectPlanRequest, ctx: Ctx) -> ActionResult:
-    """Reject the plan with feedback. The planner writes a new version."""
+    """Reject the plan with feedback. The planner writes a new version. 409 as for approval."""
+    await require_plan_review(ctx, task_id)
     await with_client(
         ctx.temporal, lambda c: durable.reject_plan(c, task_id, by=BY, feedback=body.feedback)
     )

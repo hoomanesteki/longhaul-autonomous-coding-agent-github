@@ -7,6 +7,8 @@ is kept in one place so that every route says the same thing about the same fail
   (FastAPI's own) for a bad parameter or body.
 * 404 for a task, call, turn or item that does not exist, and 409 for a signal sent to a task that
   has ended: the person can tell "no such task" from "too late".
+* 401 for a missing or wrong bearer token, and 429 for a token that sends more than 30 actions a
+  minute (deps.authorize). They come before any other check, so they hide nothing.
 * 502 when the blob store fails or holds something unreadable, and 503 when Temporal or the
   database cannot be reached. The page shows the line and the rest of the console goes on.
 """
@@ -26,7 +28,19 @@ from longhaul.blobs.base import BlobError
 
 log = logging.getLogger(__name__)
 
-__all__ = ["TEMPORAL_ERRORS", "STORE_ERRORS", "not_found", "temporal_failure", "with_client"]
+__all__ = [
+    "PROTECTED",
+    "TEMPORAL_ERRORS",
+    "STORE_ERRORS",
+    "not_found",
+    "temporal_failure",
+    "with_client",
+]
+
+# What every route behind the token can answer besides its own replies, for the OpenAPI schema.
+PROTECTED: dict[int | str, dict[str, str]] = {
+    401: {"description": "The bearer token is missing or wrong."},
+}
 
 # What a call to Temporal raises when the server is down or does not know the workflow.
 TEMPORAL_ERRORS = (ConnectionError, OSError, RPCError, TimeoutError)

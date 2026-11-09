@@ -237,3 +237,10 @@ spikes/out/
 *.tfvars.json
 *.tfplan
 tfplan
+
+# The console (console/): installed packages and the build. dist/ is ignored above.
+node_modules/
+console/*.tsbuildinfo
+console/coverage/
+console/playwright-report/
+console/test-results/

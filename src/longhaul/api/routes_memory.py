@@ -12,15 +12,19 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
-from longhaul.api.deps import ApiContext, Ctx
-from longhaul.api.errors import not_found
+from longhaul.api.deps import ApiContext, Ctx, authorize
+from longhaul.api.errors import PROTECTED, not_found
 from longhaul.api.redaction import redact
 from longhaul.api.schemas import MemoryItemView
 from longhaul.memory.store import MemoryEntry, MemoryItemNotFoundError
 
-router = APIRouter(prefix="/api/memory")
+router = APIRouter(
+    prefix="/api/memory",
+    dependencies=[Depends(authorize)],
+    responses=PROTECTED,
+)
 
 BY = "console"
 DEFAULT_LIMIT = 200

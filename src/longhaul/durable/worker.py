@@ -43,6 +43,11 @@ What it is built from, and why each piece is what it is:
   start, with the name of the setting to change.
 * The tools are the default set. `run_tests` has one test command for the whole worker, because
   the workflow does not pass the task's settings to `tool_exec`.
+* Where the tools run is `tools.backend` (LH-909). `direct`, the default, runs them in the sandbox.
+  `keystone` sends each call through a Keystone gateway, and the worker then also serves the
+  sandbox tools as an MCP server for Keystone to call (tools/mcp_server.py), on the address in
+  `tools.gateway`. It needs LONGHAUL_KEYSTONE_TOKEN (or a file with it) to sign in to Keystone and
+  LONGHAUL_SANDBOX_MCP_KEY to protect its own server, and it stops at the start without them.
 * The planner (LH-501) gets its own tool list from the same registry: the read and run tools and
   `submit_plan`, and none that writes a file (roles/planner.py). `store_plan` writes the plans
   table and every worker registers it. With the GitHub token the worker also registers
@@ -71,6 +76,10 @@ What it is built from, and why each piece is what it is:
   through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
   that PollerWorkflow runs after each poll: it removes the bare repos under LONGHAUL_CKPT_DIR of
   tasks that ended more than seven days ago. A worker sweeps the repos on its own disk.
+* The row of each task in `tasks` is kept current by `record_task_state` (LH-891), which every
+  worker registers. The poller writes the row at pickup, and the workflow updates it at every phase
+  change, every few turns and at the end, so the console lists tasks as they are. A task started
+  with `longhaul run` gets its row from the first write.
 * The run report (LH-705) is `write_run_report`, which every worker registers: it reads the tables
   and writes one blob. `deliver` makes the same report for the body of the pull request, so the
   templates folder must hold run_report.md.j2 as well.
@@ -127,13 +136,15 @@ import asyncio
 import dataclasses
 import logging
 import signal
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from starlette.types import ASGIApp
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -164,6 +175,7 @@ from longhaul.durable.activities.plan import (
 )
 from longhaul.durable.activities.report import ReportActivities, RunReports, sql_reader
 from longhaul.durable.activities.support import Meters
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.activity_log import ActivityLogInterceptor
@@ -191,7 +203,10 @@ from longhaul.settings import (
 )
 from longhaul.telemetry import metrics
 from longhaul.telemetry.otel import setup_tracing
-from longhaul.tools.registry import default_registry
+from longhaul.tools.backend import DirectBackend, ToolBackend
+from longhaul.tools.keystone_backend import build_backend
+from longhaul.tools.mcp_server import build_app, serving
+from longhaul.tools.registry import ToolRegistry, default_registry
 
 log = logging.getLogger(__name__)
 
@@ -212,6 +227,10 @@ class WorkerParts:
     engine: AsyncEngine
     github: GitHubClient | None = None
     memory: PgMemoryStore | None = None
+    backend: ToolBackend = dataclasses.field(default_factory=DirectBackend)
+    # The MCP server of the sandbox tools, and where it listens. Set with tools.backend: keystone.
+    tool_app: ASGIApp | None = None
+    tool_address: tuple[str, int] | None = None
 
     async def check_memory(self) -> None:
         """Refuse to start on a memory table that another embedder wrote, or on a model that
@@ -229,7 +248,9 @@ class WorkerParts:
             raise ValueError(f"could not check the memory table of the database: {reason}") from exc
 
     async def close(self) -> None:
-        """Close the database pool and the GitHub client. The others hold no open connection."""
+        """Close the Keystone sessions, the database pool and the GitHub client. The others hold no
+        open connection."""
+        await self.backend.aclose()
         await self.engine.dispose()
         if self.github is not None:
             await self.github.aclose()
@@ -394,6 +415,7 @@ def build_parts(
         templates=templates_path(settings),
     )
     budgets = BudgetActivities(pricing, ledger, config_for, tools_for=llm.tools_for, meters=meters)
+    backend = build_backend(cfg.tools, settings)
     tools = ToolActivities(
         registry,
         sandboxes,
@@ -401,7 +423,9 @@ def build_parts(
         recorder,
         checkpoints=store,
         tool_output_max_tokens=cfg.context.tool_output_max_tokens,
+        backend=backend,
     )
+    tool_app, tool_address = _tool_server(cfg, settings, registry, sandboxes)
     github: GitHubClient | None = None
     remote: GitHubRemote | None = None
     # One ledger for every GitHub write, so that a key is held and recorded once.
@@ -424,6 +448,7 @@ def build_parts(
     notes = MemoryActivities(prompt_memory, blobs)
     lessons = LessonActivities(prompt_memory, recorder, provider, blobs, config_for, ledger=ledger)
     events = EventActivities(recorder)
+    task_rows = TaskRowActivities(SqlTaskStore(sessions))
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
     janitor = JanitorActivities(store, recorder)
@@ -473,6 +498,7 @@ def build_parts(
             *notes.activities,
             *lessons.activities,
             *events.activities,
+            *task_rows.activities,
             *plans.activities,
             *steps.activities,
             *janitor.activities,
@@ -485,7 +511,40 @@ def build_parts(
         engine=engine,
         github=github,
         memory=memory,
+        backend=backend,
+        tool_app=tool_app,
+        tool_address=tool_address,
     )
+
+
+def _tool_server(
+    cfg: AppConfig, settings: EnvSettings, registry: ToolRegistry, sandboxes: DockerSandboxManager
+) -> tuple[ASGIApp | None, tuple[str, int] | None]:
+    """The app that serves the sandbox tools to Keystone, and its address. None in direct mode."""
+    gateway = cfg.tools.gateway
+    if cfg.tools.backend != "keystone" or gateway is None or settings.sandbox_mcp_key is None:
+        return None, None
+    app = build_app(registry, sandboxes, key=settings.sandbox_mcp_key.get_secret_value())
+    return app, (gateway.listen_host, gateway.listen_port)
+
+
+@asynccontextmanager
+async def _no_server() -> AsyncIterator[None]:
+    yield
+
+
+def tool_server(parts: Any) -> AbstractAsyncContextManager[int | None]:
+    """Serve the sandbox tools to Keystone while the worker runs. Yields the port, or None when
+    the worker runs its tools itself.
+
+    `parts` is what build_parts made. It is read for the app and the address by name, so a
+    stand-in for a worker that has no tool server (the tests of main) needs neither.
+    """
+    app = getattr(parts, "tool_app", None)
+    address = getattr(parts, "tool_address", None)
+    if app is None or address is None:
+        return _no_server()
+    return serving(app, *address)
 
 
 def install_signal_handlers(stop: asyncio.Event) -> None:
@@ -550,7 +609,9 @@ async def main() -> None:
             settings.temporal_address,
             settings.temporal_namespace,
         )
-        await serve(client, settings.task_queue, parts.activities, stop)
+        # The tool server comes up before the first task can ask Keystone for a tool.
+        async with tool_server(parts):
+            await serve(client, settings.task_queue, parts.activities, stop)
         log.info("worker stopped")
     finally:
         if endpoint is not None:

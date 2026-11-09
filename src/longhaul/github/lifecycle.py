@@ -29,6 +29,9 @@ maintainer asks `/longhaul status`, and `denied_comment` is the answer to a comm
 someone who may not steer the task. The workflow posts the first, as the `post_comment`
 activity. The poller posts the second, through the same function of side_effects.py.
 
+A person who acts from the console (LH-805) leaves nothing on the issue, so `console_comment` is
+the line that repeats the action there, for the people who read the issue.
+
 This module only says what to write and under which key. The workflow runs each step as the
 `post_comment`, `add_label` or `remove_label` activity, so every write goes through
 github/side_effects.py (CONTRIBUTING.md rule 6). The keys are stable: the same step of the same
@@ -40,7 +43,7 @@ The module has no I/O and imports only the pure inputs, so the workflow can impo
 """
 
 import re
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from longhaul.contracts import OutcomeKind, TaskSpec, TaskStatus
 from longhaul.github.inputs import CommentInput, LabelInput, key_of
@@ -49,7 +52,9 @@ __all__ = [
     "NEEDS_HUMAN",
     "PR_OPEN",
     "WORKING",
+    "ConsoleAction",
     "LabelStep",
+    "console_comment",
     "denied_comment",
     "final_comment",
     "is_github_task",
@@ -84,6 +89,10 @@ SHORT_SHA_CHARS = 7
 # so this only guards the key against a value that GitHub would never send.
 _NOT_KEY_CHAR = re.compile(r"[^a-z0-9._-]")
 MAX_LOGIN_CHARS = 60
+
+# The longest quote of a hint or a piece of feedback in a mirror comment. The signal keeps the
+# whole text for the model. The issue only needs enough to show what the person asked.
+MAX_QUOTE_CHARS = 1_000
 
 
 class LabelStep(NamedTuple):
@@ -277,6 +286,75 @@ def status_comment(spec: TaskSpec, status: TaskStatus, *, by: str, n: int) -> Co
         body=" ".join(parts),
         idempotency_key=key_of(spec.task_id, "status", n),
     )
+
+
+# The actions of the console that a task repeats on its issue. A cancel is not here: the final
+# comment of the task already says "cancelled by console" and why.
+ConsoleAction = Literal["approve_plan", "reject_plan", "hint", "add_budget"]
+
+_CONSOLE_HEADINGS: dict[ConsoleAction, str] = {
+    "approve_plan": "Plan approved from console",
+    "reject_plan": "Plan rejected from console",
+    "hint": "Hint from console",
+    "add_budget": "Budget added from console",
+}
+
+
+def console_comment(
+    spec: TaskSpec,
+    action: ConsoleAction,
+    *,
+    n: int,
+    text: str = "",
+    usd: float = 0.0,
+    turns: int = 0,
+) -> CommentInput:
+    """What a task writes on its issue when a person acts on it from the console (LH-805).
+
+    A hint or a plan decision from the console leaves no trace on the issue, unlike a command
+    typed there, so the task repeats it for the people who read the issue. `n` counts these
+    comments from 1 and is part of the key, so each action gets one comment and a replay gets
+    none.
+    """
+    heading = _CONSOLE_HEADINGS[action]
+    if action == "approve_plan":
+        body = f"{heading}."
+    elif action == "add_budget":
+        body = f"{heading}: {_amounts(usd, turns)}."
+    else:
+        body = f"{heading}:\n\n{_quoted(text)}"
+    return CommentInput(
+        task_id=spec.task_id,
+        repo=spec.repo,
+        number=_issue(spec),
+        body=body,
+        idempotency_key=key_of(spec.task_id, "console", n),
+    )
+
+
+def _amounts(usd: float, turns: int) -> str:
+    parts = []
+    if usd > 0:
+        # A top-up under a cent would read as "$0.00", as if nothing was added.
+        parts.append(f"${usd:.2f}" if usd >= 0.005 else "<$0.01")
+    if turns > 0:
+        parts.append(f"{turns} turn" if turns == 1 else f"{turns} turns")
+    return " and ".join(parts)
+
+
+def _quoted(text: str) -> str:
+    """The text in a code fence, cut to MAX_QUOTE_CHARS.
+
+    A fence keeps an @name in the text from notifying someone and keeps markdown in it from
+    changing the comment. The fence is longer than any run of backticks in the text, so the text
+    cannot close it early.
+    """
+    text = text.strip()
+    if len(text) > MAX_QUOTE_CHARS:
+        text = text[:MAX_QUOTE_CHARS].rstrip() + "..."
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{text}\n{fence}"
 
 
 def denied_comment(task_id: str, repo: str, number: int, login: str) -> CommentInput:

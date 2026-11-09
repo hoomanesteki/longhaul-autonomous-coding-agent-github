@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types site site-preview gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate
 
 PHASE ?= 0
 
@@ -48,10 +48,30 @@ migrate:
 sandbox-image:
 	docker build -t longhaul-sandbox:py312 docker/sandbox
 
-# The OpenAPI schema of the console API. The console's typed client is generated from the file, so
-# run this after any change to src/longhaul/api and commit the result.
+# The OpenAPI schema of the console API, then the TypeScript types the console builds from it
+# (console/src/api/schema.ts). Run this after any change to src/longhaul/api and commit both
+# files. The second step needs the packages: run `npm ci` in console/ once.
 api-types:
 	uv run python scripts/dump_openapi.py
+	npm --prefix console run api:types
+
+# What the console job of CI runs: lint, typecheck, test and build.
+console-check:
+	npm --prefix console ci
+	npm --prefix console run lint
+	npm --prefix console run typecheck
+	npm --prefix console test
+	npm --prefix console run build
+
+# The browser test of the console (LH-808). Playwright starts scripts/seed_demo.sh itself, which
+# needs `make up` first and takes a couple of minutes to seed. The seeded tasks run in real
+# sandboxes, so the image is a prerequisite; docker reuses it when it is built (LH-891). To look at
+# the seeded console by hand instead, run ./scripts/seed_demo.sh after the build.
+console-e2e: sandbox-image
+	npm --prefix console ci
+	npm --prefix console run build
+	npm --prefix console exec -- playwright install chromium
+	npm --prefix console run e2e
 
 # The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
 # are read from docs/, so there is nothing to copy before a render.
@@ -61,6 +81,10 @@ site:
 site-preview:
 	quarto preview site
 
+# The phases whose gate also runs the console: phase 8 built it, and phase 9 includes it.
+# Integration checkpoint 8 names its unit tests and the Playwright main path (LH-891).
+CONSOLE_PHASES := 8 9
+
 # Capture the expression before running pytest. Written inline as a command substitution
 # argument, a failing markers.py is ignored and `pytest -m ""` runs every test.
 gate: check
@@ -69,3 +93,7 @@ gate: check
 	test -n "$$expr" || { echo "gate: markers.py printed no expression" >&2; exit 1; }; \
 	echo "gate: pytest -m ($$expr) and $(OPT_IN)"; \
 	uv run pytest -m "($$expr) and $(OPT_IN)"
+	@if [ -n "$(filter $(PHASE),$(CONSOLE_PHASES))" ]; then \
+	  echo "gate: console checks for PHASE=$(PHASE)"; \
+	  $(MAKE) console-check console-e2e; \
+	fi

@@ -52,7 +52,7 @@ The API sends only the signals that a person can send, and it sends them under t
 
 **Harder**
 
-- The `tasks` row can lag behind the task: only the poller writes it today, so `status` and `phase` stay at `active` and `queued` until a later story updates them. The detail page shows the live status beside the row for that reason. The list shows the row, and its `status` filter filters on the row.
+- The `tasks` row can lag behind the task. The poller writes it at pickup, and since LH-891 the workflow keeps it current through the `record_task_state` activity: at every change of phase, every few turns and at the end. A write that fails is logged and the task goes on, so the row can still be a little behind. The detail page shows the live status beside the row for that reason. The list shows the row, and its `status` filter filters on the row.
 - The timeline orders tool calls by the time their row was written, which is when the call ended. A tool call that took a minute appears a minute after the model call that asked for it. The duration is in the row.
 - The API imports `durable.client`, which imports the workflow class so that signals and queries are typed. It runs no workflow code.
 - The line numbers of a tool output page count the redacted text. They match the numbers the model saw unless a private key block was collapsed into one line.

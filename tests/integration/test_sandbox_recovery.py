@@ -60,9 +60,11 @@ from longhaul.contracts import (
 )
 from longhaul.db.records import SqlRecorder
 from longhaul.db.session import make_engine
+from longhaul.db.tasks import MemoryTaskStore
 from longhaul.durable import acts
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import SANDBOX_RECREATED, WorkspaceActivities
 from longhaul.durable.client import start_task
@@ -283,6 +285,7 @@ async def running(
             *tools.activities,
             *stack.workspace.activities,  # includes the real cleanup
             *EventActivities(stack.recorder).activities,
+            *TaskRowActivities(MemoryTaskStore()).activities,
         ],
         workflow_runner=workflow_runner(),
     ):
@@ -294,11 +297,17 @@ async def result_of(handle: WorkflowHandle[Any, Outcome], wait_s: float = DOCKER
 
 
 def scheduled(history: WorkflowHistory) -> list[str]:
-    """The names of the activities the workflow scheduled, in order."""
+    """The names of the activities the workflow scheduled, in order.
+
+    The writes of the task row (LH-891) are left out: they are bookkeeping for the console, and
+    these tests are about the work of the task.
+    """
     return [
         event.activity_task_scheduled_event_attributes.activity_type.name
         for event in history.events
         if event.HasField("activity_task_scheduled_event_attributes")
+        and event.activity_task_scheduled_event_attributes.activity_type.name
+        != acts.RECORD_TASK_STATE.name
     ]
 
 

@@ -68,10 +68,13 @@ test("the main path of the console", async ({ page }) => {
     await expect(plan).toContainText("awaiting_plan_approval", SETTLED);
     await expect(plan.locator("td").last()).toHaveText("Approve the plan");
 
-    await page.getByLabel("Needs you").check();
+    // The box follows the address, so it changes a moment after the click and not during it.
+    await page.getByLabel("Needs you").click();
+    await expect(page.getByLabel("Needs you")).toBeChecked();
     await expect(page.locator("tbody tr")).toHaveCount(2);
     await expect(page.getByRole("link", { name: SHIPPED.title, exact: true })).toHaveCount(0);
-    await page.getByLabel("Needs you").uncheck();
+    await page.getByLabel("Needs you").click();
+    await expect(page.getByLabel("Needs you")).not.toBeChecked();
     await expect(page.locator("tbody tr")).toHaveCount(3);
   });
 

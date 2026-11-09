@@ -193,7 +193,8 @@ def test_demo_script_uses_the_pattern_of_the_chaos_script() -> None:
     assert "WORKER_PID=$!" in text
     assert 'kill "$WORKER_PID"' in text
     assert "trap cleanup EXIT" in text
-    assert "uv run" not in text.replace("`uv run`", "")
+    commands = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert not any("uv run" in line for line in commands)
     assert "calc_fix.yaml" in text
     assert "--provider scripted" in text
     # Nothing here may reach a model, GitHub or a key.

@@ -109,10 +109,11 @@ def test_the_spec_logs_in_with_the_token_the_seed_uses(demo: ModuleType) -> None
     assert "LONGHAUL_ADMIN_TOKEN ??" not in text
 
 
-def test_the_spec_names_the_four_steps_of_the_plan() -> None:
+def test_the_spec_names_the_steps_of_the_plan() -> None:
     steps = re.findall(r'test\.step\("([^"]+)"', SPEC.read_text(encoding="utf-8"))
     assert steps == [
         "log in and see the three tasks",
+        "see each task in the list as it is",
         "send a hint to the stuck task and see it code again",
         "approve the plan",
         "approve a lesson",
@@ -415,3 +416,26 @@ def test_the_ci_job_keeps_the_report_when_the_spec_fails() -> None:
         s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/upload-artifact")
     ]
     assert uploads and all(s["if"] == "failure()" for s in uploads)
+
+
+# ---------- the ready line (LH-891) ----------
+def ready_line(demo: ModuleType, token: str) -> str:
+    stack = demo.Demo(port="8794", token=token)
+    try:
+        return str(demo.ready_message(stack))
+    finally:
+        shutil.rmtree(stack.folder, ignore_errors=True)
+
+
+def test_the_ready_line_prints_the_default_token_and_no_other(demo: ModuleType) -> None:
+    # Playwright keeps this line in its log, and a token from LONGHAUL_ADMIN_TOKEN is a real one.
+    secret = "real-token-" + "9f3a" * 6
+
+    default = ready_line(demo, demo.DEFAULT_TOKEN)
+    real = ready_line(demo, secret)
+
+    assert demo.DEFAULT_TOKEN in default
+    assert secret not in real
+    # The line still says where the token is, without saying what it is.
+    assert "with the token from LONGHAUL_ADMIN_TOKEN" in real
+    assert "http://127.0.0.1:8794" in real

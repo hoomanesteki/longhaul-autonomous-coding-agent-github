@@ -426,10 +426,19 @@ describe("timeline", () => {
     serve({ items: [turn(0, { cost_usd: 0.1 }), turn(1, { cost_usd: 0.2 }), turn(2, { cost_usd: 0.3 })] });
     renderPage();
 
-    const chart = await screen.findByRole("img", { name: /Cost over turns/ });
+    const chart = await screen.findByRole("img", { name: /Cost per turn/ });
     expect(chart).toHaveAccessibleName(expect.stringContaining("$0.60"));
     const line = chart.querySelector("polyline");
     expect(line?.getAttribute("points")?.trim().split(/\s+/)).toHaveLength(3);
+  });
+
+  it("labels the cost line and says so when the task has cost nothing", async () => {
+    serve({ items: [turn(0, { cost_usd: 0 }), turn(1, { cost_usd: 0 })] });
+    renderPage();
+
+    expect(await screen.findByText("Cost per turn")).toBeInTheDocument();
+    expect(await screen.findByText("no cost yet")).toBeInTheDocument();
+    expect(screen.queryByRole("img", { name: /Cost per turn/ })).not.toBeInTheDocument();
   });
 
   it("says when nothing has been recorded", async () => {
@@ -450,7 +459,7 @@ describe("timeline", () => {
 
     await screen.findByText("Turn 0");
     // The last page has to arrive before the page counts as loaded: the sparkline covers all 300.
-    await screen.findByRole("img", { name: /Cost over turns, \$3\.00/ });
+    await screen.findByRole("img", { name: /Cost per turn, \$3\.00/ });
     expect(screen.queryByText("Turn 299")).not.toBeInTheDocument();
     const rows = screen.getAllByTestId("timeline-row");
     expect(rows.length).toBeGreaterThan(0);

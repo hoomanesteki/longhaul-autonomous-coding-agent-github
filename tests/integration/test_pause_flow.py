@@ -53,11 +53,17 @@ from longhaul.contracts import (
 from longhaul.cost.ledger import MemoryLedger as CostLedger
 from longhaul.cost.pricing import Pricing
 from longhaul.db.records import MemoryRecorder
+from longhaul.db.tasks import MemoryTaskStore
 from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.plan import PlanActivities, StepActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
@@ -221,6 +227,7 @@ class World:
     provider: Probe
     recorder: MemoryRecorder
     costs: CostLedger
+    tasks: MemoryTaskStore
     fake: FakeGitHub | None = None
     number: int | None = None
 
@@ -264,8 +271,12 @@ async def light(
     *,
     hold_summary: bool = False,
     tmp_path: Path | None = None,
+    tasks: MemoryTaskStore | None = None,
 ) -> AsyncIterator[World]:
-    """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue."""
+    """A worker. With `tmp_path` the issue is on a FakeGitHub and the task is one of an issue.
+
+    The worker keeps the task row (LH-891) in `tasks`, a store of its own when none is given.
+    """
     blobs = MemoryBlobStore()
     recorder = MemoryRecorder()
     costs = CostLedger(PRICES)
@@ -298,6 +309,7 @@ async def light(
         templates=TEMPLATES,
     )
     boxes = Boxes()
+    rows = tasks if tasks is not None else MemoryTaskStore()
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
     github: Github | None = None
     fake: FakeGitHub | None = None
@@ -308,7 +320,12 @@ async def light(
         seed_calc(fake, tmp_path / "gh")
         number = fake.seed_issue(REPO, "lookup fails")
         github = github_for(fake)
-        writes = SideEffectActivities(github.client, MemoryLedger()).activities
+        ledger = MemoryLedger()
+        writes = [
+            *SideEffectActivities(github.client, ledger).activities,
+            # A task of an issue posts its plan (LH-501).
+            *PlanCommentActivities(github.client, ledger, templates=TEMPLATES).activities,
+        ]
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
         async with Worker(
@@ -323,6 +340,7 @@ async def light(
                 *PlanActivities(recorder).activities,
                 *StepActivities(recorder).activities,
                 *writes,
+                *TaskRowActivities(rows).activities,
                 boxes.prepare_workspace,
                 boxes.cleanup,
                 boxes.ensure_sandbox,
@@ -330,7 +348,7 @@ async def light(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield World(queue, provider, recorder, costs, fake, number)
+            yield World(queue, provider, recorder, costs, rows, fake, number)
     finally:
         await boxes.destroy_all()
         if github is not None:

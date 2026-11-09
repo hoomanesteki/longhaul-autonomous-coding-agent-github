@@ -17,6 +17,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx2
@@ -26,7 +27,17 @@ from temporalio.client import Client, WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
 from tests.integration import test_run_report as report_tests
 from tests.integration import test_task_workflow as workflow_tests
+from tests.integration.test_pause_flow import (
+    FINISH,
+    light,
+    loop_then_finish,
+    paused,
+    turn,
+    write_script,
+)
+from tests.integration.test_pause_flow import REPO as ISSUE_REPO
 from tests.integration.test_run_report import REPO, TASK, a_plan, at
+from tests.integration.test_task_row import gated, planned_and_asking, row_in
 from tests.integration.test_task_workflow import (
     SHORT_HEARTBEAT,
     Stubs,
@@ -59,6 +70,7 @@ from longhaul.contracts import (
 from longhaul.db.models import Event, PlanRow, RepoSetting, Task, ToolCallRow
 from longhaul.db.records import SqlRecorder, TurnRecord
 from longhaul.db.session import make_engine
+from longhaul.db.tasks import MemoryTaskStore, SqlTaskStore, TaskState
 from longhaul.durable import acts
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
@@ -333,6 +345,200 @@ async def test_task_detail_without_temporal_or_row(api: Stack) -> None:
     assert missing.status_code == 404
 
 
+# ---------- the list and the detail agree (LH-891) ----------
+class MirroredStore(MemoryTaskStore):
+    """The task store of a test worker, with every write also going to the scratch database."""
+
+    def __init__(self, sql: SqlTaskStore) -> None:
+        super().__init__()
+        self._sql = sql
+
+    async def record_state(self, state: TaskState) -> None:
+        await super().record_state(state)
+        await self._sql.record_state(state)
+
+
+def needs_you(task: dict[str, Any]) -> bool:
+    """What the console's Needs you filter asks of a row (console/src/util/tasks.ts)."""
+    return bool(task["phase"] in ("paused", "awaiting_plan_approval"))
+
+
+async def test_the_list_says_what_the_detail_page_says_for_each_task(
+    env: WorkflowEnvironment, sessions: Sessions, tmp_path: Path
+) -> None:
+    """The list reads the row, and the workflow keeps the row current, so the two cannot differ.
+
+    Three tasks run on real workflows: one paused for a hint, one waiting for an approval of its
+    plan, one finished. Before the workflow wrote the row, the list showed all three as queued
+    with no turns and no cost, and the Needs you filter was empty.
+    """
+    sql = SqlTaskStore(sessions)
+    pausing = write_script(tmp_path, loop_then_finish(3))
+    planning = write_script(tmp_path, planned_and_asking())
+    shipping = write_script(tmp_path, [turn("coder", 0, FINISH)])
+    async with (
+        light(env, pausing, tasks=MirroredStore(sql)) as a,
+        light(env, planning, tasks=MirroredStore(sql)) as b,
+        light(env, shipping, tasks=MirroredStore(sql)) as c,
+        serving(sessions, env.client) as api,
+    ):
+        spec_b = gated(b.spec())
+        waiting = await start_task(env.client, a.spec(), task_queue=a.queue)
+        approving = await start_task(env.client, spec_b, task_queue=b.queue, plan=True)
+        shipped = await start_task(env.client, c.spec(), task_queue=c.queue)
+        await paused(a, waiting)
+        await row_in(a, waiting.id, "paused")
+        await row_in(b, spec_b.task_id, "awaiting_plan_approval")
+        await result_of(shipped)
+
+        listed = {t["id"]: t for t in (await api.get("/api/tasks")).json()["items"]}
+        details = {task_id: (await api.get(f"/api/tasks/{task_id}")).json() for task_id in listed}
+        await waiting.signal(TaskWorkflow.cancel, args=["maintainer", "done looking"])
+        await approving.signal(TaskWorkflow.cancel, args=["maintainer", "done looking"])
+        await result_of(waiting)
+        await result_of(approving)
+
+    assert set(listed) == {waiting.id, spec_b.task_id, shipped.id}
+    for task_id, row in listed.items():
+        detail = details[task_id]
+        # The row of the list is the row of the detail page, whole.
+        assert {key: detail["task"][key] for key in row} == row
+        # And it is what the workflow itself reports, not what the poller wrote at pickup.
+        assert row["phase"] == detail["live"]["phase"]
+        assert row["turns"] == detail["live"]["turn_index"]
+        # The column keeps ten thousandths of a dollar.
+        assert row["cost_usd"] == pytest.approx(detail["live"]["cost_usd"], abs=1e-4)
+
+    assert (listed[waiting.id]["phase"], listed[waiting.id]["status"]) == ("paused", "active")
+    assert listed[waiting.id]["turns"] == 3
+    assert (listed[spec_b.task_id]["phase"], listed[spec_b.task_id]["turns"]) == (
+        "awaiting_plan_approval",
+        1,
+    )
+    done = listed[shipped.id]
+    assert (done["status"], done["phase"], done["outcome"]) == ("done", "done", "pr_opened")
+    assert done["turns"] == 1 and done["ended_at"] is not None
+    assert details[shipped.id]["live"]["outcome"]["kind"] == done["outcome"]
+    assert {t for t, row in listed.items() if needs_you(row)} == {waiting.id, spec_b.task_id}
+
+
+# ---------- the plan as the detail page shows it (LH-891) ----------
+async def seed_plan(
+    sessions: Sessions,
+    *,
+    phase: str,
+    row_status: str = "proposed",
+    versions: int = 1,
+    **fields: Any,
+) -> None:
+    await add_task(sessions, TASK, phase=phase)
+    async with sessions.begin() as session:
+        for version in range(1, versions + 1):
+            last = version == versions
+            session.add(
+                PlanRow(
+                    task_id=TASK,
+                    version=version,
+                    plan=a_plan().model_dump(),
+                    status=row_status if last else "rejected",
+                    decided_by=fields.get("decided_by") if last else "alice",
+                    decided_at=at(5) if last and fields.get("decided_by") else None,
+                )
+            )
+
+
+def steps_of(detail: dict[str, Any]) -> dict[str, str]:
+    return {step["id"]: step["status"] for step in detail["plan"]["plan"]["steps"]}
+
+
+async def test_the_plan_shows_the_steps_as_the_updates_left_them(api: Stack) -> None:
+    await seed_plan(api.sessions, phase="coding")
+    await add_event(api.sessions, 10, "step_updated", step_id="s1", status="doing")
+    await add_event(api.sessions, 20, "step_updated", step_id="s1", status="done")
+    await add_event(api.sessions, 30, "step_updated", step_id="s2", status="doing")
+    # Things the update log can hold that the view must not trip on.
+    await add_event(api.sessions, 31, "step_updated", step_id="s9", status="done")
+    await add_event(api.sessions, 32, "step_updated", step_id="s3", status="finished")
+    await add_event(api.sessions, 33, "step_updated", status="done")
+    await add_event(api.sessions, 34, "hint", step_id="s3", status="done")
+    await add_task(api.sessions, "lh-acme-other-1")
+    async with api.sessions.begin() as session:
+        session.add(
+            Event(
+                task_id="lh-acme-other-1",
+                ts=at(35),
+                type="step_updated",
+                payload={"step_id": "s3", "status": "done"},
+            )
+        )
+
+    detail = (await api.get(f"/api/tasks/{TASK}")).json()
+
+    assert steps_of(detail) == {"s1": "done", "s2": "doing", "s3": "todo"}
+
+
+async def test_the_last_update_of_a_step_wins_even_when_it_was_written_first(api: Stack) -> None:
+    # Two updates in the same second are told apart by the order they were recorded in.
+    await seed_plan(api.sessions, phase="coding")
+    await add_event(api.sessions, 10, "step_updated", step_id="s1", status="doing")
+    await add_event(api.sessions, 10, "step_updated", step_id="s1", status="done")
+
+    detail = (await api.get(f"/api/tasks/{TASK}")).json()
+
+    assert steps_of(detail)["s1"] == "done"
+
+
+@pytest.mark.parametrize(
+    ("phase", "updates", "status"),
+    [
+        # The plan waits for a person, or for the planner to finish with it.
+        ("awaiting_plan_approval", False, "proposed"),
+        ("planning", False, "proposed"),
+        # A plan that was never decided on and never used.
+        ("failed", False, "proposed"),
+        ("cancelled", False, "proposed"),
+        # The coder works from it, so it is in force. A repo that asks for no decision approves
+        # its plans by not asking.
+        ("coding", False, "approved"),
+        ("paused", False, "approved"),
+        ("verifying", False, "approved"),
+        ("done", False, "approved"),
+        ("failed", True, "approved"),
+    ],
+)
+async def test_a_plan_that_nobody_decided_on_is_approved_once_the_task_works_from_it(
+    api: Stack, phase: str, updates: bool, status: str
+) -> None:
+    await seed_plan(api.sessions, phase=phase)
+    if updates:
+        await add_event(api.sessions, 10, "step_updated", step_id="s1", status="done")
+
+    detail = (await api.get(f"/api/tasks/{TASK}")).json()
+
+    assert detail["plan"]["status"] == status
+    # Nobody decided, so nobody is named.
+    assert detail["plan"]["decided_by"] is None and detail["plan"]["decided_at"] is None
+
+
+@pytest.mark.parametrize("row_status", ["approved", "rejected", "superseded"])
+async def test_a_decision_on_the_plan_is_shown_as_it_was_made(api: Stack, row_status: str) -> None:
+    await seed_plan(api.sessions, phase="coding", row_status=row_status, decided_by="alice")
+
+    detail = (await api.get(f"/api/tasks/{TASK}")).json()
+
+    assert detail["plan"]["status"] == row_status
+    assert detail["plan"]["decided_by"] == "alice"
+
+
+async def test_the_plan_of_the_newest_version_is_the_one_that_is_shown(api: Stack) -> None:
+    await seed_plan(api.sessions, phase="coding", versions=2, row_status="proposed")
+
+    detail = (await api.get(f"/api/tasks/{TASK}")).json()
+
+    assert detail["plan"]["version"] == 2
+    assert detail["plan"]["status"] == "approved"
+
+
 # ---------- GET /api/tasks/{id}/timeline ----------
 def label(item: dict[str, Any]) -> str:
     kind = item["kind"]
@@ -601,8 +807,6 @@ async def test_actions_signal(env: WorkflowEnvironment, sessions: Sessions) -> N
         await wait_for_phase(handle, Phase.PREPARING)
         base = f"/api/tasks/{spec.task_id}"
 
-        approved = await api.post(f"{base}/approve-plan")
-        rejected = await api.post(f"{base}/reject-plan", {"feedback": "split step 2"})
         budget = await api.post(f"{base}/budget", {"usd": 2.5, "turns": 10})
         hinted = await api.post(f"{base}/hint", {"text": HINT})
         stubs.release(acts.PREPARE_WORKSPACE.name)
@@ -612,13 +816,10 @@ async def test_actions_signal(env: WorkflowEnvironment, sessions: Sessions) -> N
 
         signals = await signals_of(handle)
 
-    assert approved.status_code == rejected.status_code == budget.status_code == 200
-    assert hinted.status_code == 200
-    assert approved.json() == {"task_id": spec.task_id, "signal": "approve_plan", "by": "console"}
+    assert budget.status_code == hinted.status_code == 200
+    assert budget.json() == {"task_id": spec.task_id, "signal": "add_budget", "by": "console"}
     assert hinted.json()["signal"] == "hint"
     assert signals == [
-        ("approve_plan", ["console"]),
-        ("reject_plan", ["console", "split step 2"]),
         ("add_budget", ["console", 2.5, 10]),
         ("hint", ["console", HINT]),
     ]
@@ -628,6 +829,70 @@ async def test_actions_signal(env: WorkflowEnvironment, sessions: Sessions) -> N
     # A task that has ended and a task that never existed are told apart from a server error.
     assert after_the_end.status_code == 409
     assert unknown.status_code == 404
+
+
+# ---------- the plan decisions (LH-891) ----------
+async def test_a_plan_decision_is_refused_while_the_task_does_not_wait_for_one(
+    env: WorkflowEnvironment, sessions: Sessions
+) -> None:
+    """The workflow ignores a decision it is not waiting for, and the issue must not say it took it.
+
+    The API answers 409 and sends no signal, so nothing reaches the workflow and nothing is
+    mirrored to the issue. Doing it here and not in the workflow keeps every recorded history
+    replaying as it did.
+    """
+    spec = make_spec(f"lh-acme-calc-{uuid.uuid4().hex[:8]}", issue=42)
+    stubs = Stubs()
+    stubs.hold(acts.PREPARE_WORKSPACE.name)
+    async with running(env, stubs) as queue, serving(sessions, env.client) as api:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await wait_for_phase(handle, Phase.PREPARING)
+        base = f"/api/tasks/{spec.task_id}"
+
+        approved = await api.post(f"{base}/approve-plan")
+        rejected = await api.post(f"{base}/reject-plan", {"feedback": "split step 2"})
+        signals = await signals_of(handle)
+        stubs.release(acts.PREPARE_WORKSPACE.name)
+        await result_of(handle)
+        late = await api.post(f"{base}/approve-plan")
+
+    assert approved.status_code == rejected.status_code == late.status_code == 409
+    assert "preparing" in approved.json()["detail"]
+    assert "done" in late.json()["detail"]
+    assert signals == []
+    assert console_posts(stubs) == []
+
+
+async def test_plan_decisions_reach_a_task_that_waits_for_one_and_a_late_one_is_refused(
+    env: WorkflowEnvironment, sessions: Sessions, tmp_path: Path
+) -> None:
+    async with light(env, write_script(tmp_path, planned_and_asking()), tmp_path=tmp_path) as world:
+        assert world.fake is not None and world.number is not None
+        spec = gated(world.spec())
+        async with serving(sessions, env.client) as api:
+            handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
+            await row_in(world, spec.task_id, "awaiting_plan_approval")
+            base = f"/api/tasks/{spec.task_id}"
+
+            approved = await api.post(f"{base}/approve-plan")
+            await paused(world, handle)
+            late = await api.post(f"{base}/reject-plan", {"feedback": "too late"})
+            await handle.signal(TaskWorkflow.cancel, args=["maintainer", "enough"])
+            await result_of(handle)
+            signals = await signals_of(handle)
+
+        mirrored = world.fake.count_comments(
+            ISSUE_REPO, world.number, containing="Plan approved from console"
+        )
+        refused = world.fake.count_comments(
+            ISSUE_REPO, world.number, containing="Plan rejected from console"
+        )
+
+    assert approved.status_code == 200
+    assert approved.json() == {"task_id": spec.task_id, "signal": "approve_plan", "by": "console"}
+    assert late.status_code == 409 and "paused" in late.json()["detail"]
+    assert [name for name, _ in signals] == ["approve_plan", "cancel"]
+    assert (mirrored, refused) == (1, 0)
 
 
 def console_posts(stubs: Stubs) -> list[CommentInput]:
@@ -667,19 +932,17 @@ async def test_console_actions_are_mirrored_one_comment_each(
         await wait_for_phase(handle, Phase.PREPARING)
         base = f"/api/tasks/{spec.task_id}"
 
-        await api.post(f"{base}/approve-plan")
-        await api.post(f"{base}/reject-plan", {"feedback": "split step 2"})
+        await api.post(f"{base}/hint", {"text": HINT})
         await api.post(f"{base}/budget", {"usd": 2.5, "turns": 10})
-        await wait_until(lambda: len(console_posts(stubs)) == 3, "three mirror comments")
+        await wait_until(lambda: len(console_posts(stubs)) == 2, "two mirror comments")
         stubs.release(acts.PREPARE_WORKSPACE.name)
         await result_of(handle)
 
     posts = sorted(console_posts(stubs), key=lambda c: c.idempotency_key)
-    assert [c.idempotency_key for c in posts] == [f"{spec.task_id}:console:{n}" for n in (1, 2, 3)]
+    assert [c.idempotency_key for c in posts] == [f"{spec.task_id}:console:{n}" for n in (1, 2)]
     assert sorted(c.body.split(":")[0].rstrip(".") for c in posts) == [
         "Budget added from console",
-        "Plan approved from console",
-        "Plan rejected from console",
+        "Hint from console",
     ]
     budget = next(c for c in posts if c.body.startswith("Budget"))
     assert "$2.50" in budget.body and "10 turns" in budget.body

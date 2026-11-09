@@ -191,3 +191,60 @@ def test_a_wrong_method_on_a_real_api_address_is_still_a_405(console: Path) -> N
     client = TestClient(create_app(console_dir=console))
 
     assert client.post("/api/repos").status_code == 405
+
+
+# ---------- the interactive docs (LH-891) ----------
+DOCS_PATHS = ["/docs", "/redoc", "/openapi.json"]
+
+
+@pytest.mark.parametrize("path", DOCS_PATHS)
+def test_the_interactive_docs_are_off_by_default(path: str) -> None:
+    # /docs loads Swagger UI from a CDN, on the origin where the console keeps its token, and
+    # none of the three routes asks for the token.
+    assert TestClient(create_app()).get(path).status_code == 404
+
+
+@pytest.mark.parametrize("path", DOCS_PATHS)
+def test_the_docs_stay_off_for_an_app_built_on_a_context(path: str) -> None:
+    context = ApiContext(
+        sessions=async_sessionmaker[AsyncSession](),
+        blobs=MemoryBlobStore(),
+        memory=PgMemoryStore(async_sessionmaker[AsyncSession](), HashEmbedder()),
+        temporal=unreachable,
+        admin_token="t",
+    )
+
+    assert TestClient(create_app(context)).get(path).status_code == 404
+
+
+@pytest.mark.parametrize("path", DOCS_PATHS)
+def test_a_setting_turns_the_docs_on_for_local_development(
+    path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LONGHAUL_API_DOCS", "true")
+    get_settings.cache_clear()
+    try:
+        response = TestClient(create_app()).get(path)
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 200
+
+
+def test_the_docs_setting_is_off_by_default() -> None:
+    assert EnvSettings.model_fields["api_docs"].default is False
+
+
+def test_the_schema_dump_works_with_the_routes_off() -> None:
+    # `make api-types` calls openapi_schema(), which does not go through the /openapi.json route.
+    schema = openapi_schema()
+
+    assert schema["info"]["title"]
+    assert "/api/tasks" in schema["paths"]
+
+
+def test_with_the_docs_off_the_console_is_served_in_their_place(console: Path) -> None:
+    # The console answers any address that is not the API, so /docs is its page and not Swagger.
+    response = TestClient(create_app(console_dir=console)).get("/docs")
+
+    assert response.text == INDEX

@@ -162,11 +162,17 @@ def task_worker(env: WorkflowEnvironment, queue: str, stubs: Stubs | None = None
 
 
 def scheduled(history: WorkflowHistory) -> list[str]:
-    """The type of every activity that the history says was scheduled, in order."""
+    """The type of every activity that the history says was scheduled, in order.
+
+    The writes of the task row (LH-891) are left out: they are bookkeeping that the console reads,
+    and these tests are about the activities that carry the work of the task.
+    """
     return [
         e.activity_task_scheduled_event_attributes.activity_type.name
         for e in history.events
         if e.HasField("activity_task_scheduled_event_attributes")
+        and e.activity_task_scheduled_event_attributes.activity_type.name
+        != acts.RECORD_TASK_STATE.name
     ]
 
 

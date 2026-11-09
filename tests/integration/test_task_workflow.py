@@ -27,6 +27,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -64,6 +65,7 @@ from longhaul.durable.workflows.task import (
     LOAD_MEMORY_PATCH,
     MIRROR_PATCH,
     OUTCOME_PATCH,
+    ROW_PATCH,
     TaskWorkflow,
 )
 from longhaul.github import lifecycle
@@ -71,6 +73,7 @@ from longhaul.github.inputs import CommentInput, LabelInput
 
 pytestmark = [pytest.mark.integration, pytest.mark.phase2]
 
+ROOT = Path(__file__).resolve().parents[2]
 BASE = "b" * 40
 WAIT_S = 30.0
 # A cancel reaches a running activity at its next heartbeat, and the SDK sends one at most
@@ -135,6 +138,10 @@ class Stubs:
     of prepare_workspace, such as `memory_enabled=True`, which is what makes the workflow call
     it.
 
+    The writes of the task row (LH-891, acts.RECORD_TASK_STATE) go in `states` and nowhere else:
+    they do not wait at a gate and are not in `log` or `every`, so the exact lists of the tests
+    below stay what they were.
+
     extract_lessons (LH-605) is kept apart in the same way: each call is in `lessons`, with the
     names of the activities that had run before it, and the `lessons` event that follows goes in
     `lesson_events`. `lessons_output` is what the stub answers.
@@ -173,6 +180,7 @@ class Stubs:
         self.overflow: dict[int, int] = {}
         self.compaction: Callable[[acts.CompactInput], acts.CompactOutput] = compacted
         self.outcomes: list[tuple[str, acts.RecordEventInput]] = []
+        self.states: list[acts.RecordTaskStateInput] = []
         self.wound_up: list[acts.CleanupInput] = []
         self.finals: list[acts.PostFinalInput] = []
         self.errors: list[acts.RecordEventInput] = []
@@ -204,6 +212,7 @@ class Stubs:
             self.cleanup,
             self.bundle_checkpoint,
             self.record_event,
+            self.record_task_state,
             self.compact,
             self.summarize_for_human,
             self.post_comment,
@@ -365,6 +374,12 @@ class Stubs:
         await self._enter(acts.RECORD_EVENT.name, inp)
         if acts.RECORD_EVENT.name in self.fails:
             raise self.fails[acts.RECORD_EVENT.name]
+
+    @activity.defn(name=acts.RECORD_TASK_STATE.name)
+    async def record_task_state(self, inp: acts.RecordTaskStateInput) -> None:
+        self.states.append(inp)
+        if acts.RECORD_TASK_STATE.name in self.fails:
+            raise self.fails[acts.RECORD_TASK_STATE.name]
 
     @activity.defn(name=acts.COMPACT.name)
     async def compact(self, inp: acts.CompactInput) -> acts.CompactOutput:
@@ -1114,6 +1129,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "tool_exec": (660, 15),
         "append_results": (2 * 60, None),
         "cleanup": (2 * 60, None),  # the end of every task (LH-507)
+        "record_task_state": (2 * 60, None),  # the row of the task (LH-891)
     }
     attempts = {
         name: attributes.retry_policy.maximum_attempts for name, attributes in sched.items()
@@ -1124,6 +1140,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "tool_exec": 3,
         "append_results": 3,
         "cleanup": 3,
+        "record_task_state": 3,
     }
     llm = sched["llm_turn"].retry_policy
     assert llm.initial_interval.ToTimedelta() == timedelta(seconds=2)
@@ -1163,6 +1180,7 @@ async def test_tuning_shortens_the_heartbeat_timeouts_of_one_run(
         "tool_exec": (660, 2),
         "append_results": (2 * 60, None),
         "cleanup": (2 * 60, None),
+        "record_task_state": (2 * 60, None),
     }
 
 
@@ -1922,6 +1940,104 @@ async def test_recorded_histories_replay(env: WorkflowEnvironment) -> None:
     )
     for history in histories:
         await replayer.replay_workflow(history)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "console_signals_before_mirror",
+        "console_gate_before_mirror",
+        "planned_pause_before_task_row",
+    ],
+)
+async def test_histories_from_before_the_console_line_replay(name: str) -> None:
+    """A run that began before a later patch keeps the behaviour it recorded (F13).
+
+    The first two were recorded with the workflow of dev at v0.7.0, before LH-805. In them the
+    console signals a hint, a budget, an approval and a rejection, and nothing is posted after
+    them, so the history has no marker for MIRROR_PATCH and the new code must not post. The last
+    was recorded before LH-891: a planned task that waits for an approval, pauses, takes a hint
+    and finishes, with no write of the task row. Its replay has to make the same commands, with
+    no record_task_state among them.
+    """
+    path = ROOT / "tests" / "fixtures" / "histories" / f"{name}.json"
+    history = WorkflowHistory.from_json(f"replay-{name}", path.read_text(encoding="utf-8"))
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)
+
+
+def activity_types(history: WorkflowHistory) -> set[str]:
+    return {
+        e.activity_task_scheduled_event_attributes.activity_type.name
+        for e in history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+    }
+
+
+def test_the_recorded_old_histories_do_not_know_the_new_activity() -> None:
+    for name in ("console_signals_before_mirror", "planned_pause_before_task_row"):
+        path = ROOT / "tests" / "fixtures" / "histories" / f"{name}.json"
+        history = WorkflowHistory.from_json(f"read-{name}", path.read_text(encoding="utf-8"))
+        assert acts.RECORD_TASK_STATE.name not in activity_types(history)
+
+
+async def test_a_new_run_asks_for_the_row_write_behind_the_patch(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert acts.RECORD_TASK_STATE.name in activity_types(history)
+    patches = [
+        e.marker_recorded_event_attributes
+        for e in history.events
+        if e.HasField("marker_recorded_event_attributes")
+        and e.marker_recorded_event_attributes.marker_name == "core_patch"
+    ]
+    ids = {
+        payload.data.decode()
+        for marker in patches
+        for payloads in marker.details.values()
+        for payload in payloads.payloads
+    }
+    assert any(ROW_PATCH in text for text in ids)
+
+
+async def test_the_last_write_of_a_delivered_task_names_the_pull_request(
+    env: WorkflowEnvironment, gh_spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    outcome, _ = await play(env, stubs, gh_spec)
+
+    assert outcome.pr_url == PR_URL
+    phases = [s.phase for s in stubs.states]
+    assert Phase.DELIVERING in phases
+    last = stubs.states[-1]
+    assert (last.phase, last.outcome, last.pr_url) == (Phase.DONE, OutcomeKind.PR_OPENED, PR_URL)
+    assert last.ended_at is not None
+    assert [s.ended_at for s in stubs.states if s.phase is not Phase.DONE] == [None] * (
+        len(stubs.states) - 1
+    )
+
+
+async def test_a_write_of_the_row_that_fails_for_good_leaves_the_outcome_alone(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    stubs = Stubs()
+    stubs.fails[acts.RECORD_TASK_STATE.name] = ApplicationError(
+        "database is down", type="OperationalError"
+    )
+    outcome, _ = await play(env, stubs, spec)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert len(stubs.states) >= acts.RECORD_TASK_STATE.retry.maximum_attempts
 
 
 # ---------- context: the compact activity and the retry after an overflow (LH-404) ----------

@@ -132,6 +132,19 @@ def log(message: str) -> None:
     print(f"seed_demo: {message}", file=sys.stderr, flush=True)
 
 
+def ready_message(demo: Demo) -> str:
+    """The line that says where the console is and how to sign in.
+
+    The token is printed only when it is the demo default, which protects nothing. A token from
+    LONGHAUL_ADMIN_TOKEN is a real one, and this line reaches the terminal and the log that
+    Playwright keeps, so it only says where the token comes from.
+    """
+    where = f"http://127.0.0.1:{demo.port}"
+    if demo.token == DEFAULT_TOKEN:
+        return f"ready: {where} with the token {demo.token}"
+    return f"ready: {where} with the token from LONGHAUL_ADMIN_TOKEN"
+
+
 def load_fixture_builder() -> Any:
     spec = importlib.util.spec_from_file_location(
         "make_fixture_git", ROOT / "scripts" / "make_fixture_git.py"
@@ -533,7 +546,7 @@ async def serve(demo: Demo) -> int:
     await demo.seed_tasks()
     await demo.seed_lessons()
     await demo.start_api(env)
-    log(f"ready: http://127.0.0.1:{demo.port} with the token {demo.token}")
+    log(ready_message(demo))
     log("press ctrl-c to stop and remove everything this run made")
     await asyncio.Event().wait()  # until a signal cancels the task
     return 0

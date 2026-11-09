@@ -71,6 +71,10 @@ What it is built from, and why each piece is what it is:
   through the same ledger as the other writes. Every worker registers `clean_repos`, the janitor
   that PollerWorkflow runs after each poll: it removes the bare repos under LONGHAUL_CKPT_DIR of
   tasks that ended more than seven days ago. A worker sweeps the repos on its own disk.
+* The row of each task in `tasks` is kept current by `record_task_state` (LH-891), which every
+  worker registers. The poller writes the row at pickup, and the workflow updates it at every phase
+  change, every few turns and at the end, so the console lists tasks as they are. A task started
+  with `longhaul run` gets its row from the first write.
 * The run report (LH-705) is `write_run_report`, which every worker registers: it reads the tables
   and writes one blob. `deliver` makes the same report for the body of the pull request, so the
   templates folder must hold run_report.md.j2 as well.
@@ -164,6 +168,7 @@ from longhaul.durable.activities.plan import (
 )
 from longhaul.durable.activities.report import ReportActivities, RunReports, sql_reader
 from longhaul.durable.activities.support import Meters
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.activities.tools import ToolActivities
 from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.activity_log import ActivityLogInterceptor
@@ -424,6 +429,7 @@ def build_parts(
     notes = MemoryActivities(prompt_memory, blobs)
     lessons = LessonActivities(prompt_memory, recorder, provider, blobs, config_for, ledger=ledger)
     events = EventActivities(recorder)
+    task_rows = TaskRowActivities(SqlTaskStore(sessions))
     plans = PlanActivities(recorder)
     steps = StepActivities(recorder)
     janitor = JanitorActivities(store, recorder)
@@ -473,6 +479,7 @@ def build_parts(
             *notes.activities,
             *lessons.activities,
             *events.activities,
+            *task_rows.activities,
             *plans.activities,
             *steps.activities,
             *janitor.activities,

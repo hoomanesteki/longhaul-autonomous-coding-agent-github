@@ -100,6 +100,10 @@ class EnvSettings(BaseSettings):
     # The built console (console/dist) that the API serves at `/` (LH-802). Empty means the API
     # serves the API only, as it does next to the Vite dev server.
     console_dir: str = ""
+    # The interactive docs of the API at /docs, /redoc and /openapi.json (LH-891). Off by default:
+    # none of the three asks for the token, and /docs loads Swagger UI from a CDN on the origin
+    # where the console keeps the token. For local development only.
+    api_docs: bool = False
 
 
 # longhaul/settings.py -> longhaul -> src -> the checkout.

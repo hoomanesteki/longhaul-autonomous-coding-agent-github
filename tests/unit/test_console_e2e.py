@@ -385,7 +385,8 @@ async def test_the_compactor_writes_the_question_of_the_stuck_task(
 # ---------- the make target and the CI job ----------
 def test_make_has_a_target_that_builds_the_console_and_runs_the_spec() -> None:
     makefile = MAKEFILE.read_text(encoding="utf-8")
-    recipe = re.search(r"^console-e2e:\n((?:\t.+\n)+)", makefile, re.M)
+    # The target may name prerequisites (the sandbox image), so the recipe starts after the line.
+    recipe = re.search(r"^console-e2e:[^\n]*\n((?:\t.+\n)+)", makefile, re.M)
     assert recipe, "the Makefile has no console-e2e target"
     assert "npm --prefix console run build" in recipe.group(1)
     assert "npm --prefix console run e2e" in recipe.group(1)

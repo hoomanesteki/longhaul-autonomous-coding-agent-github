@@ -342,11 +342,17 @@ async def result_of(handle: WorkflowHandle[Any, Outcome], wait_s: float = WAIT_S
 
 
 def scheduled(history: WorkflowHistory) -> list[str]:
-    """The names of the activities the workflow scheduled, in order."""
+    """The names of the activities the workflow scheduled, in order.
+
+    The writes of the task row (LH-891) are left out: they are bookkeeping that the console reads,
+    they come at every change of phase, and these tests are about the work of the task.
+    """
     return [
         event.activity_task_scheduled_event_attributes.activity_type.name
         for event in history.events
         if event.HasField("activity_task_scheduled_event_attributes")
+        and event.activity_task_scheduled_event_attributes.activity_type.name
+        != acts.RECORD_TASK_STATE.name
     ]
 
 

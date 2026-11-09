@@ -18,6 +18,11 @@ Everything under `/api` needs the bearer token (LH-807), and so does `/metrics` 
 listens on this machine. `/healthz` and the console's own files are open: the login page has to
 load before there is a token to send, and a probe has none.
 
+The interactive docs (`/docs`, `/redoc` and `/openapi.json`) are off. They need no token, and
+`/docs` loads Swagger UI from a CDN on the origin where the console keeps its token, so a page
+that the CDN changed could read it. `LONGHAUL_API_DOCS=true` turns them on for local development.
+`make api-types` does not need the routes: it builds the schema with `openapi_schema()`.
+
 Operation ids are the names of the route functions, so the generated client (LH-802) has
 `listTasks` and `approvePlan` and not `list_tasks_api_tasks_get`.
 """
@@ -70,6 +75,7 @@ def create_app(
     console_dir: Path | None = None,
     *,
     with_console: bool = True,
+    docs: bool | None = None,
 ) -> FastAPI:
     """Build the app. `console_dir` is the built console to serve at `/`.
 
@@ -77,13 +83,20 @@ def create_app(
     a context also give the folder or none. `with_console=False` serves no console and reads no
     setting for one, which is what `openapi_schema()` uses: the dump must work on a clone that
     has no build yet. The file routes are left out of the schema in any case.
+
+    `docs` turns the interactive docs on. None means LONGHAUL_API_DOCS for a deployment, and off
+    for an app built on a context, which reads no settings.
     """
+    show_docs = docs if docs is not None else context is None and get_settings().api_docs
     app = FastAPI(
         title=TITLE,
         description=DESCRIPTION,
         version="1.0.0",
         generate_unique_id_function=operation_id,
         lifespan=from_settings if context is None else None,
+        docs_url="/docs" if show_docs else None,
+        redoc_url="/redoc" if show_docs else None,
+        openapi_url="/openapi.json" if show_docs else None,
     )
     if context is not None:
         app.state.context = context
@@ -154,7 +167,7 @@ def add_system_routes(app: FastAPI) -> None:
 
 def openapi_schema() -> dict[str, Any]:
     """The OpenAPI schema of the app. It needs no database, no blob store and no Temporal."""
-    return create_app(with_console=False).openapi()
+    return create_app(with_console=False, docs=False).openapi()
 
 
 def render_openapi() -> str:

@@ -2095,7 +2095,7 @@
     },
     "/api/tasks/{task_id}/approve-plan": {
       "post": {
-        "description": "Approve the plan the task is waiting on.",
+        "description": "Approve the plan the task is waiting on. 409 when it is not waiting for one.",
         "operationId": "approve_plan",
         "parameters": [
           {
@@ -2324,7 +2324,7 @@
     },
     "/api/tasks/{task_id}/reject-plan": {
       "post": {
-        "description": "Reject the plan with feedback. The planner writes a new version.",
+        "description": "Reject the plan with feedback. The planner writes a new version. 409 as for approval.",
         "operationId": "reject_plan",
         "parameters": [
           {

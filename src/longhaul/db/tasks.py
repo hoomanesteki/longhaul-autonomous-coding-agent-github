@@ -5,13 +5,23 @@ without Postgres. `SqlTaskStore` writes the tables and `MemoryTaskStore` keeps t
 memory, like `Recorder` and `MemoryRecorder` in db/records.py. tests/integration/test_poller.py
 runs the poller on the SQL store.
 
-What the poller writes to `tasks`, and why it is only this:
+Who writes `tasks`, and what.
 
-* One row when a task is picked up, with the repo, the issue, the title, the settings the task
-  runs with, the status `active` and the phase `queued`. The workflow starts in that phase.
-* Nothing after that. The status and the phase follow the task through later stories (the
-  outcome, the cost, the PR url). A row that exists is never put back to `queued`: a poll that
-  meets a row again updates only the title and the settings, which come from the issue.
+* The poller writes one row when it picks a task up, with the repo, the issue, the title, the
+  settings the task runs with, the status `active` and the phase `queued`. The workflow starts in
+  that phase. After that the poller touches only the title and the settings, which come from the
+  issue, and the comment cursor below. A row that exists is never put back to `queued`.
+* The workflow keeps the rest current through the `record_task_state` activity (LH-891,
+  `record_state` here): the phase at every change, the turns and the cost every few turns, and at
+  the end the status, the outcome, the pull request URL and `ended_at`. The console lists tasks
+  from this row, so a row that nobody updated showed every task as queued with no turns. The
+  write is an upsert, so a task started with `longhaul run`, which has no poller and no row,
+  gets one with its first write. It never changes the title, the settings, the started time or
+  the cursor, which belong to the poller (or, for a local run, were set by that first write).
+* The cost ledger writes `cost_usd` and the token totals as the sum of its rows, and the
+  recorder writes `compactions` and `max_fraction`. The workflow's cost figure only ever raises
+  the stored one, so it fills a local run's row until the ledger catches up and never undoes the
+  ledger's exact sum.
 
 The poller starts the workflow first and writes the row after it. The other order would lose a
 task when the poller dies in between: the row would say the task is known, the next poll would
@@ -25,7 +35,9 @@ id is what decides, because GitHub stamps a comment to the second and an id only
 moves forward only (`advance_comments`), and moves after the signal of a command was sent, so a
 poll that dies in between sends the command again and a poll that is retried never sends one twice.
 A row that was written before the columns existed has no cursor, and its comments are read from
-the time the task started.
+the time the task started. The same holds for a row that the workflow wrote before the poller
+did: the poller starts the workflow first, so the workflow's first write can come first. A
+pickup that meets such a row fills in the empty cursor, and never moves one that is set.
 
 An issue can have more than one task. `/longhaul retry` starts the next attempt after the first
 has ended, with the id `<task id>-a2`, `-a3` and so on (github/intake.py). `latest_attempts` finds
@@ -42,7 +54,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, Self
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -57,11 +69,59 @@ __all__ = [
     "MemoryTaskStore",
     "SqlTaskStore",
     "TaskRow",
+    "TaskState",
     "TaskStore",
+    "status_for",
 ]
 
-# The status of a task that the poller has started. Later stories write the ones that follow.
+# The status of a task that is running. The poller writes it at pickup.
 ACTIVE = "active"
+# The statuses of a task that has ended, by how it ended (the console's filter lists them).
+DONE = "done"
+FAILED = "failed"
+CANCELLED = "cancelled"
+
+
+def status_for(phase: str, *, ended: bool) -> str:
+    """The status of a row from the phase of the task and whether it has ended.
+
+    A task that ended in a phase other than done or cancelled is a failure, also when the phase
+    is one it can wait in (stuck while paused, a review that gave up while verifying): the
+    phase says where it stopped and the status says that it is over.
+    """
+    if not ended:
+        return ACTIVE
+    if phase == Phase.DONE.value:
+        return DONE
+    if phase == Phase.CANCELLED.value:
+        return CANCELLED
+    return FAILED
+
+
+@dataclass(frozen=True)
+class TaskState:
+    """What the workflow knows of a task, as the row should say it (LH-891).
+
+    `settings` is only used when the row has to be created. `outcome` is an OutcomeKind value and
+    `ended_at` is set once, when the task ends. A write that leaves them empty keeps what the row
+    has, so a late or repeated write cannot take an outcome away.
+    """
+
+    task_id: str
+    repo: str
+    issue_number: int | None
+    title: str
+    settings: dict[str, Any]
+    phase: str
+    turns: int
+    cost_usd: float
+    outcome: str | None = None
+    pr_url: str | None = None
+    ended_at: datetime | None = None
+
+    @property
+    def status(self) -> str:
+        return status_for(self.phase, ended=self.ended_at is not None)
 
 
 @dataclass(frozen=True)
@@ -88,7 +148,17 @@ class TaskStore(Protocol):
         """Write the row of a task that has started, or update the title and settings of it.
 
         `cursor` is where the comments of the task begin. It is stored with a new row and
-        ignored for a row that exists, so a poll that meets a task again cannot move it.
+        filled in for a row that exists only when that row has none, so a poll that meets a task
+        again cannot move it.
+        """
+        ...
+
+    async def record_state(self, state: TaskState) -> None:
+        """Bring the row of a task up to date, or create it for a task the poller never saw.
+
+        The phase, turns, cost, outcome, pull request and end time are set. The title, settings,
+        start time and comment cursor are not. Turns and cost only go up, and an outcome, a URL
+        or an end time that `state` leaves empty keeps the stored one.
         """
         ...
 
@@ -106,7 +176,7 @@ class TaskStore(Protocol):
 
 @dataclass
 class TaskRow:
-    """A row of `tasks`, as far as the poller writes it."""
+    """A row of `tasks`, as far as the poller and the workflow write it."""
 
     id: str
     repo: str
@@ -118,6 +188,11 @@ class TaskRow:
     started_at: datetime
     last_comment_at: datetime | None = None
     last_comment_id: int | None = None
+    turns: int = 0
+    cost_usd: float = 0.0
+    outcome: str | None = None
+    pr_url: str | None = None
+    ended_at: datetime | None = None
 
     @property
     def cursor(self) -> CommentCursor | None:
@@ -163,6 +238,8 @@ class MemoryTaskStore:
     def __init__(self) -> None:
         self.rows: dict[str, TaskRow] = {}
         self.synced: list[AppConfig] = []
+        # Every state the workflow wrote, in order, for a test that checks what was written when.
+        self.written: list[TaskState] = []
 
     async def sync_repos(self, config: AppConfig) -> None:
         self.synced.append(config)
@@ -175,8 +252,33 @@ class MemoryTaskStore:
         kept = self.rows.get(spec.task_id)
         if kept is None:
             self.rows[spec.task_id] = row
-        else:
-            kept.title, kept.settings = row.title, row.settings
+            return
+        kept.title, kept.settings = row.title, row.settings
+        if kept.last_comment_id is None and cursor is not None:
+            kept.last_comment_at, kept.last_comment_id = cursor.at, cursor.comment_id
+
+    async def record_state(self, state: TaskState) -> None:
+        self.written.append(state)
+        row = self.rows.get(state.task_id)
+        if row is None:
+            row = self.rows[state.task_id] = TaskRow(
+                id=state.task_id,
+                repo=state.repo,
+                issue_number=state.issue_number,
+                title=state.title,
+                status=state.status,
+                phase=state.phase,
+                settings=dict(state.settings),
+                started_at=datetime.now(UTC),
+            )
+        # A row that has ended stays as it ended, whatever late write arrives.
+        if row.ended_at is None or state.ended_at is not None:
+            row.status, row.phase = state.status, state.phase
+        row.turns = max(row.turns, state.turns)
+        row.cost_usd = max(row.cost_usd, state.cost_usd)
+        row.outcome = state.outcome or row.outcome
+        row.pr_url = state.pr_url or row.pr_url
+        row.ended_at = state.ended_at or row.ended_at
 
     async def latest_attempts(self, repo: str, issue_numbers: Sequence[int]) -> dict[int, TaskRow]:
         wanted = set(issue_numbers)
@@ -228,9 +330,57 @@ class SqlTaskStore:
         )
         # Only what comes from the issue is updated. The status and the phase belong to the task,
         # and the cursor to the poll that handles its comments.
+        # The cursor is the one exception: it fills an empty one, for a row that the workflow
+        # wrote before the poller did.
         upsert = insert_row.on_conflict_do_update(
             index_elements=[Task.id],
-            set_={"title": insert_row.excluded.title, "settings": insert_row.excluded.settings},
+            set_={
+                "title": insert_row.excluded.title,
+                "settings": insert_row.excluded.settings,
+                "last_comment_at": func.coalesce(
+                    Task.last_comment_at, insert_row.excluded.last_comment_at
+                ),
+                "last_comment_id": func.coalesce(
+                    Task.last_comment_id, insert_row.excluded.last_comment_id
+                ),
+            },
+        )
+        async with self._sessions.begin() as session:
+            await session.execute(upsert)
+
+    async def record_state(self, state: TaskState) -> None:
+        values = dict(
+            id=state.task_id,
+            repo=state.repo,
+            issue_number=state.issue_number,
+            title=state.title,
+            status=state.status,
+            phase=state.phase,
+            settings=state.settings,
+            started_at=datetime.now(UTC),
+            turns=state.turns,
+            cost_usd=state.cost_usd,
+            outcome=state.outcome,
+            pr_url=state.pr_url,
+            ended_at=state.ended_at,
+        )
+        insert_row = insert(Task).values(**values)
+        new = insert_row.excluded
+        # A row that has ended keeps its status and phase against a late write that is not the
+        # end. Turns and cost only go up, and an empty outcome, URL or end time keeps the stored
+        # one. The title, settings, start time and cursor are not in the list on purpose.
+        still_open = or_(Task.ended_at.is_(None), new.ended_at.is_not(None))
+        upsert = insert_row.on_conflict_do_update(
+            index_elements=[Task.id],
+            set_={
+                "status": case((still_open, new.status), else_=Task.status),
+                "phase": case((still_open, new.phase), else_=Task.phase),
+                "turns": func.greatest(Task.turns, new.turns),
+                "cost_usd": func.greatest(Task.cost_usd, new.cost_usd),
+                "outcome": func.coalesce(new.outcome, Task.outcome),
+                "pr_url": func.coalesce(new.pr_url, Task.pr_url),
+                "ended_at": func.coalesce(new.ended_at, Task.ended_at),
+            },
         )
         async with self._sessions.begin() as session:
             await session.execute(upsert)
@@ -268,4 +418,9 @@ def _to_row(task: Task) -> TaskRow:
         started_at=task.started_at or task.created_at,
         last_comment_at=task.last_comment_at,
         last_comment_id=task.last_comment_id,
+        turns=task.turns,
+        cost_usd=float(task.cost_usd),
+        outcome=task.outcome,
+        pr_url=task.pr_url,
+        ended_at=task.ended_at,
     )

@@ -135,7 +135,7 @@ export interface paths {
         put?: never;
         /**
          * Approve Plan
-         * @description Approve the plan the task is waiting on.
+         * @description Approve the plan the task is waiting on. 409 when it is not waiting for one.
          */
         post: operations["approve_plan"];
         delete?: never;
@@ -215,7 +215,7 @@ export interface paths {
         put?: never;
         /**
          * Reject Plan
-         * @description Reject the plan with feedback. The planner writes a new version.
+         * @description Reject the plan with feedback. The planner writes a new version. 409 as for approval.
          */
         post: operations["reject_plan"];
         delete?: never;

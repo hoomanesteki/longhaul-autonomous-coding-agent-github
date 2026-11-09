@@ -64,9 +64,10 @@ console-check:
 	npm --prefix console run build
 
 # The browser test of the console (LH-808). Playwright starts scripts/seed_demo.sh itself, which
-# needs `make up` and `make sandbox-image` first and takes a couple of minutes to seed. To look at
+# needs `make up` first and takes a couple of minutes to seed. The seeded tasks run in real
+# sandboxes, so the image is a prerequisite; docker reuses it when it is built (LH-891). To look at
 # the seeded console by hand instead, run ./scripts/seed_demo.sh after the build.
-console-e2e:
+console-e2e: sandbox-image
 	npm --prefix console ci
 	npm --prefix console run build
 	npm --prefix console exec -- playwright install chromium
@@ -80,6 +81,10 @@ site:
 site-preview:
 	quarto preview site
 
+# The phases whose gate also runs the console: phase 8 built it, and phase 9 includes it.
+# Integration checkpoint 8 names its unit tests and the Playwright main path (LH-891).
+CONSOLE_PHASES := 8 9
+
 # Capture the expression before running pytest. Written inline as a command substitution
 # argument, a failing markers.py is ignored and `pytest -m ""` runs every test.
 gate: check
@@ -88,3 +93,7 @@ gate: check
 	test -n "$$expr" || { echo "gate: markers.py printed no expression" >&2; exit 1; }; \
 	echo "gate: pytest -m ($$expr) and $(OPT_IN)"; \
 	uv run pytest -m "($$expr) and $(OPT_IN)"
+	@if [ -n "$(filter $(PHASE),$(CONSOLE_PHASES))" ]; then \
+	  echo "gate: console checks for PHASE=$(PHASE)"; \
+	  $(MAKE) console-check console-e2e; \
+	fi

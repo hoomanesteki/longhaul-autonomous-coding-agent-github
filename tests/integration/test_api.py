@@ -406,13 +406,14 @@ async def test_the_list_says_what_the_detail_page_says_for_each_task(
         # And it is what the workflow itself reports, not what the poller wrote at pickup.
         assert row["phase"] == detail["live"]["phase"]
         assert row["turns"] == detail["live"]["turn_index"]
-        assert row["cost_usd"] == pytest.approx(detail["live"]["cost_usd"])
+        # The column keeps ten thousandths of a dollar.
+        assert row["cost_usd"] == pytest.approx(detail["live"]["cost_usd"], abs=1e-4)
 
     assert (listed[waiting.id]["phase"], listed[waiting.id]["status"]) == ("paused", "active")
     assert listed[waiting.id]["turns"] == 3
     assert (listed[spec_b.task_id]["phase"], listed[spec_b.task_id]["turns"]) == (
         "awaiting_plan_approval",
-        0,
+        1,
     )
     done = listed[shipped.id]
     assert (done["status"], done["phase"], done["outcome"]) == ("done", "done", "pr_opened")
@@ -461,9 +462,15 @@ async def test_the_plan_shows_the_steps_as_the_updates_left_them(api: Stack) -> 
     await add_event(api.sessions, 33, "step_updated", status="done")
     await add_event(api.sessions, 34, "hint", step_id="s3", status="done")
     await add_task(api.sessions, "lh-acme-other-1")
-    await add_event(
-        api.sessions, 35, "step_updated", "lh-acme-other-1", step_id="s3", status="done"
-    )
+    async with api.sessions.begin() as session:
+        session.add(
+            Event(
+                task_id="lh-acme-other-1",
+                ts=at(35),
+                type="step_updated",
+                payload={"step_id": "s3", "status": "done"},
+            )
+        )
 
     detail = (await api.get(f"/api/tasks/{TASK}")).json()
 

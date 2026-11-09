@@ -7,13 +7,13 @@ activity. The body is one call to the task store.
 from datetime import UTC, datetime
 
 import pytest
-from longhaul.durable.activities.task_row import TaskRowActivities
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.contracts import OutcomeKind, Phase, RepoSettings
 from longhaul.db.tasks import MemoryTaskStore
 from longhaul.durable import acts
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.payload_guard import DEFAULT_LIMIT
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase8]

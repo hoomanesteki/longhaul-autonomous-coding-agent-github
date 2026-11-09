@@ -126,19 +126,76 @@ async def task_exists(sessions: Sessions, task_id: str) -> bool:
         return await session.get(Task, task_id) is not None
 
 
+# The event the coder's `update_step` calls leave (durable/activities/plan.py keeps the same name).
+STEP_EVENT = "step_updated"
+STEP_STATUSES = frozenset({"todo", "doing", "done", "skipped"})
+# The phases in which the coder works from the plan. A plan that nobody decided on and the task
+# has got this far with is in force.
+WORKING_PHASES = frozenset({"coding", "paused", "verifying", "delivering", "done"})
+
+
+def _steps_as_updated(plan: dict[str, Any], updates: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """The plan with each step in the status its last update gave it.
+
+    The plans table holds the plan as the planner wrote it, every step `todo`. The coder's
+    updates are events (durable/activities/plan.py), so the view applies them in order. An update
+    that names no step of the plan, or a status that is not one, is ignored.
+    """
+    steps = plan.get("steps")
+    if not isinstance(steps, list):
+        return plan
+    latest: dict[str, str] = {}
+    for payload in updates:
+        step_id, status = payload.get("step_id"), payload.get("status")
+        if isinstance(step_id, str) and status in STEP_STATUSES:
+            latest[step_id] = str(status)
+    return {
+        **plan,
+        "steps": [
+            {**step, "status": latest.get(str(step.get("id")), step.get("status"))}
+            if isinstance(step, dict)
+            else step
+            for step in steps
+        ],
+    }
+
+
+def _plan_status(recorded: str, *, phase: str | None, updated: bool) -> str:
+    """The status of the newest plan: what a person decided, else whether the task uses it.
+
+    A repo that asks for no decision approves its plans by not asking, and the plans table then
+    says `proposed` for good. The view calls such a plan approved once the task works from it,
+    which the phase or a step update shows, and leaves `decided_by` empty because nobody decided.
+    A plan that waits for a person, or that the task never got to use, stays proposed.
+    """
+    if recorded == "proposed" and (updated or phase in WORKING_PHASES):
+        return "approved"
+    return recorded
+
+
 async def latest_plan(sessions: Sessions, task_id: str) -> PlanView | None:
-    """The newest version of the plan: the one in force, or the last one that was turned down."""
+    """The newest version of the plan, as the task stands: the steps as the coder left them.
+
+    This is the version in force, or the last one that was turned down.
+    """
     stmt = select(PlanRow).where(PlanRow.task_id == task_id).order_by(PlanRow.version.desc())
+    updates_stmt = (
+        select(Event.payload)
+        .where(Event.task_id == task_id, Event.type == STEP_EVENT)
+        .order_by(Event.ts, Event.id)
+    )
     async with sessions() as session:
         row = (await session.scalars(stmt.limit(1))).first()
-    if row is None:
-        return None
+        if row is None:
+            return None
+        updates = list((await session.scalars(updates_stmt)).all())
+        phase = await session.scalar(select(Task.phase).where(Task.id == task_id))
     return PlanView.model_validate(
         {
             "version": row.version,
-            "status": row.status,
+            "status": _plan_status(row.status, phase=phase, updated=bool(updates)),
             # The planner may have copied text from the repo, so the plan is redacted like a turn.
-            "plan": redact_json(row.plan),
+            "plan": redact_json(_steps_as_updated(row.plan, updates)),
             "decided_by": row.decided_by,
             "decided_at": row.decided_at,
             "created_at": row.created_at,

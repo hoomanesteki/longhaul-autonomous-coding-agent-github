@@ -106,7 +106,9 @@ async def test_the_row_follows_a_task_through_a_plan_a_pause_and_a_finish(
         await row_in(world, spec.task_id, "awaiting_plan_approval")
         row = world.tasks.rows[spec.task_id]
         assert (row.status, row.repo, row.issue_number) == ("active", spec.repo, None)
-        assert row.title == spec.title and row.turns == 0
+        assert row.title == spec.title
+        # The planner's turn is a turn of the task.
+        assert row.turns == (await handle.query(TaskWorkflow.status)).turn_index == 1
         assert row.settings["plan_approval_required"] is True
         started = row.started_at
 
@@ -114,9 +116,13 @@ async def test_the_row_follows_a_task_through_a_plan_a_pause_and_a_finish(
         await paused(world, handle)
         await row_in(world, spec.task_id, "paused")
         live = await handle.query(TaskWorkflow.status)
-        assert (row.status, row.turns) == ("active", 1)
+        assert (row.status, row.turns) == ("active", 2)
         assert row.turns == live.turn_index
-        assert row.cost_usd == pytest.approx(live.cost_usd) and row.cost_usd > 0
+        # The cost includes the question for the person, which is written just after the phase.
+        await wait_until(
+            lambda: row.cost_usd == pytest.approx(live.cost_usd), "the cost of the question"
+        )
+        assert row.cost_usd > 0
         assert row.outcome is None and row.ended_at is None
 
         await send_hint(handle, "yes, a list of skus")

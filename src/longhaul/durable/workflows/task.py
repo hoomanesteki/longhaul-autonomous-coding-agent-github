@@ -279,6 +279,18 @@ posts are given a short while to finish at a hand-over and at the end (`_settle_
 post that fails is logged and does not fail the task. A cancel is not repeated, because the final
 comment already names who cancelled. Replay: the mirror is behind `workflow.patched(MIRROR_PATCH)`.
 
+The row of the task (LH-891). The poller writes the task's row in `tasks` once, at pickup, and the
+console lists tasks from it, so the workflow keeps it current through the `record_task_state`
+activity (`_save_row`). It writes at every change of phase (`_enter`), so a pause or a wait for a
+plan shows at once, again every ROW_TURN_INTERVAL turns while the task codes (`_save_progress`) so
+that the turns and the cost do not lag far behind, and in `_wind_up` with the status, the outcome,
+the pull request URL and the end time. A write is skipped when it would say what the last one
+said. The write is best effort: it is retried like the other database writes, and when it fails
+for good it is logged and the task goes on, because a stale row is a smaller fault than a task
+that fails over its own bookkeeping. A task started with `longhaul run` has no row, and its first
+write creates one. Replay: all of it is behind `workflow.patched(ROW_PATCH)`, so a history from
+before this story has no such activity to replay.
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -586,6 +598,10 @@ HINT_KIND = "hint"
 
 # The patch marker of the pause for a hint (LH-506). See "The pause for a hint" above.
 PAUSE_PATCH = "lh-506-pause-for-hint"
+# The patch marker of the writes of the task row (LH-891). See "The row of the task" above.
+ROW_PATCH = "lh-891-task-row"
+# The turns between two writes of the row while the task codes. A phase change is always written.
+ROW_TURN_INTERVAL = 3
 # The mirror comments of console actions (LH-805). A history from before this story has signals
 # from the console and no activity after them, so it replays without the comment.
 MIRROR_PATCH = "lh-805-console-mirror"
@@ -729,6 +745,11 @@ class TaskWorkflow:
         self.verified_tests: str | None = None
         # Why the task waits for a person, for the status. None unless it is paused.
         self.paused_reason: str | None = None
+        # The last row written to `tasks` (LH-891), so that a write that would repeat it is
+        # skipped, the turn it was written at, and the time the task ended, set once.
+        self.saved_row: acts.RecordTaskStateInput | None = None
+        self.saved_turn = 0
+        self.ended_at: datetime | None = None
 
     # ---------- signals and the query ----------
     @workflow.signal
@@ -923,9 +944,62 @@ class TaskWorkflow:
         state = self.state
         if state.sandbox_id is not None or not lifecycle.is_github_task(state.spec):
             return
-        state.phase = Phase.PREPARING
+        await self._enter(Phase.PREPARING)
         await self._call(acts.POST_COMMENT, lifecycle.pickup_comment(state.spec))
         await self._label(lifecycle.on_pickup(state.spec))
+
+    # ---------- the row of the task ----------
+    async def _enter(self, phase: Phase) -> None:
+        """Move to a phase and write the row, so the console shows it when it happens."""
+        self.state.phase = phase
+        await self._save_row()
+
+    async def _save_progress(self) -> None:
+        """Write the row when the turns have moved ROW_TURN_INTERVAL since the last write."""
+        if self.state.turn_index - self.saved_turn >= ROW_TURN_INTERVAL:
+            await self._save_row()
+
+    async def _save_row(self, ended: Outcome | None = None) -> None:
+        """Write the phase, turns and cost to the row of the task. `ended` writes the end of it.
+
+        A write that fails for good is logged and does not fail the task, and is not counted as
+        saved, so the next change tries again. It goes through `execute_activity` and not `_call`:
+        a cancel that has been asked for must not stop the write that records the cancel.
+        """
+        if not workflow.patched(ROW_PATCH):
+            return
+        state = self.state
+        if ended is not None and self.ended_at is None:
+            self.ended_at = workflow.now()
+        row = acts.RecordTaskStateInput(
+            task_id=state.spec.task_id,
+            repo=state.spec.repo,
+            issue_number=state.spec.issue_number,
+            title=state.spec.title[: acts.ROW_TITLE_CHARS],
+            settings=state.spec.settings,
+            phase=state.phase,
+            turns=state.turn_index,
+            cost_usd=state.cost_usd,
+            outcome=None if ended is None else ended.kind,
+            pr_url=None if ended is None else ended.pr_url,
+            ended_at=None if ended is None else self.ended_at,
+        )
+        if row == self.saved_row:
+            return
+        try:
+            await workflow.execute_activity(
+                acts.RECORD_TASK_STATE.name,
+                row,
+                result_type=acts.RECORD_TASK_STATE.result_type,
+                **acts.options(acts.RECORD_TASK_STATE, self._tuning()),
+            )
+        except FailureError as err:
+            workflow.logger.warning(
+                "row of task %s not written: %s", state.spec.task_id, err.cause or err
+            )
+            return
+        self.saved_row = row
+        self.saved_turn = state.turn_index
 
     async def _note_outcome(self, outcome: Outcome) -> None:
         """Tell the worker that the task ended, so that it counts it (see the module docstring)."""
@@ -991,6 +1065,8 @@ class TaskWorkflow:
             await self._note_outcome(outcome)
             return outcome
         state = self.state
+        # First, so that the console shows the end while the sandbox goes and GitHub is told.
+        await self._save_row(outcome)
         await self._try(
             "cleanup",
             self._wind_call(
@@ -1002,6 +1078,7 @@ class TaskWorkflow:
         await self._settle_mirrors()
         if lifecycle.is_github_task(state.spec):
             outcome = await self._open_draft(outcome)
+            await self._save_row(outcome)  # a draft pull request of a stuck task is its URL
             await self._report(outcome)
             await self._end_labels(outcome)
         await self._remove_repo(outcome)
@@ -1224,7 +1301,7 @@ class TaskWorkflow:
 
     async def _prepare(self) -> None:
         state = self.state
-        state.phase = Phase.PREPARING
+        await self._enter(Phase.PREPARING)
         if state.sandbox_id is not None:
             # An earlier run of this workflow prepared the workspace, and its container may be
             # gone by now. ensure_sandbox answers with the same id when it is still running.
@@ -1339,7 +1416,7 @@ class TaskWorkflow:
         with its own turns and its own repair turn.
         """
         state = self.state
-        state.phase = Phase.PLANNING
+        await self._enter(Phase.PLANNING)
         failures = 0  # plans that were not valid so far, for the one repair turn (F14)
         idle = 0  # replies in a row that ended without a tool call
         for _ in range(acts.PLANNER_MAX_TURNS):
@@ -1513,7 +1590,7 @@ class TaskWorkflow:
         so no request is left on the issue and no label goes on or off.
         """
         state = self.state
-        state.phase = Phase.AWAITING_PLAN_APPROVAL
+        await self._enter(Phase.AWAITING_PLAN_APPROVAL)
         asked = self.plan_decision is None
         if asked:
             await self._ask_for_review(version)
@@ -1571,14 +1648,14 @@ class TaskWorkflow:
 
     # ---------- the coding phase ----------
     async def _code(self) -> Outcome:
-        state = self.state
-        state.phase = Phase.CODING
+        await self._enter(Phase.CODING)
         while True:
             if self._out_of_turns():
                 return self._end(rules.turn_limit_outcome(), Phase.FAILED)
             outcome = await self._turn()
             if outcome is not None:
                 return outcome
+            await self._save_progress()
             reason = self._hand_over_reason()
             if reason is not None and not self._out_of_turns():
                 await self._hand_over(reason)
@@ -1860,7 +1937,7 @@ class TaskWorkflow:
             # The verifier needs a turn, so no command of the pre-check could be used. Each one can
             # take minutes, and the task ends the same way once the review has started.
             return self._end(rules.turn_limit_outcome(), Phase.FAILED)
-        state.phase = Phase.VERIFYING
+        await self._enter(Phase.VERIFYING)
         number = state.verify_rounds + 1
         coder_view = (state.transcript_ref, state.notes, state.last_input_tokens)
         try:
@@ -2022,7 +2099,7 @@ class TaskWorkflow:
             ),
         )
         state.turn_index = index + 1
-        state.phase = Phase.CODING
+        await self._enter(Phase.CODING)
 
     # ---------- the pause for a hint ----------
     async def _pause(self, signal: StuckSignal) -> Outcome | None:
@@ -2041,10 +2118,11 @@ class TaskWorkflow:
         # Counted before the first await. A hint that arrives while the question is written is
         # then an answer to it, and one that came before it answered nothing yet.
         seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
-        state.phase = Phase.PAUSED
         self.paused_reason = f"waiting for a hint after {signal.reason.value.replace('_', ' ')}"
         began = workflow.now()
+        await self._enter(Phase.PAUSED)
         await self._ask(signal, pause)
+        await self._save_row()  # the question was a model call, and it is in the cost now
         try:
             await workflow.wait_condition(
                 lambda: self._answered(seen) is not None or self.cancel_request is not None,
@@ -2162,8 +2240,8 @@ class TaskWorkflow:
         seen = _Unanswered(len(state.hints), state.extra_budget_usd, state.extra_turns)
         began = workflow.now()
         midnight = budget.next_midnight(began)
-        state.phase = Phase.PAUSED
         self.paused_reason = budget.pause_reason(stop)
+        await self._enter(Phase.PAUSED)
         await self._announce_budget(stop, pause, wait, midnight)
         if daily:
             via = MIDNIGHT_VIA
@@ -2250,8 +2328,8 @@ class TaskWorkflow:
             # A new window: the task has worked no time at all as of now.
             whole = budget.elapsed(state.started_at, now, paused_s=0).total_seconds()
             state.paused_s = max(state.paused_s, whole)
-        state.phase = before
         self.paused_reason = None
+        await self._enter(before)
         if via == BUDGET_VIA and lifecycle.is_github_task(state.spec):
             await self._label(lifecycle.on_budget_resume(state.spec, pause))
         reason = stop.reason.value if stop.reason is not None else None
@@ -2352,8 +2430,8 @@ class TaskWorkflow:
             payload["by"] = state.hints[seen.hints].split(": ", 1)[0]
         state.stuck_count += 1
         state.stuck_window = []
-        state.phase = Phase.CODING
         self.paused_reason = None
+        await self._enter(Phase.CODING)
         await self._human_done(pause)
         await self._note(RESUMED_EVENT, payload)
 
@@ -2616,6 +2694,7 @@ class TaskWorkflow:
         pre-check backed it, and a draft otherwise (`verified_tests`, set by `_verify`).
         """
         state = self.state
+        await self._save_row()  # the phase is DELIVERING, set by _finish
         issue = state.spec.issue_number
         base_sha = state.spec.base_sha
         if state.head_sha is None or base_sha is None or issue is None:

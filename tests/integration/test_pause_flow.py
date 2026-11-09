@@ -25,7 +25,6 @@ from typing import Any
 
 import pytest
 import yaml
-from longhaul.durable.activities.task_row import TaskRowActivities
 from temporalio import activity
 from temporalio.client import WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
@@ -59,7 +58,12 @@ from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.durable.activities.events import EventActivities
 from longhaul.durable.activities.llm import LlmActivities
-from longhaul.durable.activities.plan import PlanActivities, StepActivities
+from longhaul.durable.activities.plan import (
+    PlanActivities,
+    PlanCommentActivities,
+    StepActivities,
+)
+from longhaul.durable.activities.task_row import TaskRowActivities
 from longhaul.durable.activities.tools import NoCheckpoints, ToolActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
@@ -316,7 +320,12 @@ async def light(
         seed_calc(fake, tmp_path / "gh")
         number = fake.seed_issue(REPO, "lookup fails")
         github = github_for(fake)
-        writes = SideEffectActivities(github.client, MemoryLedger()).activities
+        ledger = MemoryLedger()
+        writes = [
+            *SideEffectActivities(github.client, ledger).activities,
+            # A task of an issue posts its plan (LH-501).
+            *PlanCommentActivities(github.client, ledger, templates=TEMPLATES).activities,
+        ]
     queue = f"lh-test-{uuid.uuid4().hex[:8]}"
     try:
         async with Worker(

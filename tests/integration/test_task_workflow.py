@@ -1129,6 +1129,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "tool_exec": (660, 15),
         "append_results": (2 * 60, None),
         "cleanup": (2 * 60, None),  # the end of every task (LH-507)
+        "record_task_state": (2 * 60, None),  # the row of the task (LH-891)
     }
     attempts = {
         name: attributes.retry_policy.maximum_attempts for name, attributes in sched.items()
@@ -1139,6 +1140,7 @@ async def test_activities_get_the_timeouts_and_retries_of_section_3_7(
         "tool_exec": 3,
         "append_results": 3,
         "cleanup": 3,
+        "record_task_state": 3,
     }
     llm = sched["llm_turn"].retry_policy
     assert llm.initial_interval.ToTimedelta() == timedelta(seconds=2)
@@ -1178,6 +1180,7 @@ async def test_tuning_shortens_the_heartbeat_timeouts_of_one_run(
         "tool_exec": (660, 2),
         "append_results": (2 * 60, None),
         "cleanup": (2 * 60, None),
+        "record_task_state": (2 * 60, None),
     }
 
 

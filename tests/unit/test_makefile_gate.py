@@ -43,7 +43,9 @@ def test_the_gate_names_the_console_checks_after_pytest_for_phases_8_and_9() -> 
     text = recipe("gate")
 
     assert text.index("pytest") < text.index("console-check") < text.index("console-e2e")
-    assert re.search(r"\b8\b", text) and re.search(r"\b9\b", text)
+    assert "$(CONSOLE_PHASES)" in text
+    phases = re.search(r"^CONSOLE_PHASES\s*:=\s*(.*)$", MAKEFILE.read_text(), re.M)
+    assert phases and phases.group(1).split() == ["8", "9"]
 
 
 def test_the_browser_test_builds_the_sandbox_image_first() -> None:

@@ -273,6 +273,14 @@ def test_a_task_gets_the_caps_of_the_fairness_rules() -> None:
     assert (budgets.task_usd, budgets.task_turns, budgets.task_wall_minutes) == (2.0, 150, 120)
 
 
+def test_an_eval_is_not_stopped_by_the_daily_limit_of_a_repo() -> None:
+    # Several tasks and configs share one repo folder, and plan section 8.4 caps each task and
+    # nothing more. A day's limit of 25 dollars would pause a paid run half way through.
+    custom = run.build_spec(first_task(), "lh-eval-try1-calc-01").settings.budgets
+    assert custom.daily_repo_usd >= 10_000
+    assert run.SWEBENCH_BUDGETS.daily_repo_usd >= 10_000
+
+
 def test_the_repo_of_a_task_is_checked_before_it_is_started() -> None:
     run.check_tasks(run.select_tasks(RunOptions(task_set="custom", config="full", run_id="r")))
 
@@ -959,6 +967,28 @@ async def test_a_durable_task_is_started_with_the_context_mode_of_its_config(
         ctx = run_context(tmp_path / f"{config}-{len(flags)}", config=config, flags=flags)
         await run.run_one(ctx, first_task())
         assert seen["context_mode"] is mode
+
+
+async def test_a_durable_task_is_started_with_its_budgets_enforced(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The caps of plan section 8.4 are in the spec, and only a task that enforces them reads them.
+    seen: dict[str, Any] = {}
+
+    async def start_task(*_args: object, **kwargs: Any) -> None:
+        seen.update(kwargs)
+        raise RuntimeError("stop here")
+
+    async def upload_script(*_args: object, **_kwargs: object) -> str:
+        return "the-script-ref"
+
+    monkeypatch.setattr(run, "start_task", start_task)
+    monkeypatch.setattr(run, "upload_script", upload_script)
+    ledger_says(monkeypatch, 0.0, Tokens())
+
+    await run.run_one(run_context(tmp_path), first_task())
+
+    assert seen["enforce_budgets"] is True
 
 
 # ---------- one model across the configs of a run set (LH-903) ----------

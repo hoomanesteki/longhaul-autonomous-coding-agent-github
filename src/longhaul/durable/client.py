@@ -93,10 +93,10 @@ async def start_task(
     same reasons, and a task started without it opens no such draft.
 
     `enforce_budgets` has the task check its budgets before every model turn and pause when a
-    limit would be crossed (LH-702). The poller asks for it, because a task nobody watches must not
-    run up a bill. A task started without it ends at its turn limit with ERROR "turn limit", and a
-    local run keeps that. The switch is in the state and not in the memo: the state is what a
-    hand-over carries, and a history that began before the story has no such field.
+    limit would be crossed (LH-702). The poller, `longhaul run` and the eval runner ask for it,
+    because a task nobody watches must not run up a bill. A task started without it ends at its
+    turn limit with ERROR "turn limit". The switch is in the state and not in the memo: the state
+    is what a hand-over carries, and a history that began before the story has no such field.
 
     A second start with the same id raises WorkflowAlreadyStartedError, whether the first run
     is still open or has closed (ADR-0004 section 6). The SDK default would start a new run

@@ -2,7 +2,7 @@
 
 A background coding agent that takes a GitHub issue, works on it for hours in a sandbox, survives crashes, resumes where it stopped, and asks a person only at checkpoints. It ends with a pull request or an honest report of where it got stuck.
 
-Status: Phase 6 of 9 done (`v0.6.0`). Each task is a durable Temporal workflow that resumes from its last git checkpoint after a crash; a labeled GitHub issue gets a plan, a coder that works it step by step, a verifier before a ready pull request, a pause with one clear question when stuck, and notes from earlier work on the repo that only reach the prompt once a merged pull request or a person approves them. Phases 7 to 9 are in progress.
+Status: Phase 7 of 9 done (`v0.7.0`). Each task is a durable Temporal workflow that resumes from its last git checkpoint after a crash; a labeled GitHub issue gets a plan, a coder that works it step by step, a verifier before a ready pull request, a pause with one clear question when stuck, and notes from earlier work on the repo that only reach the prompt once a merged pull request or a person approves them. Every task has hard budgets for dollars, turns and wall time, and ends with a run report of its cost and timeline. Phases 8 and 9 are in progress.
 
 Docs site: [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/), built from `docs/` with Quarto.
 

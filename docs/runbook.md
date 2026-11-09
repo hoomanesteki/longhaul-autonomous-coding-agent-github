@@ -229,7 +229,7 @@ The worker stops at its start with a message that names `uv sync --extra memory`
 | Command | What it does |
 |---|---|
 | `longhaul worker` | Polls the task queue (`LONGHAUL_TASK_QUEUE`, default `longhaul`) and runs the activities of every task. Stop it with Ctrl-C or SIGTERM. |
-| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. |
+| `longhaul run --path DIR --issue-file FILE` | Starts a task for a folder and follows it. With `--provider scripted --script FILE` the script goes to the worker with the task. `--window N` gives the task a context window of N tokens in place of the config's. `--budgets/--no-budgets` turns the budget checks on (the default) or off; see "Budgets and top-ups". |
 | `longhaul status TASK_ID` | Prints the state in Temporal, the status of the workflow, the compactions and the largest request of the task (`context: 5 compactions, max_fraction 0.59`) and, once it ended, the outcome. |
 | `longhaul report TASK_ID` | Prints the run report of the task as markdown (see "The run report"). It reads the database only, so it works while the task runs, after it ended, and for a task of `longhaul run`. |
 | `longhaul cancel TASK_ID [--reason TEXT]` | Sends the cancel signal. The workflow removes the sandbox and the checkpoint repo and ends as cancelled. |
@@ -582,13 +582,15 @@ Reply with `/longhaul budget +2` to add $2, or `/longhaul cancel` to stop the ta
 | `/longhaul budget +1 turns +25` | Adds 1 dollar and 25 turns. A top-up always has dollars, and a turns top-up carries one as well. |
 | `/longhaul cancel` | Ends the task as cancelled. |
 
+The worst case of the next call counts the whole request: after the first call of the planner, the coder or the verifier it is the size of the request before, and for the first call it is an estimate from the system prompt, the tools, the task, the plan, the memory notes and the review brief. The `paused` and `resumed` events of a budget pause carry `kind` `budget`, because the budget pauses and the pauses for a hint both number from 1 and the run report pairs a pause with its answer by kind and number.
+
 A top-up removes the label, records a `resumed` event (`via` is `budget`) and a `budget_added` event with the dollars and turns that came in, and the next check uses the new limits. A top-up that is too small pauses the task again, with its own comment (`budget:2`). A `/longhaul hint` does not answer a budget pause: the task waits for money. With no answer in 24 hours (`stuck.hint_wait_hours`) the task ends with outcome `budget_exhausted` in the phase `failed`, and the summary says which limit and how long it waited.
 
 Three limits behave in their own way:
 
 - **The wall clock** counts the time the task worked. The time it spent waiting for a hint, a top-up or midnight is left out, so a maintainer who answers after three hours has not used three hours of the task. `/longhaul budget` has no minutes, so a top-up of any amount after a wall-clock pause starts a new window of `task_wall_minutes`.
 - **The daily limit of the repo** is not lifted by a top-up. The task sleeps on a durable timer until 00:00 UTC and goes on by itself, with no signal and no label, and the comment says when. A worker restart does not lose the timer. `/longhaul cancel` still ends it. A call that is bigger than a whole day of the repo's budget would get the same answer tomorrow, so the task ends with `budget_exhausted` at once.
-- **A task that is not started by the poller** does not check budgets. `longhaul run` on a folder ends at its turn limit with the error "turn limit", as it did before.
+- **`longhaul run` and the eval runner** check budgets like the poller does. `longhaul run --no-budgets` starts a task that does not: it ends at its turn limit with the error "turn limit" and nothing else stops it, and the header says "budgets off". A paused task of a folder has no issue to answer on. Top it up with `POST /api/tasks/{id}/budget` (the console does the same), or end it with `longhaul cancel TASK_ID`. With neither, it waits up to `stuck.hint_wait_hours` and then ends as `budget_exhausted`. The eval runner sets the caps of plan section 8.4 (2 dollars on the custom set, 4 on SWE-bench) and leaves the daily limit of the repo out of reach, so only the task's own caps stop a task. Its watcher cancels a task that stays paused for `--pause-timeout-s`.
 
 A task of a folder (`local:`) has no issue, so the numbers are in the `paused` event instead (`payload.numbers`, and `payload.resume_at` for the daily limit).
 

@@ -254,6 +254,141 @@ def test_a_pause_nobody_answered_is_shown_as_open() -> None:
     assert "agent asked, not answered" in section(render(data), "Timeline")
 
 
+def paused_lines(data: ReportData) -> list[str]:
+    return [line for line in section(render(data), "Timeline").splitlines() if "| Paused |" in line]
+
+
+def test_a_hint_pause_and_a_budget_pause_with_the_same_number_keep_their_own_answers() -> None:
+    # The stuck counter and the budget counter both start at 1, so the number alone is not a key.
+    data = a_run(
+        events=[
+            event(600, "paused", reason="no_progress", pause=1, turn_index=5),
+            event(7800, "resumed", pause=1, via="hint", by="alice", turn_index=5),
+            event(9000, "paused", reason="task_usd", pause=1, kind="budget", turn_index=20),
+        ]
+    )
+
+    first, second = paused_lines(data)
+
+    assert "no progress, answered with a hint from alice after 2h 00m" in first
+    assert "task usd, not answered" in second
+
+
+def test_the_order_of_two_pauses_with_the_same_number_does_not_change_their_answers() -> None:
+    data = a_run(
+        events=[
+            event(600, "paused", reason="task_usd", pause=1, kind="budget", turn_index=5),
+            event(900, "resumed", pause=1, via="budget", kind="budget", turn_index=5),
+            event(1200, "paused", reason="no_progress", pause=1, turn_index=9),
+            event(8400, "resumed", pause=1, via="hint", by="alice", turn_index=9),
+        ]
+    )
+
+    first, second = paused_lines(data)
+
+    assert "task usd, answered with a budget top-up after 5m 0s" in first
+    assert "no progress, answered with a hint from alice after 2h 00m" in second
+
+
+def test_a_budget_pause_from_before_the_kind_field_is_still_told_from_a_hint_pause() -> None:
+    # Histories recorded before the field have no `kind`: the reason and the way out say which.
+    data = a_run(
+        events=[
+            event(600, "paused", reason="no_progress", pause=1, turn_index=5),
+            event(700, "paused", reason="task_usd", pause=1, turn_index=6),
+            event(900, "resumed", pause=1, via="budget", turn_index=6),
+        ]
+    )
+
+    first, second = paused_lines(data)
+
+    assert "no progress, not answered" in first
+    assert "task usd, answered with a budget top-up after 3m 20s" in second
+
+
+def test_a_stuck_pause_answered_with_a_budget_top_up_is_told_as_that() -> None:
+    # The runbook says `/longhaul budget +$2` also unblocks a stuck task, and the workflow keeps
+    # the family of the pause on the event: a hint pause answered by a top-up is no budget pause.
+    data = a_run(
+        events=[
+            event(600, "paused", reason="no_progress", pause=1, kind="hint", turn_index=5),
+            event(900, "resumed", pause=1, via="budget", kind="hint", turn_index=5),
+        ]
+    )
+
+    (line,) = paused_lines(data)
+
+    assert "no progress, answered with a budget top-up after 5m 0s" in line
+
+
+def test_a_stuck_pause_answered_with_a_top_up_keeps_its_own_wait_next_to_a_budget_pause() -> None:
+    data = a_run(
+        events=[
+            event(600, "paused", reason="task_usd", pause=1, kind="budget", turn_index=5),
+            event(900, "resumed", pause=1, via="budget", kind="budget", reason="task_usd"),
+            event(1200, "paused", reason="no_progress", pause=1, kind="hint", turn_index=9),
+            event(8400, "resumed", pause=1, via="budget", kind="hint", turn_index=9),
+        ]
+    )
+
+    first, second = paused_lines(data)
+
+    assert "task usd, answered with a budget top-up after 5m 0s" in first
+    assert "no progress, answered with a budget top-up after 2h 00m" in second
+
+
+def test_a_stuck_pause_answered_with_a_top_up_from_before_the_kind_field_is_still_paired() -> None:
+    # No `kind` on either event: a hint resume never carries a `reason`, and a budget one always
+    # does, so the resume answers the stuck pause and the budget pause keeps its own answer.
+    data = a_run(
+        events=[
+            event(600, "paused", reason="task_usd", pause=1, turn_index=5),
+            event(900, "resumed", pause=1, via="budget", reason="task_usd", turn_index=5),
+            event(1200, "paused", reason="no_progress", pause=1, turn_index=9),
+            event(8400, "resumed", pause=1, via="budget", turn_index=9),
+        ]
+    )
+
+    first, second = paused_lines(data)
+
+    assert "task usd, answered with a budget top-up after 5m 0s" in first
+    assert "no progress, answered with a budget top-up after 2h 00m" in second
+
+
+def test_a_stuck_pause_answered_with_a_top_up_alone_is_paired_without_the_kind_field() -> None:
+    data = a_run(
+        events=[
+            event(600, "paused", reason="no_progress", pause=1, turn_index=5),
+            event(900, "resumed", pause=1, via="budget", turn_index=5),
+        ]
+    )
+
+    (line,) = paused_lines(data)
+
+    assert "no progress, answered with a budget top-up after 5m 0s" in line
+
+
+def test_a_daily_limit_pause_says_it_waited_for_midnight_and_that_nobody_answered() -> None:
+    data = a_run(
+        events=[
+            event(
+                600,
+                "paused",
+                reason="daily_repo_usd",
+                pause=1,
+                kind="budget",
+                resume_at="2026-11-04T00:00:00+00:00",
+            ),
+            event(13800, "resumed", pause=1, via="midnight", kind="budget", turn_index=5),
+        ]
+    )
+
+    (line,) = paused_lines(data)
+
+    assert "daily repo usd, waited until midnight UTC (3h 40m)" in line
+    assert "answered" not in line
+
+
 def test_a_long_timeline_is_cut_with_a_note() -> None:
     folds = [
         event(s, "compaction", tokens_before=9, tokens_after=3, folded_turns=2)
@@ -554,6 +689,10 @@ def test_the_event_types_are_the_ones_the_writers_use() -> None:
     assert render.LESSONS_EVENT == acts.LESSONS_EVENT
     assert render.BUDGET_EVENT == task.BUDGET_ADDED_EVENT
     assert render.BUDGET_VIA == task.BUDGET_VIA
+    assert render.MIDNIGHT_VIA == task.MIDNIGHT_VIA
+    assert render.BUDGET_KIND == task.BUDGET_KIND
+    assert render.HINT_KIND == task.HINT_KIND
+    assert render.HINT_VIA == task.HINT_VIA
 
 
 def test_the_report_is_not_made_of_anything_that_could_swallow_the_pull_request_body() -> None:

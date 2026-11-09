@@ -44,6 +44,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from longhaul.context.tokens import cache_ratio
+from longhaul.cost.budget import BudgetReason
 from longhaul.github.pr_body import defuse
 from longhaul.reports.data import EventInfo, PlanVersion, ReportData, ToolTotals, TurnInfo
 from longhaul.telemetry.logging import redact
@@ -90,6 +91,14 @@ SEGMENT_LABELS = {"planner": "Planning", "coder": "Coding", "verifier": "Verifyi
 GONE = frozenset({"rejected", "superseded"})
 ANSWERS = {"hint": "a hint", "budget": "a budget top-up"}
 BUDGET_VIA = "budget"
+HINT_VIA = "hint"
+# A daily-limit pause ends by itself at 00:00 UTC, and `resumed` says so with this `via`.
+MIDNIGHT_VIA = "midnight"
+# The `kind` of the events of a pause: "budget" for a budget pause, "hint" for one for a hint.
+# The stuck counter and the budget counter both start at 1, so a `resumed` event answers the
+# `paused` event of its own kind and number, never the one of the other kind with the same number.
+BUDGET_KIND = "budget"
+HINT_KIND = "hint"
 # The outcome kind of a cancel and the start of the summary the workflow writes for it
 # (durable/workflows/task.py cancel_summary).
 CANCELLED_KIND = "cancelled"
@@ -267,14 +276,74 @@ def _approval(plans: list[PlanVersion]) -> list[_Entry]:
     ]
 
 
-def _pause(event: EventInfo, answers: Mapping[Any, EventInfo]) -> _Entry:
+BUDGET_REASONS = frozenset(reason.value for reason in BudgetReason)
+
+
+def _pause_kind(event: EventInfo) -> str:
+    """Which counter numbers a `paused` event: the budget's or the hint's.
+
+    The workflow writes `kind` on the events of every pause. A history from before the field has
+    none, and the limit that stopped the task (`reason`) says the same.
+    """
+    kind = event.payload.get("kind")
+    if kind in (BUDGET_KIND, HINT_KIND):
+        return str(kind)
+    return BUDGET_KIND if event.payload.get("reason") in BUDGET_REASONS else HINT_KIND
+
+
+def _resume_kind(event: EventInfo) -> str | None:
+    """Which counter numbers a `resumed` event, or None when an old history does not say.
+
+    A top-up can answer a pause for a hint, so `via` does not tell the family. A budget resume has
+    always carried the `reason` of its limit and a hint resume never has, which leaves one case
+    open: a top-up with no `kind` and no `reason` from before either field.
+    """
+    kind = event.payload.get("kind")
+    if kind in (BUDGET_KIND, HINT_KIND):
+        return str(kind)
+    if event.payload.get("reason") in BUDGET_REASONS or event.payload.get("via") == MIDNIGHT_VIA:
+        return BUDGET_KIND
+    if event.payload.get("via") == HINT_VIA:
+        return HINT_KIND
+    return None
+
+
+def _answers(events: list[EventInfo]) -> dict[int, EventInfo]:
+    """The `resumed` event of each `paused` event, by the index of the latter.
+
+    A task waits on one pause at a time, so a resume answers the newest open pause that has its
+    number and, when the event says it, its family. The stuck counter and the budget counter both
+    start at 1, which is why the number alone would pair the wrong events.
+    """
+    answers: dict[int, EventInfo] = {}
+    open_pauses: list[int] = []
+    for i, e in enumerate(events):
+        if e.type == PAUSED_EVENT:
+            open_pauses.append(i)
+        elif e.type == RESUMED_EVENT:
+            kind = _resume_kind(e)
+            for j in reversed(open_pauses):
+                paused = events[j]
+                if paused.payload.get("pause") != e.payload.get("pause"):
+                    continue
+                if kind is not None and _pause_kind(paused) != kind:
+                    continue
+                answers[j] = e
+                open_pauses.remove(j)
+                break
+    return answers
+
+
+def _pause(event: EventInfo, answer: EventInfo | None) -> _Entry:
     reason = _words(event.payload.get("reason", "unknown"))
-    answer = answers.get(event.payload.get("pause"))
-    if answer is None:
+    if answer is None or answer.ts < event.ts:
         return _Entry(event.ts, "Paused", _text(f"{reason}, not answered"))
+    waited = _duration((answer.ts - event.ts).total_seconds())
+    if answer.payload.get("via") == MIDNIGHT_VIA:
+        # Nobody answered the daily limit: the day changed.
+        return _Entry(event.ts, "Paused", _text(f"{reason}, waited until midnight UTC ({waited})"))
     via = ANSWERS.get(str(answer.payload.get("via")), "an answer")
     who = answer.payload.get("by")
-    waited = _duration((answer.ts - event.ts).total_seconds())
     by = f" from {who}" if who else ""
     return _Entry(event.ts, "Paused", _text(f"{reason}, answered with {via}{by} after {waited}"))
 
@@ -310,12 +379,12 @@ def _verdict(event: EventInfo, counted: int) -> _Entry:
 
 
 def _event_entries(events: list[EventInfo]) -> list[_Entry]:
-    answers = {e.payload.get("pause"): e for e in events if e.type == RESUMED_EVENT}
+    answers = _answers(events)
     entries: list[_Entry] = []
     rounds = 0
-    for e in events:
+    for i, e in enumerate(events):
         if e.type == PAUSED_EVENT:
-            entries.append(_pause(e, answers))
+            entries.append(_pause(e, answers.get(i)))
         elif e.type == COMPACTION_EVENT:
             entries.append(_compaction(e))
         elif e.type == SANDBOX_EVENT:

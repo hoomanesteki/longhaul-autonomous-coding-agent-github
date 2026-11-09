@@ -108,6 +108,7 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-704 | Prometheus metrics and Grafana dashboard | 3 | Done | merge | 2026-11-04 |
 | LH-705 | Run report | 3 | Done | merge | 2026-11-08 |
 | LH-706 | Structured logs and redaction | 2 | Done | merge | 2026-11-04 |
+| LH-791 | Budgets for every task and a report that pairs each pause | 2 | Done | merge | 2026-11-08 |
 
 ## Phase 8: Console (tag v0.8.0)
 | ID | Title | Pts | Status | PR | Merged |

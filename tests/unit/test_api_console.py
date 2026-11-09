@@ -8,6 +8,7 @@ without a database, because the file routes do not use one.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -197,7 +198,25 @@ def test_a_wrong_method_on_a_real_api_address_is_still_a_405(console: Path) -> N
 DOCS_PATHS = ["/docs", "/redoc", "/openapi.json"]
 
 
+@pytest.fixture
+def docs_unset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """The settings as they are with LONGHAUL_API_DOCS unset.
+
+    .env.example tells a developer to set it to true, so the test must not read the shell or a
+    .env of the checkout. The settings read .env from the working folder, so the test runs in an
+    empty one.
+    """
+    monkeypatch.delenv("LONGHAUL_API_DOCS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
+
+
 @pytest.mark.parametrize("path", DOCS_PATHS)
+@pytest.mark.usefixtures("docs_unset")
 def test_the_interactive_docs_are_off_by_default(path: str) -> None:
     # /docs loads Swagger UI from a CDN, on the origin where the console keeps its token, and
     # none of the three routes asks for the token.
@@ -243,6 +262,7 @@ def test_the_schema_dump_works_with_the_routes_off() -> None:
     assert "/api/tasks" in schema["paths"]
 
 
+@pytest.mark.usefixtures("docs_unset")
 def test_with_the_docs_off_the_console_is_served_in_their_place(console: Path) -> None:
     # The console answers any address that is not the API, so /docs is its page and not Swagger.
     response = TestClient(create_app(console_dir=console)).get("/docs")

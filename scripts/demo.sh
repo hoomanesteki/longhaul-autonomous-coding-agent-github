@@ -14,6 +14,11 @@
 # console script of the virtualenv and not as `uv run longhaul`, because `uv run` swallows the
 # signal and the worker would outlive it. The sandbox setup installs pytest from PyPI, so the
 # machine needs outbound network for the first minute of the task.
+#
+# The output of the run is printed while the task runs, so a slow first setup can be told from a
+# hang. If the script is interrupted or the worker dies, it cancels the workflow of the task (and
+# terminates it if the cancel does not close it), because a workflow on a task queue that no
+# worker polls would stay open for good.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,7 +26,11 @@ cd "$(dirname "$0")/.."
 LONGHAUL="${LONGHAUL:-.venv/bin/longhaul}"
 FIXTURE=tests/fixtures/repos/calc
 SCRIPT=tests/fixtures/scripts/calc_fix.yaml
-WAIT_S=600
+# The limits can be lowered from the environment, which the tests of this script do.
+WAIT_S="${DEMO_WAIT_S:-600}"
+RUN_WAIT_S="${DEMO_RUN_WAIT_S:-3600}"
+CANCEL_WAIT_S="${DEMO_CANCEL_WAIT_S:-60}"
+PYTHON="${DEMO_PYTHON:-.venv/bin/python}"
 
 if [ ! -x "$LONGHAUL" ]; then
   echo "$LONGHAUL not found: run make setup first, or set LONGHAUL to the longhaul command" >&2
@@ -49,8 +58,16 @@ sed -e 's/^\(  embedder:\) local\(.*\)$/\1 hash/' \
 export LONGHAUL_CONFIG="$WORK/longhaul.yaml"
 
 WORKER_PID=""
+RUN_PID=""
+TAIL_PID=""
 TASK_ID=""
 FAILED=1
+
+# The task id is the second word of the first line `longhaul run` prints once it has started the
+# workflow: "task lh-local-calc-1234abcd: <title>".
+read_task_id() {
+  sed -n 's/^task \(lh-local-[^:]*\):.*/\1/p' "$WORK/run.log" 2>/dev/null | head -n 1
+}
 
 # Wait until a log file has a line that matches, or give up.
 wait_for() {
@@ -70,7 +87,73 @@ wait_for() {
   done
 }
 
+# Close the workflow of a run that is still going. The cancel goes first and while the worker is
+# up, because the workflow removes its own sandbox when it is cancelled. When the cancel does not
+# close it in time, or no worker is left to act on it, the workflow is terminated.
+stop_run() {
+  if [ -z "$RUN_PID" ] || ! kill -0 "$RUN_PID" 2>/dev/null; then
+    return 0
+  fi
+  if [ -z "$TASK_ID" ]; then
+    TASK_ID="$(read_task_id)"
+  fi
+  if [ -n "$TASK_ID" ]; then
+    echo "stopping task $TASK_ID" >&2
+    local waited=0
+    if [ -n "$WORKER_PID" ] && kill -0 "$WORKER_PID" 2>/dev/null; then
+      "$LONGHAUL" cancel "$TASK_ID" --reason "demo interrupted" >&2 || true
+      # `longhaul run` follows the workflow, so it exits once the workflow has closed.
+      while kill -0 "$RUN_PID" 2>/dev/null && [ "$waited" -lt $((CANCEL_WAIT_S * 5)) ]; do
+        sleep 0.2
+        waited=$((waited + 1))
+      done
+    fi
+    if kill -0 "$RUN_PID" 2>/dev/null; then
+      terminate_workflow
+    fi
+  fi
+  kill "$RUN_PID" 2>/dev/null || true
+  wait "$RUN_PID" 2>/dev/null || true
+  RUN_PID=""
+}
+
+# Temporal has no command here, so the script asks the client library. The task id is the id of the
+# workflow. The task row of a terminated task is closed later by the janitor.
+terminate_workflow() {
+  "$PYTHON" - "$TASK_ID" <<'PY' >&2 || echo "could not terminate the workflow of $TASK_ID" >&2
+import asyncio
+import os
+import sys
+
+from temporalio.client import Client
+
+
+async def main(workflow_id: str) -> None:
+    client = await Client.connect(
+        os.environ.get("LONGHAUL_TEMPORAL_ADDRESS", "localhost:7233"),
+        namespace=os.environ.get("LONGHAUL_TEMPORAL_NAMESPACE", "default"),
+    )
+    await client.get_workflow_handle(workflow_id).terminate(reason="demo interrupted")
+
+
+asyncio.run(main(sys.argv[1]))
+PY
+  # Give the run a moment to see the end, then let the caller kill it if it still hangs.
+  local waited=0
+  while kill -0 "$RUN_PID" 2>/dev/null && [ "$waited" -lt 25 ]; do
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+}
+
 cleanup() {
+  # A second Ctrl-C must not cut the cleanup short and leave the worker behind.
+  trap '' INT TERM
+  if [ -n "$TAIL_PID" ]; then
+    kill "$TAIL_PID" 2>/dev/null || true
+    wait "$TAIL_PID" 2>/dev/null || true
+  fi
+  stop_run
   if [ -n "$WORKER_PID" ]; then
     kill "$WORKER_PID" 2>/dev/null || true
     wait "$WORKER_PID" 2>/dev/null || true
@@ -89,6 +172,9 @@ cleanup() {
     echo "logs are in $WORK" >&2
   fi
 }
+# Ctrl-C and a plain kill end the script through the exit trap, which does the cleanup.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap cleanup EXIT
 
 START="$(date +%s)"
@@ -96,14 +182,45 @@ START="$(date +%s)"
 WORKER_PID=$!
 wait_for "$WORK/worker.log" "worker running"
 
-if "$LONGHAUL" run \
+# The run goes to a file and `tail` shows the file as it grows. The run is a background job so
+# the script can watch the worker while it follows the task.
+: >"$WORK/run.log"
+"$LONGHAUL" run \
   --path "$FIXTURE" \
   --issue-file "$FIXTURE/ISSUE.md" \
   --provider scripted \
-  --script "$SCRIPT" >"$WORK/run.log" 2>&1; then CODE=0; else CODE=$?; fi
-cat "$WORK/run.log"
+  --script "$SCRIPT" >"$WORK/run.log" 2>&1 &
+RUN_PID=$!
+tail -n +1 -f "$WORK/run.log" &
+TAIL_PID=$!
 
-TASK_ID="$(sed -n 's/^task \(lh-local-[^:]*\):.*/\1/p' "$WORK/run.log" | head -n 1)"
+waited=0
+while kill -0 "$RUN_PID" 2>/dev/null; do
+  # Record the id as soon as it is printed, so an interrupt can cancel the workflow.
+  if [ -z "$TASK_ID" ]; then
+    TASK_ID="$(read_task_id)"
+  fi
+  if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+    echo "the worker stopped while the task was running; the worker log follows" >&2
+    cat "$WORK/worker.log" >&2
+    exit 1
+  fi
+  sleep 0.2
+  waited=$((waited + 1))
+  if [ "$waited" -gt $((RUN_WAIT_S * 5)) ]; then
+    echo "gave up after ${RUN_WAIT_S}s waiting for the task to end" >&2
+    exit 1
+  fi
+done
+if wait "$RUN_PID"; then CODE=0; else CODE=$?; fi
+RUN_PID=""
+# Let `tail` print the last lines before it is stopped.
+sleep 0.5
+kill "$TAIL_PID" 2>/dev/null || true
+wait "$TAIL_PID" 2>/dev/null || true
+TAIL_PID=""
+
+TASK_ID="$(read_task_id)"
 if [ "$CODE" -ne 0 ]; then
   echo "the run failed with exit code $CODE; the worker log follows" >&2
   cat "$WORK/worker.log" >&2

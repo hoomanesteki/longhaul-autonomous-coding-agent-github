@@ -5,6 +5,7 @@ import {
   argsSummary,
   cacheRatio,
   costSeries,
+  describeEvent,
   eventSummary,
   eventTone,
   formatDuration,
@@ -170,5 +171,138 @@ describe("costSeries", () => {
     expect(series.map((point) => point.turn)).toEqual([0, 1]);
     expect(series[0]?.total).toBeCloseTo(0.1);
     expect(series[1]?.total).toBeCloseTo(0.6);
+  });
+});
+
+describe("describeEvent", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("writes a step update as the step, its status, the note and the short commit", () => {
+    expect(
+      describeEvent("step_updated", {
+        step_id: "s1",
+        status: "done",
+        note: "Added the parser test",
+        head_sha: SHA,
+        turn_index: 4,
+      }),
+    ).toBe("Step s1 done: Added the parser test (0123456)");
+    expect(describeEvent("step_updated", { step_id: "s2", status: "in_progress", note: "", head_sha: null })).toBe(
+      "Step s2 in progress",
+    );
+  });
+
+  it("writes a verdict with its round and the tests, or with the first reason it failed", () => {
+    expect(describeEvent("verdict", { round: 1, passed: true, tests_summary: "pytest -q" })).toBe(
+      "Verifier passed (round 1): pytest -q",
+    );
+    expect(describeEvent("verdict", { round: 1, passed: true, tests_summary: null })).toBe(
+      "Verifier passed (round 1)",
+    );
+    expect(
+      describeEvent("verdict", { round: 2, passed: false, issues: ["test_add still fails", "no docs"] }),
+    ).toBe("Verifier failed (round 2): test_add still fails, and 1 more");
+    expect(describeEvent("verdict", { round: 3, passed: false, issues: [] })).toBe("Verifier failed (round 3)");
+  });
+
+  it("writes an outcome with its turns and summary, and leaves the cost out", () => {
+    expect(
+      describeEvent("outcome", {
+        kind: "pr_opened",
+        repo: "acme/widgets",
+        turns: 9,
+        cost_usd: 0,
+        summary: "Fixed the parser",
+      }),
+    ).toBe("Pull request opened after 9 turns: Fixed the parser");
+    expect(describeEvent("outcome", { kind: "stuck", turns: 1, summary: "" })).toBe("Stopped as stuck after 1 turn");
+    expect(describeEvent("outcome", { kind: "budget_exhausted", turns: 30 })).toBe(
+      "Stopped, the budget ran out after 30 turns",
+    );
+    expect(describeEvent("outcome", { kind: "cancelled", turns: 2, summary: "cancelled by alice" })).toBe(
+      "Cancelled after 2 turns: cancelled by alice",
+    );
+    expect(describeEvent("outcome", { kind: "error", turns: 2, summary: "boom" })).toBe(
+      "Ended with an error after 2 turns: boom",
+    );
+  });
+
+  it("cuts a long summary and leaves the rest to the details", () => {
+    const line = describeEvent("outcome", { kind: "pr_opened", turns: 3, summary: "x".repeat(400) });
+
+    expect(line).not.toBeNull();
+    expect(line!.length).toBeLessThan(200);
+    expect(line!.endsWith("…")).toBe(true);
+  });
+
+  it("writes a pause with its reason and a resume with how it ended", () => {
+    expect(describeEvent("paused", { kind: "hint", reason: "repeated_failure", pause: 1 })).toBe(
+      "Paused: repeated failure",
+    );
+    expect(describeEvent("paused", { kind: "hint", reason: "agent_asked", question: "Which API?" })).toBe(
+      "Paused: agent asked, Which API?",
+    );
+    expect(describeEvent("resumed", { kind: "hint", via: "hint", by: "alice" })).toBe(
+      "Resumed with a hint from alice",
+    );
+    expect(describeEvent("resumed", { kind: "budget", via: "budget", reason: "max_usd" })).toBe(
+      "Resumed with a budget top-up (max usd)",
+    );
+    expect(describeEvent("resumed", { kind: "budget", via: "midnight" })).toBe(
+      "Resumed at midnight UTC, when the daily limit reset",
+    );
+    expect(describeEvent("resumed", { pause: 2, via: null })).toBe("Resumed");
+  });
+
+  it("writes the amount of a budget top-up", () => {
+    expect(describeEvent("budget_added", { pause: 1, usd: 2, turns: 5, by: "alice" })).toBe(
+      "Budget added: $2.00 and 5 turns, by alice",
+    );
+    expect(describeEvent("budget_added", { pause: 1, usd: 0, turns: 1 })).toBe("Budget added: 1 turn");
+    expect(describeEvent("budget_added", { pause: 1, usd: 0, turns: 0 })).toBe("Budget added: nothing");
+  });
+
+  it("writes a compaction as the tokens it saved", () => {
+    expect(
+      describeEvent("compaction", {
+        tokens_before: 40_000,
+        tokens_after: 28_000,
+        folded_turns: 8,
+        forced: false,
+      }),
+    ).toBe("Compaction saved 12,000 tokens (40,000 to 28,000), 8 turns folded");
+    expect(
+      describeEvent("compaction", { tokens_before: 9000, tokens_after: 4000, folded_turns: 1, forced: true }),
+    ).toBe("Compaction saved 5,000 tokens (9,000 to 4,000), 1 turn folded, forced");
+  });
+
+  it("gives up, so the caller shows the key and value pairs, for a kind or a payload it does not know", () => {
+    expect(describeEvent("sandbox_recreated", { sandbox_id: "abc" })).toBeNull();
+    expect(describeEvent("verdict", { passed: "yes" })).toBeNull();
+    expect(describeEvent("step_updated", {})).toBeNull();
+    expect(describeEvent("compaction", { dropped_turns: 6 })).toBeNull();
+    expect(describeEvent("outcome", {})).toBeNull();
+  });
+});
+
+describe("groupTimeline checkpoints", () => {
+  it("puts a checkpoint under the turn that made it", () => {
+    const rows = groupTimeline([
+      turn(2),
+      call("a", 2),
+      {
+        kind: "checkpoint",
+        ts: "2026-11-01T10:00:03Z",
+        id: 7,
+        sha: "0123456789abcdef0123456789abcdef01234567",
+        checkpoint_kind: "step",
+        turn_index: 2,
+        step_id: "s1",
+      },
+    ]);
+
+    expect(rows).toHaveLength(1);
+    const only = rows[0];
+    expect(only?.kind === "turn" && only.checkpoints.map((c) => c.sha.slice(0, 7))).toEqual(["0123456"]);
   });
 });

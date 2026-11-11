@@ -537,3 +537,41 @@ describe("expanders", () => {
     await waitFor(() => expect(within(row).getByRole("alert")).toHaveTextContent(/not found/));
   });
 });
+
+describe("checkpoints", () => {
+  it("marks the turn that made a checkpoint with the short commit", async () => {
+    serve({
+      items: [
+        turn(0),
+        call("a", 0, { post_sha: SHA }),
+        {
+          kind: "checkpoint",
+          ts: at(14),
+          id: 1,
+          sha: SHA,
+          checkpoint_kind: "tool",
+          turn_index: 0,
+          step_id: null,
+        },
+        turn(1),
+        {
+          kind: "checkpoint",
+          ts: at(20),
+          id: 2,
+          sha: "fedcba9876543210fedcba9876543210fedcba98",
+          checkpoint_kind: "step",
+          turn_index: 1,
+          step_id: "s1",
+        },
+      ],
+    });
+    renderPage();
+
+    const first = rowOf(await screen.findByText("Turn 0"));
+    expect(within(first).getByText("Checkpoint 0123456")).toBeInTheDocument();
+    const second = rowOf(screen.getByText("Turn 1"));
+    expect(within(second).getByText("Checkpoint fedcba9")).toBeInTheDocument();
+    expect(within(second).getByText("step s1")).toBeInTheDocument();
+    expect(within(second).queryByText("Checkpoint 0123456")).not.toBeInTheDocument();
+  });
+});

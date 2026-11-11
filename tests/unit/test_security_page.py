@@ -150,21 +150,52 @@ SPAWN_CALLS = {
     "Popen",
     "system",
     "popen",
+    "fork",
+    "forkpty",
+    "posix_spawn",
+    "posix_spawnp",
+    "spawn",
+    "spawnl",
+    "spawnle",
+    "spawnlp",
+    "spawnlpe",
+    "spawnv",
+    "spawnve",
+    "spawnvp",
+    "spawnvpe",
+    "execl",
+    "execle",
+    "execlp",
+    "execlpe",
     "execv",
     "execve",
     "execvp",
+    "execvpe",
 }
+# A module that can only start processes, so importing it is enough to be listed.
+SPAWN_MODULES = {"subprocess", "pty"}
 
 
 def spawns_processes(source: str) -> bool:
     tree = ast.parse(source)
     for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name.split(".")[0] in SPAWN_MODULES for alias in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom):
+            # `from subprocess import run` makes a bare `run(...)` a spawn, so the import is
+            # what is flagged. `from os import fork` and the like are caught the same way.
+            if (node.module or "").split(".")[0] in SPAWN_MODULES:
+                return True
+            if any(alias.name in SPAWN_CALLS for alias in node.names):
+                return True
         if isinstance(node, ast.Call):
             func = node.func
             name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
             if name in SPAWN_CALLS:
                 return True
-            if isinstance(func, ast.Attribute) and getattr(func.value, "id", "") == "subprocess":
+            if isinstance(func, ast.Attribute) and getattr(func.value, "id", "") in SPAWN_MODULES:
                 return True
     return False
 
@@ -187,6 +218,13 @@ def test_the_spawn_scan_sees_each_way_to_start_a_process() -> None:
     assert spawns_processes("subprocess.run(['ls'])")
     assert spawns_processes("os.system('ls')")
     assert spawns_processes("os.execv('/bin/sh', [])")
+    assert spawns_processes("from subprocess import run\nrun(['make'])")
+    assert spawns_processes("import subprocess as sp")
+    assert spawns_processes("import pty\npty.spawn(['sh'])")
+    assert spawns_processes("os.spawnv(os.P_WAIT, '/bin/sh', [])")
+    assert spawns_processes("os.posix_spawn('/bin/sh', [], {})")
+    assert spawns_processes("pid = os.fork()")
+    assert spawns_processes("from os import fork")
     assert not spawns_processes("print('subprocess')")
 
 

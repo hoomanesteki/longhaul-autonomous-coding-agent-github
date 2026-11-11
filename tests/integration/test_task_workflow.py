@@ -1468,19 +1468,30 @@ async def test_a_run_that_starts_with_a_sandbox_ensures_it_before_the_first_turn
     assert final.last_checkpoint == sha(7)
 
 
-async def test_a_run_that_starts_with_a_sandbox_is_preparing_while_it_is_ensured(
+async def test_a_run_that_starts_with_a_sandbox_keeps_its_phase_while_it_is_ensured(
     env: WorkflowEnvironment, spec: TaskSpec
 ) -> None:
+    """This test asserted `preparing` while the sandbox is ensured, for a new run (LH-991).
+
+    The run is a hand-over of a task that was coding, and a write of `preparing` made the console
+    show it as begun over again. The history that has the old write replays through the patch
+    marker (test_a_history_of_a_hand_over_from_before_the_phase_was_kept_replays).
+    """
     stubs = Stubs()
     stubs.hold(acts.ENSURE_SANDBOX.name)
     stubs.hold(acts.LLM_TURN.name)
     async with running(env, stubs) as queue:
         handle = await start_with(env, queue, resumed(spec))
-        assert (await wait_for_phase(handle, Phase.PREPARING)).last_checkpoint == sha(7)
+        while acts.ENSURE_SANDBOX.name not in stubs.names():
+            await asyncio.sleep(0.02)
+        held = await handle.query(TaskWorkflow.status)
+        assert (held.phase, held.last_checkpoint) == (Phase.CODING, sha(7))
         stubs.release(acts.ENSURE_SANDBOX.name)
         await wait_for_phase(handle, Phase.CODING)
         stubs.release(acts.LLM_TURN.name)
         await result_of(handle)
+
+    assert Phase.PREPARING not in [s.phase for s in stubs.states]
 
 
 async def test_ensure_sandbox_gets_the_timeout_and_retries_of_section_3_7(

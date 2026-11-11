@@ -599,8 +599,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      GITLEAKS_VERSION: "8.28.0"
-      GITLEAKS_SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
+      GITLEAKS_VERSION: "8.30.1"
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - uses: actions/checkout@v7
         with:
@@ -614,7 +614,7 @@ jobs:
           tar -xzf gitleaks.tar.gz -C "$RUNNER_TEMP/gitleaks" gitleaks
           echo "$RUNNER_TEMP/gitleaks" >> "$GITHUB_PATH"
       - name: Scan git history for secrets
-        run: gitleaks detect --source . --redact --verbose
+        run: gitleaks git --log-opts="--all" --redact --verbose .
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"

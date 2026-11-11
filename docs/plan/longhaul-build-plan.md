@@ -3315,13 +3315,13 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 - **Cumulative tests:** `make gate PHASE=9`. That covers every phase marker, `chaos_lite`, Playwright, and the hardening tests. The full chaos suite and the eval runs are manual and their result files are committed.
 - **Manual smoke:**
   ```bash
-  # on the eval VM
-  uv run python eval/swebench/select_subset.py --seed 42 --check   # subset unchanged
+  # on the eval VM. The run ids are the folders under eval/results/.
+  uv run python eval/swebench/select_subset.py --check   # subset unchanged (the seed is fixed at 42)
   uv run python eval/run.py --set custom --config full --run-id custom-full-$(date +%F) --concurrency 3
   uv run python eval/run.py --set swebench --config full --run-id swe-full-$(date +%F) --concurrency 4
-  ./eval/swebench/grade.sh swe-full-$(date +%F)
-  uv run python eval/chaos/chaos.py --runs 20 --seed 7
-  uv run python eval/report/build_report.py custom-full-* swe-* chaos-*
+  ./eval/swebench/grade.sh eval/results/swe-full-$(date +%F)
+  uv run python eval/chaos/chaos.py --runs 20 --seed 7   # writes eval/results/chaos-$(date +%F)
+  uv run python eval/report/build_report.py swe-full-$(date +%F) custom-full-$(date +%F) chaos-$(date +%F)
   ```
 
 ### Phase gate 9 (release)

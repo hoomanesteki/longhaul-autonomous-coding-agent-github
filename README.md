@@ -2,7 +2,7 @@
 
 A background coding agent that survives crashes and tells you when it is stuck. It takes a GitHub issue, works on it for hours in a sandbox, resumes where it stopped after a crash, and ends with a pull request or an honest report of where it got stuck.
 
-Status: all nine phases are built, and `v1.0.0` is the release. The tag is made at the Phase 9 gate. Docs site: [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/), built from `docs/` with Quarto.
+Status: all nine phases are built, and `v1.0.0` is the release. The tag is made at the Phase 9 gate. The repo is public. The docs site is built from `docs/` with Quarto and is not live yet: it goes live at [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/) once the owner turns on GitHub Pages and the next push to `main` deploys it. The runbook's [Publishing](docs/runbook.md#publishing) section has the steps.
 
 [![ci](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml)
 
@@ -93,7 +93,7 @@ make setup && make up && make demo
 - `make up` starts Postgres, Temporal and MinIO, plus Jaeger, Prometheus and Grafana, from `docker-compose.yml`. The first run pulls the images.
 - `make demo` builds the sandbox image, creates the database tables, starts a worker, and runs one task on the `calc` fixture, a small package whose `add()` subtracts. It prints each status line and the final diff, then stops the worker. Nothing stays running.
 
-The sandbox setup installs pytest from PyPI, so the machine needs outbound network for the first minute of the task. If another project already uses a port, edit the `LH_*_PORT` values in `.env`. A new `LH_POSTGRES_PORT`, `LH_TEMPORAL_PORT` or `LH_MINIO_PORT` also needs the same port in `LONGHAUL_DATABASE_URL`, `LONGHAUL_TEMPORAL_ADDRESS` or `LONGHAUL_BLOB_ENDPOINT`, because those settings keep the default ports otherwise. The Grafana, Prometheus and Jaeger ports can change on their own. `make down` stops the stack and removes its volumes.
+The sandbox setup installs pytest from PyPI, so the machine needs outbound network for the first minute of the task. If another project already uses a port, edit the `LH_*_PORT` values in `.env`. A new `LH_POSTGRES_PORT`, `LH_TEMPORAL_PORT` or `LH_MINIO_PORT` also needs the same port in `LONGHAUL_DATABASE_URL`, `LONGHAUL_TEMPORAL_ADDRESS` or `LONGHAUL_BLOB_ENDPOINT`, because those settings keep the default ports otherwise. A new `LH_OTLP_GRPC_PORT` also needs the same port in `OTEL_EXPORTER_OTLP_ENDPOINT`, or the traces go to whatever listens on port 4317. The Grafana, Prometheus and Jaeger ports can change on their own. `make down` stops the stack and removes its volumes.
 
 Other commands:
 
@@ -168,7 +168,7 @@ One line each. The full records, with the alternatives, are in [docs/adr/](docs/
 - **Sandbox.** Repo code runs only in a Docker container: non-root user, all capabilities dropped, `no-new-privileges`, read-only root filesystem, limits on processes, memory and CPU. The network is on for the setup command and cut after it.
 - **No credentials inside.** The GitHub token and model keys live in the worker environment. The sandbox environment is an allowlist, and a test checks it holds no secret.
 - **Writes go one way.** Every GitHub write goes through one module with an idempotency key, so a retry cannot post twice. The agent never pushes to a default branch.
-- **Budgets.** Each task and each repo has a limit on dollars, turns and wall time. A task that reaches one pauses and asks.
+- **Budgets.** Each task has limits on dollars, turns and wall time, and each repo has a daily dollar limit. A task that reaches a task limit pauses and asks. A task that reaches the daily repo limit waits until 00:00 UTC.
 - **A person merges.** Longhaul opens the pull request. It does not merge it.
 - **Memory.** Notes from unmerged work are candidates and never reach a prompt until a merged pull request or a person approves them.
 
@@ -180,7 +180,7 @@ The threat model, the test behind each control and the known gaps are in [docs/s
 - One host. A worker needs a Docker daemon next to it. The Terraform in `deploy/terraform/aws` is checked for validity in CI and applied by hand ([docs/deploy-aws.md](docs/deploy-aws.md)).
 - Polling delay. A labeled issue waits up to a minute for its task, and a comment command up to a minute for its effect.
 - The eval numbers are pending, and the chaos runs used scripted model answers. When the eval runs are made, they cover a 40-task subset of SWE-bench Verified and a set of 15 custom tasks, which gives wide intervals.
-- The demo video and the public release are not done. They are steps at the `v1.0.0` gate.
+- The repo is public, but the demo video, the `v1.0.0` tag, the release notes and the live docs site are not done. They are steps at the `v1.0.0` gate.
 
 ## Repo layout
 

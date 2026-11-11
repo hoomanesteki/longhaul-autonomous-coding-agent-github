@@ -9,7 +9,7 @@ Applying it is manual, and it costs money while it exists. Plan to apply, try it
 | Part | Runs on | Why |
 |---|---|---|
 | Worker | ECS on EC2, one task per instance | A worker starts a Docker sandbox for every task, so it needs a Docker daemon and its socket. A Fargate task has neither. |
-| API | ECS on Fargate | It never starts a container. It is off by default (see "What the application does not do yet"). |
+| API | ECS on Fargate | It never starts a container. It is off by default, because nothing in front of it gives it TLS or a way in (see "Security notes"). |
 | Poller | A Fargate task that you run on request | It installs the Temporal Schedule `longhaul-poller` and exits. The schedule lives in Temporal, so nothing has to stay up for it. The workers run `poll_once`. |
 | Migrations | A Fargate task that you run on request | It applies the Alembic migrations to the database and exits. |
 | Database | RDS PostgreSQL 17 with pgvector | Private subnets only, encrypted, TLS required. |
@@ -116,10 +116,12 @@ TAG=v0.1.0
 URLS=$(terraform -chdir=deploy/terraform/aws output -json ecr_repository_urls)
 WORKER=$(jq -r .worker <<<"$URLS")
 SANDBOX=$(jq -r .sandbox <<<"$URLS")
+API=$(jq -r .api <<<"$URLS")
 aws ecr get-login-password --region us-east-1 \
   | docker login --username AWS --password-stdin "${WORKER%%/*}"
 docker buildx build --platform linux/amd64 -f docker/worker/Dockerfile -t "$WORKER:$TAG" --push .
 docker buildx build --platform linux/amd64 -t "$SANDBOX:$TAG" --push docker/sandbox
+docker buildx build --platform linux/amd64 -f docker/api/Dockerfile -t "$API:$TAG" --push .   # only for api_enabled
 ```
 
 The repo list lives in the config file inside the image. The default image config has no repositories, so put your own in `config/longhaul.yaml` before you build the worker image, and set `config_path = "/app/config/longhaul.yaml"` in `terraform.tfvars`.
@@ -152,7 +154,7 @@ To upgrade, push images with a new tag, apply with the new `image_tag`, and repl
 | `temporal_namespace` | none | The namespace, `name.account-id` in Temporal Cloud |
 | `temporal_client_cert_secret_arn`, `temporal_client_key_secret_arn` | empty | Secrets that hold the client certificate and key. Required in cloud mode |
 | `services_enabled` | `false` | Starts the worker hosts and the worker service |
-| `api_enabled` | `false` | Starts the API service when the services are on |
+| `api_enabled` | `false` | Starts the API service when the services are on. Push the `api` image first, and fill `longhaul/admin-token` |
 | `image_tag` | empty | The tag you pushed. Required when `services_enabled` is true |
 | `llm_provider` | `anthropic` | Decides which model key the workers receive |
 | `worker_count` | `1` | Workers, each on an instance of its own |
@@ -192,6 +194,7 @@ Things that Terraform did not create stay: the Temporal certificate secrets that
 ## Security notes
 
 - **No inbound path from the internet.** No security group has a rule from `0.0.0.0/0`, and nothing has a public address. The API accepts port 8000 from inside the VPC only. No load balancer is built; add an internal one, a VPN or a bastion host when the console needs to be reached.
+- **The API is off by default.** Its image (`docker/api/Dockerfile`) and its command (`longhaul api`) exist, and `api_enabled = true` starts the service. It stays off because the stack puts no load balancer and no TLS in front of it: the service has no public address, listens on plain HTTP on port 8000 and answers only inside the VPC, and its admin token travels in the clear on that hop. Turn it on when you have an internal load balancer with a certificate, a VPN or a bastion host to reach it, and have filled the `longhaul/admin-token` secret. Change `api_command` if you name the command differently.
 - **The Docker socket.** The worker task mounts the host's socket, which is root on the host (see "The worker in Docker" in `docs/runbook.md`). Each worker has an instance to itself, and the instance holds nothing but the worker and its sandboxes.
 - **Sandboxes cannot reach the database or the instance role.** Sandbox traffic leaves through the host's own network interface and carries the host's security group, which the database does not accept. The host requires metadata service version 2 with a hop limit of 1, so a container behind the Docker bridge cannot read the instance role, and `ECS_AWSVPC_BLOCK_IMDS` blocks the awsvpc task containers.
 - **The containers hold no AWS role.** They receive secrets as environment variables from ECS. The one AWS credential they hold is the key pair of the blob user, which can read and write one bucket. The API shares it, so it can write there too.
@@ -204,8 +207,6 @@ The stack is written against the application as it is. These gaps are in the app
 
 - **Temporal Cloud needs TLS, and the client has none.** `longhaul.durable.client.connect` calls `Client.connect(address, namespace=...)` with no certificate. Until the settings and the client accept `LONGHAUL_TEMPORAL_TLS_CERT` and `LONGHAUL_TEMPORAL_TLS_KEY`, which are the names the tasks already receive, `cloud` mode cannot connect, and `self_hosted` inside the VPC can.
 - **The blob store needs static keys and `us-east-1`.** `S3BlobStore.from_settings` refuses to start without an access key and a secret key, and it signs for `us-east-1`. That is why the stack creates an IAM user and keeps the region fixed. When the store learns to use the credential chain and a region, the user and its secret can go.
-- **The API has no image or command yet.** `docker/api/Dockerfile` and `longhaul api` come with the console API story. The `api` repository and task definition exist, and `api_enabled` stays false until the image does. Change `api_command` if the command is named differently.
-- **The poller command is not in the CLI yet.** `longhaul poller install` is part of the poller story. Until it is merged, the poller task exits with an error. Change `poller_command` if the command is named differently.
 
 ## Check the Terraform without AWS
 

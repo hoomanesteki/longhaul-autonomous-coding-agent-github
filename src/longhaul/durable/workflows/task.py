@@ -377,6 +377,14 @@ once no run that began before this story is open. The lessons are behind
 `workflow.patched(LESSONS_PATCH)`, asked only by a task that has a `memory_ref`, so a history that
 ended before LH-605 replays without the call, and a task with no memory records no marker.
 
+The stored run report (LH-705, LH-991). `deliver` stores the report for the body of the pull
+request, which is before the outcome and the lessons are recorded, so that copy lacks both. At
+the very end of the wind-up, after the outcome event, a task of an issue asks `write_run_report`
+for a new copy, which replaces the blob. The pull request body is not touched: it was made from
+the first copy, and nothing reads the stored copy for a body after the wind-up begins. Replay: the
+call is behind `workflow.patched(FINAL_REPORT_PATCH)`, asked only by a task of an issue, so a
+history that ended before this story replays without it.
+
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
 When the turn is over and its results are in the transcript, the workflow acts on it, in
@@ -567,6 +575,8 @@ LOAD_MEMORY_PATCH = "lh-604-load-memory"
 PLAN_GATE_PATCH = "lh-502-plan-gate"
 # The patch marker of the review of a planned `finish` (LH-991). See "The verifying phase" above.
 FINISH_REVIEWED_PATCH = "lh-991-finish-reviewed"
+# The patch marker of the second write of the stored run report (LH-991). See "How a task ends".
+FINAL_REPORT_PATCH = "lh-991-final-report"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
 # ends" above.
 OUTCOME_PATCH = "lh-507-final-outcome"
@@ -1069,7 +1079,8 @@ class TaskWorkflow:
         for one, the final comment (which links that pull request), and the final labels. The
         repo of a cancelled task goes after them, since the comment reads its diff. The lessons of
         a task that keeps memory come next (LH-605), so nobody waits for a model. The note for the
-        metrics comes last, so it counts a task that has finished all of this.
+        metrics comes next, so it counts a task that has finished all of this. The stored run
+        report is written last (LH-991), because it reads the outcome and the lessons.
 
         Each step is best effort. An activity that fails for good is logged, and the next step
         goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
@@ -1099,6 +1110,7 @@ class TaskWorkflow:
         await self._remove_repo(outcome)
         await self._lessons(outcome)
         await self._note_outcome(outcome)
+        await self._final_report(outcome)
         return outcome
 
     def _cancelled_by_a_person(self, outcome: Outcome) -> bool:
@@ -1233,6 +1245,25 @@ class TaskWorkflow:
         always a draft.
         """
         return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
+
+    async def _final_report(self, outcome: Outcome) -> None:
+        """Store the run report again, now that the outcome and the lessons are in the rows.
+
+        The copy that `deliver` stored was built before either existed. This write comes after the
+        `outcome` event, which is the last row of the task, and replaces the blob. Best effort,
+        like the rest of the wind-up: a report that cannot be built leaves the older copy and the
+        outcome as they are.
+        """
+        state = self.state
+        if not lifecycle.is_github_task(state.spec) or not workflow.patched(FINAL_REPORT_PATCH):
+            return
+        await self._try(
+            "run report",
+            self._wind_call(
+                acts.WRITE_RUN_REPORT,
+                acts.RunReportInput(task_id=state.spec.task_id, outcome=outcome.kind.value),
+            ),
+        )
 
     async def _lessons(self, outcome: Outcome) -> None:
         """Draft the lessons of the task and record them (LH-605). Best effort, like the rest.

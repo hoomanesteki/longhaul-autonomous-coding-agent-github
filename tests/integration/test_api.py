@@ -22,8 +22,10 @@ from typing import Any
 
 import httpx2
 import pytest
+from sqlalchemy import event as sa_event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client, WorkflowHandle
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from tests.integration import test_run_report as report_tests
 from tests.integration import test_task_workflow as workflow_tests
@@ -1022,6 +1024,40 @@ async def test_actions_report_unreachable_temporal(api: Stack) -> None:
     assert response.status_code == 503
 
 
+class RefusingTemporal:
+    """A Temporal client whose server answers every signal with the status it was given."""
+
+    def __init__(self, status: RPCStatusCode) -> None:
+        self.status = status
+
+    def get_workflow_handle_for(self, *args: Any, **kwargs: Any) -> RefusingTemporal:
+        return self
+
+    async def signal(self, *args: Any, **kwargs: Any) -> None:
+        raise RPCError("host 10.1.2.3 refused", self.status, b"")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (RPCStatusCode.UNAVAILABLE, 503),
+        (RPCStatusCode.DEADLINE_EXCEEDED, 503),
+        (RPCStatusCode.INVALID_ARGUMENT, 400),
+        (RPCStatusCode.FAILED_PRECONDITION, 409),
+        (RPCStatusCode.PERMISSION_DENIED, 502),
+        (RPCStatusCode.INTERNAL, 502),
+    ],
+)
+async def test_an_action_maps_the_status_temporal_answered_with(
+    sessions: Sessions, status: RPCStatusCode, expected: int
+) -> None:
+    async with serving(sessions, RefusingTemporal(status)) as api:  # type: ignore[arg-type]
+        response = await api.post(f"/api/tasks/{TASK}/cancel", {"reason": "stop"})
+
+    assert response.status_code == expected
+    assert "10.1.2.3" not in response.text
+
+
 async def test_cancel_action_takes_a_null_body_like_the_console_sends(api: Stack) -> None:
     # The console sends the JSON text `null` when it has no reason to give. Reaching Temporal
     # (and failing there, 503) means the body passed validation.
@@ -1087,6 +1123,29 @@ async def test_memory_list_filters(api: Stack) -> None:
 
     assert (await api.get("/api/memory", status="maybe")).status_code == 422
     assert (await api.get("/api/memory", kind="note")).status_code == 422
+
+
+async def test_memory_list_cuts_at_the_limit_in_the_query(api: Stack, sessions: Sessions) -> None:
+    """The limit is part of the SELECT, so a busy repo is not loaded whole to show 200 rows."""
+    ids = await seed_memory(api)
+    engine = sessions.kw["bind"].sync_engine
+    statements: list[str] = []
+
+    def keep(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        if "FROM memory_items" in statement:
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", keep)
+    try:
+        limited = (await api.get("/api/memory", repo=REPO, limit=2)).json()
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", keep)
+
+    # The oldest two, which is the order of the list, and nothing past them was read.
+    assert [i["id"] for i in limited] == [ids["lesson"], ids["pitfall"]]
+    (select_,) = statements
+    assert "LIMIT" in select_ and "ORDER BY" in select_
+    assert (await api.get("/api/memory", repo=REPO, limit=0)).status_code == 422
 
 
 async def test_memory_approve_and_reject(api: Stack) -> None:

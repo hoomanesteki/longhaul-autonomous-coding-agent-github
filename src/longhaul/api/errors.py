@@ -11,6 +11,11 @@ is kept in one place so that every route says the same thing about the same fail
   minute (deps.authorize). They come before any other check, so they hide nothing.
 * 502 when the blob store fails or holds something unreadable, and 503 when Temporal or the
   database cannot be reached. The page shows the line and the rest of the console goes on.
+* An answer of Temporal is mapped by its status (`temporal_failure`): UNAVAILABLE and
+  DEADLINE_EXCEEDED are 503, INVALID_ARGUMENT is 400, FAILED_PRECONDITION is 409, and anything
+  else is 502. Every route that reaches Temporal sends a signal, so a refused request is the
+  person's to fix (400, 409) or the server's (502). The detail names the status and never the
+  message of the server, which can hold hosts and namespaces.
 """
 
 from __future__ import annotations
@@ -51,6 +56,14 @@ STORE_ERRORS = (BlobError, BotoCoreError, ClientError, ValidationError, ValueErr
 UNREACHABLE = frozenset({RPCStatusCode.UNAVAILABLE, RPCStatusCode.DEADLINE_EXCEEDED})
 
 
+# What the answer is for a refusal that the person can do something about. Every other refusal is
+# the server's fault or its configuration, and is a 502.
+REFUSED_AS = {
+    RPCStatusCode.INVALID_ARGUMENT: 400,
+    RPCStatusCode.FAILED_PRECONDITION: 409,
+}
+
+
 def not_found(what: str) -> HTTPException:
     return HTTPException(status_code=404, detail=f"no such {what}")
 
@@ -64,9 +77,11 @@ def temporal_failure(exc: Exception) -> HTTPException:
         return HTTPException(status_code=404, detail="no such running task")
     log.warning("temporal request failed: %s: %s", type(exc).__name__, exc)
     if isinstance(exc, RPCError) and exc.status not in UNREACHABLE:
-        # The server answered and refused: a permission or a rate limit is not an outage.
+        # The server answered and refused: a permission or a rate limit is not an outage. The
+        # detail is the status only, so no host, namespace or stack of the server reaches a page.
+        code = REFUSED_AS.get(exc.status, 502)
         return HTTPException(
-            status_code=502, detail=f"Temporal refused the request: {exc.status.name}"
+            status_code=code, detail=f"Temporal refused the request: {exc.status.name}"
         )
     return HTTPException(status_code=503, detail="Temporal is not reachable")
 

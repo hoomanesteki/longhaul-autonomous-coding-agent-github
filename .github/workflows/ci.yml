@@ -619,7 +619,7 @@ jobs:
           enable-cache: true
       - name: Audit locked dependencies
         run: |
-          uv export --locked --format requirements-txt --no-hashes --no-emit-project \
+          uv export --locked --all-extras --format requirements-txt --no-hashes --no-emit-project \
             > requirements-audit.txt
           uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps --timeout 60
 

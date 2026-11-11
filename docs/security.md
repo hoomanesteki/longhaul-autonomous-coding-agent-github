@@ -66,6 +66,7 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 | A flood of output cannot grow the worker's memory. | `integration/test_sandbox.py::test_a_flood_of_output_ends_at_the_timeout_with_bounded_memory` |
 | Orphaned processes cannot use up the pid limit. | `integration/test_sandbox.py::test_pid_1_is_an_init_that_reaps_orphans`, `::test_orphans_do_not_pile_up_against_the_pid_limit` |
 | File tools and the file API stay inside the workspace, also through symlinks. | `unit/test_path_safety.py::test_every_tool_with_a_path_refuses_to_leave_the_workspace`, `integration/test_sandbox.py::test_read_file_is_confined_to_the_writable_roots`, `::test_write_file_does_not_follow_a_symlink_out_of_the_workspace` |
+| The worker never runs repo code. Only the sandbox does. The modules that start a process are known and listed, the fake sandbox that runs a shell on the machine is imported by no module of the package, and git on the host runs with hooks and the fsmonitor program switched off, because the sandbox can rewrite the config and hooks of the repo it has mounted. | `unit/test_security_page.py::test_only_the_known_modules_start_a_process`, `::test_the_fake_sandbox_is_imported_by_no_module_of_the_package`, `::test_git_on_the_host_runs_no_hook_and_no_fsmonitor_program`, `unit/test_push_branch.py::test_a_hook_in_the_task_repo_does_not_run` |
 
 ### GitHub and the default branch
 
@@ -96,6 +97,7 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 | `redact` removes `sk-`, GitHub (`ghp_`, `ghs_`, `ghu_`, `gho_`, `ghr_`, `github_pat_`), AWS key ids and PEM private keys. | `unit/test_redaction.py::test_patterns` |
 | Logs are redacted last, in fields, exceptions and reprs. | `unit/test_logging.py::test_secrets_are_redacted_wherever_they_sit`, `::test_an_exception_message_is_redacted` |
 | The trace of an unexpected error is redacted before it is stored in an event. | `unit/test_activities_events.py::test_the_trace_of_an_error_is_written_without_a_secret` |
+| A span keeps the type of an exception and drops its text, unless content capture is on. Temporal's interceptor would otherwise export "Type: message" and the stacktrace, and a provider error can echo the request. `_QuietSpan` in `telemetry/otel.py` does this for the interceptor spans, and the chat and tool spans keep prompts and tool content out by default. | `unit/test_otel.py::test_interceptor_spans_keep_the_error_type_and_drop_the_text`, `::test_a_span_started_by_hand_drops_exception_text_too`, `::test_a_failed_call_is_an_error_span_that_keeps_the_text_out`, `::test_a_chat_span_has_no_content_by_default`, `::test_a_tool_span_has_no_content_by_default` |
 | Run reports are redacted. | `unit/test_run_report.py::test_a_secret_in_a_hint_never_reaches_the_report` |
 | The console API redacts turns, outputs, events and memory notes when it reads them. | `unit/test_api_redaction.py::test_every_string_of_a_nested_value_is_redacted`, `integration/test_api.py::test_outputs_redacted` |
 | A secret-looking key in the YAML config is refused. | `unit/test_settings.py::test_secret_keys_rejected_in_yaml` |
@@ -111,6 +113,13 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 | `/metrics` needs the token unless the server is bound to this machine. `/healthz` is open. | `integration/test_api_auth.py::test_metrics_need_the_token_unless_the_server_is_local`, `::test_healthz_is_public` |
 | An action token may send 30 actions a minute. A refused request does not use up the limit. | `integration/test_api_auth.py::test_rate_limit_actions`, `::test_a_refused_request_does_not_use_up_the_limit`, `unit/test_api_auth.py::test_the_limiter_allows_the_limit_and_then_says_how_long_to_wait` |
 
+### Where the services listen
+
+| Control | Test |
+|---|---|
+| Every port in `docker-compose.yml` is published on `127.0.0.1` only. The runbook explains the limit of loopback binding. | `unit/test_security_page.py::test_every_compose_port_is_published_on_loopback_only`, `::test_a_port_without_an_address_would_be_caught` |
+| The API and the metrics endpoint default to `127.0.0.1` (`EnvSettings.api_host` and `metrics_host`). | `unit/test_security_page.py::test_the_api_and_the_metrics_endpoint_default_to_this_machine`, `unit/test_cli_api.py::test_the_settings_default_to_a_port_on_this_machine` |
+
 ### Memory
 
 | Control | Test |
@@ -122,14 +131,12 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 | Control | Test or check |
 |---|---|
 | Actions in CI are pinned to major versions and the Temporal image to a digest. | `unit/test_ci_config.py::test_actions_use_pinned_major_versions`, `::test_temporal_image_check_accepts_the_pinned_image` |
-| Dependencies are locked, scanned by `pip-audit`, and the history is scanned by gitleaks. | The `security` job in `.github/workflows/ci.yml`. The results of the pass that wrote this page are below. |
+| Dependencies are locked and scanned by `pip-audit`, with every extra and the dev group included, and the history is scanned by gitleaks. | The `security` job in `.github/workflows/ci.yml`, and `unit/test_security_page.py::test_the_ci_audit_covers_every_extra`. The results of the pass that wrote this page are below. |
 
 ### Controls without a test
 
 | Control | How to check it |
 |---|---|
-| Every compose port is published on `127.0.0.1` only. | Read `docker-compose.yml`. The runbook explains the limit of loopback binding. |
-| The API and the metrics endpoint default to `127.0.0.1`. | `EnvSettings.api_host` and `metrics_host` in `src/longhaul/settings.py`. |
 | Branch protection on `main` and `dev`. | `scripts/protect_branches.sh`, and the settings of the repo on GitHub. It needs an admin with `gh`, so no test can run it. |
 | The container user is `agent` by name, and the image fixes the uid at 10001. | `docker/sandbox/Dockerfile`. `test_inspect_flags` checks the name and `test_the_flags_hold_inside_the_container` checks the uid. |
 

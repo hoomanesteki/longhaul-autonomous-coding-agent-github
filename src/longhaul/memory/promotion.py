@@ -40,6 +40,7 @@ __all__ = [
     "PullReader",
     "Settled",
     "approver_for",
+    "decided_by",
 ]
 
 # The types of the events that the poller records (plan section 3.5).
@@ -84,6 +85,17 @@ class Settled:
 def approver_for(pr_number: int) -> str:
     """The `approved_by` of a lesson that a merged pull request approved."""
     return f"merged_pr#{pr_number}"
+
+
+def decided_by(payload: Mapping[str, Any]) -> str | None:
+    """Who settled the lessons of a `memory_promoted` or `memory_rejected` event.
+
+    A rejection names `decided_by`, since nobody approved anything. Before LH-991 it said
+    `approved_by`, like a promotion still does, and those rows are in the table for good, so
+    a reader asks for both.
+    """
+    found = payload.get("decided_by", payload.get("approved_by"))
+    return found if isinstance(found, str) else None
 
 
 def pull_number(entry: MemoryEntry) -> int | None:
@@ -142,9 +154,14 @@ class Promoter:
         task_id = await self._events.lessons_task(repo, str(number))
         if task_id is None:
             # The task recorded no lessons event, or its row is gone. The decision still counts,
-            # so the event is filed under the pull request.
+            # so the event is filed under "<repo>#<number>". That is not a task id: no row of
+            # `tasks` has it, `events.task_id` is plain text with no foreign key, and a task's
+            # timeline or report never shows the event. The payload has the repo and the pull
+            # request, so a query by those finds it.
             task_id = f"{repo}#{number}"
+        # A promotion names who approved. A rejection names who decided, as nobody approved.
+        key = "approved_by" if type == PROMOTED_EVENT else "decided_by"
         await self._events.record_event(
-            task_id, type, {"repo": repo, "pr": number, "items": list(moved), "approved_by": by}
+            task_id, type, {"repo": repo, "pr": number, "items": list(moved), key: by}
         )
         log.info("%s: %d lessons of %s#%d, by %s", type, len(moved), repo, number, by)

@@ -29,6 +29,7 @@ from longhaul.github.client import GitHubClient
 from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.memory.embedder import HashEmbedder, LocalEmbedder
+from longhaul.memory.promotion import Promoter
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
@@ -161,6 +162,19 @@ def test_the_token_of_the_settings_goes_to_the_poller(tmp_path: Path) -> None:
     parts = worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.github, GitHubClient)
     assert poller_of(parts)._github is parts.github
+
+
+def test_the_poller_settles_lessons_when_memory_is_on(tmp_path: Path) -> None:
+    # Without a Promoter the candidates of a merged pull request would wait for ever (LH-606).
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    promoter = poller_of(parts)._promoter
+    assert isinstance(promoter, Promoter)
+
+
+def test_the_poller_has_no_promoter_when_memory_is_off(tmp_path: Path) -> None:
+    off = CONFIG.model_copy(update={"memory": Memory(enabled=False, embedder="hash")})
+    parts = worker.build_parts(make_settings(tmp_path), off, FakeManager())  # type: ignore[arg-type]
+    assert poller_of(parts)._promoter is None
 
 
 def test_tasks_start_on_the_queue_of_the_worker(tmp_path: Path) -> None:

@@ -71,7 +71,7 @@ def test_the_timeline_items_are_told_apart_by_kind() -> None:
     items = page["properties"]["items"]["items"]
 
     assert items["discriminator"]["propertyName"] == "kind"
-    assert set(items["discriminator"]["mapping"]) == {"event", "turn", "tool_call"}
+    assert set(items["discriminator"]["mapping"]) == {"event", "turn", "tool_call", "checkpoint"}
 
 
 def test_the_schema_is_stable_json() -> None:

@@ -702,6 +702,34 @@ export interface components {
              */
             type: "text";
         };
+        /**
+         * TimelineCheckpoint
+         * @description One saved workspace state: the commit a turn left in the task's checkpoint repo.
+         *
+         *     `checkpoint_kind` is `tool`, `step`, `compaction` or `bundle`, and `step_id` is set for `step`.
+         */
+        TimelineCheckpoint: {
+            /** Checkpoint Kind */
+            checkpoint_kind: string;
+            /** Id */
+            id: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "checkpoint";
+            /** Sha */
+            sha: string;
+            /** Step Id */
+            step_id: string | null;
+            /**
+             * Ts
+             * Format: date-time
+             */
+            ts: string;
+            /** Turn Index */
+            turn_index: number;
+        };
         /** TimelineEvent */
         TimelineEvent: {
             /** Id */
@@ -726,7 +754,7 @@ export interface components {
         /** TimelinePage */
         TimelinePage: {
             /** Items */
-            items: (components["schemas"]["TimelineEvent"] | components["schemas"]["TimelineTurn"] | components["schemas"]["TimelineToolCall"])[];
+            items: (components["schemas"]["TimelineEvent"] | components["schemas"]["TimelineTurn"] | components["schemas"]["TimelineToolCall"] | components["schemas"]["TimelineCheckpoint"])[];
             /** Next Cursor */
             next_cursor: string | null;
         };

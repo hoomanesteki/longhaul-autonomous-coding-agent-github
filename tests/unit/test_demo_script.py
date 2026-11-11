@@ -45,6 +45,8 @@ case "$1" in
   run)
     echo $$ >"$dir/run.pid"
     echo "task lh-local-fake-1: Fix the calculator"
+    # A run that ends by itself, as a finished (0) or a failed task does.
+    if [ -n "${FAKE_RUN_EXIT:-}" ]; then sleep 1; exit "$FAKE_RUN_EXIT"; fi
     while [ ! -e "$dir/closed" ]; do sleep 0.1; done
     echo "task ended as cancelled"
     exit 1
@@ -145,6 +147,48 @@ def start_demo(tmp_path: Path) -> Iterator[object]:
             if path.exists():
                 with contextlib.suppress(ProcessLookupError, ValueError):
                     os.kill(int(path.read_text()), signal.SIGKILL)
+
+
+def pid_of(demo: Demo, name: str) -> int:
+    return int((demo.folder / name).read_text(encoding="utf-8"))
+
+
+def is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def assert_nothing_left_running(demo: Demo) -> None:
+    # The check runs before the fixture teardown, which kills what is left as a last resort. The
+    # pids come from the stand-in itself, so they are the pids of the real commands, not of a
+    # subshell that started them.
+    left = [name for name in ("worker.pid", "run.pid") if is_alive(pid_of(demo, name))]
+    assert left == [], f"still running after the script exited: {left}\n{demo.output}"
+
+
+def test_a_finished_run_leaves_no_worker_or_run_process_behind(start_demo) -> None:  # type: ignore[no-untyped-def]
+    demo = start_demo(FAKE_RUN_EXIT="0")
+    assert demo.process.wait(timeout=60) == 0
+    assert "worker stopped" in demo.output
+    assert_nothing_left_running(demo)
+
+
+def test_a_failed_run_leaves_no_worker_or_run_process_behind(start_demo) -> None:  # type: ignore[no-untyped-def]
+    demo = start_demo(FAKE_RUN_EXIT="2")
+    assert demo.process.wait(timeout=60) == 2
+    assert_nothing_left_running(demo)
+
+
+def test_an_interrupt_leaves_no_worker_or_run_process_behind(start_demo) -> None:  # type: ignore[no-untyped-def]
+    demo = start_demo()
+    demo.wait_for_output(f"task {TASK_ID}")
+    time.sleep(1.0)
+    demo.interrupt()
+    assert demo.process.wait(timeout=60) != 0
+    assert_nothing_left_running(demo)
 
 
 def test_interrupt_cancels_the_workflow_while_the_worker_is_still_up(start_demo) -> None:  # type: ignore[no-untyped-def]

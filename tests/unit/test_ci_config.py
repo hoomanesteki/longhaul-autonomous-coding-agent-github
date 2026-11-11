@@ -268,6 +268,14 @@ def test_the_e2e_job_runs_the_e2e_tests_only() -> None:
     assert selection is not None and selection.startswith("e2e and ")
 
 
+def test_the_coverage_upload_cannot_fail_the_unit_job() -> None:
+    # The tests have passed by then. An outage of the artifact store once turned a green unit
+    # run red, and the report is only there to be read.
+    steps = load_workflow()["jobs"]["unit"]["steps"]
+    uploads = [s for s in steps if str(s.get("uses", "")).startswith("actions/upload-artifact")]
+    assert uploads and all(s.get("continue-on-error") is True for s in uploads)
+
+
 @pytest.mark.parametrize("job", ["integration", "e2e", "chaos-lite"])
 def test_jobs_with_a_sandbox_build_the_image_before_the_tests(job: str) -> None:
     # The sandbox tests fail with "image is missing" on a runner that has not built it.

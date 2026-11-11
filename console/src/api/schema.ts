@@ -233,7 +233,7 @@ export interface paths {
         };
         /**
          * Get Timeline
-         * @description Events, model calls and tool calls of a task, merged by time, oldest first.
+         * @description Events, model calls, tool calls and checkpoints of a task, merged by time, oldest first.
          */
         get: operations["get_timeline"];
         put?: never;

@@ -2439,7 +2439,7 @@
     },
     "/api/tasks/{task_id}/timeline": {
       "get": {
-        "description": "Events, model calls and tool calls of a task, merged by time, oldest first.",
+        "description": "Events, model calls, tool calls and checkpoints of a task, merged by time, oldest first.",
         "operationId": "get_timeline",
         "parameters": [
           {

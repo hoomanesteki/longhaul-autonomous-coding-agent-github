@@ -1,4 +1,4 @@
-import { formatDuration, shortSha, type TimelineToolCall } from "../../util/timeline";
+import { formatDuration, shortSha, toolCallStatus, type TimelineToolCall } from "../../util/timeline";
 import ToolOutput from "./ToolOutput";
 
 /** One tool call of a turn: what it was, whether it worked, how long it took and what it committed. */
@@ -17,17 +17,14 @@ export default function ToolCallItem({
   onToggle: () => void;
 }) {
   const sha = shortSha(call.post_sha);
+  const status = toolCallStatus(call);
   return (
     <li className="py-1">
       <div className="flex flex-wrap items-baseline gap-x-3 text-sm">
         <span className="font-mono font-medium">{call.name}</span>
         {args !== undefined && <span className="min-w-0 truncate font-mono text-slate-700">{args}</span>}
-        <span className={call.ok ? "text-green-800" : "font-medium text-red-700"}>
-          {call.ok ? "ok" : "error"}
-        </span>
-        {!call.ok && call.exit_code !== null && (
-          <span className="text-slate-600">{`exit ${call.exit_code}`}</span>
-        )}
+        <span className={status.failed ? "font-medium text-red-700" : "text-green-800"}>{status.label}</span>
+        {status.exitCode !== null && <span className="text-slate-600">{`exit ${status.exitCode}`}</span>}
         <span className="text-slate-600">{formatDuration(call.duration_ms)}</span>
         {sha !== null && <span className="font-mono text-slate-600">{sha}</span>}
         {call.has_output && (

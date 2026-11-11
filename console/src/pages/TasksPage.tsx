@@ -5,7 +5,7 @@ import { listRepos, listTasks } from "../api/client";
 import PhaseBadge from "../components/PhaseBadge";
 import ScrollBox from "../components/ScrollBox";
 import { useNow } from "../hooks/useNow";
-import { formatAge, formatCost, issueUrl, needsYou } from "../util/tasks";
+import { formatAge, formatCost, issueUrl, needsYou, phaseWords } from "../util/tasks";
 
 const POLL_MS = 10_000;
 // Ages are written in whole minutes at the finest, so a tick twice a minute is enough.
@@ -171,13 +171,13 @@ export default function TasksPage() {
                       <td className={`${CELL} min-w-[9rem] lg:min-w-0`}>
                         {task.repo}
                         {/* Phase and Needs you are the last columns, off screen on a phone. They go in the
-                            first column, which is always in view, and break anywhere because a phase such
-                            as awaiting_plan_approval has no space to break at. */}
+                            first column, which is always in view. The phase is written in words so that
+                            it wraps between them, and a word that is still too long breaks as a last resort. */}
                         <div
                           data-testid="status-line"
-                          className="mt-1 flex flex-col text-xs break-all text-slate-600 lg:hidden"
+                          className="mt-1 flex flex-col text-xs break-words text-slate-600 lg:hidden"
                         >
-                          <span>{`Phase: ${task.phase}`}</span>
+                          <span>{`Phase: ${phaseWords(task.phase)}`}</span>
                           {waiting !== null && (
                             <span className="font-medium text-amber-900">{`Needs you: ${waiting}`}</span>
                           )}

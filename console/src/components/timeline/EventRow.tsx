@@ -15,6 +15,8 @@ const TONES: Record<EventTone, string> = {
   pause: "border-amber-300 bg-amber-50",
   hint: "border-sky-300 bg-sky-50",
   verdict: "border-green-300 bg-green-50",
+  success: "border-green-300 bg-green-50",
+  warning: "border-orange-300 bg-orange-50",
   recovery: "border-teal-300 bg-teal-50",
   error: "border-red-300 bg-red-50",
   other: "border-slate-200 bg-slate-50",
@@ -27,7 +29,7 @@ const TONES: Record<EventTone, string> = {
  * payload is one click away either way, shown as text.
  */
 export default function EventRow({ event, open }: { event: TimelineEvent; open: OpenState }) {
-  const tone = eventTone(event.type);
+  const tone = eventTone(event.type, event.payload);
   const summary = describeEvent(event.type, event.payload) ?? eventSummary(event.payload);
   const detailKey = `event:${event.id}`;
   const shown = open.has(detailKey);

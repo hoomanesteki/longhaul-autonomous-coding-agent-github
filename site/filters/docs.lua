@@ -125,3 +125,15 @@ function Table(tbl)
   })
   return pandoc.Div({ marked }, pandoc.Attr("", { "table-scroll" }))
 end
+
+-- A ```mermaid fence in an included file draws on GitHub, but Quarto only draws the cells it
+-- writes itself (pre.mermaid-js, from a {mermaid} cell). Without this, the diagrams of
+-- docs/architecture.md would show as code. The element and its class are the ones Quarto's
+-- own runtime looks for, and the text goes in escaped because the runtime reads textContent.
+function CodeBlock(block)
+  if not block.classes:includes("mermaid") then
+    return nil
+  end
+  local escaped = block.text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+  return pandoc.RawBlock("html", '<pre class="mermaid mermaid-js">' .. escaped .. "</pre>")
+end

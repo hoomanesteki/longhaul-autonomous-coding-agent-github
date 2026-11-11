@@ -1067,6 +1067,118 @@ uv run pytest tests/integration/test_keystone_backend.py -v
 
 Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check. With `KEYSTONE_ADMIN_TOKEN` set, the test reads `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` itself and checks that the allowed call and the denied one are both there, with the task id of the run in their arguments and one session id. Without the token it skips that half and says so. You can read the same rows with `keystone audit export`.
 
+## Operate a running install
+
+This section is the short form for the person who looks after a Longhaul install. The details sit in the sections it links to.
+
+### Start and stop
+
+Start, in this order. Each step needs the one before it.
+
+```bash
+make up                          # Postgres, Temporal, MinIO and the monitoring services
+make sandbox-image               # once, and again when docker/sandbox changes
+make migrate                     # the tables, at the head revision
+uv run longhaul worker           # the process that does the work; keep it in the foreground or a service
+uv run longhaul poller install   # once; GitHub tasks only
+uv run longhaul api              # optional; the console API (see "The console API")
+```
+
+Stop in the reverse order, and leave the data alone:
+
+1. `uv run longhaul poller pause`, so no new task starts. A poll that is running finishes.
+2. Stop the API with Ctrl-C or SIGTERM.
+3. Drain the worker (next section).
+4. `docker compose stop` stops the services and keeps their volumes. `make down` also deletes the volumes, which means the database, the history of every task and the blobs, so use it only to throw a stack away.
+
+Start again with `make up`, the worker, `uv run longhaul poller resume` and the API. Tasks that were running carry on from their last step, because their state is in Temporal and not in the worker.
+
+### Drain a worker
+
+A task does not belong to a worker, so there is nothing to wait for. SIGTERM or Ctrl-C starts a graceful stop (see "Stopping a worker"): the worker takes no new activity, waits up to 30 seconds for the ones that run, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on a worker that is up, from the checkpoint it started at. No task is lost and no tool call runs twice on half-applied edits.
+
+To replace a worker with no gap, start the new one first on the same task queue, check that its log says `worker running`, and then stop the old one. A task keeps its bare checkpoint repo on the worker host, in `LONGHAUL_CKPT_DIR`. Run the new worker on the same host, or with the same folder, so a task that is still running finds its repo.
+
+`longhaul_active_tasks` on the metrics port says how many tasks the worker holds. It is 0.0 when a worker is idle.
+
+### Cancel stuck tasks
+
+First find out what the task is doing:
+
+```bash
+uv run longhaul status TASK_ID     # phase, turns, spend, outcome once it ended
+uv run longhaul report TASK_ID     # the run report as markdown
+```
+
+A task that is `paused` is waiting for a person, and its comment or its console page says for what. Answer it with a hint or a budget top-up, or cancel it. A task that is `coding` and shows no new turn for a long time, with a worker up, is the case the stuck detector exists for, and it pauses the task by itself. If it does not, cancel it:
+
+| Where | How |
+|---|---|
+| CLI | `uv run longhaul cancel TASK_ID --reason "text"` |
+| Issue | a comment that starts with `/longhaul cancel` |
+| Console | Cancel task on the task page; the task id must be typed in full |
+| API | `POST /api/tasks/{id}/cancel` |
+
+The cancel is a signal. The workflow removes the sandbox and ends as `cancelled`, and a task of an issue posts a final comment. With no worker running, nothing handles the signal until one starts.
+
+If the workflow cannot take the signal, terminate it in the Temporal UI (http://localhost:8233). A terminated task records no outcome and cleans up nothing, so remove what it left:
+
+```bash
+docker ps -a --filter "label=longhaul.task_id=TASK_ID"     # then docker rm -f the container ids
+docker volume rm "lh-ws-TASK_ID"
+```
+
+Its checkpoint repo stays in `LONGHAUL_CKPT_DIR` until you delete `TASK_ID.git`.
+
+### Rotate tokens
+
+`docs/security.md` has the steps for each secret, under "Rotating tokens": the GitHub token, the GitHub App key, the console admin token, the model keys, and the database, blob store and Temporal credentials. The order is always the same. Make the new secret, put it where the process reads it, restart that process, check it works, and revoke the old one last. The GitHub token and the model keys are read by the worker at start, so the worker is the process to restart. The admin token belongs to the API.
+
+### The replay test
+
+A workflow that is running is replayed from its history every time a worker picks it up, and a change to workflow code that makes a different command from the recorded one fails the task with a non-determinism error. The replay tests are the check against that. They run the current `TaskWorkflow` over a recorded history and fail when it would make another command.
+
+- `test_recorded_histories_replay` in `tests/integration/test_task_workflow.py` makes fresh runs (signals, a cancel, a lost sandbox, a hand-over to a new run, a task of an issue), fetches their histories and replays them against the same code. It checks that the workflow is replay-safe in itself.
+- `test_histories_from_before_the_console_line_replay` and its siblings in `test_pause_flow.py`, `test_plan_gate.py` and `test_coder_steps.py` replay JSON histories that were recorded before a change, from `tests/fixtures/histories/`. These are the ones that prove an old task survives an upgrade.
+
+```bash
+uv run pytest tests/integration -k replay -q
+```
+
+They run on a local Temporal test server.
+
+To add one for a change: before you touch the workflow, run a task that reaches the code you will change, fetch its history with `handle.fetch_history()`, write it with `history.to_json()` into `tests/fixtures/histories/<name>.json`, and add the name to a replay test like the ones above. Then make the change behind a patch marker and see that the old history still replays and a new run records the marker.
+
+### Upgrade with workflow versioning
+
+Any change to what `TaskWorkflow` or `PollerWorkflow` does, such as a new activity call, a different order, a new wait or a new branch, goes behind `workflow.patched("<marker>")`. A history that began before the change has no marker, so `patched` answers false on its replay and the old path runs. A run that begins after the change records the marker and takes the new path. Name a marker `lh-<story>-<what>`, keep the constant next to the code it guards, and say in a comment which history it protects.
+
+The markers in the code today:
+
+| Marker | Story | What it guards |
+|---|---|---|
+| `lh-502-plan-gate` | LH-502 | The wait for approval of the plan. A history from before it goes straight to coding. |
+| `lh-506-pause-for-hint` | LH-506 | The pause that asks a person a question. |
+| `lh-507-final-outcome` | LH-507 | The wind-up that ends every task: final comment, labels, outcome event and clean-up. |
+| `lh-507-sweep-repos` | LH-507 | The `clean_repos` call that `PollerWorkflow` makes after each poll. |
+| `lh-604-load-memory` | LH-604 | The `load_memory` call after `prepare_workspace`. |
+| `lh-605-lessons` | LH-605 | The `extract_lessons` call at the end of a task that has a memory ref. |
+| `lh-805-console-mirror` | LH-805 | The comments that repeat a console action on the issue. |
+| `lh-891-task-row` | LH-891 | The writes of the task row that the console reads. |
+
+To upgrade a running install:
+
+1. Run the replay tests (`uv run pytest tests/integration -k replay -q`). If one fails with a non-determinism error, the change needs a marker or the marker is in the wrong place.
+2. Start the new worker on the same task queue, then drain the old one. Running tasks are replayed on the new code, and the markers keep the old ones on their old path.
+3. Check the Temporal UI for a task that was running during the switch. It should show no failed workflow task.
+
+Other rules for an upgrade:
+
+- Do not delete a marker while a workflow older than the change can still be open. A task waits up to `stuck.hint_wait_hours` (24) for a hint, and a task that was handed to a new run is a new history, so the open histories of the last few days are the ones to check. Do not remove a marker in v1.
+- A new field on a payload gets a default, so a history written before it still reads back. `tests/unit/test_acts.py` has examples of old shapes that still read.
+- Do not roll a worker back across a marker without replaying a history that the newer worker wrote against the older code. The replay test is how you know.
+- A schema change goes through Alembic. Run `make migrate` before the new worker starts, and write the migration so the old worker still runs on the new schema for the minutes the two overlap.
+
 ## Run the evaluation
 
 `eval/run.py` runs a task set on the durable stack and writes the numbers that the README quotes. Every config goes through this one command, so the numbers can be compared.

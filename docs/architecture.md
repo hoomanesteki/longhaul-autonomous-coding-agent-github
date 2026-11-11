@@ -8,6 +8,165 @@ All pieces share one module of types, `src/longhaul/contracts.py`. It has no
 I/O and imports only the standard library and pydantic. Vendor shapes, such as
 the Anthropic Messages API format, live in `src/longhaul/agent/render.py`.
 
+## System context
+
+The picture of plan section 3.1, brought up to what is built. The console and the API read Postgres and signal Temporal, and never touch a sandbox. The worker is the only process that calls a model, runs a tool or writes to GitHub. Budgets, memory and Keystone are parts of the worker's activities and not services of their own. Keystone is optional: with `tools.backend: keystone` each tool call goes through that gateway on its way to the sandbox (see "Route tool calls through Keystone" in the runbook).
+
+```mermaid
+flowchart LR
+  subgraph GitHub
+    ISS["Issue labeled longhaul"]
+    CMT["Issue comments:<br/>/longhaul approve, reject, hint, budget, cancel, status, retry"]
+    PR["Pull request"]
+  end
+
+  subgraph Longhaul
+    POLL["PollerWorkflow<br/>Temporal Schedule, every 60 s"]
+    WF["TaskWorkflow<br/>one per issue, deterministic"]
+    ACT["Worker: activities<br/>llm_turn, tool_exec, check_budget,<br/>load_memory, compact, deliver"]
+    BUD["Budgets and cost ledger<br/>per task, per repo, per day"]
+    MEM["Memory<br/>repo map, commands, approved notes"]
+    API["FastAPI<br/>console API, healthz, metrics"]
+    CON["Console<br/>React, Vite, TypeScript"]
+    CLI["longhaul CLI<br/>run, status, cancel, report, memory, poller"]
+  end
+
+  subgraph Infra
+    T[("Temporal server")]
+    PG[("Postgres + pgvector")]
+    S3[("MinIO / S3 blobs")]
+    SB[["Docker sandbox<br/>one per task"]]
+    CK[("Bare checkpoint repo<br/>on the worker host")]
+    OT["OTel collector -> Jaeger"]
+    PM["Prometheus -> Grafana"]
+  end
+
+  KS["Keystone gateway<br/>policy, approval, audit (optional)"]
+  LLM[("Anthropic Messages API<br/>or OpenAI-compatible")]
+
+  ISS --> POLL
+  CMT --> POLL
+  POLL -->|start / signal| WF
+  CLI -->|start / signal| WF
+  WF <--> T
+  T <--> ACT
+  ACT --> LLM
+  ACT --> BUD
+  ACT --> MEM
+  ACT --> SB
+  ACT -.->|tools.backend: keystone| KS
+  KS -.-> SB
+  SB <--> CK
+  ACT --> S3
+  ACT --> PG
+  BUD --> PG
+  MEM --> PG
+  ACT -->|idempotent writes| PR
+  ACT -->|idempotent writes| CMT
+  CON --> API
+  API --> PG
+  API -->|signals / queries| T
+  ACT --> OT
+  ACT --> PM
+```
+
+## Task workflow
+
+What `TaskWorkflow` does for one task, in the phases that `status()` reports (`queued`, `preparing`, `planning`, `awaiting_plan_approval`, `coding`, `verifying`, `paused`, `delivering` and the three that end it). Every box that does work is an activity. The workflow keeps the order, the counters and the waits, and nothing else. The sequence of plan section 3.2 shows the same path as messages.
+
+```mermaid
+flowchart TD
+  START(["start: poller, CLI or console"]) --> PREP["prepare_workspace<br/>clone, sandbox, setup, cut the network"]
+  PREP --> MEM["load_memory<br/>repo facts for the prompt"]
+  MEM --> PLAN["planner turns until submit_plan"]
+  PLAN --> POST["store_plan and post_plan"]
+  POST --> GATE{"plan approval<br/>required?"}
+  GATE -->|no| STEP
+  GATE -->|yes| WAIT["wait for approve_plan or reject_plan<br/>durable timer"]
+  WAIT -->|reject with feedback| PLAN
+  WAIT -->|approve| STEP
+
+  STEP["check_budget"] --> BUDGET{"within every<br/>limit?"}
+  BUDGET -->|no| PAUSE
+  BUDGET -->|yes| TURN["coder turn: llm_turn, then tool_exec<br/>checkpoint after each mutating call"]
+  TURN --> DETECT{"stuck detector<br/>fires?"}
+  DETECT -->|yes| PAUSE["paused: post one question<br/>wait for hint, add_budget or cancel"]
+  PAUSE -->|hint or top-up| STEP
+  PAUSE -->|no answer in time| ENDED
+  DETECT -->|no| CTX["evict old tool output,<br/>compact past the threshold"]
+  CTX --> CAN{"40 turns<br/>in this run?"}
+  CAN -->|yes| CONT["bundle_checkpoint,<br/>continue as new"]
+  CONT --> STEP
+  CAN -->|no| FIN{"finish<br/>called?"}
+  FIN -->|no| STEP
+  FIN -->|yes| VERIFY["verifier: run the tests, review the diff"]
+  VERIFY -->|send back to a step| STEP
+  VERIFY -->|fails 3 times| ENDED
+  VERIFY -->|pass| DELIVER["build_pr_branch, push,<br/>create_pr"]
+  DELIVER --> ENDED["wind-up: final comment, labels,<br/>run report, lessons, cleanup"]
+```
+
+A cancel signal ends the task from any wait or any turn and goes to the wind-up. A sandbox that has gone is made again at the head commit (`ensure_sandbox`), and the call is retried from its `pre_sha`.
+
+## Data stores
+
+Each store holds one kind of thing, and each thing has one home. Temporal's history is the source of truth for what the workflow did. It holds small values and references only, because no payload may pass 256 KB (ADR-0005). The rest of a task is in Postgres and the blob store, and the checkpoint repo holds the work itself.
+
+```mermaid
+flowchart LR
+  subgraph Writers
+    WF["TaskWorkflow"]
+    ACT["Worker activities"]
+    API["FastAPI"]
+  end
+
+  subgraph Temporal
+    HIST["Workflow history<br/>commands, signals, results as BlobRefs"]
+    SCH["Schedule longhaul-poller"]
+  end
+
+  subgraph Postgres
+    TASKS["tasks, plans, events"]
+    TURNS["turns, tool_calls, checkpoints"]
+    COST["cost_ledger, side_effects"]
+    MEMT["memory_items (pgvector), repo_settings"]
+  end
+
+  subgraph MinIO
+    BLOBS["tasks/id/turns, log, outputs,<br/>report, script, ckpt bundles"]
+  end
+
+  subgraph Worker host
+    CKPT["Bare checkpoint repo per task<br/>LONGHAUL_CKPT_DIR/task.git"]
+    VOL["Workspace volume lh-ws-task<br/>mounted in the sandbox"]
+  end
+
+  WF --> HIST
+  SCH --> WF
+  ACT --> TASKS
+  ACT --> TURNS
+  ACT --> COST
+  ACT --> MEMT
+  ACT --> BLOBS
+  ACT --> CKPT
+  CKPT <--> VOL
+  API -->|reads| TASKS
+  API -->|reads| TURNS
+  API -->|reads, approves, rejects| MEMT
+  API -->|reads blobs| BLOBS
+  API -->|signals, queries| HIST
+```
+
+| Store | Holds | Written by |
+|---|---|---|
+| Temporal | The history of each workflow and the poller Schedule | The workflow and the Temporal client |
+| Postgres | The tables of plan section 3.5, including `cost_ledger`, which has a row for every provider call, and `memory_items`, which holds the notes | The activities. The API and the `longhaul memory` command also write the decisions on notes (approved, rejected) to `memory_items`, so their database role needs write access to that table. Every other table the API only reads. |
+| MinIO | Transcripts, tool output, the run report, the script of a scripted task and the checkpoint bundles | The activities |
+| Checkpoint repo | The commits of the work, one bare repo per task | The activities, through the sandbox |
+| Workspace volume | The checked-out files and the venv of one sandbox | The sandbox |
+
+The chaos suite kills the worker, a sandbox, Temporal and Postgres one by one and counts what each task leaves behind (`eval/chaos/README.md`).
+
 ## Contracts changelog
 
 Every change to `contracts.py` gets an entry here, with the new

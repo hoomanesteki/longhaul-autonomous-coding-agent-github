@@ -594,6 +594,10 @@ class CompactInput(BaseModel):
     # The memory block of the task, as in LlmTurnInput. The system prompt that the token counts
     # are made from has it, as the one that the model turn sends does.
     memory_ref: BlobRef | None = None
+    # True for the coder of a task that has a plan, which has a system prompt and a tool list of
+    # its own (LH-503). The token counts are made from them. A history from before this field is
+    # a coder without a plan.
+    planned: bool = False
 
 
 class CompactOutput(BaseModel):

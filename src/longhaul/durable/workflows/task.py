@@ -2656,6 +2656,7 @@ class TaskWorkflow:
                 script_ref=self._script(),
                 context_mode=mode,
                 memory_ref=state.memory_ref,
+                planned=role is Role.CODER and state.plan is not None,
             ),
         )
         state.cost_usd += done.cost_usd

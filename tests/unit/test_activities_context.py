@@ -15,7 +15,11 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import FIRST_USER_MESSAGE, build_system_prompt
+from longhaul.agent.prompts import (
+    FIRST_USER_MESSAGE,
+    build_planned_system_prompt,
+    build_system_prompt,
+)
 from longhaul.agent.turns import show_hints, validate_pairs
 from longhaul.blobs.base import blob_key
 from longhaul.blobs.memory import MemoryBlobStore
@@ -43,6 +47,7 @@ from longhaul.cost.pricing import Pricing
 from longhaul.durable import acts
 from longhaul.durable.activities.context import ContextActivities
 from longhaul.providers.base import read_turn_offset, turn_index
+from longhaul.roles import coder, planner, verifier
 from longhaul.settings import Context
 from longhaul.tools.registry import default_registry
 
@@ -137,12 +142,19 @@ class Rig:
         *steps: LLMResponse | ProviderError,
         ledger: MemoryLedger | None = None,
         policy: Context = POLICY,
+        tools_for: Any = None,
     ) -> None:
         self.provider = FakeProvider(*steps)
         self.blobs = MemoryBlobStore()
         self.ledger = ledger or MemoryLedger(PRICES)
         self.activities = ContextActivities(
-            self.provider, self.blobs, TOOLS, config_for, policy, ledger=self.ledger
+            self.provider,
+            self.blobs,
+            TOOLS,
+            config_for,
+            policy,
+            ledger=self.ledger,
+            **({} if tools_for is None else {"tools_for": tools_for}),
         )
 
     async def run(self, inp: acts.CompactInput, *, attempt: int = 1) -> acts.CompactOutput:
@@ -313,6 +325,58 @@ async def test_the_tokens_include_the_memory_block_that_the_system_prompt_carrie
     assert out.tokens_before == math.ceil(count_request_chars(system, messages, TOOLS) / 3.5)
     assert out.tokens_after == math.ceil(count_request_chars(system, view, TOOLS) / 3.5)
     assert out.tokens_before > math.ceil(count_request_chars(SYSTEM, messages, TOOLS) / 3.5)
+
+
+# ---------- the tools of the role whose transcript it is (LH-991) ----------
+PLANNER_TOOLS = planner.tool_specs(TOOLS)
+VERIFIER_TOOLS = verifier.tool_specs(TOOLS)
+PLANNED_TOOLS = coder.tool_specs(TOOLS)
+
+
+def tools_of_each_role(role: Role, *, planned: bool = False) -> list[Any]:
+    """What LlmActivities.tools_for answers on a worker that has all three lists."""
+    if role is Role.PLANNER:
+        return PLANNER_TOOLS
+    if role is Role.VERIFIER:
+        return VERIFIER_TOOLS
+    return PLANNED_TOOLS if planned else TOOLS
+
+
+@pytest.mark.parametrize(
+    ("role", "tools"),
+    [(Role.PLANNER, PLANNER_TOOLS), (Role.VERIFIER, VERIFIER_TOOLS), (Role.CODER, TOOLS)],
+)
+async def test_the_tokens_are_counted_with_the_tools_of_the_role_of_the_transcript(
+    role: Role, tools: list[Any]
+) -> None:
+    rig = Rig(notes_reply(), tools_for=tools_of_each_role)
+    messages = rounds(8)
+    ref = await rig.put(messages)
+
+    out = await rig.run(compact_input(ref, role=role))
+
+    system = build_system_prompt(role, SPEC)
+    view = await rig.view(out.transcript_ref)
+    assert out.tokens_before == math.ceil(count_request_chars(system, messages, tools) / 3.5)
+    assert out.tokens_after == math.ceil(count_request_chars(system, view, tools) / 3.5)
+    if role is not Role.CODER:
+        coders = math.ceil(count_request_chars(system, messages, TOOLS) / 3.5)
+        assert out.tokens_before != coders
+
+
+async def test_a_coder_with_a_plan_is_counted_with_its_own_prompt_and_tools() -> None:
+    rig = Rig(notes_reply(), tools_for=tools_of_each_role)
+    messages = rounds(8)
+    ref = await rig.put(messages)
+
+    out = await rig.run(compact_input(ref, planned=True))
+
+    system = build_planned_system_prompt(SPEC)
+    view = await rig.view(out.transcript_ref)
+    assert out.tokens_before == math.ceil(
+        count_request_chars(system, messages, PLANNED_TOOLS) / 3.5
+    )
+    assert out.tokens_after == math.ceil(count_request_chars(system, view, PLANNED_TOOLS) / 3.5)
 
 
 # ---------- nothing to cut ----------

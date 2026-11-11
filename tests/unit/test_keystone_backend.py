@@ -262,6 +262,35 @@ async def test_the_call_carries_what_the_worker_needs_to_find_the_sandbox(
     }
 
 
+async def test_the_test_command_of_the_task_travels_with_a_run_tests_call(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    # The server behind Keystone is built once for the worker. The task's command reaches it
+    # only through the context, so run_tests runs the same command as in direct mode.
+    registry = default_registry().with_test_command("make check")
+    call = ToolCall(id="toolu_1", name="run_tests", input={})
+    ctx = ToolContext(task_id="lh-task-1", turn_index=3, blob_prefix="tasks/lh-task-1")
+
+    await backend.run(registry, sandbox, call, ctx, sandbox_id=sandbox.id)
+
+    (seen,) = keystone.calls
+    assert seen.arguments[CONTEXT_KEY]["test_command"] == "make check"
+    assert "test_command" not in seen.arguments
+
+
+async def test_a_call_other_than_run_tests_carries_no_test_command(
+    backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
+) -> None:
+    registry = default_registry().with_test_command("make check")
+    call = ToolCall(id="toolu_1", name="run_command", input={"command": "echo hi"})
+    ctx = ToolContext(task_id="lh-task-1", turn_index=3, blob_prefix="tasks/lh-task-1")
+
+    await backend.run(registry, sandbox, call, ctx, sandbox_id=sandbox.id)
+
+    (seen,) = keystone.calls
+    assert "test_command" not in seen.arguments[CONTEXT_KEY]
+
+
 async def test_the_workers_context_wins_over_one_the_model_sends(
     backend: KeystoneBackend, sandbox: FakeSandbox, keystone: FakeKeystone
 ) -> None:

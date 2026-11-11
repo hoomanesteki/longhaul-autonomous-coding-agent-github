@@ -72,6 +72,9 @@ class CallContext(BaseModel):
     sandbox_id: str
     turn_index: int
     output_max_tokens: int = 4000
+    # The test command of the task, for run_tests. The registry of this server is built once for
+    # the worker, so a task's own command can only arrive with the call (LH-991).
+    test_command: str | None = None
 
 
 def exposed_names(registry: ToolRegistry) -> frozenset[str]:
@@ -91,6 +94,7 @@ def with_context(schema: Mapping[str, Any]) -> dict[str, Any]:
             "sandbox_id": {"type": "string"},
             "turn_index": {"type": "integer"},
             "output_max_tokens": {"type": "integer"},
+            "test_command": {"type": "string"},
         },
         "required": ["task_id", "sandbox_id", "turn_index"],
     }
@@ -145,7 +149,10 @@ class SandboxTools:
         )
         # The id is the worker's to set: it knows which tool_use block the call answers.
         call = ToolCall(id="", name=params.name, input=arguments)
-        return to_mcp(await self._registry.run(call, sandbox, tool_ctx))
+        registry = self._registry
+        if context.test_command and params.name == "run_tests":
+            registry = registry.with_test_command(context.test_command)
+        return to_mcp(await registry.run(call, sandbox, tool_ctx))
 
 
 def to_mcp(result: ToolResult) -> types.CallToolResult:

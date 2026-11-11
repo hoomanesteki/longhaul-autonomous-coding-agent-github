@@ -64,6 +64,7 @@ from mcp.client.streamable_http import streamable_http_client
 from longhaul.contracts import Sandbox, ToolCall, ToolContext, ToolResult
 from longhaul.settings import EnvSettings, Tools
 from longhaul.tools.backend import DirectBackend, Ran, ToolBackend
+from longhaul.tools.exec import RunTests
 from longhaul.tools.mcp_server import CONTEXT_KEY, EXIT_CODE_KEY, exposed_names
 from longhaul.tools.registry import ToolRegistry
 
@@ -204,7 +205,7 @@ class KeystoneBackend:
         if approval_id is not None:
             sent = await self._send(ctx.task_id, AWAIT_TOOL, {"approval_id": approval_id})
         else:
-            arguments = {**call.input, CONTEXT_KEY: _context(ctx, sandbox_id)}
+            arguments = {**call.input, CONTEXT_KEY: _context(ctx, sandbox_id, registry, call)}
             sent = await self._send(ctx.task_id, self._prefix + call.name, arguments)
         elapsed = int((time.monotonic() - began) * 1000)
         reply = interpret(sent, call, elapsed)
@@ -364,13 +365,21 @@ def _exit_code(sent: types.CallToolResult, call: ToolCall, text: str) -> int | N
     return int(match.group("code")) if match else None
 
 
-def _context(ctx: ToolContext, sandbox_id: str) -> dict[str, Any]:
-    return {
+def _context(
+    ctx: ToolContext, sandbox_id: str, registry: ToolRegistry, call: ToolCall
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
         "task_id": ctx.task_id,
         "sandbox_id": sandbox_id,
         "turn_index": ctx.turn_index,
         "output_max_tokens": ctx.output_max_tokens,
     }
+    # The server on the other side has the worker's registry. The registry of this call has the
+    # command of the task, so a run_tests call names it (LH-991).
+    tool = registry.get("run_tests")
+    if call.name == "run_tests" and isinstance(tool, RunTests) and tool.test_command:
+        context["test_command"] = tool.test_command
+    return context
 
 
 def _digest(arguments: dict[str, Any]) -> str:

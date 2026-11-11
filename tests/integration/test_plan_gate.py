@@ -836,7 +836,8 @@ async def test_the_setting_without_a_planner_has_nothing_to_hold(
 ) -> None:
     """A task started without the plan switch has no plan, so the gate has nothing to hold."""
     spec = local_spec()
-    steps = [coder_turn(0, FINISH), verifier_turn(0, PASS)]
+    # No plan, so the verifier never reviews the finish and the script has no turn for it.
+    steps = [coder_turn(0, FINISH)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue)
         outcome = await result_of(handle)

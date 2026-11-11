@@ -1083,6 +1083,22 @@ async def test_a_pull_request_is_a_draft_when_the_review_ran_no_command(
     assert verifier_role.NO_PRECHECK in shown
 
 
+# ---------- the log of a harness without the row activity (LH-991) ----------
+async def test_a_harness_without_the_row_activity_logs_no_warning_per_write(
+    env: WorkflowEnvironment, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`light` registers no record_task_state. tests/conftest.py adds a no-op, so the workflow does
+    not log "row of task ... not written" for every change of phase."""
+    async with light(env, write_script(tmp_path, clean_run())) as world:
+        handle = await start_task(
+            env.client, local_spec(HAS_ADD), task_queue=world.queue, plan=True
+        )
+        await result_of(handle)
+
+    warned = [r.getMessage() for r in caplog.records if "not written" in r.getMessage()]
+    assert warned == []
+
+
 # ---------- tasks that are not verified ----------
 async def test_a_task_without_a_plan_is_not_verified(
     env: WorkflowEnvironment, tmp_path: Path

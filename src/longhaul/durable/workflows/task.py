@@ -296,6 +296,12 @@ that fails over its own bookkeeping. A task started with `longhaul run` has no r
 write creates one. Replay: all of it is behind `workflow.patched(ROW_PATCH)`, so a history from
 before this story has no such activity to replay.
 
+A run that follows a hand-over keeps the phase the task had (LH-991): `_prepare` only finds the
+sandbox again and does not write `preparing`. The task was coding, and the row used to say
+`preparing` until the first turn of the new run wrote `coding`. Replay: the old write is kept for
+a history without `workflow.patched(KEEP_PHASE_PATCH)`, asked only by a run that was handed a
+sandbox (tests/fixtures/histories/handover_before_phase_kept.json).
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -575,6 +581,9 @@ LOAD_MEMORY_PATCH = "lh-604-load-memory"
 PLAN_GATE_PATCH = "lh-502-plan-gate"
 # The patch marker of the review of a planned `finish` (LH-991). See "The verifying phase" above.
 FINISH_REVIEWED_PATCH = "lh-991-finish-reviewed"
+# The patch marker of the hand-over that keeps the phase of the task (LH-991). See "The row of the
+# task" above.
+KEEP_PHASE_PATCH = "lh-991-keep-phase"
 # The patch marker of the second write of the stored run report (LH-991). See "How a task ends".
 FINAL_REPORT_PATCH = "lh-991-final-report"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
@@ -1347,10 +1356,16 @@ class TaskWorkflow:
 
     async def _prepare(self) -> None:
         state = self.state
+        if state.sandbox_id is not None and workflow.patched(KEEP_PHASE_PATCH):
+            # An earlier run of this workflow prepared the workspace, and its container may be
+            # gone by now. ensure_sandbox answers with the same id when it is still running. The
+            # task keeps the phase it had (LH-991): it is coding, and a write of `preparing` made
+            # the console show a task that had begun over again until the next write.
+            await self._ensure_sandbox()
+            return
         await self._enter(Phase.PREPARING)
         if state.sandbox_id is not None:
-            # An earlier run of this workflow prepared the workspace, and its container may be
-            # gone by now. ensure_sandbox answers with the same id when it is still running.
+            # The same, for a history recorded before LH-991, which has the write above.
             await self._ensure_sandbox()
             return
         prepared = await self._call(acts.PREPARE_WORKSPACE, state.spec)

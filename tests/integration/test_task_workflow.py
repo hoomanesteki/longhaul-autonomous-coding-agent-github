@@ -2010,6 +2010,44 @@ async def test_a_new_run_asks_for_the_row_write_behind_the_patch(
     assert any(ROW_PATCH in text for text in ids)
 
 
+async def test_a_run_after_a_hand_over_keeps_the_phase_the_task_had(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    """After a hand-over the row said `preparing` for a moment, because `_prepare` set it (LH-991).
+
+    The task was coding, and its new run only finds the sandbox again.
+    """
+    stubs = Stubs(edits_then_finishes(6))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == 3
+    phases = [s.phase for s in stubs.states]
+    assert phases.count(Phase.PREPARING) == 1
+    assert phases[0] is Phase.PREPARING
+    assert phases[-1] is Phase.DONE
+    assert all(p in (Phase.CODING, Phase.DONE) for p in phases[1:])
+
+
+async def test_a_history_of_a_hand_over_from_before_the_phase_was_kept_replays() -> None:
+    """Recorded with dev at v0.8.0 plus the Phase 8 report, before LH-991.
+
+    The second run of a task that handed over after three turns. It writes the row as `preparing`
+    when it starts, as the code did then, and has no marker for KEEP_PHASE_PATCH, so the new code
+    must make that write at the same place (F13).
+    """
+    path = ROOT / "tests" / "fixtures" / "histories" / "handover_before_phase_kept.json"
+    history = WorkflowHistory.from_json("replay-handover", path.read_text(encoding="utf-8"))
+    assert history.events[0].workflow_execution_started_event_attributes.continued_execution_run_id
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)
+
+
 async def test_the_last_write_of_a_delivered_task_names_the_pull_request(
     env: WorkflowEnvironment, gh_spec: TaskSpec
 ) -> None:

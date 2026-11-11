@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
 
@@ -121,3 +121,24 @@ def counters() -> Iterator[Metrics]:
     fresh = metrics.Metrics()
     with metrics.configured(fresh):
         yield fresh
+
+
+@pytest.fixture(autouse=True)
+def _task_row_stand_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give a worker that runs TaskWorkflow a no-op record_task_state when it has none (LH-891).
+
+    Many harnesses build their own worker and none of them cares about the row of the task. Without
+    the activity, the workflow logs a warning for every write it tries. One place fixes all of
+    them, and a worker that registers its own copy is left as it is (tests/fakes/task_row.py).
+    """
+    from temporalio.worker import Worker
+    from tests.fakes.task_row import with_task_row
+
+    real_init = Worker.__init__
+
+    def init(self: Worker, *args: Any, **kwargs: Any) -> None:
+        if "workflows" in kwargs:
+            kwargs["activities"] = with_task_row(kwargs["workflows"], kwargs.get("activities", ()))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Worker, "__init__", init)

@@ -242,6 +242,8 @@ async def test_closed_rejects(world: World) -> None:
     [event] = await world.events("memory_rejected")
     assert event.task_id == f"{REPO}#{pr}"
     assert event.payload["pr"] == pr
+    assert event.payload["decided_by"] == f"closed_pr#{pr}"
+    assert "approved_by" not in event.payload
     assert len(event.payload["items"]) == 2
     assert await world.store.search(REPO, "delete failing tests", k=10) == []
 

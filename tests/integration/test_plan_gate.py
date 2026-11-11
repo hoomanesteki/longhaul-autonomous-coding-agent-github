@@ -69,7 +69,7 @@ from longhaul.github.client import GitHubClient, PatAuth
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities, effect_key
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import planner
+from longhaul.roles import planner, verifier
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
 
@@ -132,6 +132,21 @@ def planner_turn(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
 
 def coder_turn(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
     return turn("coder", index, *calls)
+
+
+def verifier_turn(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
+    return turn("verifier", index, *calls)
+
+
+# A coder that calls `finish` has its work reviewed now (LH-991), so each script that ends on it
+# has a verifier that passes the work.
+PASS = tool(
+    "submit_verdict",
+    passed=True,
+    tests_run="pytest -q",
+    tests_summary="2 passed",
+    issues=[],
+)
 
 
 def submit(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -296,7 +311,10 @@ async def running(
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
     )
     boxes = Boxes()
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
@@ -404,7 +422,7 @@ async def test_approve_proceeds(env: WorkflowEnvironment, fake: FakeGitHub, tmp_
     """The task waits for a person. An approval two hours later starts the coding."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     holds = {"coder": asyncio.Event()}  # keeps the workflow in CODING, so it can be looked at
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -449,7 +467,12 @@ async def test_reject_revises(env: WorkflowEnvironment, fake: FakeGitHub, tmp_pa
     coding. Each version is asked about, posted and decided on by itself."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    steps = [
+        planner_turn(0, submit(V1)),
+        planner_turn(1, submit(V2)),
+        coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
+    ]
     holds = {"coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -501,7 +524,7 @@ async def test_timeout_stuck(env: WorkflowEnvironment, fake: FakeGitHub, tmp_pat
     """Nobody answers for a day. The task ends as stuck, and the person is still asked."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         await wait_for_version(handle, 1)
@@ -534,7 +557,7 @@ async def test_gate_off_skips(env: WorkflowEnvironment, fake: FakeGitHub, tmp_pa
     """A repo without the setting goes from the plan to the coder, as it did before the gate."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number, gate=False)
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     holds = {"coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -566,7 +589,7 @@ async def test_an_approval_sent_during_planning_is_not_lost(
     """The planner is still working when a maintainer approves. The approval is kept, and the
     task goes through the gate without waiting for a day."""
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     holds = {"planner": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -588,7 +611,12 @@ async def test_a_rejection_sent_during_planning_is_not_lost(
     env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
 ) -> None:
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    steps = [
+        planner_turn(0, submit(V1)),
+        planner_turn(1, submit(V2)),
+        coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
+    ]
     holds = {"planner": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -618,7 +646,7 @@ async def test_an_approval_sent_during_planning_does_not_ask_for_one(
     a decision, because a request that stays on the issue after the answer would mislead."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     holds = {"planner": asyncio.Event(), "coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -647,7 +675,12 @@ async def test_a_rejection_sent_during_planning_asks_about_the_revision_only(
 ) -> None:
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    steps = [
+        planner_turn(0, submit(V1)),
+        planner_turn(1, submit(V2)),
+        coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
+    ]
     holds = {"planner": asyncio.Event(), "coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -678,7 +711,12 @@ async def test_an_approval_sent_while_the_planner_revises_counts_for_the_new_ver
     env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
 ) -> None:
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    steps = [
+        planner_turn(0, submit(V1)),
+        planner_turn(1, submit(V2)),
+        coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
+    ]
     holds = {"planner": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -703,7 +741,7 @@ async def test_a_decision_after_the_approval_changes_nothing(
 ) -> None:
     """A late rejection, such as a command sent twice, does not pull a task back to planning."""
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     holds = {"coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -733,6 +771,7 @@ async def test_the_third_rejection_ends_the_task_as_stuck(
         planner_turn(1, submit(V2)),
         planner_turn(2, submit(V3)),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
@@ -762,7 +801,7 @@ async def test_a_cancel_while_waiting_ends_the_task_as_cancelled(
     env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
 ) -> None:
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         await wait_for_version(handle, 1)
@@ -780,7 +819,7 @@ async def test_a_local_task_waits_for_a_decision_too(
     """The gate is the repo's setting, not GitHub's. A task on a folder has no issue to label or
     comment on, and a person can still answer with the signal."""
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         await wait_for_version(handle, 1)
@@ -797,6 +836,7 @@ async def test_the_setting_without_a_planner_has_nothing_to_hold(
 ) -> None:
     """A task started without the plan switch has no plan, so the gate has nothing to hold."""
     spec = local_spec()
+    # No plan, so the verifier never reviews the finish and the script has no turn for it.
     steps = [coder_turn(0, FINISH)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue)
@@ -814,7 +854,12 @@ async def test_a_history_that_waited_and_revised_replays(
     as commands, and the code issues them in the same order."""
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
-    steps = [planner_turn(0, submit(V1)), planner_turn(1, submit(V2)), coder_turn(0, FINISH)]
+    steps = [
+        planner_turn(0, submit(V1)),
+        planner_turn(1, submit(V2)),
+        coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
+    ]
     holds = {"coder": asyncio.Event()}
     async with running(env, write_script(tmp_path, steps), fake, gates=holds) as world:
         handle = await start_task(
@@ -837,7 +882,7 @@ async def test_a_history_that_timed_out_replays(
     env: WorkflowEnvironment, fake: FakeGitHub, tmp_path: Path
 ) -> None:
     spec = local_spec()
-    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH)]
+    steps = [planner_turn(0, submit(V1)), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     async with running(env, write_script(tmp_path, steps), fake) as world:
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         outcome = await result_of(handle)

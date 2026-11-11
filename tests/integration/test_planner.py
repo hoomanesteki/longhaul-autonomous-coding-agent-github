@@ -78,7 +78,7 @@ from longhaul.github.side_effects import MemoryLedger, SideEffectActivities, eff
 from longhaul.memory.retrieve import render_memory_block
 from longhaul.providers.base import parse_role_line
 from longhaul.providers.scripted import ScriptedProvider
-from longhaul.roles import coder, planner
+from longhaul.roles import coder, planner, verifier
 from longhaul.sandbox.docker_manager import TASK_LABEL, DockerSandboxManager
 from longhaul.sandbox.local_manager import FakeSandbox
 from longhaul.tools.registry import default_registry
@@ -144,6 +144,21 @@ def coder_turn(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
     return turn("coder", index, *calls)
 
 
+def verifier_turn(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
+    return turn("verifier", index, *calls)
+
+
+# A coder that calls `finish` has its work reviewed now (LH-991), so each script that ends on it
+# has a verifier that passes the work.
+PASS = tool(
+    "submit_verdict",
+    passed=True,
+    tests_run="pytest -q",
+    tests_summary="2 passed",
+    issues=[],
+)
+
+
 def submit(arguments: dict[str, Any] = PLAN_INPUT) -> dict[str, Any]:
     return tool("submit_plan", **arguments)
 
@@ -158,6 +173,7 @@ def planning_steps() -> list[dict[str, Any]]:
         planner_turn(1, tool("read_file", path=MODULE)),
         planner_turn(2, submit()),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
 
 
@@ -339,7 +355,10 @@ async def running(
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
     )
     boxes = Boxes()
     boxes.memory_enabled = memory is not None
@@ -577,6 +596,7 @@ async def test_an_invalid_plan_gets_one_repair_turn(
         planner_turn(0, submit(ONE_STEP)),
         planner_turn(1, submit()),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     spec = local_spec()
     async with running(env, write_script(tmp_path, steps), fake) as world:
@@ -602,6 +622,7 @@ async def test_a_second_invalid_plan_ends_with_an_error_outcome(
         planner_turn(0, submit(ONE_STEP)),
         planner_turn(1, submit(ONE_STEP)),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     number = fake.seed_issue(REPO, "add() subtracts")
     spec = github_spec(number)
@@ -632,6 +653,7 @@ async def test_a_planner_that_never_submits_ends_after_its_turn_limit(
             "respond": {"tool_calls": [tool("search", pattern="add")]},
         },
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     spec = local_spec()
     async with running(env, write_script(tmp_path, steps), fake) as world:
@@ -652,6 +674,7 @@ async def test_a_planner_reply_without_a_call_gets_one_nudge_for_the_plan(
         {"match": {"role": "planner", "turn_index": 0}, "respond": {"text": "I have a plan."}},
         planner_turn(1, submit()),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     spec = local_spec()
     async with running(env, write_script(tmp_path, steps), fake) as world:
@@ -704,6 +727,7 @@ async def test_a_plan_is_not_made_again_after_a_hand_over(
         coder_turn(1, tool("read_file", path=MODULE)),
         coder_turn(2, tool("read_file", path=MODULE)),
         coder_turn(3, FINISH),
+        verifier_turn(0, PASS),
     ]
     spec = local_spec()
     async with running(env, write_script(tmp_path, steps), fake) as world:
@@ -774,7 +798,11 @@ async def test_planner_cannot_mutate(env: WorkflowEnvironment, tmp_path: Path) -
         title="add() subtracts",
         body="`calc.add` subtracts its arguments instead of adding them.",
         settings=RepoSettings(
-            repo=repo, test_command=PYTEST, setup_command="", budgets=Budgets(task_turns=10)
+            # The review that follows `finish` runs this in the container, which has no pytest.
+            repo=repo,
+            test_command="true",
+            setup_command="",
+            budgets=Budgets(task_turns=10),
         ),
     )
     steps = [
@@ -791,6 +819,7 @@ async def test_planner_cannot_mutate(env: WorkflowEnvironment, tmp_path: Path) -
         ),
         planner_turn(1, submit()),
         coder_turn(0, FINISH),
+        verifier_turn(0, PASS),
     ]
     looked = Looked()
 
@@ -811,7 +840,10 @@ async def test_planner_cannot_mutate(env: WorkflowEnvironment, tmp_path: Path) -
         recorder,
         registry.specs(),
         lambda role: CFG,
-        role_tools={Role.PLANNER: planner.tool_specs(registry.specs())},
+        role_tools={
+            Role.PLANNER: planner.tool_specs(registry.specs()),
+            Role.VERIFIER: verifier.tool_specs(registry.specs()),
+        },
     )
     tools = ToolActivities(registry, manager, blobs, recorder, checkpoints=store)
     workspace = WorkspaceActivities(manager, store, recorder, image=IMAGE, limits=SandboxLimits())
@@ -847,7 +879,12 @@ async def test_planner_cannot_mutate(env: WorkflowEnvironment, tmp_path: Path) -
         assert status.last_checkpoint == base
 
         # The command did run and wrote both files: it saw them in its own git status.
-        (row,) = [r for r in recorder.tool_calls.values() if r.name == "run_command"]
+        # The review of the finish runs the test command with run_command too, in read-only mode.
+        (row,) = [
+            r
+            for r in recorder.tool_calls.values()
+            if r.name == "run_command" and "-verify" not in r.id
+        ]
         assert row.ok and row.post_sha is None
         assert row.output_ref is not None
         text = (await blobs.get_by_key(row.output_ref)).decode()

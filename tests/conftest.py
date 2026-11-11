@@ -15,7 +15,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import pytest
 
@@ -121,3 +121,25 @@ def counters() -> Iterator[Metrics]:
     fresh = metrics.Metrics()
     with metrics.configured(fresh):
         yield fresh
+
+
+@pytest.fixture(autouse=True)
+def _activity_stand_ins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give a worker that runs TaskWorkflow a no-op for each best-effort activity it lacks.
+
+    Many harnesses build their own worker, and none of them cares about the row of the task
+    (LH-891) or the stored report (LH-991). Without the activities, the workflow logs a warning for
+    every call it tries. One place fixes all of them, and a worker that registers its own copy is
+    left as it is (tests/fakes/stand_ins.py).
+    """
+    from temporalio.worker import Worker
+    from tests.fakes.stand_ins import with_stand_ins
+
+    real_init = Worker.__init__
+
+    def init(self: Worker, *args: Any, **kwargs: Any) -> None:
+        if "workflows" in kwargs:
+            kwargs["activities"] = with_stand_ins(kwargs["workflows"], kwargs.get("activities", ()))
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(Worker, "__init__", init)

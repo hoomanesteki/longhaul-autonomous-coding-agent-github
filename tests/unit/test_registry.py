@@ -343,3 +343,22 @@ def test_mutates_flags_of_every_registered_tool() -> None:
         assert tool is not None
         flags[spec.name] = tool.mutates
     assert flags == EXPECTED_MUTATES
+
+
+# ---------- a registry with the test command of one task (LH-991) ----------
+def test_a_registry_can_run_tests_with_another_command_and_leave_the_original_alone() -> None:
+    base = default_registry(test_command="pytest -q")
+    other = base.with_test_command("make check")
+
+    assert other is not base
+    assert other.get("run_tests").test_command == "make check"  # type: ignore[union-attr]
+    assert base.get("run_tests").test_command == "pytest -q"  # type: ignore[union-attr]
+    assert other.blobs is base.blobs
+    assert [s.name for s in other.specs()] == [s.name for s in base.specs()]
+    assert other.get("read_file") is base.get("read_file")
+
+
+def test_the_same_command_or_no_run_tests_gives_the_same_registry() -> None:
+    base = default_registry(test_command="pytest -q")
+    assert base.with_test_command("pytest -q") is base
+    assert ToolRegistry().with_test_command("make check") is not None

@@ -61,6 +61,10 @@ async def list_memory(
     limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
 ) -> list[MemoryItemView]:
     """Memory items, oldest first. With no `repo`, the items of every repo."""
+    # The limit is part of the query (PgMemoryStore.list_items), so a busy repo is cut in the
+    # database and not after every row has been read. The cut keeps the oldest, which is why the
+    # console asks for one status at a time. (A comment and not the docstring, because the
+    # docstring is in console/openapi.json.)
     entries = await ctx.memory.list_items(repo, status=status, kind=kind, limit=limit)
     return [view(entry) for entry in entries]
 

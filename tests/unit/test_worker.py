@@ -29,6 +29,7 @@ from longhaul.github.client import GitHubClient
 from longhaul.github.remote import GitHubRemote
 from longhaul.github.side_effects import SqlLedger as SqlEffectLedger
 from longhaul.memory.embedder import HashEmbedder, LocalEmbedder
+from longhaul.memory.promotion import Promoter
 from longhaul.memory.store import PgMemoryStore
 from longhaul.providers.replay import ReplayProvider
 from longhaul.providers.scripted import ScriptedProvider
@@ -161,6 +162,19 @@ def test_the_token_of_the_settings_goes_to_the_poller(tmp_path: Path) -> None:
     parts = worker.build_parts(settings, CONFIG, FakeManager())  # type: ignore[arg-type]
     assert isinstance(parts.github, GitHubClient)
     assert poller_of(parts)._github is parts.github
+
+
+def test_the_poller_settles_lessons_when_memory_is_on(tmp_path: Path) -> None:
+    # Without a Promoter the candidates of a merged pull request would wait for ever (LH-606).
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    promoter = poller_of(parts)._promoter
+    assert isinstance(promoter, Promoter)
+
+
+def test_the_poller_has_no_promoter_when_memory_is_off(tmp_path: Path) -> None:
+    off = CONFIG.model_copy(update={"memory": Memory(enabled=False, embedder="hash")})
+    parts = worker.build_parts(make_settings(tmp_path), off, FakeManager())  # type: ignore[arg-type]
+    assert poller_of(parts)._promoter is None
 
 
 def test_tasks_start_on_the_queue_of_the_worker(tmp_path: Path) -> None:
@@ -632,6 +646,22 @@ def test_the_planner_gets_its_own_tools_on_every_worker(tmp_path: Path) -> None:
     coder = {tool.name for tool in llm.tools_for(Role.CODER)}
     assert {"edit_file", "write_file", "finish"} <= coder
     assert "submit_plan" not in coder
+
+
+def test_the_compactor_counts_a_transcript_with_the_tools_of_its_role(tmp_path: Path) -> None:
+    # Without tools_for the compactor counts every role with the tools of the coder, which is
+    # the miscount of LH-501.
+    parts = worker.build_parts(make_settings(tmp_path), CONFIG, FakeManager())  # type: ignore[arg-type]
+    llm = activity_object(parts, "llm_turn")
+    compactor = activity_object(parts, "compact")
+
+    assert compactor._tools_for == llm.tools_for
+    planner_tools = [tool.name for tool in compactor._tools_of(Role.PLANNER, planned=False)]
+    assert planner_tools == [*planner.TOOLS, "submit_plan"]
+    planned = {tool.name for tool in compactor._tools_of(Role.CODER, planned=True)}
+    unplanned = {tool.name for tool in compactor._tools_of(Role.CODER, planned=False)}
+    assert "submit_for_review" in planned and "finish" not in planned
+    assert "finish" in unplanned
 
 
 def test_a_worker_stores_plans_with_the_recorder_of_the_rest(tmp_path: Path) -> None:

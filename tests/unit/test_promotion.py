@@ -19,6 +19,7 @@ from longhaul.memory.promotion import (
     REJECTED_EVENT,
     Promoter,
     approver_for,
+    decided_by,
     pull_number,
 )
 from longhaul.memory.store import MemoryEntry
@@ -123,6 +124,29 @@ async def test_each_pull_request_is_asked_about_once_and_open_ones_are_left() ->
             {"repo": REPO, "pr": 17, "items": ["a", "b"], "approved_by": "merged_pr#17"},
         )
     ]
+
+
+async def test_a_rejection_is_recorded_with_who_decided_and_not_who_approved() -> None:
+    events = FakeEvents({"17": "lh-acme-inventory-7"})
+
+    await Promoter(FakeStore([entry("a", "17")]), events).settle(FakePulls({17: "closed"}), REPO)
+
+    assert events.recorded == [
+        (
+            "lh-acme-inventory-7",
+            REJECTED_EVENT,
+            {"repo": REPO, "pr": 17, "items": ["a"], "decided_by": "closed_pr#17"},
+        )
+    ]
+
+
+def test_the_decider_is_read_from_new_and_old_events() -> None:
+    # Before LH-991 a rejection said `approved_by` too, and those rows are still in the table.
+    assert decided_by({"decided_by": "closed_pr#17"}) == "closed_pr#17"
+    assert decided_by({"approved_by": "closed_pr#17"}) == "closed_pr#17"
+    assert decided_by({"approved_by": "merged_pr#9"}) == "merged_pr#9"
+    assert decided_by({"decided_by": "a", "approved_by": "b"}) == "a"
+    assert decided_by({"repo": REPO}) is None
 
 
 async def test_a_task_without_a_pull_request_is_never_decided_here() -> None:

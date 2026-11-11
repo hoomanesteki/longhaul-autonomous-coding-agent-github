@@ -115,8 +115,9 @@ and `ask_human` in place of `finish`, and reads the plan in the first message of
    that names a step the plan does not have, or a status it does not know, is answered as an
    error and changes nothing.
 2. `submit_for_review` ends the coding and starts the review (see "The verifying phase" below). A
-   call to `finish` still ends such a task the way it did before the verifier, without a review,
-   for a worker or a history from before that story. The `build_pr_branch` activity gets the
+   call to `finish` is reviewed the same way (LH-991), so that every planned task is verified
+   before a ready pull request. A history from before that change ended on `finish` without a
+   review, and keeps that end through the patch marker. The `build_pr_branch` activity gets the
    plan, and makes one commit for each done step.
 3. `ask_human` pauses the task for a person, as a stuck signal does (see "The pause for a hint"
    below).
@@ -154,9 +155,12 @@ Replay. The new activity calls are on the paths a plan opens: `record_step` runs
 coder of a planned task calls `update_step`, and the extra input of `build_pr_branch` is the plan.
 The review adds `tool_exec` calls for the pre-check and the diff, and the verifier's own turns, and
 makes them only after a `submit_for_review`. A task without a plan makes the commands it made
-before, in the same order, and so does a planned task that ends on `finish`, so those histories
-replay as they were. A planned task that submitted for review before this story replays
-differently, which matters only for a deployment that has such a history in flight (F13).
+before, in the same order. A planned task that ends on `finish` is reviewed behind
+`workflow.patched(FINISH_REVIEWED_PATCH)` (LH-991), asked only when a planned coder calls `finish`,
+so a history recorded before it replays as it was, with no review
+(tests/fixtures/histories/planned_finish_before_review.json). A planned task that submitted for
+review before LH-504 replays differently, which matters only for a deployment that has such a
+history in flight (F13).
 
 The stuck detector (LH-505). After each coder turn that does not end the run, `_watch` shows the
 turn to the detector of roles/stuck.py. The detector keeps its window in `state.stuck_window`, so
@@ -292,6 +296,12 @@ that fails over its own bookkeeping. A task started with `longhaul run` has no r
 write creates one. Replay: all of it is behind `workflow.patched(ROW_PATCH)`, so a history from
 before this story has no such activity to replay.
 
+A run that follows a hand-over keeps the phase the task had (LH-991): `_prepare` only finds the
+sandbox again and does not write `preparing`. The task was coding, and the row used to say
+`preparing` until the first turn of the new run wrote `coding`. Replay: the old write is kept for
+a history without `workflow.patched(KEEP_PHASE_PATCH)`, asked only by a run that was handed a
+sandbox (tests/fixtures/histories/handover_before_phase_kept.json).
+
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:
 
@@ -372,6 +382,14 @@ up, and a failure noted the outcome and raised. Drop the patch with `workflow.de
 once no run that began before this story is open. The lessons are behind
 `workflow.patched(LESSONS_PATCH)`, asked only by a task that has a `memory_ref`, so a history that
 ended before LH-605 replays without the call, and a task with no memory records no marker.
+
+The stored run report (LH-705, LH-991). `deliver` stores the report for the body of the pull
+request, which is before the outcome and the lessons are recorded, so that copy lacks both. At
+the very end of the wind-up, after the outcome event, a task of an issue asks `write_run_report`
+for a new copy, which replaces the blob. The pull request body is not touched: it was made from
+the first copy, and nothing reads the stored copy for a body after the wind-up begins. Replay: the
+call is behind `workflow.patched(FINAL_REPORT_PATCH)`, asked only by a task of an issue, so a
+history that ended before this story replays without it.
 
 The context tiers (LH-404, ADR-0013). The workflow cannot count tokens, so each `llm_turn` returns
 a decision for the turn after it: "ok", "compact" or "force" (acts.LlmTurnOutput.context_decision).
@@ -561,6 +579,13 @@ NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 LOAD_MEMORY_PATCH = "lh-604-load-memory"
 # The patch marker of the plan gate (LH-502, failure mode F13). See "The plan gate" above.
 PLAN_GATE_PATCH = "lh-502-plan-gate"
+# The patch marker of the review of a planned `finish` (LH-991). See "The verifying phase" above.
+FINISH_REVIEWED_PATCH = "lh-991-finish-reviewed"
+# The patch marker of the hand-over that keeps the phase of the task (LH-991). See "The row of the
+# task" above.
+KEEP_PHASE_PATCH = "lh-991-keep-phase"
+# The patch marker of the second write of the stored run report (LH-991). See "How a task ends".
+FINAL_REPORT_PATCH = "lh-991-final-report"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
 # ends" above.
 OUTCOME_PATCH = "lh-507-final-outcome"
@@ -1063,7 +1088,8 @@ class TaskWorkflow:
         for one, the final comment (which links that pull request), and the final labels. The
         repo of a cancelled task goes after them, since the comment reads its diff. The lessons of
         a task that keeps memory come next (LH-605), so nobody waits for a model. The note for the
-        metrics comes last, so it counts a task that has finished all of this.
+        metrics comes next, so it counts a task that has finished all of this. The stored run
+        report is written last (LH-991), because it reads the outcome and the lessons.
 
         Each step is best effort. An activity that fails for good is logged, and the next step
         goes on, so one failure leaves the outcome as it is and does not leave the rest undone. A
@@ -1093,6 +1119,7 @@ class TaskWorkflow:
         await self._remove_repo(outcome)
         await self._lessons(outcome)
         await self._note_outcome(outcome)
+        await self._final_report(outcome)
         return outcome
 
     def _cancelled_by_a_person(self, outcome: Outcome) -> bool:
@@ -1228,6 +1255,25 @@ class TaskWorkflow:
         """
         return outcome.kind is OutcomeKind.PR_OPENED and self.verified_tests is not None
 
+    async def _final_report(self, outcome: Outcome) -> None:
+        """Store the run report again, now that the outcome and the lessons are in the rows.
+
+        The copy that `deliver` stored was built before either existed. This write comes after the
+        `outcome` event, which is the last row of the task, and replaces the blob. Best effort,
+        like the rest of the wind-up: a report that cannot be built leaves the older copy and the
+        outcome as they are.
+        """
+        state = self.state
+        if not lifecycle.is_github_task(state.spec) or not workflow.patched(FINAL_REPORT_PATCH):
+            return
+        await self._try(
+            "run report",
+            self._wind_call(
+                acts.WRITE_RUN_REPORT,
+                acts.RunReportInput(task_id=state.spec.task_id, outcome=outcome.kind.value),
+            ),
+        )
+
     async def _lessons(self, outcome: Outcome) -> None:
         """Draft the lessons of the task and record them (LH-605). Best effort, like the rest.
 
@@ -1310,10 +1356,16 @@ class TaskWorkflow:
 
     async def _prepare(self) -> None:
         state = self.state
+        if state.sandbox_id is not None and workflow.patched(KEEP_PHASE_PATCH):
+            # An earlier run of this workflow prepared the workspace, and its container may be
+            # gone by now. ensure_sandbox answers with the same id when it is still running. The
+            # task keeps the phase it had (LH-991): it is coding, and a write of `preparing` made
+            # the console show a task that had begun over again until the next write.
+            await self._ensure_sandbox()
+            return
         await self._enter(Phase.PREPARING)
         if state.sandbox_id is not None:
-            # An earlier run of this workflow prepared the workspace, and its container may be
-            # gone by now. ensure_sandbox answers with the same id when it is still running.
+            # The same, for a history recorded before LH-991, which has the write above.
             await self._ensure_sandbox()
             return
         prepared = await self._call(acts.PREPARE_WORKSPACE, state.spec)
@@ -1812,7 +1864,7 @@ class TaskWorkflow:
         )
         state.turn_index = index + 1
         if ran.finish is not None:
-            if not ran.review:
+            if not ran.review and not self._reviews_a_finish():
                 return self._finish(rules.finished(ran.finish))
             ended = await self._verify(ran.finish)
             if ended is None:  # sent back: the coder goes on, as after any other turn
@@ -1834,6 +1886,16 @@ class TaskWorkflow:
                 return ended
         await self._relieve(index, sampled.context_decision)
         return None
+
+    def _reviews_a_finish(self) -> bool:
+        """Whether the `finish` of this task goes to the verifier like `submit_for_review`.
+
+        Every planned task is reviewed before a ready pull request (LH-991). LH-503 left `finish`
+        out of that for the histories from before the verifier, which the patch marker keeps: a
+        history without it takes the old way at this same place. A task without a plan has no
+        plan to judge against, so it never asks for the marker.
+        """
+        return self.state.plan is not None and workflow.patched(FINISH_REVIEWED_PATCH)
 
     async def _run_calls(
         self,
@@ -2609,6 +2671,7 @@ class TaskWorkflow:
                 script_ref=self._script(),
                 context_mode=mode,
                 memory_ref=state.memory_ref,
+                planned=role is Role.CODER and state.plan is not None,
             ),
         )
         state.cost_usd += done.cost_usd
@@ -2673,6 +2736,7 @@ class TaskWorkflow:
                         sandbox_id=self._sandbox_id(),
                         read_only=read_only,
                         window_tokens=self._window(),
+                        test_command=state.spec.settings.test_command,
                     ),
                 )
                 break

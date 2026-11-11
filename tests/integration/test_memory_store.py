@@ -436,6 +436,73 @@ async def test_an_approval_names_a_person(
     assert (await row_of(sessions, item_id)).status == "candidate"
 
 
+# ---------- the status guard of the poller's calls (LH-606, LH-991) ----------
+async def test_promote_candidate_takes_a_candidate_and_names_who_did(
+    store: PgMemoryStore, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    item_id = await store.add_candidate(note(REMOVE_LESSON))
+
+    assert await store.promote_candidate(item_id, "merged_pr#7") is True
+
+    row = await row_of(sessions, item_id)
+    assert (row.status, row.approved_by) == ("approved", "merged_pr#7")
+
+
+async def test_reject_candidate_takes_a_candidate(
+    store: PgMemoryStore, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    item_id = await store.add_candidate(note(REMOVE_LESSON))
+
+    assert await store.reject_candidate(item_id, "closed_pr#7") is True
+
+    row = await row_of(sessions, item_id)
+    assert (row.status, row.approved_by) == ("rejected", None)
+
+
+@pytest.mark.parametrize("decided", ["approved", "rejected"])
+@pytest.mark.parametrize("action", ["promote_candidate", "reject_candidate"])
+async def test_an_item_that_is_not_a_candidate_is_left_as_it_is(
+    store: PgMemoryStore,
+    sessions: async_sessionmaker[AsyncSession],
+    action: str,
+    decided: str,
+) -> None:
+    """A pull request that closes after a person decided cannot undo the decision."""
+    item_id = await store.add_candidate(note(REMOVE_LESSON))
+    if decided == "approved":
+        await store.promote(item_id, "alice")
+    else:
+        await store.reject(item_id, "alice")
+    before = await row_of(sessions, item_id)
+
+    assert await getattr(store, action)(item_id, "merged_pr#7") is False
+
+    after = await row_of(sessions, item_id)
+    assert (after.status, after.approved_by) == (before.status, before.approved_by)
+
+
+@pytest.mark.parametrize("action", ["promote_candidate", "reject_candidate"])
+async def test_a_candidate_call_on_an_unknown_item_moves_nothing_and_does_not_raise(
+    store: PgMemoryStore, action: str
+) -> None:
+    for item_id in (str(uuid.uuid4()),):
+        assert await getattr(store, action)(item_id, "merged_pr#7") is False
+
+
+async def test_two_candidate_calls_move_an_item_once(
+    store: PgMemoryStore, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    item_id = await store.add_candidate(note(REMOVE_LESSON))
+
+    moved = await asyncio.gather(
+        store.promote_candidate(item_id, "merged_pr#7"),
+        store.reject_candidate(item_id, "closed_pr#7"),
+    )
+
+    assert sorted(moved) == [False, True]
+    assert (await row_of(sessions, item_id)).status in {"approved", "rejected"}
+
+
 # ---------- listing ----------
 async def test_list_items_stops_at_the_limit(store: PgMemoryStore) -> None:
     first = await store.add_candidate(note(REMOVE_LESSON))

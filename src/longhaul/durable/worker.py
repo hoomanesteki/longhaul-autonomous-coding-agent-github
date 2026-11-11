@@ -413,6 +413,7 @@ def build_parts(
         ledger=ledger,
         meters=meters,
         templates=templates_path(settings),
+        tools_for=llm.tools_for,
     )
     budgets = BudgetActivities(pricing, ledger, config_for, tools_for=llm.tools_for, meters=meters)
     backend = build_backend(cfg.tools, settings)

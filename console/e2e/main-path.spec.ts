@@ -68,6 +68,16 @@ test("the main path of the console", async ({ page }) => {
     await expect(plan).toContainText("awaiting_plan_approval", SETTLED);
     await expect(plan.locator("td").last()).toHaveText("Approve the plan");
 
+    // On a phone the Needs you column is off screen, so the line under the title has to say it.
+    await page.setViewportSize({ width: 375, height: 800 });
+    await expect(stuck.getByTestId("status-line")).toBeVisible();
+    await expect(stuck.getByText("Needs you: Paused")).toBeInViewport();
+    await expect(plan.getByText("Needs you: Approve the plan")).toBeInViewport();
+    // The scroll box shows that there is more to the right.
+    await expect(page.getByTestId("edge-right")).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(stuck.getByTestId("status-line")).toBeHidden();
+
     // The box follows the address, so it changes a moment after the click and not during it.
     await page.getByLabel("Needs you").click();
     await expect(page.getByLabel("Needs you")).toBeChecked();
@@ -76,19 +86,6 @@ test("the main path of the console", async ({ page }) => {
     await page.getByLabel("Needs you").click();
     await expect(page.getByLabel("Needs you")).not.toBeChecked();
     await expect(page.locator("tbody tr")).toHaveCount(3);
-  });
-
-  await test.step("see what needs you on a phone without scrolling", async () => {
-    await page.setViewportSize({ width: 375, height: 800 });
-    // The Needs you column is off screen at this width, so the line under the title has to say it.
-    const stuck = rowOf(page, STUCK.title);
-    await expect(stuck.getByTestId("status-line")).toBeVisible();
-    await expect(stuck.getByText("Needs you: Paused")).toBeInViewport();
-    await expect(rowOf(page, PLAN.title).getByText("Needs you: Approve the plan")).toBeInViewport();
-    // The box shows that it scrolls.
-    await expect(page.getByTestId("edge-right")).toBeVisible();
-    await page.setViewportSize({ width: 1280, height: 720 });
-    await expect(stuck.getByTestId("status-line")).toBeHidden();
   });
 
   await test.step("send a hint to the stuck task and see it code again", async () => {

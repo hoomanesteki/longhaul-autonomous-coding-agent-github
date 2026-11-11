@@ -3251,6 +3251,32 @@ async def test_a_test_command_in_the_settings_is_never_replaced(
     }
 
 
+async def test_every_tool_call_carries_the_command_the_task_runs_its_tests_with(
+    env: WorkflowEnvironment,
+) -> None:
+    """The settings first, then the verified command from memory, then nothing (LH-991).
+
+    `run_tests` runs what the call carries, and the worker default only when it carries none.
+    """
+    verified = {**WITH_MEMORY, "test_command": "pytest -q"}
+    cases = [
+        ("the settings", "make check", verified, "make check"),
+        ("memory", None, verified, "pytest -q"),
+        ("neither", None, WITH_MEMORY, None),
+    ]
+    for number, (why, setting, prepared, expected) in enumerate(cases):
+        spec = make_spec(f"lh-acme-calc-{number}").model_copy(
+            update={"settings": RepoSettings(repo="acme/calc", test_command=setting)}
+        )
+        stubs = Stubs(edits_then_finishes(2))
+        stubs.prepared_with = prepared
+        await play(env, stubs, spec)
+
+        calls = stubs.payloads(acts.TOOL_EXEC.name)
+        assert len(calls) == 2, why
+        assert {c.test_command for c in calls} == {expected}, why
+
+
 async def test_histories_with_and_without_the_memory_call_replay(env: WorkflowEnvironment) -> None:
     """An old history has no load_memory and a new one has it, and the same code replays both.
 

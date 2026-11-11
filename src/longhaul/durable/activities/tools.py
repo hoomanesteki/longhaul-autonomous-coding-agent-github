@@ -244,6 +244,7 @@ class ToolActivities:
         inp = small(inp)
         sandbox = await self._sandbox(inp.sandbox_id)
         call, args_ref = await self._call(inp)
+        registry = self._registry_for(inp)
         ctx = ToolContext(
             task_id=inp.task_id,
             turn_index=inp.turn_index,
@@ -262,7 +263,7 @@ class ToolActivities:
                 ) as span:
                     began = time.monotonic()
                     ran = await self._backend.run(
-                        self._registry, sandbox, call, ctx, sandbox_id=inp.sandbox_id
+                        registry, sandbox, call, ctx, sandbox_id=inp.sandbox_id
                     )
                     result = ran.result
                     self._time(call.name, time.monotonic() - began)
@@ -291,7 +292,7 @@ class ToolActivities:
                 key=blob_key(inp.task_id, "turns", inp.turn_index, f"tool-{slug}-args.json"),
             )
         # The detector does not watch the planner, so a call of the planning phase gets no facts.
-        signal = None if inp.read_only else call_signal(call, result, self._test_command())
+        signal = None if inp.read_only else call_signal(call, result, self._test_command(registry))
         returned = acts.ToolExecResult(
             **result.model_dump(exclude={"output", "output_ref", "pre_sha", "post_sha"}),
             output=_preview(result.output, output_ref),
@@ -336,9 +337,21 @@ class ToolActivities:
         if self._backend.remote and not result.ok and await self._is_gone(sandbox_id):
             raise _gone(sandbox_id)
 
-    def _test_command(self) -> str | None:
+    def _registry_for(self, inp: acts.ToolExecInput) -> ToolRegistry:
+        """The registry that runs this call: the worker's, with the test command of the task.
+
+        The repo's own setting and the verified command from memory arrive as `inp.test_command`,
+        already in that order (the workflow folds the second into the first). Without one, the
+        command the worker was built with runs, as it did before this field.
+        """
+        if inp.test_command and inp.call.name == "run_tests":
+            return self._registry.with_test_command(inp.test_command)
+        return self._registry
+
+    @staticmethod
+    def _test_command(registry: ToolRegistry) -> str | None:
         """The command that run_tests runs, which the facts of a test run name it by."""
-        tool = self._registry.get("run_tests")
+        tool = registry.get("run_tests")
         return tool.test_command if isinstance(tool, RunTests) else None
 
     def _time(self, tool: str, seconds: float) -> None:

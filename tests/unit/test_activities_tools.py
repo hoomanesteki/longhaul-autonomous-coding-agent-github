@@ -336,6 +336,43 @@ def test_the_label_of_a_command_names_the_program_and_not_its_path() -> None:
     assert command_label("make test") == "make test"
 
 
+# ---------- which command run_tests runs (LH-991) ----------
+def with_test_command(call: Any, command: str | None) -> Any:
+    return call.model_copy(update={"test_command": command})
+
+
+async def test_run_tests_runs_the_command_the_task_names_before_the_worker_default(
+    sandbox: FakeSandbox,
+) -> None:
+    rig = Rig(sandbox, test_command="echo from-the-worker")
+    result = await rig.exec(with_test_command(exec_input("run_tests"), "echo from-the-repo"))
+
+    assert result.ok
+    assert "from-the-repo" in result.output and "from-the-worker" not in result.output
+    # The target is added to the command of the task, as it is to the default.
+    targeted = await rig.exec(
+        with_test_command(exec_input("run_tests", "toolu_2", target="tests/a.py"), "echo repo")
+    )
+    assert "repo tests/a.py" in targeted.output
+
+
+async def test_run_tests_falls_back_to_the_worker_default_when_the_task_names_none(
+    sandbox: FakeSandbox,
+) -> None:
+    rig = Rig(sandbox, test_command="echo from-the-worker")
+    result = await rig.exec(with_test_command(exec_input("run_tests"), None))
+
+    assert result.ok and "from-the-worker" in result.output
+
+
+async def test_the_facts_of_a_test_run_name_the_command_that_ran(sandbox: FakeSandbox) -> None:
+    rig = Rig(sandbox, test_command="false")
+    result = await rig.exec(with_test_command(exec_input("run_tests"), "echo broken; false"))
+
+    assert result.signal is not None
+    assert result.signal.failed_command == "echo broken; false"
+
+
 async def test_a_run_that_passes_leaves_a_count_and_no_failure(sandbox: FakeSandbox) -> None:
     await sandbox.write_file(
         MODULE, b"def add(a, b):\n    return a + b\n\n\ndef multiply(a, b):\n    return a * b\n"

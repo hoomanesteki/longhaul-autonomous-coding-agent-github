@@ -2720,6 +2720,7 @@ class TaskWorkflow:
                         sandbox_id=self._sandbox_id(),
                         read_only=read_only,
                         window_tokens=self._window(),
+                        test_command=state.spec.settings.test_command,
                     ),
                 )
                 break

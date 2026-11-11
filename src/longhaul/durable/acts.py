@@ -513,6 +513,10 @@ class ToolExecInput(BaseModel):
     # The context window of the run (Tuning.window_tokens). A tool pages its output to the cap for
     # one result, and that cap shrinks with a small window (context.tokens.result_cap).
     window_tokens: int | None = Field(default=None, ge=1)
+    # The test command of the task: its settings, else the verified command that memory found. A
+    # `run_tests` call runs it, and the command the worker was built with is only the fallback
+    # when this is None. A history from before this field has none.
+    test_command: str | None = None
 
 
 class ToolExecResult(ToolResult):

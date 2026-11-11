@@ -1,9 +1,10 @@
 /**
  * What the task page shows of a timeline, worked out from the rows of the API.
  *
- * The API sends events, model calls and tool calls as one flat list in the order they happened.
- * The page wants one block per turn, with its tool calls inside, so the grouping and the small
- * formats live here as plain functions and are tested without a browser.
+ * The API sends events, model calls, tool calls and checkpoints (the commits a turn saved) as one
+ * flat list in the order they happened. The page wants one block per turn, with its tool calls and
+ * checkpoints inside, so the grouping and the small formats live here as plain functions and are
+ * tested without a browser.
  */
 
 import type { components } from "../api/schema";
@@ -26,7 +27,9 @@ export type TurnRow = {
   checkpoints: TimelineCheckpoint[];
 };
 export type EventRow = { kind: "event"; key: string; event: TimelineEvent };
-export type Row = TurnRow | EventRow;
+/** A hand-over bundle, in the place it was made. It belongs to no turn, see `groupTimeline`. */
+export type CheckpointRow = { kind: "checkpoint"; key: string; checkpoint: TimelineCheckpoint };
+export type Row = TurnRow | EventRow | CheckpointRow;
 
 /**
  * One row for each turn and each event, in the order they first appear.
@@ -52,6 +55,11 @@ export function groupTimeline(items: readonly TimelineItem[]): Row[] {
   for (const item of items) {
     if (item.kind === "event") rows.push({ kind: "event", key: `event:${item.id}`, event: item });
     else if (item.kind === "turn") groupOf(item.turn_index).attempts.push(item);
+    // The hand-over records a bundle with the number of turns done, which is the index of the next
+    // turn, run by the next workflow run. Grouping it by that index would open an empty block for a
+    // turn that has not started and put it before the hand-over event, so it keeps its own row.
+    else if (item.kind === "checkpoint" && item.checkpoint_kind === "bundle")
+      rows.push({ kind: "checkpoint", key: `checkpoint:${item.id}`, checkpoint: item });
     else if (item.kind === "checkpoint") groupOf(item.turn_index).checkpoints.push(item);
     else groupOf(item.turn_index).calls.push(item);
   }

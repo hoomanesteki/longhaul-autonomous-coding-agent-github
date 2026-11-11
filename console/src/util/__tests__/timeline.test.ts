@@ -306,3 +306,38 @@ describe("groupTimeline checkpoints", () => {
     expect(only?.kind === "turn" && only.checkpoints.map((c) => c.sha.slice(0, 7))).toEqual(["0123456"]);
   });
 });
+
+describe("groupTimeline hand-over bundle", () => {
+  const bundle: Item = {
+    kind: "checkpoint",
+    ts: "2026-11-01T10:00:03Z",
+    id: 9,
+    sha: "89abcdef0123456789abcdef0123456789abcdef",
+    checkpoint_kind: "bundle",
+    // The hand-over records the number of turns done, which is the index of the next turn.
+    turn_index: 5,
+    step_id: null,
+  };
+
+  it("keeps a bundle in time order and makes no block for the turn that has not run", () => {
+    const rows = groupTimeline([
+      turn(4),
+      { ...bundle, id: 8, checkpoint_kind: "tool", turn_index: 4 },
+      bundle,
+      event(2, "continue_as_new"),
+    ]);
+
+    expect(rows.map((r) => r.key)).toEqual(["turn:4", "checkpoint:9", "event:2"]);
+    const first = rows[0];
+    expect(first?.kind === "turn" && first.checkpoints.map((c) => c.checkpoint_kind)).toEqual(["tool"]);
+    expect(rows.some((r) => r.kind === "turn" && r.turnIndex === 5)).toBe(false);
+  });
+
+  it("puts the next turn after the hand-over", () => {
+    const rows = groupTimeline([turn(4), bundle, event(2, "continue_as_new"), turn(5)]);
+
+    expect(rows.map((r) => r.key)).toEqual(["turn:4", "checkpoint:9", "event:2", "turn:5"]);
+    const next = rows[3];
+    expect(next?.kind === "turn" && next.checkpoints).toEqual([]);
+  });
+});

@@ -2,6 +2,7 @@ import { useWindowVirtualizer } from "@tanstack/react-virtual";
 import { useCallback, useLayoutEffect, useRef, useState } from "react";
 
 import type { Row } from "../../util/timeline";
+import CheckpointRow from "./CheckpointRow";
 import EventRow from "./EventRow";
 import TurnBlock, { type OpenState } from "./TurnBlock";
 
@@ -82,6 +83,8 @@ export default function Timeline({
           >
             {row.kind === "event" ? (
               <EventRow event={row.event} open={open} />
+            ) : row.kind === "checkpoint" ? (
+              <CheckpointRow checkpoint={row.checkpoint} />
             ) : (
               <TurnBlock taskId={taskId} row={row} coderModel={coderModel} open={open} />
             )}

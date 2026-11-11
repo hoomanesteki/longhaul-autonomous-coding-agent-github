@@ -168,7 +168,21 @@ export default function TasksPage() {
                       key={task.id}
                       className={`border-b border-slate-100 ${waiting === null ? "" : "bg-amber-50"}`}
                     >
-                      <td className={CELL}>{task.repo}</td>
+                      <td className={`${CELL} min-w-[9rem] lg:min-w-0`}>
+                        {task.repo}
+                        {/* Phase and Needs you are the last columns, off screen on a phone. They go in the
+                            first column, which is always in view, and break anywhere because a phase such
+                            as awaiting_plan_approval has no space to break at. */}
+                        <div
+                          data-testid="status-line"
+                          className="mt-1 flex flex-col text-xs break-all text-slate-600 lg:hidden"
+                        >
+                          <span>{`Phase: ${task.phase}`}</span>
+                          {waiting !== null && (
+                            <span className="font-medium text-amber-900">{`Needs you: ${waiting}`}</span>
+                          )}
+                        </div>
+                      </td>
                       <td className={CELL}>
                         {issue !== null && (
                           <a
@@ -185,16 +199,6 @@ export default function TasksPage() {
                         <Link to={`/tasks/${encodeURIComponent(task.id)}`} className="hover:underline">
                           {task.title}
                         </Link>
-                        {/* Phase and Needs you are the last columns, off screen on a phone. */}
-                        <div
-                          data-testid="status-line"
-                          className="mt-1 flex flex-wrap gap-x-3 text-xs text-slate-600 lg:hidden"
-                        >
-                          <span>{`Phase: ${task.phase}`}</span>
-                          {waiting !== null && (
-                            <span className="font-medium text-amber-900">{`Needs you: ${waiting}`}</span>
-                          )}
-                        </div>
                       </td>
                       <td className={CELL}>
                         <PhaseBadge phase={task.phase} />

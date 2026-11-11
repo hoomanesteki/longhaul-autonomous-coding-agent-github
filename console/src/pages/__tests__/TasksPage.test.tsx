@@ -170,14 +170,14 @@ describe("tasks page", () => {
     expect(within(rowOf("Rename the flag")).queryByText("Paused")).not.toBeInTheDocument();
   });
 
-  it("repeats the phase and what needs you under the title, for a screen too narrow for the columns", async () => {
+  it("repeats the phase and what needs you under the repo, for a screen too narrow for the columns", async () => {
     serve([CODING, PAUSED, APPROVAL]);
     renderPage();
 
     await screen.findByText("Fix the parser");
     // The table scrolls sideways on a phone, and Phase and Needs you are the last columns. The
-    // line under the title is what a person sees without scrolling. CSS hides it on wide screens.
-    const line = (title: string) => within(rowOf(title).querySelectorAll("td")[2] as HTMLElement);
+    // line under the repo, in the first column, is what a person sees without scrolling. CSS hides it on wide screens.
+    const line = (title: string) => within(rowOf(title).querySelectorAll("td")[0] as HTMLElement);
     expect(line("Fix the parser").getByTestId("status-line")).toHaveTextContent("Phase: coding");
     expect(line("Fix the parser").queryByText(/Needs you/)).not.toBeInTheDocument();
     expect(line("Speed up the build").getByTestId("status-line")).toHaveTextContent("Phase: paused");

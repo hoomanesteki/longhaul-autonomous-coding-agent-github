@@ -574,4 +574,34 @@ describe("checkpoints", () => {
     expect(within(second).getByText("step s1")).toBeInTheDocument();
     expect(within(second).queryByText("Checkpoint 0123456")).not.toBeInTheDocument();
   });
+
+  it("shows a hand-over bundle between the turns, before the continue_as_new event", async () => {
+    serve({
+      items: [
+        turn(4),
+        {
+          kind: "checkpoint",
+          ts: at(30),
+          id: 3,
+          sha: SHA,
+          checkpoint_kind: "bundle",
+          turn_index: 5,
+          step_id: null,
+        },
+        event(9, "continue_as_new", 31, { reason: "turns" }),
+        turn(5, { ts: at(40) }),
+      ],
+    });
+    renderPage();
+
+    const rows = await screen.findAllByTestId("timeline-row");
+    const labels = rows.map((r) => r.textContent ?? "");
+    const bundle = labels.findIndex((t) => t.includes("Checkpoint 0123456"));
+    const handOver = labels.findIndex((t) => t.includes("continue_as_new"));
+    const next = labels.findIndex((t) => t.includes("Turn 5"));
+    expect(bundle).toBeGreaterThanOrEqual(0);
+    expect(bundle).toBeLessThan(handOver);
+    expect(handOver).toBeLessThan(next);
+    expect(within(rowOf(screen.getByText("Turn 5"))).queryByText("Checkpoint 0123456")).not.toBeInTheDocument();
+  });
 });

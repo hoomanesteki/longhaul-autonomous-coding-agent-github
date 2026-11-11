@@ -115,8 +115,9 @@ and `ask_human` in place of `finish`, and reads the plan in the first message of
    that names a step the plan does not have, or a status it does not know, is answered as an
    error and changes nothing.
 2. `submit_for_review` ends the coding and starts the review (see "The verifying phase" below). A
-   call to `finish` still ends such a task the way it did before the verifier, without a review,
-   for a worker or a history from before that story. The `build_pr_branch` activity gets the
+   call to `finish` is reviewed the same way (LH-991), so that every planned task is verified
+   before a ready pull request. A history from before that change ended on `finish` without a
+   review, and keeps that end through the patch marker. The `build_pr_branch` activity gets the
    plan, and makes one commit for each done step.
 3. `ask_human` pauses the task for a person, as a stuck signal does (see "The pause for a hint"
    below).
@@ -154,9 +155,12 @@ Replay. The new activity calls are on the paths a plan opens: `record_step` runs
 coder of a planned task calls `update_step`, and the extra input of `build_pr_branch` is the plan.
 The review adds `tool_exec` calls for the pre-check and the diff, and the verifier's own turns, and
 makes them only after a `submit_for_review`. A task without a plan makes the commands it made
-before, in the same order, and so does a planned task that ends on `finish`, so those histories
-replay as they were. A planned task that submitted for review before this story replays
-differently, which matters only for a deployment that has such a history in flight (F13).
+before, in the same order. A planned task that ends on `finish` is reviewed behind
+`workflow.patched(FINISH_REVIEWED_PATCH)` (LH-991), asked only when a planned coder calls `finish`,
+so a history recorded before it replays as it was, with no review
+(tests/fixtures/histories/planned_finish_before_review.json). A planned task that submitted for
+review before LH-504 replays differently, which matters only for a deployment that has such a
+history in flight (F13).
 
 The stuck detector (LH-505). After each coder turn that does not end the run, `_watch` shows the
 turn to the detector of roles/stuck.py. The detector keeps its window in `state.stuck_window`, so
@@ -561,6 +565,8 @@ NOTHING_TO_DELIVER = "nothing to deliver: no file changed"
 LOAD_MEMORY_PATCH = "lh-604-load-memory"
 # The patch marker of the plan gate (LH-502, failure mode F13). See "The plan gate" above.
 PLAN_GATE_PATCH = "lh-502-plan-gate"
+# The patch marker of the review of a planned `finish` (LH-991). See "The verifying phase" above.
+FINISH_REVIEWED_PATCH = "lh-991-finish-reviewed"
 # The patch marker of the wind-up that ends every task (LH-507, failure mode F13). See "How a task
 # ends" above.
 OUTCOME_PATCH = "lh-507-final-outcome"
@@ -1812,7 +1818,7 @@ class TaskWorkflow:
         )
         state.turn_index = index + 1
         if ran.finish is not None:
-            if not ran.review:
+            if not ran.review and not self._reviews_a_finish():
                 return self._finish(rules.finished(ran.finish))
             ended = await self._verify(ran.finish)
             if ended is None:  # sent back: the coder goes on, as after any other turn
@@ -1834,6 +1840,16 @@ class TaskWorkflow:
                 return ended
         await self._relieve(index, sampled.context_decision)
         return None
+
+    def _reviews_a_finish(self) -> bool:
+        """Whether the `finish` of this task goes to the verifier like `submit_for_review`.
+
+        Every planned task is reviewed before a ready pull request (LH-991). LH-503 left `finish`
+        out of that for the histories from before the verifier, which the patch marker keeps: a
+        history without it takes the old way at this same place. A task without a plan has no
+        plan to judge against, so it never asks for the marker.
+        """
+        return self.state.plan is not None and workflow.patched(FINISH_REVIEWED_PATCH)
 
     async def _run_calls(
         self,

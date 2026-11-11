@@ -412,7 +412,7 @@ A coder that has a plan works it one step at a time (LH-503). It reads the plan 
 | `submit_for_review(summary)` | Ends the coding and starts the review (see "The verifier and the send-back loop"). A task of an issue goes on to open the pull request once the work passes. |
 | `ask_human(question)` | Asks a person. The task pauses as it does for a stuck signal (see "The pause and the hint" below) and goes back to coding when someone answers. |
 
-A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, without a review and with a draft pull request, for a worker or a history from before the verifier. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan is reviewed like `submit_for_review` (LH-991). Only a history recorded before that change still ends on `finish` with no review and a draft pull request. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
 
 An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
 

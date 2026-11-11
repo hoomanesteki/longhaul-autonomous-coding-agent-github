@@ -12,6 +12,7 @@ import os
 import signal
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -25,8 +26,11 @@ ROOT = Path(__file__).resolve().parents[2]
 DEMO = ROOT / "scripts" / "demo.sh"
 TASK_ID = "lh-local-fake-1"
 
-# One stand-in for the longhaul command. `worker` prints its ready line and sleeps. `run` prints
-# the task line and follows the "workflow" until a cancel arrives, as the real command does.
+# One stand-in for the longhaul command. `worker` prints its ready line and runs until it is told
+# to stop. Like the real worker, it installs its own SIGINT handler and stops at once, which
+# replaces the "ignore" that bash gives a background job. So a Ctrl-C that reaches it ends it.
+# `run` prints the task line and follows the "workflow" until a cancel arrives, as the real
+# command does.
 FAKE_LONGHAUL = """#!/usr/bin/env bash
 dir="$FAKE_DIR"
 case "$1" in
@@ -34,7 +38,9 @@ case "$1" in
     echo $$ >"$dir/worker.pid"
     echo "worker running"
     if [ -n "${FAKE_WORKER_LIFE_S:-}" ]; then sleep "$FAKE_WORKER_LIFE_S"; exit 1; fi
-    exec sleep 300
+    # Bash cannot trap a signal that a background job started with ignored, but perl can
+    # replace it, as the real worker does. The pid stays the one written above.
+    exec perl -e '$SIG{INT} = $SIG{TERM} = sub { exit 0 }; sleep 1 while 1'
     ;;
   run)
     echo $$ >"$dir/run.pid"
@@ -175,3 +181,40 @@ def test_a_worker_that_dies_during_the_run_ends_the_demo_with_an_error(start_dem
     assert "worker stopped" in demo.output
     # The task is not left open: the demo cancels or terminates it on the way out.
     assert TASK_ID in demo.calls
+
+
+def test_the_terminate_helper_reads_the_address_from_dotenv(tmp_path: Path) -> None:
+    # A stand-in for temporalio records where the helper connects. The helper runs in a folder
+    # whose .env names a non-default address, as the demo does from the repo root.
+    fake = tmp_path / "fake" / "temporalio"
+    fake.mkdir(parents=True)
+    (fake / "__init__.py").write_text("", encoding="utf-8")
+    (fake / "client.py").write_text(
+        "import os\n"
+        "class _Handle:\n"
+        "    async def terminate(self, reason=None):\n"
+        "        pass\n"
+        "class Client:\n"
+        "    @classmethod\n"
+        "    async def connect(cls, address, namespace='default'):\n"
+        "        open(os.environ['FAKE_OUT'], 'w').write(address + ' ' + namespace)\n"
+        "        return cls()\n"
+        "    def get_workflow_handle(self, workflow_id):\n"
+        "        return _Handle()\n",
+        encoding="utf-8",
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".env").write_text(
+        "LONGHAUL_TEMPORAL_ADDRESS=localhost:7999\nLONGHAUL_TEMPORAL_NAMESPACE=demo-ns\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.txt"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("LONGHAUL_")}
+    env["PYTHONPATH"] = os.pathsep.join([str(tmp_path / "fake"), str(ROOT / "src")])
+    env["FAKE_OUT"] = str(out)
+    helper = ROOT / "scripts" / "demo_terminate.py"
+    subprocess.run(
+        [sys.executable, str(helper), TASK_ID], cwd=work, env=env, check=True, timeout=60
+    )
+    assert out.read_text(encoding="utf-8") == "localhost:7999 demo-ns"

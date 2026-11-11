@@ -3342,6 +3342,42 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 4. **What if the results are bad?** We publish them anyway, with the failure list. A clear negative result with a working harness is still a strong signal; a suspicious perfect one is not.
 5. **Why EC2 workers in the AWS plan instead of Fargate?** Workers start Docker containers for sandboxes, and Fargate can't run a Docker daemon. The API and poller don't need Docker, so they stay on Fargate.
 
+### Phase 9 fix stories (from the gate)
+
+#### LH-991 · Loose ends in the worker, the API and memory
+- **Epic:** E15 · **Points:** 5 · **Branch:** `feat/lh-991-loose-ends` · **Depends on:** LH-504, LH-604, LH-606, LH-705, LH-801, LH-891
+- **Story:** As an operator, I want every planned task reviewed before its pull request, and the run report, the test command and the API errors to say what really happened, so that v1 has no known gaps from the earlier gates.
+- **Build:**
+  - A planned coder that calls `finish` goes to the verifier like the end of the last step, behind the patch marker `lh-991-finish-reviewed`. A history from before it ends as it did.
+  - The wind-up writes the stored run report again after the outcome and the lessons (`lh-991-final-report`). The pull request body keeps its cap.
+  - `run_tests` runs the repo's own test command first, then the verified command from memory, then the worker default, in direct and in Keystone mode.
+  - `compact` counts tokens with the tools of the role whose transcript it is.
+  - A hand-over to a new run keeps the phase of the task (`lh-991-keep-phase`).
+  - The API maps Temporal errors by status: unavailable and deadline to 503, a refused argument or precondition to 400 or 409, anything else to 502 with a short reason.
+  - A memory rejection names `decided_by`, and old events with `approved_by` still read.
+  - The test harness registers stand-ins for `record_task_state` and `write_run_report`, so the log of a test run stays clean.
+- **Acceptance criteria:**
+  - [ ] A planned finish is reviewed in a new run, and a history recorded before the change replays.
+  - [ ] The stored run report names the final outcome.
+  - [ ] Each source of the test command is used in its order.
+- **Tests:** `tests/integration/test_verifier.py`, `tests/integration/test_run_report.py`, `tests/integration/test_task_workflow.py`, `tests/unit/test_activities_tools.py`, `tests/unit/test_activities_context.py`, `tests/unit/test_api_errors.py`
+- **Files:** `src/longhaul/durable/workflows/task.py`, `src/longhaul/durable/activities/`, `src/longhaul/api/errors.py`, `src/longhaul/memory/promotion.py`, `src/longhaul/tools/`, tests
+
+#### LH-992 · A readable timeline and a complete security page
+- **Epic:** E13 · **Points:** 3 · **Branch:** `feat/lh-992-timeline-security` · **Depends on:** LH-804, LH-906
+- **Story:** As an operator, I want the timeline to read as sentences and the security page to name a test for every control, so that I can follow a task and trust the claims about it.
+- **Build:**
+  - Each known event kind reads as one line (step updates with the short sha, verdicts, outcome, pauses, budget top-ups, compactions), with the full payload behind a toggle. Unknown kinds keep the key and value view.
+  - The timeline endpoint returns checkpoint rows, and the console shows a marker on the turn that made each one.
+  - At 375 px the tasks table shows the phase and the Needs you text in view, and its scroll box has a visible edge.
+  - `docs/security.md` maps trace redaction and "the worker never runs repo code" to tests, and puts the compose loopback and the default hosts in the tested tables.
+- **Acceptance criteria:**
+  - [ ] Component tests cover each event kind and the fallback.
+  - [ ] The Playwright main path checks the tasks table at 375 px.
+  - [ ] Every test that `docs/security.md` names exists.
+- **Tests:** `console/src/pages/__tests__/TaskPage.test.tsx`, `console/e2e/main-path.spec.ts`, `tests/integration/test_api.py`, `tests/unit/test_security_page.py`
+- **Files:** `console/src/`, `src/longhaul/api/`, `docs/security.md`, tests
+
 ---
 
 ## 8. Evaluation and proof plan

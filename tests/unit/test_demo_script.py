@@ -165,7 +165,7 @@ def test_interrupt_terminates_the_workflow_when_the_cancel_does_not_close_it(sta
     time.sleep(1.0)
     demo.interrupt()
     assert demo.process.wait(timeout=60) != 0
-    assert f"terminate - {TASK_ID}" in demo.calls
+    assert f"terminate scripts/demo_terminate.py {TASK_ID}" in demo.calls
 
 
 def test_the_run_output_reaches_the_terminal_while_the_task_runs(start_demo) -> None:  # type: ignore[no-untyped-def]

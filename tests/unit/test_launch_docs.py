@@ -390,3 +390,16 @@ def test_demo_script_lists_the_owner_steps_as_open() -> None:
     assert "- [x] " not in checklist
     assert "public" in checklist
     assert "docs/media/demo.gif" in checklist
+
+
+def test_readme_ties_a_moved_port_to_its_connection_setting() -> None:
+    text = read(ROOT / "README.md")
+    for setting in ("LONGHAUL_DATABASE_URL", "LONGHAUL_TEMPORAL_ADDRESS", "LONGHAUL_BLOB_ENDPOINT"):
+        assert setting in text, setting
+
+
+def test_architecture_says_the_api_writes_memory_decisions() -> None:
+    text = read(DOCS / "architecture.md")
+    stores = section(text, "Data stores")
+    assert "API -->|reads, approves, rejects| MEMT" in stores
+    assert "The API only reads. |" not in stores

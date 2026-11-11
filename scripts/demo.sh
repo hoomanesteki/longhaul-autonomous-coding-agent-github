@@ -117,27 +117,12 @@ stop_run() {
   RUN_PID=""
 }
 
-# Temporal has no command here, so the script asks the client library. The task id is the id of the
-# workflow. The task row of a terminated task is closed later by the janitor.
+# Temporal has no command here, so a helper asks the client library, with the address from the
+# same settings the worker reads (.env included). The task id is the id of the workflow. The task
+# row of a terminated task is closed later by the janitor.
 terminate_workflow() {
-  "$PYTHON" - "$TASK_ID" <<'PY' >&2 || echo "could not terminate the workflow of $TASK_ID" >&2
-import asyncio
-import os
-import sys
-
-from temporalio.client import Client
-
-
-async def main(workflow_id: str) -> None:
-    client = await Client.connect(
-        os.environ.get("LONGHAUL_TEMPORAL_ADDRESS", "localhost:7233"),
-        namespace=os.environ.get("LONGHAUL_TEMPORAL_NAMESPACE", "default"),
-    )
-    await client.get_workflow_handle(workflow_id).terminate(reason="demo interrupted")
-
-
-asyncio.run(main(sys.argv[1]))
-PY
+  "$PYTHON" scripts/demo_terminate.py "$TASK_ID" >&2 ||
+    echo "could not terminate the workflow of $TASK_ID" >&2
   # Give the run a moment to see the end, then let the caller kill it if it still hangs.
   local waited=0
   while kill -0 "$RUN_PID" 2>/dev/null && [ "$waited" -lt 25 ]; do
@@ -177,15 +162,23 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap cleanup EXIT
 
+# Start a command in a process group of its own. A terminal Ctrl-C goes to the whole foreground
+# group, and the real worker stops at once when it gets one, so it would no longer poll when the
+# cancel arrives. In a group of its own it sees only the signals this script sends. macOS has no
+# setsid, so perl does it. The pid of the job stays the pid of the command, because perl execs it.
+detached() {
+  perl -e 'setpgrp(0, 0); exec @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@"
+}
+
 START="$(date +%s)"
-"$LONGHAUL" worker >"$WORK/worker.log" 2>&1 &
+detached "$LONGHAUL" worker >"$WORK/worker.log" 2>&1 &
 WORKER_PID=$!
 wait_for "$WORK/worker.log" "worker running"
 
 # The run goes to a file and `tail` shows the file as it grows. The run is a background job so
 # the script can watch the worker while it follows the task.
 : >"$WORK/run.log"
-"$LONGHAUL" run \
+detached "$LONGHAUL" run \
   --path "$FIXTURE" \
   --issue-file "$FIXTURE/ISSUE.md" \
   --provider scripted \

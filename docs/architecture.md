@@ -152,7 +152,7 @@ flowchart LR
   CKPT <--> VOL
   API -->|reads| TASKS
   API -->|reads| TURNS
-  API -->|reads| MEMT
+  API -->|reads, approves, rejects| MEMT
   API -->|reads blobs| BLOBS
   API -->|signals, queries| HIST
 ```
@@ -160,7 +160,7 @@ flowchart LR
 | Store | Holds | Written by |
 |---|---|---|
 | Temporal | The history of each workflow and the poller Schedule | The workflow and the Temporal client |
-| Postgres | The tables of plan section 3.5, including `cost_ledger`, which has a row for every provider call, and `memory_items`, which holds the notes | The activities. The API only reads. |
+| Postgres | The tables of plan section 3.5, including `cost_ledger`, which has a row for every provider call, and `memory_items`, which holds the notes | The activities. The API and the `longhaul memory` command also write the decisions on notes (approved, rejected) to `memory_items`, so their database role needs write access to that table. Every other table the API only reads. |
 | MinIO | Transcripts, tool output, the run report, the script of a scripted task and the checkpoint bundles | The activities |
 | Checkpoint repo | The commits of the work, one bare repo per task | The activities, through the sandbox |
 | Workspace volume | The checked-out files and the venv of one sandbox | The sandbox |

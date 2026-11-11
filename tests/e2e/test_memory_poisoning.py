@@ -50,6 +50,7 @@ from tests.e2e.test_issue_to_pr import (  # noqa: F401  (database is a fixture)
 )
 from tests.fakes.fake_github import FakeGitHub
 
+from longhaul.blobs.base import report_key
 from longhaul.contracts import MemoryItem, OutcomeKind
 from longhaul.db.session import make_engine
 from longhaul.durable import acts
@@ -209,12 +210,19 @@ async def poison_then_ask_again(stack: Stack) -> None:
 
     # The view and the log of the transcript, the replies, and any other blob of the task say the
     # same. The scan covers more than the block, so a second path into the prompt would show up.
-    # The one blob left out is the answer of B's own extract_lessons, written after its last
-    # prompt (LH-605 keeps it for a retry): the script drafts the same note again there.
+    # Two blobs are written after B's last prompt and are left out: the answer of B's own
+    # extract_lessons (LH-605 keeps it for a retry), where the script drafts the same note again,
+    # and the stored run report, which LH-991 writes again after the lessons and which lists that
+    # draft under its candidate lessons and nowhere else.
     assert any("/turns/" in key for key in blobs), sorted(blobs)
     drafted = f"tasks/{task_b}/memory/0000/{LESSONS_NAME}"
     assert POISON.encode() in blobs[drafted], sorted(blobs)
-    leaked = sorted(k for k, data in blobs.items() if POISON.encode() in data and k != drafted)
+    report = report_key(task_b)
+    before, _, lessons = blobs[report].decode().partition("### Candidate lessons")
+    assert POISON in lessons and POISON not in before, blobs[report].decode()
+    leaked = sorted(
+        k for k, data in blobs.items() if POISON.encode() in data and k not in (drafted, report)
+    )
     assert leaked == [], f"the poisoned lesson reached {leaked}"
 
     # B drafted the same note again, and the store kept the one row that was rejected.

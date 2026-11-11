@@ -78,6 +78,19 @@ test("the main path of the console", async ({ page }) => {
     await expect(page.locator("tbody tr")).toHaveCount(3);
   });
 
+  await test.step("see what needs you on a phone without scrolling", async () => {
+    await page.setViewportSize({ width: 375, height: 800 });
+    // The Needs you column is off screen at this width, so the line under the title has to say it.
+    const stuck = rowOf(page, STUCK.title);
+    await expect(stuck.getByTestId("status-line")).toBeVisible();
+    await expect(stuck.getByText("Needs you: Paused")).toBeInViewport();
+    await expect(rowOf(page, PLAN.title).getByText("Needs you: Approve the plan")).toBeInViewport();
+    // The box shows that it scrolls.
+    await expect(page.getByTestId("edge-right")).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(stuck.getByTestId("status-line")).toBeHidden();
+  });
+
   await test.step("send a hint to the stuck task and see it code again", async () => {
     await openTask(page, STUCK.title);
     await expect(phase(page)).toHaveText("paused", SETTLED);

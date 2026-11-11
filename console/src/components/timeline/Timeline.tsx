@@ -81,7 +81,7 @@ export default function Timeline({
             style={{ transform: `translateY(${item.start - margin}px)` }}
           >
             {row.kind === "event" ? (
-              <EventRow event={row.event} />
+              <EventRow event={row.event} open={open} />
             ) : (
               <TurnBlock taskId={taskId} row={row} coderModel={coderModel} open={open} />
             )}

@@ -399,7 +399,7 @@ describe("timeline", () => {
       rowOf(type).getAttribute("data-tone"),
     );
     expect(tones).toEqual(["compaction", "pause", "hint", "verdict", "recovery"]);
-    expect(within(rowOf("paused")).getByText("reason: stuck")).toBeInTheDocument();
+    expect(within(rowOf("paused")).getByText("Paused: stuck")).toBeInTheDocument();
   });
 
   it("shows every attempt of a turn that was asked again", async () => {

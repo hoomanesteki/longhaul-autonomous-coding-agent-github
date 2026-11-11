@@ -44,7 +44,8 @@ $RUN --set custom --config full --run-id custom-full-2 --run-set custom-headline
 # warm-up runs first and its notes are approved before the plain full run, which is the partner
 # of both ablations. The warm-up run stays out of the report.
 $RUN --set custom --config full --run-id abl-warmup --run-set ablations
-# approve the notes it learned: longhaul memory list --status candidate, then memory approve
+# approve the notes it learned:
+#   longhaul memory list --repo OWNER/NAME --status candidate, then memory approve
 $RUN --set custom --config full --run-id abl-full --run-set ablations
 $RUN --set custom --config full --context-mode no_compaction --run-id abl-no-compaction \
   --run-set ablations

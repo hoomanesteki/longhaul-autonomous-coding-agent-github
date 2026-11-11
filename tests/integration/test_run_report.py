@@ -36,7 +36,8 @@ from longhaul.cost.pricing import Pricing
 from longhaul.db.models import Event, PlanRow, Task
 from longhaul.db.records import PlanRecord, SqlRecorder, ToolCallRecord, TurnRecord
 from longhaul.db.session import make_engine
-from longhaul.durable.activities.report import RunReports, sql_reader
+from longhaul.durable import acts
+from longhaul.durable.activities.report import ReportActivities, RunReports, sql_reader
 from longhaul.github.pr_body import MAX_BODY_CHARS, LastTestRun, render_pr_body
 from longhaul.reports.data import read_report_data
 from longhaul.reports.render import LESSONS_EVENT, MAX_TIMELINE_ROWS
@@ -383,6 +384,53 @@ async def test_lessons_that_a_later_story_recorded_are_in_the_report(
 
     assert "- **pitfall**: reserve() must check stock under the lock" in section(
         text, "Candidate lessons"
+    )
+
+
+async def test_the_stored_report_names_the_final_outcome_and_lessons_after_the_wind_up(
+    database: Scratch, sessions: Sessions
+) -> None:
+    """`deliver` stores the report before the outcome and the lessons exist (LH-991).
+
+    The wind-up asks write_run_report again once both are recorded. The stored copy then has them,
+    and the body that the pull request got from the first copy is not touched.
+    """
+    await add_task(sessions)
+    await add_turn(sessions, "coder", 0, 5)
+    blobs = MemoryBlobStore()
+    run_reports = reports(sessions, blobs)
+    delivered = await run_reports.stored_or_new(TASK, outcome="pr_opened")
+    body = render_pr_body(
+        7, "Fixed it.", [], LastTestRun(None, None), templates=TEMPLATES, report=delivered
+    )
+    assert "No lessons were recorded for this task." in section(delivered, "Candidate lessons")
+
+    await add_event(
+        sessions,
+        60,
+        LESSONS_EVENT,
+        items=[{"kind": "pitfall", "content": "reserve() must check stock under the lock"}],
+    )
+    await add_event(sessions, 90, "outcome", kind="stuck", repo=REPO, turns=1, cost_usd=0.1)
+    written = await ReportActivities(run_reports).write_run_report(
+        acts.RunReportInput(task_id=TASK, outcome="stuck")
+    )
+
+    stored = (await blobs.get(written)).decode()
+    assert written.key == report_key(TASK)
+    assert "| Outcome | stuck |" in section(stored, "Overview")
+    assert "- **pitfall**: reserve() must check stock under the lock" in section(
+        stored, "Candidate lessons"
+    )
+    assert "| Outcome | pr opened |" in section(delivered, "Overview")
+    assert len(body) <= MAX_BODY_CHARS
+    assert (
+        len(
+            render_pr_body(
+                7, "Fixed it.", [], LastTestRun(None, None), templates=TEMPLATES, report=stored
+            )
+        )
+        <= MAX_BODY_CHARS
     )
 
 

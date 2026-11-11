@@ -1087,6 +1087,59 @@
         "title": "TextBlock",
         "type": "object"
       },
+      "TimelineCheckpoint": {
+        "description": "One saved workspace state: the commit a turn left in the task's checkpoint repo.\n\n`checkpoint_kind` is `tool`, `step`, `compaction` or `bundle`, and `step_id` is set for `step`.",
+        "properties": {
+          "checkpoint_kind": {
+            "title": "Checkpoint Kind",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "checkpoint",
+            "default": "checkpoint",
+            "title": "Kind",
+            "type": "string"
+          },
+          "sha": {
+            "title": "Sha",
+            "type": "string"
+          },
+          "step_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step Id"
+          },
+          "ts": {
+            "format": "date-time",
+            "title": "Ts",
+            "type": "string"
+          },
+          "turn_index": {
+            "title": "Turn Index",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ts",
+          "id",
+          "sha",
+          "checkpoint_kind",
+          "turn_index",
+          "step_id"
+        ],
+        "title": "TimelineCheckpoint",
+        "type": "object"
+      },
       "TimelineEvent": {
         "properties": {
           "id": {
@@ -1129,6 +1182,7 @@
             "items": {
               "discriminator": {
                 "mapping": {
+                  "checkpoint": "#/components/schemas/TimelineCheckpoint",
                   "event": "#/components/schemas/TimelineEvent",
                   "tool_call": "#/components/schemas/TimelineToolCall",
                   "turn": "#/components/schemas/TimelineTurn"
@@ -1144,6 +1198,9 @@
                 },
                 {
                   "$ref": "#/components/schemas/TimelineToolCall"
+                },
+                {
+                  "$ref": "#/components/schemas/TimelineCheckpoint"
                 }
               ]
             },
@@ -2382,7 +2439,7 @@
     },
     "/api/tasks/{task_id}/timeline": {
       "get": {
-        "description": "Events, model calls and tool calls of a task, merged by time, oldest first.",
+        "description": "Events, model calls, tool calls and checkpoints of a task, merged by time, oldest first.",
         "operationId": "get_timeline",
         "parameters": [
           {

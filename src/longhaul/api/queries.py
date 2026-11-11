@@ -27,19 +27,21 @@ from longhaul.api.schemas import (
     TaskPage,
     TaskRecord,
     TaskSummary,
+    TimelineCheckpoint,
     TimelineEvent,
     TimelineItem,
     TimelinePage,
     TimelineToolCall,
     TimelineTurn,
 )
-from longhaul.db.models import Event, PlanRow, RepoSetting, Task, ToolCallRow, Turn
+from longhaul.db.models import Checkpoint, Event, PlanRow, RepoSetting, Task, ToolCallRow, Turn
 
 Sessions = async_sessionmaker[AsyncSession]
 
 # The kinds of a timeline row, in the order they sort when they share a time: the model call that
-# started, then the tool calls it made, then the events recorded about them.
-TURN_RANK, CALL_RANK, EVENT_RANK = 0, 1, 2
+# started, then the tool calls it made, then the events recorded about them, then the checkpoints
+# saved along the way.
+TURN_RANK, CALL_RANK, EVENT_RANK, CHECKPOINT_RANK = 0, 1, 2, 3
 
 __all__ = [
     "find_task",
@@ -220,12 +222,13 @@ def _event_key(event_id: Any) -> Any:
 async def timeline(
     sessions: Sessions, task_id: str, *, limit: int, cursor: str | None
 ) -> TimelinePage:
-    """Events, model calls and tool calls of one task in the order they happened.
+    """Events, model calls, tool calls and checkpoints of one task in the order they happened.
 
-    The three tables are merged in the database, ordered by time, then by kind, then by a key
-    that is unique inside the kind (the turn and attempt, the tool call id, the event id). The
-    full key is in the cursor, so a page can end in the middle of a tie and the next one carries
-    on from the right row. Only the keys of the page are selected first, and the rows after.
+    The four tables are merged in the database, ordered by time, then by kind, then by a key
+    that is unique inside the kind (the turn and attempt, the tool call id, the event id, the
+    checkpoint id). The full key is in the cursor, so a page can end in the middle of a tie and the
+    next one carries on from the right row. Only the keys of the page are selected first, and the
+    rows after.
     """
     turns = select(
         Turn.started_at.label("ts"),
@@ -242,7 +245,12 @@ async def timeline(
         literal(EVENT_RANK, Integer).label("rank"),
         _event_key(Event.id).label("key"),
     ).where(Event.task_id == task_id)
-    merged = union_all(turns, calls, events).subquery()
+    checkpoints = select(
+        Checkpoint.created_at.label("ts"),
+        literal(CHECKPOINT_RANK, Integer).label("rank"),
+        _event_key(Checkpoint.id).label("key"),
+    ).where(Checkpoint.task_id == task_id)
+    merged = union_all(turns, calls, events, checkpoints).subquery()
     keys = select(merged.c.ts, merged.c.rank, merged.c.key)
     if cursor is not None:
         stamp, rank, key = paging.decode_cursor(cursor, 3)
@@ -279,10 +287,12 @@ async def _timeline_rows(
     turn_rows = await _turns_by_key(session, task_id, keys_of(TURN_RANK))
     call_rows = await _calls_by_key(session, task_id, keys_of(CALL_RANK))
     event_rows = await _events_by_key(session, task_id, keys_of(EVENT_RANK))
+    checkpoint_rows = await _checkpoints_by_key(session, task_id, keys_of(CHECKPOINT_RANK))
     found: dict[tuple[int, str], TimelineItem] = {}
     found.update({(TURN_RANK, key): row for key, row in turn_rows.items()})
     found.update({(CALL_RANK, key): row for key, row in call_rows.items()})
     found.update({(EVENT_RANK, key): row for key, row in event_rows.items()})
+    found.update({(CHECKPOINT_RANK, key): row for key, row in checkpoint_rows.items()})
     # A row deleted between the two selects is left out.
     return [found[(rank, key)] for _, rank, key in page if (rank, key) in found]
 
@@ -352,6 +362,27 @@ async def _events_by_key(
             ts=event.ts, id=event.id, type=event.type, payload=redact_json(event.payload)
         )
         for event in await session.scalars(stmt)
+    }
+
+
+async def _checkpoints_by_key(
+    session: AsyncSession, task_id: str, keys: list[str]
+) -> dict[str, TimelineCheckpoint]:
+    if not keys:
+        return {}
+    stmt = select(Checkpoint).where(
+        Checkpoint.task_id == task_id, Checkpoint.id.in_([int(k) for k in keys])
+    )
+    return {
+        f"{row.id:012d}": TimelineCheckpoint(
+            ts=row.created_at,
+            id=row.id,
+            sha=row.sha,
+            checkpoint_kind=row.kind,
+            turn_index=row.turn_index,
+            step_id=row.step_id,
+        )
+        for row in await session.scalars(stmt)
     }
 
 

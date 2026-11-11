@@ -399,7 +399,7 @@ describe("timeline", () => {
       rowOf(type).getAttribute("data-tone"),
     );
     expect(tones).toEqual(["compaction", "pause", "hint", "verdict", "recovery"]);
-    expect(within(rowOf("paused")).getByText("reason: stuck")).toBeInTheDocument();
+    expect(within(rowOf("paused")).getByText("Paused: stuck")).toBeInTheDocument();
   });
 
   it("shows every attempt of a turn that was asked again", async () => {
@@ -535,5 +535,73 @@ describe("expanders", () => {
     await user.click(within(row).getByRole("button", { name: "Show output" }));
 
     await waitFor(() => expect(within(row).getByRole("alert")).toHaveTextContent(/not found/));
+  });
+});
+
+describe("checkpoints", () => {
+  it("marks the turn that made a checkpoint with the short commit", async () => {
+    serve({
+      items: [
+        turn(0),
+        call("a", 0, { post_sha: SHA }),
+        {
+          kind: "checkpoint",
+          ts: at(14),
+          id: 1,
+          sha: SHA,
+          checkpoint_kind: "tool",
+          turn_index: 0,
+          step_id: null,
+        },
+        turn(1),
+        {
+          kind: "checkpoint",
+          ts: at(20),
+          id: 2,
+          sha: "fedcba9876543210fedcba9876543210fedcba98",
+          checkpoint_kind: "step",
+          turn_index: 1,
+          step_id: "s1",
+        },
+      ],
+    });
+    renderPage();
+
+    const first = rowOf(await screen.findByText("Turn 0"));
+    expect(within(first).getByText("Checkpoint 0123456")).toBeInTheDocument();
+    const second = rowOf(screen.getByText("Turn 1"));
+    expect(within(second).getByText("Checkpoint fedcba9")).toBeInTheDocument();
+    expect(within(second).getByText("step s1")).toBeInTheDocument();
+    expect(within(second).queryByText("Checkpoint 0123456")).not.toBeInTheDocument();
+  });
+
+  it("shows a hand-over bundle between the turns, before the continue_as_new event", async () => {
+    serve({
+      items: [
+        turn(4),
+        {
+          kind: "checkpoint",
+          ts: at(30),
+          id: 3,
+          sha: SHA,
+          checkpoint_kind: "bundle",
+          turn_index: 5,
+          step_id: null,
+        },
+        event(9, "continue_as_new", 31, { reason: "turns" }),
+        turn(5, { ts: at(40) }),
+      ],
+    });
+    renderPage();
+
+    const rows = await screen.findAllByTestId("timeline-row");
+    const labels = rows.map((r) => r.textContent ?? "");
+    const bundle = labels.findIndex((t) => t.includes("Checkpoint 0123456"));
+    const handOver = labels.findIndex((t) => t.includes("continue_as_new"));
+    const next = labels.findIndex((t) => t.includes("Turn 5"));
+    expect(bundle).toBeGreaterThanOrEqual(0);
+    expect(bundle).toBeLessThan(handOver);
+    expect(handOver).toBeLessThan(next);
+    expect(within(rowOf(screen.getByText("Turn 5"))).queryByText("Checkpoint 0123456")).not.toBeInTheDocument();
   });
 });

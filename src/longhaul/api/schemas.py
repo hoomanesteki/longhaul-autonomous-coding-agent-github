@@ -37,6 +37,7 @@ __all__ = [
     "TaskPage",
     "TaskRecord",
     "TaskSummary",
+    "TimelineCheckpoint",
     "TimelineEvent",
     "TimelineItem",
     "TimelinePage",
@@ -157,8 +158,24 @@ class TimelineToolCall(BaseModel):
     post_sha: str | None
 
 
+class TimelineCheckpoint(BaseModel):
+    """One saved workspace state: the commit a turn left in the task's checkpoint repo.
+
+    `checkpoint_kind` is `tool`, `step`, `compaction` or `bundle`, and `step_id` is set for `step`.
+    """
+
+    kind: Literal["checkpoint"] = "checkpoint"
+    ts: datetime
+    id: int
+    sha: str
+    checkpoint_kind: str
+    turn_index: int
+    step_id: str | None
+
+
 TimelineItem = Annotated[
-    TimelineEvent | TimelineTurn | TimelineToolCall, Field(discriminator="kind")
+    TimelineEvent | TimelineTurn | TimelineToolCall | TimelineCheckpoint,
+    Field(discriminator="kind"),
 ]
 
 

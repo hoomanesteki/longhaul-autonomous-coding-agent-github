@@ -9,6 +9,7 @@ import {
   formatPercent,
   formatTime,
   formatTurnCost,
+  shortSha,
   type TurnRow,
 } from "../../util/timeline";
 import ToolCallItem from "./ToolCallItem";
@@ -103,6 +104,21 @@ export default function TurnBlock({
           </div>
         );
       })}
+
+      {row.checkpoints.length > 0 && (
+        <ul aria-label="Checkpoints" className="mt-1 border-t border-slate-100 pt-1">
+          {row.checkpoints.map((checkpoint) => (
+            <li key={checkpoint.id} className="flex flex-wrap items-baseline gap-x-3 text-sm">
+              <span className="font-mono text-slate-700">{`Checkpoint ${shortSha(checkpoint.sha) ?? ""}`}</span>
+              <span className="text-xs text-slate-600">
+                {checkpoint.step_id === null
+                  ? checkpoint.checkpoint_kind
+                  : `${checkpoint.checkpoint_kind} ${checkpoint.step_id}`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
 
       {row.calls.length > 0 && (
         <ul className="mt-1 divide-y divide-slate-100 border-t border-slate-100">

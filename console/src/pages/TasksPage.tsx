@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 
 import { listRepos, listTasks } from "../api/client";
 import PhaseBadge from "../components/PhaseBadge";
+import ScrollBox from "../components/ScrollBox";
 import { useNow } from "../hooks/useNow";
 import { formatAge, formatCost, issueUrl, needsYou } from "../util/tasks";
 
@@ -142,61 +143,77 @@ export default function TasksPage() {
       {rows.length > 0 && (
         // The table keeps a width that fits its columns and its wrapper scrolls, so a narrow screen
         // scrolls the table and not the page.
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full min-w-[56rem] text-left text-sm">
-            <thead className="border-b border-slate-300 text-slate-600">
-              <tr>
-                <th className={HEAD}>Repo</th>
-                <th className={HEAD}>Issue</th>
-                <th className={HEAD}>Title</th>
-                <th className={HEAD}>Phase</th>
-                <th className={HEAD}>Outcome</th>
-                <th className={`${HEAD} text-right`}>Turns</th>
-                <th className={`${HEAD} text-right`}>Cost</th>
-                <th className={HEAD}>Age</th>
-                <th className="py-2 font-medium">Needs you</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((task) => {
-                const waiting = needsYou(task);
-                const issue = issueUrl(task);
-                return (
-                  <tr
-                    key={task.id}
-                    className={`border-b border-slate-100 ${waiting === null ? "" : "bg-amber-50"}`}
-                  >
-                    <td className={CELL}>{task.repo}</td>
-                    <td className={CELL}>
-                      {issue !== null && (
-                        <a
-                          href={issue}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-blue-700 underline"
+        <div className="mt-3">
+          <ScrollBox label="Tasks table">
+            <table className="w-full min-w-[56rem] text-left text-sm">
+              <thead className="border-b border-slate-300 text-slate-600">
+                <tr>
+                  <th className={HEAD}>Repo</th>
+                  <th className={HEAD}>Issue</th>
+                  <th className={HEAD}>Title</th>
+                  <th className={HEAD}>Phase</th>
+                  <th className={HEAD}>Outcome</th>
+                  <th className={`${HEAD} text-right`}>Turns</th>
+                  <th className={`${HEAD} text-right`}>Cost</th>
+                  <th className={HEAD}>Age</th>
+                  <th className="py-2 font-medium">Needs you</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((task) => {
+                  const waiting = needsYou(task);
+                  const issue = issueUrl(task);
+                  return (
+                    <tr
+                      key={task.id}
+                      className={`border-b border-slate-100 ${waiting === null ? "" : "bg-amber-50"}`}
+                    >
+                      <td className={`${CELL} min-w-[9rem] lg:min-w-0`}>
+                        {task.repo}
+                        {/* Phase and Needs you are the last columns, off screen on a phone. They go in the
+                            first column, which is always in view, and break anywhere because a phase such
+                            as awaiting_plan_approval has no space to break at. */}
+                        <div
+                          data-testid="status-line"
+                          className="mt-1 flex flex-col text-xs break-all text-slate-600 lg:hidden"
                         >
-                          #{task.issue_number}
-                        </a>
-                      )}
-                    </td>
-                    <td className={CELL}>
-                      <Link to={`/tasks/${encodeURIComponent(task.id)}`} className="hover:underline">
-                        {task.title}
-                      </Link>
-                    </td>
-                    <td className={CELL}>
-                      <PhaseBadge phase={task.phase} />
-                    </td>
-                    <td className={CELL}>{task.outcome}</td>
-                    <td className={`${CELL} text-right tabular-nums`}>{task.turns}</td>
-                    <td className={`${CELL} text-right tabular-nums`}>{formatCost(task.cost_usd)}</td>
-                    <td className={CELL}>{formatAge(task.created_at, now)}</td>
-                    <td className="py-2 align-top font-medium text-amber-900">{waiting}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                          <span>{`Phase: ${task.phase}`}</span>
+                          {waiting !== null && (
+                            <span className="font-medium text-amber-900">{`Needs you: ${waiting}`}</span>
+                          )}
+                        </div>
+                      </td>
+                      <td className={CELL}>
+                        {issue !== null && (
+                          <a
+                            href={issue}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-blue-700 underline"
+                          >
+                            #{task.issue_number}
+                          </a>
+                        )}
+                      </td>
+                      <td className={CELL}>
+                        <Link to={`/tasks/${encodeURIComponent(task.id)}`} className="hover:underline">
+                          {task.title}
+                        </Link>
+                      </td>
+                      <td className={CELL}>
+                        <PhaseBadge phase={task.phase} />
+                      </td>
+                      <td className={CELL}>{task.outcome}</td>
+                      <td className={`${CELL} text-right tabular-nums`}>{task.turns}</td>
+                      <td className={`${CELL} text-right tabular-nums`}>{formatCost(task.cost_usd)}</td>
+                      <td className={CELL}>{formatAge(task.created_at, now)}</td>
+                      <td className="py-2 align-top font-medium text-amber-900">{waiting}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </ScrollBox>
         </div>
       )}
 

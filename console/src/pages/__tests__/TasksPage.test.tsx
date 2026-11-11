@@ -170,6 +170,22 @@ describe("tasks page", () => {
     expect(within(rowOf("Rename the flag")).queryByText("Paused")).not.toBeInTheDocument();
   });
 
+  it("repeats the phase and what needs you under the repo, for a screen too narrow for the columns", async () => {
+    serve([CODING, PAUSED, APPROVAL]);
+    renderPage();
+
+    await screen.findByText("Fix the parser");
+    // The table scrolls sideways on a phone, and Phase and Needs you are the last columns. The
+    // line under the repo, in the first column, is what a person sees without scrolling. CSS hides it on wide screens.
+    const line = (title: string) => within(rowOf(title).querySelectorAll("td")[0] as HTMLElement);
+    expect(line("Fix the parser").getByTestId("status-line")).toHaveTextContent("Phase: coding");
+    expect(line("Fix the parser").queryByText(/Needs you/)).not.toBeInTheDocument();
+    expect(line("Speed up the build").getByTestId("status-line")).toHaveTextContent("Phase: paused");
+    expect(line("Speed up the build").getByText("Needs you: Paused")).toBeInTheDocument();
+    expect(line("Add a retry").getByText("Needs you: Approve the plan")).toBeInTheDocument();
+    expect(line("Add a retry").getByTestId("status-line").className).toContain("lg:hidden");
+  });
+
   it("leaves out the issue link for a task without an issue number", async () => {
     serve([task({ id: "t-1", title: "Manual task", issue_number: null })]);
     renderPage();

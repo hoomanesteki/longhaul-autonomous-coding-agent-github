@@ -165,20 +165,21 @@ trap cleanup EXIT
 # Start a command in a process group of its own. A terminal Ctrl-C goes to the whole foreground
 # group, and the real worker stops at once when it gets one, so it would no longer poll when the
 # cancel arrives. In a group of its own it sees only the signals this script sends. macOS has no
-# setsid, so perl does it. The pid of the job stays the pid of the command, because perl execs it.
-detached() {
-  perl -e 'setpgrp(0, 0); exec @ARGV or die "exec $ARGV[0]: $!\n"' -- "$@"
-}
+# setsid, so perl does it. Perl is the background command itself, and not a shell function that
+# calls it: a function in the background runs in a forked subshell, so $! would be the pid of
+# that subshell and a kill would miss the command. Perl execs the command in its own process, so
+# $! is the pid of the worker or the run.
+DETACH='setpgrp(0, 0); exec @ARGV or die "exec $ARGV[0]: $!\n"'
 
 START="$(date +%s)"
-detached "$LONGHAUL" worker >"$WORK/worker.log" 2>&1 &
+perl -e "$DETACH" -- "$LONGHAUL" worker >"$WORK/worker.log" 2>&1 &
 WORKER_PID=$!
 wait_for "$WORK/worker.log" "worker running"
 
 # The run goes to a file and `tail` shows the file as it grows. The run is a background job so
 # the script can watch the worker while it follows the task.
 : >"$WORK/run.log"
-detached "$LONGHAUL" run \
+perl -e "$DETACH" -- "$LONGHAUL" run \
   --path "$FIXTURE" \
   --issue-file "$FIXTURE/ISSUE.md" \
   --provider scripted \

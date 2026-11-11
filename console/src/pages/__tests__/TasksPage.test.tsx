@@ -186,6 +186,18 @@ describe("tasks page", () => {
     expect(line("Add a retry").getByTestId("status-line").className).toContain("lg:hidden");
   });
 
+  it("writes the phase in words and wraps the status line between words", async () => {
+    serve([APPROVAL]);
+    renderPage();
+
+    await screen.findByText("Add a retry");
+    const line = within(rowOf("Add a retry").querySelectorAll("td")[0] as HTMLElement).getByTestId("status-line");
+    // awaiting_plan_approval has no space to wrap at and broke as "awaiting_plan_appr / oval".
+    expect(line).toHaveTextContent("Phase: awaiting plan approval");
+    expect(line.className).toContain("break-words");
+    expect(line.className).not.toContain("break-all");
+  });
+
   it("leaves out the issue link for a task without an issue number", async () => {
     serve([task({ id: "t-1", title: "Manual task", issue_number: null })]);
     renderPage();

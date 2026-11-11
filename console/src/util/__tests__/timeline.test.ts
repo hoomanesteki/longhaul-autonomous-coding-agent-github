@@ -6,6 +6,7 @@ import {
   cacheRatio,
   costSeries,
   describeEvent,
+  toolCallStatus,
   eventSummary,
   eventTone,
   formatDuration,
@@ -108,6 +109,22 @@ describe("eventTone", () => {
     ["step_updated", "other"],
   ])("colours %s as %s", (type, tone) => {
     expect(eventTone(type)).toBe(tone);
+  });
+});
+
+describe("eventTone for an outcome", () => {
+  it("is green for a pull request and a warning for a run that did not deliver", () => {
+    expect(eventTone("outcome", { kind: "pr_opened" })).toBe("success");
+    for (const kind of ["stuck", "error", "budget_exhausted"]) {
+      expect(eventTone("outcome", { kind })).toBe("warning");
+    }
+  });
+
+  it("keeps the plain tone for a cancel, an unknown kind and a payload with no kind", () => {
+    expect(eventTone("outcome", { kind: "cancelled" })).toBe("other");
+    expect(eventTone("outcome", { kind: "something_new" })).toBe("other");
+    expect(eventTone("outcome", {})).toBe("other");
+    expect(eventTone("outcome")).toBe("other");
   });
 });
 
@@ -235,12 +252,30 @@ describe("describeEvent", () => {
     expect(line!.endsWith("…")).toBe(true);
   });
 
+  it("writes a stuck event with its reason, the turn and the first line of evidence", () => {
+    expect(
+      describeEvent("stuck", {
+        reason: "repeated_failure",
+        turn_index: 6,
+        evidence: ["pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5", "more"],
+      }),
+    ).toBe(
+      "Stuck: repeated failure (turn 6): pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5",
+    );
+    expect(describeEvent("stuck", { reason: "no_progress", turn_index: 0, evidence: [] })).toBe(
+      "Stuck: no progress (turn 0)",
+    );
+    expect(describeEvent("stuck", { reason: "no_progress" })).toBe("Stuck: no progress");
+    expect(describeEvent("stuck", { reason: "x", evidence: ["y".repeat(400)] })?.length).toBeLessThan(200);
+    expect(describeEvent("stuck", {})).toBeNull();
+  });
+
   it("writes a pause with its reason and a resume with how it ended", () => {
     expect(describeEvent("paused", { kind: "hint", reason: "repeated_failure", pause: 1 })).toBe(
-      "Paused: repeated failure",
+      "Paused (repeated failure)",
     );
     expect(describeEvent("paused", { kind: "hint", reason: "agent_asked", question: "Which API?" })).toBe(
-      "Paused: agent asked, Which API?",
+      "Paused (agent asked): Which API?",
     );
     expect(describeEvent("resumed", { kind: "hint", via: "hint", by: "alice" })).toBe(
       "Resumed with a hint from alice",
@@ -282,6 +317,23 @@ describe("describeEvent", () => {
     expect(describeEvent("step_updated", {})).toBeNull();
     expect(describeEvent("compaction", { dropped_turns: 6 })).toBeNull();
     expect(describeEvent("outcome", {})).toBeNull();
+  });
+});
+
+describe("toolCallStatus", () => {
+  it("is ok for a call that exited with 0 or has no exit code", () => {
+    expect(toolCallStatus({ ok: true, exit_code: 0 })).toEqual({ label: "ok", failed: false, exitCode: null });
+    expect(toolCallStatus({ ok: true, exit_code: null })).toEqual({ label: "ok", failed: false, exitCode: null });
+  });
+
+  it("is failed, with its exit code, for a command that ran and exited with a non-zero code", () => {
+    // The tool layer only sets ok to false for a timeout, so a failing test run arrives as ok.
+    expect(toolCallStatus({ ok: true, exit_code: 1 })).toEqual({ label: "failed", failed: true, exitCode: 1 });
+  });
+
+  it("is an error for a call that did not finish, and keeps its exit code when it has one", () => {
+    expect(toolCallStatus({ ok: false, exit_code: null })).toEqual({ label: "error", failed: true, exitCode: null });
+    expect(toolCallStatus({ ok: false, exit_code: 124 })).toEqual({ label: "error", failed: true, exitCode: 124 });
   });
 });
 

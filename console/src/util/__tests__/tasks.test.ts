@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatAge, formatCost, issueUrl, needsYou } from "../tasks";
+import { formatAge, formatCost, issueUrl, needsYou, phaseWords } from "../tasks";
 
 describe("needsYou", () => {
   it("names what a waiting task needs", () => {
@@ -12,6 +12,13 @@ describe("needsYou", () => {
     for (const phase of ["queued", "coding", "verifying", "delivering", "done", "failed"]) {
       expect(needsYou({ phase })).toBeNull();
     }
+  });
+});
+
+describe("phaseWords", () => {
+  it("writes a phase with spaces, so that it breaks between words", () => {
+    expect(phaseWords("awaiting_plan_approval")).toBe("awaiting plan approval");
+    expect(phaseWords("coding")).toBe("coding");
   });
 });
 

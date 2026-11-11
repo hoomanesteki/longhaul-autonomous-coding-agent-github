@@ -382,6 +382,29 @@ describe("timeline", () => {
     expect(within(second).queryByRole("button", { name: "Show output" })).not.toBeInTheDocument();
   });
 
+  it("shows a command that exited with a non-zero code as failed, with its exit code", async () => {
+    // A failing test run is a tool call that worked: ok is true and only the exit code says it failed.
+    serve({
+      items: [
+        turn(0),
+        call("call-0", 0, { name: "run_tests", ok: true, exit_code: 1 }),
+        call("call-1", 0, { name: "run_tests", ok: true, exit_code: 0 }),
+        call("call-2", 0, { name: "run_command", ok: false, exit_code: null }),
+      ],
+    });
+    renderPage();
+
+    const block = rowOf(await screen.findByText("Turn 0"));
+    const items = within(block).getAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    expect(items[0]).toHaveTextContent("failed");
+    expect(items[0]).toHaveTextContent("exit 1");
+    expect(within(items[0]!).getByText("failed").className).toContain("text-red-700");
+    expect(items[1]).toHaveTextContent("ok");
+    expect(items[1]).not.toHaveTextContent("exit");
+    expect(items[2]).toHaveTextContent("error");
+  });
+
   it("colours event rows by their type", async () => {
     serve({
       items: [

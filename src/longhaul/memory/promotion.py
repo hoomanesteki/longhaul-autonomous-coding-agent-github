@@ -160,6 +160,8 @@ class Promoter:
             # request, so a query by those finds it.
             task_id = f"{repo}#{number}"
         # A promotion names who approved. A rejection names who decided, as nobody approved.
+        # Rejections recorded before LH-991 carry `approved_by` too. Nothing in src reads these
+        # events yet; a reader has to go through decided_by() so that it sees both spellings.
         key = "approved_by" if type == PROMOTED_EVENT else "decided_by"
         await self._events.record_event(
             task_id, type, {"repo": repo, "pr": number, "items": list(moved), key: by}

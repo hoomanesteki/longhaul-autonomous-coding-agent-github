@@ -370,6 +370,21 @@ def test_diff_equality_is_counted_over_completed_runs_in_every_row(tmp_path: Pat
     assert rows[-1][4].endswith(f"/ {summary.completed}")
 
 
+def test_the_all_row_counts_the_runs_a_kill_landed_in_not_every_run() -> None:
+    summary = ChaosSummary.model_validate_json(
+        (ROOT / "eval" / "results" / "chaos-2026-11-07" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    # Two runs of the committed suite had no planned kill land, so they were not hit.
+    assert summary.runs == 20
+    last = sections.chaos_table(summary).splitlines()[-1]
+    cells = [c.strip() for c in last.strip("|").split("|")]
+    assert cells[0] == "**All**"
+    assert cells[2] == "18"
+    assert cells[3] == f"{summary.completed} / {summary.runs}"
+
+
 def test_the_chaos_section_puts_a_blank_line_after_its_heading() -> None:
     summary = ChaosSummary.model_validate_json(
         (ROOT / "eval" / "results" / "chaos-2026-11-07" / "summary.json").read_text(

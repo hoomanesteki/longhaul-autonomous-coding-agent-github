@@ -194,13 +194,15 @@ def chaos_table_rows(summary: dict[str, object], *, runs_hit: bool) -> list[str]
         ]
         rows.append("| " + " | ".join(cells) + " |")
     total = summary["runs"]
+    # A run counts as hit when at least one of its kills landed, as in the per-type rows.
+    hit_any = [r for r in results if any(k["landed"] for k in r["kills"])]
     overall = summary["resume_latency"]
     cells = [
         "All",
         f"{sum(summary['kills_landed'].values())} / {sum(summary['kills_planned'].values())}",  # type: ignore[attr-defined]
     ]
     if runs_hit:
-        cells.append(str(total))
+        cells.append(str(len(hit_any)))
     cells += [
         f"{summary['completed']} / {total}",
         f"{summary['diff_matches']} / {total}",

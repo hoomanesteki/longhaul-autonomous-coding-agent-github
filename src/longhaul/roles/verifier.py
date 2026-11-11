@@ -264,11 +264,11 @@ def precheck_commands(
 ) -> list[Command]:
     """The commands to run before the verifier looks at anything, in the order they run.
 
-    First the test command of the repo, which runs as a shell command because `run_tests` has the
-    one command of the worker and not the task's. A repo with no test command runs none. Then the
-    acceptance checks of the plan that are commands (`command_of`), without repeats and at most
-    MAX_CHECKS of them. `round_number` counts from 1. The ids name the task and the round, so a
-    retry or a replay makes the same ones and no other task makes them.
+    First the test command of the repo, which runs as a shell command so that its exit code is the
+    check's. `run_tests` runs the same command (LH-991). A repo with no test command runs none.
+    Then the acceptance checks of the plan that are commands (`command_of`), without repeats and
+    at most MAX_CHECKS of them. `round_number` counts from 1. The ids name the task and the round,
+    so a retry or a replay makes the same ones and no other task makes them.
     """
     commands: list[Command] = []
     seen: set[str] = set()

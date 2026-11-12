@@ -3378,6 +3378,21 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 - **Tests:** `console/src/pages/__tests__/TaskPage.test.tsx`, `console/e2e/main-path.spec.ts`, `tests/integration/test_api.py`, `tests/unit/test_security_page.py`
 - **Files:** `console/src/`, `src/longhaul/api/`, `docs/security.md`, tests
 
+#### LH-993 · Release fixes from the gate review
+- **Epic:** E15 · **Points:** 3 · **Branch:** `feat/lh-993-demo-report`, `feat/lh-993-console`, `feat/lh-993-docs` · **Depends on:** LH-907, LH-991, LH-992
+- **Story:** As a reader of the release, I want the demo, the console and the docs to do and say what the code does, so that nothing in v1.0.0 is a claim I find false the first time I try it.
+- **Build:**
+  - `make demo` stops its worker and its run on success, on failure and on an interrupt: the pids it keeps are the commands' own, not those of a subshell. A failed run keeps its logs under `TMPDIR`.
+  - The chaos table counts in its All row the runs that a kill hit (18 of 20), as the rows per kill type do.
+  - Prometheus scrapes the worker only.
+  - The timeline reads stuck events as one line with their evidence, shows a failed tool call with its exit code, keeps words whole at 375 px, and colours an outcome by how it ended. A verdict is recorded under the verifier turn that gave it.
+  - The README, runbook, architecture page, AWS page, security page, case study and demo script say what is true today: the repo is public, the docs site waits for Pages to be turned on, and the eval numbers and the video are not made yet. The CI secret scan covers every branch and tag with the version the security page names.
+- **Acceptance criteria:**
+  - [ ] No worker or run process is left after `make demo` ends, whichever way it ends.
+  - [ ] Every finding of the gate review is fixed or listed in the gate report with a reason.
+- **Tests:** `tests/unit/test_demo_script.py`, `tests/unit/test_report_tables.py`, `tests/unit/test_security_page.py`, `tests/integration/test_verifier.py`, `console/src/util/__tests__/timeline.test.ts`, `console/e2e/main-path.spec.ts`
+- **Files:** `scripts/demo.sh`, `eval/report/`, `docker/prometheus/prometheus.yml`, `console/src/`, `src/longhaul/durable/workflows/task.py`, `.github/workflows/ci.yml`, `README.md`, `docs/`
+
 ---
 
 ## 8. Evaluation and proof plan

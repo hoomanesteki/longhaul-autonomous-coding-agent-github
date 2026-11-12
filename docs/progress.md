@@ -137,3 +137,4 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-909 | Route tool calls through Keystone (Could) | 3 | Done | merge | 2026-11-08 |
 | LH-991 | Loose ends in the worker, the API and memory | 5 | Done | merge | 2026-11-11 |
 | LH-992 | A readable timeline and a complete security page | 3 | Done | merge | 2026-11-11 |
+| LH-993 | Release fixes from the gate review | 3 | Done | merge | 2026-11-12 |

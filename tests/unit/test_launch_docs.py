@@ -194,13 +194,15 @@ def chaos_table_rows(summary: dict[str, object], *, runs_hit: bool) -> list[str]
         ]
         rows.append("| " + " | ".join(cells) + " |")
     total = summary["runs"]
+    # A run counts as hit when at least one of its kills landed, as in the per-type rows.
+    hit_any = [r for r in results if any(k["landed"] for k in r["kills"])]
     overall = summary["resume_latency"]
     cells = [
         "All",
         f"{sum(summary['kills_landed'].values())} / {sum(summary['kills_planned'].values())}",  # type: ignore[attr-defined]
     ]
     if runs_hit:
-        cells.append(str(total))
+        cells.append(str(len(hit_any)))
     cells += [
         f"{summary['completed']} / {total}",
         f"{summary['diff_matches']} / {total}",
@@ -383,13 +385,24 @@ def test_demo_script_has_the_timeline_of_plan_section_11_3() -> None:
 
 
 def test_demo_script_lists_the_owner_steps_as_open() -> None:
-    # Recording the video and making the repo public happen at the v1.0.0 gate. The page lists
-    # them and must not claim they are done.
-    checklist = section(read(DOCS / "demo-script.md"), "Recording checklist")
-    assert "- [ ] " in checklist
-    assert "- [x] " not in checklist
-    assert "public" in checklist
+    # The repo is public and its secrets check is done. The video, the GIF and the Pages site
+    # are not, and the page must not claim they are.
+    text = read(DOCS / "demo-script.md")
+    checklist = section(text, "Recording checklist")
+    done = [line for line in checklist.splitlines() if line.startswith("- [x] ")]
+    assert len(done) == 1 and "public" in done[0] and "gitleaks" in done[0]
+    open_steps = [line for line in checklist.splitlines() if line.startswith("- [ ] ")]
+    for word in ("Record the video", "30-second GIF", "GitHub Pages"):
+        assert any(word in line for line in open_steps), word
     assert "docs/media/demo.gif" in checklist
+    assert "not public" not in text
+
+
+def test_demo_script_voice_over_counts_the_runs_that_survived_a_kill() -> None:
+    # 18 of the 20 runs had a kill land. The voice-over must not say that all 20 survived kills.
+    text = read(DOCS / "demo-script.md")
+    assert "18 runs survived one to three kills" in text
+    assert "all 20 ended with the same diff and no duplicate write" in text
 
 
 def test_readme_ties_a_moved_port_to_its_connection_setting() -> None:

@@ -1,6 +1,6 @@
 # Two-minute demo script
 
-The script for the demo video and the 30-second GIF. The video is not recorded yet and the repo is not public yet. Both are steps for the v1.0.0 gate, listed in the checklist at the end.
+The script for the demo video and the 30-second GIF. The video and the GIF are not recorded yet, and GitHub Pages is not live. The repo is public. The open steps are listed in the checklist at the end.
 
 ## What the video shows
 
@@ -28,7 +28,7 @@ Every number said aloud is read from a committed file or from the run report on 
 | 0:52 | Temporal UI shows the retry, the timeline resumes | "A new worker picks it up, resets to the last checkpoint and carries on. Nothing ran twice." |
 | 1:10 | Verifier sends work back | "The Verifier runs the tests, finds a missed edge case and sends it back." |
 | 1:25 | Pull request with the run report | "The PR has one commit per plan step and a run report. Here are the minutes, the turns and the dollars it shows." |
-| 1:40 | Results page | "The chaos table: 20 of 20 runs ended with the same diff after the kills, with no duplicate write. The resolve rates against a naive loop come from the results page once those runs are made." |
+| 1:40 | Results page | "The chaos table: 18 runs survived one to three kills, and all 20 ended with the same diff and no duplicate write. The resolve rates against a naive loop come from the results page once those runs are made." |
 | 1:55 | Repo link | "Code, method and failures are all in the repo." |
 
 Notes on three rows:
@@ -43,14 +43,14 @@ Cut from the same take, in this order: the label on the issue, the plan comment,
 
 ## Recording checklist
 
-These are the owner's steps. None is done.
+These are the owner's steps. The repo is public and its secrets check is done. The rest is open.
 
 - [ ] Run the evaluation commands in `docs/results.md` with a live model, and rebuild that page.
 - [ ] Replace the pending lines in the README (headline numbers and limitations), `docs/case-study.md` and the 1:40 row above with the numbers on the rebuilt page.
 - [ ] Record the video from the timeline above on `lh-demo-inventory`.
 - [ ] Cut the 30-second GIF and save it as `docs/media/demo.gif`, then add the image to the README Demo section.
 - [ ] Put the video link in the README and in `docs/case-study.md`.
-- [ ] Check the repo for secrets and private paths, then make the repo public.
+- [x] Check the repo for secrets and private paths, then make the repo public. The repo is public. `gitleaks git --log-opts=--all` found no leaks in 583 commits on 2026-11-11.
 - [ ] Turn on GitHub Pages as the runbook says ("Docs site").
 - [ ] Merge `dev` into `main` at the Phase 9 gate and tag `v1.0.0`.
 - [ ] Add the project card and page to the portfolio site from `docs/case-study.md`.

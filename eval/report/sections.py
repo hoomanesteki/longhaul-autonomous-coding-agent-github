@@ -460,7 +460,9 @@ def chaos_table(summary: ChaosSummary) -> str:
         [
             "**All**",
             f"{sum(summary.kills_landed.values())} / {sum(summary.kills_planned.values())}",
-            str(summary.runs),
+            # A run counts as hit when any of its kills landed, as in the rows above. The cell
+            # must not be summary.runs: runs where every kill missed were not hit.
+            str(sum(any(k.landed for k in r.kills) for r in summary.results)),
             f"{summary.completed} / {summary.runs}",
             diff_equal_cell(summary.results),
             str(summary.duplicate_side_effects),

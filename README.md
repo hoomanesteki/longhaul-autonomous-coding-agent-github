@@ -141,7 +141,7 @@ The chaos table below is from `eval/results/chaos-2026-11-07`, with scripted mod
 | Sandbox kill | 11 / 12 | 10 | 10 / 10 | 10 / 10 | 0 | 0.4 s / 22.1 s |
 | Temporal restart | 9 / 12 | 7 | 7 / 7 | 7 / 7 | 0 | 2.0 s / 10.5 s |
 | Postgres restart | 9 / 11 | 6 | 6 / 6 | 6 / 6 | 0 | 1.4 s / 34.6 s |
-| **All** | 39 / 45 | 20 | 20 / 20 | 20 / 20 | 0 | 2.0 s / 22.1 s |
+| **All** | 39 / 45 | 18 | 20 / 20 | 20 / 20 | 0 | 2.0 s / 22.1 s |
 
 The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
 

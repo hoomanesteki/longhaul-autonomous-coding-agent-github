@@ -176,6 +176,15 @@ def test_a_finished_run_leaves_no_worker_or_run_process_behind(start_demo) -> No
     assert_nothing_left_running(demo)
 
 
+def test_a_failed_run_keeps_its_logs_under_tmpdir(start_demo) -> None:  # type: ignore[no-untyped-def]
+    # A failed run keeps its work folder for the logs. A bare `mktemp -d` ignores TMPDIR on macOS,
+    # so each failing test run left a folder in the system temp folder.
+    demo = start_demo(FAKE_RUN_EXIT="2")
+    assert demo.process.wait(timeout=60) != 0
+    kept = list((demo.folder / "tmp").glob("longhaul-demo.*"))
+    assert kept and f"logs are in {kept[0]}" in demo.output, demo.output
+
+
 def test_a_failed_run_leaves_no_worker_or_run_process_behind(start_demo) -> None:  # type: ignore[no-untyped-def]
     demo = start_demo(FAKE_RUN_EXIT="2")
     assert demo.process.wait(timeout=60) == 2

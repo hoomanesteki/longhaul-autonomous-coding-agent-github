@@ -37,7 +37,7 @@ if [ ! -x "$LONGHAUL" ]; then
   exit 2
 fi
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/longhaul-demo.XXXXXX")"
 export LONGHAUL_TASK_QUEUE="demo-$$-$(date +%s)"
 export LONGHAUL_CKPT_DIR="$WORK/ckpt"
 # The scripted provider plays the task, so no key is needed and a stray one must not be used.

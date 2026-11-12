@@ -156,7 +156,7 @@ ADR-0012 says the redaction filter must match `ghs_`, the prefix of installation
 
 ### gitleaks
 
-`gitleaks git --log-opts="--all"` (version 8.30.1) over every branch and tag: 483 commits scanned, about 10 MB, **no leaks found**. The tests that need a secret-shaped string build it from parts, so the history has none. CI runs the same scan on each pull request.
+`gitleaks git --log-opts="--all"` (version 8.30.1) over every branch and tag: 591 commits scanned, about 11 MB, **no leaks found**. The tests that need a secret-shaped string build it from parts, so the history has none. The `security` job in CI runs the same command with the same version on each pull request and on each push to a branch it covers. The job fetches the full history, so it scans every branch and tag of the clone and not only the commits behind the ref under test.
 
 ### pip-audit
 

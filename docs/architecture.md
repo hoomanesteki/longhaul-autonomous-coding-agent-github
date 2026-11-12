@@ -255,7 +255,7 @@ The names come from `opentelemetry-semantic-conventions` 0.66b2 (module `opentel
 | both | `longhaul.task_id` | the task id |
 | | `longhaul.turn_index` | the turn |
 | `chat <model>` only | `longhaul.role` | planner, coder, verifier or compactor |
-| | `longhaul.cost_usd` | 0.0 until the pricing table arrives (LH-701), as in `LlmTurnOutput` |
+| | `longhaul.cost_usd` | the price the cost ledger put on the call, and 0.0 only when a run has no ledger |
 | | `longhaul.cache_ratio` | `cache_read / (input + cache_read)`, or 0.0 when both are 0 |
 
 `longhaul.role` is not on tool spans, because a `tool_exec` call does not carry the role of the turn that made it.
@@ -295,7 +295,7 @@ Every log line that Python code in the worker writes is one JSON object on stder
 
 - `setup_logging()` configures structlog and replaces the handlers of the root logger with one that writes JSON. Standard library records, from the modules of this repo (`logging.getLogger(__name__)`) and from temporalio, go through the same processors as structlog events, so they get the same fields and the same redaction. Calling it twice does not write a line twice.
 - `interceptors()` is a Temporal client and worker interceptor. `durable.client.connect` registers it on the client after `otel.interceptors()`, so the `RunActivity` span is open when it binds the trace id, and the worker takes it from there. Registering it on the worker as well would run it twice. Each activity runs in a task of its own, so the fields stay on the lines of that activity only, including the "Completing activity as failed" warning that temporalio writes after the activity raised.
-- The worker module (LH-208) is built next to this story. The change that brings it in calls `setup_logging()` first, in place of `logging.basicConfig`, before `setup_tracing` and `connect`. The `connect` it uses already registers `interceptors()`.
+- The worker (LH-208) starts through `longhaul worker`, which calls `setup_logging()` first. `worker.main` then calls `setup_tracing` and `connect`, and the `connect` registers `interceptors()`.
 - Temporal Core, the Rust library under the SDK, is the exception to "one JSON object per line". It writes its own WARN and ERROR lines to stderr in a colored compact format, such as the warning about a server older than 1.16 or a lost connection, and those lines skip the JSON renderer and the redaction. A log shipper that parses every stderr line as JSON has to tolerate them. To bring them in, build the worker's `Runtime` with `LoggingConfig(filter=..., forwarding=LogForwardingConfig(logger=logging.getLogger("temporalio.core")))`, and they go through the same processors as every other record.
 - The lines that temporalio writes outside an activity, such as "Beginning worker shutdown", carry none of the four fields.
 

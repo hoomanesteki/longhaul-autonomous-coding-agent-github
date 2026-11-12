@@ -298,9 +298,9 @@ before this story has no such activity to replay.
 
 A run that follows a hand-over keeps the phase the task had (LH-991): `_prepare` only finds the
 sandbox again and does not write `preparing`. The task was coding, and the row used to say
-`preparing` until the first turn of the new run wrote `coding`. Replay: the old write is kept for
-a history without `workflow.patched(KEEP_PHASE_PATCH)`, asked only by a run that was handed a
-sandbox (tests/fixtures/histories/handover_before_phase_kept.json).
+`preparing` while the sandbox was ensured, until `_code` wrote `coding`. Replay: the old write is
+kept for a history without `workflow.patched(KEEP_PHASE_PATCH)`, asked only by a run that was
+handed a sandbox (tests/fixtures/histories/handover_before_phase_kept.json).
 
 How a run ends. `finish` is the one good end. Every other end has a fixed summary, so a caller
 can tell them apart without reading prose:

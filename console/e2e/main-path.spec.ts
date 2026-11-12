@@ -77,7 +77,7 @@ test("the main path of the console", async ({ page }) => {
     for (const [row, text] of [
       [stuck, "Needs you: Paused"],
       [plan, "Needs you: Approve the plan"],
-      [plan, "Phase: awaiting_plan_approval"],
+      [plan, "Phase: awaiting plan approval"],
     ] as const) {
       const line = row.getByText(text);
       await expect(line).toBeInViewport({ ratio: 1 });

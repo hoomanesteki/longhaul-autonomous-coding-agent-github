@@ -23,6 +23,11 @@ export function needsYou(task: Pick<TaskSummary, "phase">): string | null {
   return WAITING_FOR[task.phase] ?? null;
 }
 
+/** A phase as words, `awaiting plan approval`, so that a narrow line can wrap between them. */
+export function phaseWords(phase: string): string {
+  return phase.replaceAll("_", " ");
+}
+
 // Phases a task does not leave.
 const ENDED = new Set(["done", "failed", "cancelled"]);
 

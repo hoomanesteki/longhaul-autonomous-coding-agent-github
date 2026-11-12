@@ -72,6 +72,8 @@ export type EventTone =
   | "pause"
   | "hint"
   | "verdict"
+  | "success"
+  | "warning"
   | "recovery"
   | "error"
   | "other";
@@ -89,8 +91,22 @@ const TONES: Record<string, EventTone> = {
   error: "error",
 };
 
-/** The colour family of an event type. A type the console does not know is plain. */
-export function eventTone(type: string): EventTone {
+// How a run ended, for the outcome row. A cancel is the operator's own choice, so it stays plain.
+const OUTCOME_TONES: Record<string, EventTone> = {
+  pr_opened: "success",
+  stuck: "warning",
+  budget_exhausted: "warning",
+  error: "warning",
+};
+
+/**
+ * The colour family of an event. A type the console does not know is plain.
+ *
+ * Most types have one colour. An outcome takes it from its `kind`, so that a pull request reads
+ * like a passed review and a run that gave up does not look like a step update.
+ */
+export function eventTone(type: string, payload: Record<string, unknown> = {}): EventTone {
+  if (type === "outcome") return OUTCOME_TONES[text(payload.kind) ?? ""] ?? "other";
   return TONES[type] ?? "other";
 }
 
@@ -177,7 +193,18 @@ function pausedLine(p: Record<string, unknown>): string | null {
   const reason = text(p.reason);
   if (reason === null) return null;
   const question = text(p.question);
-  return `Paused: ${words(reason)}${question === null ? "" : `, ${clip(question)}`}`;
+  // The reason is a label and the question is a sentence, so they read as two parts.
+  return `Paused (${words(reason)})${question === null ? "" : `: ${clip(question)}`}`;
+}
+
+function stuckLine(p: Record<string, unknown>): string | null {
+  const reason = text(p.reason);
+  if (reason === null) return null;
+  const turn = count(p.turn_index);
+  // The evidence is the useful part of the event. The first line is enough for the row and the
+  // details show the rest.
+  const [first] = Array.isArray(p.evidence) ? p.evidence.filter((e): e is string => text(e) !== null) : [];
+  return `Stuck: ${words(reason)}${turn === null ? "" : ` (turn ${turn})`}${first === undefined ? "" : `: ${clip(first)}`}`;
 }
 
 const ANSWERS: Record<string, string> = { hint: "a hint", budget: "a budget top-up" };
@@ -219,6 +246,7 @@ const LINES: Record<string, (payload: Record<string, unknown>) => string | null>
   verdict: verdictLine,
   outcome: outcomeLine,
   paused: pausedLine,
+  stuck: stuckLine,
   resumed: resumedLine,
   budget_added: budgetLine,
   compaction: compactionLine,
@@ -236,6 +264,22 @@ export function describeEvent(type: string, payload: Record<string, unknown>): s
 }
 
 // ---------- tool calls ----------
+export type ToolCallStatus = { label: "ok" | "failed" | "error"; failed: boolean; exitCode: number | null };
+
+/**
+ * Whether a tool call worked, from its row.
+ *
+ * `ok` is false only for a call that did not finish (a timeout, a bad argument). A command that ran
+ * and exited with a non-zero code, such as a failing test run, is `ok` with that exit code, and
+ * reading `ok` alone showed it as a success. So a non-zero exit code is a failure too.
+ */
+export function toolCallStatus(call: Pick<TimelineToolCall, "ok" | "exit_code">): ToolCallStatus {
+  if (!call.ok) return { label: "error", failed: true, exitCode: call.exit_code };
+  if (call.exit_code !== null && call.exit_code !== 0)
+    return { label: "failed", failed: true, exitCode: call.exit_code };
+  return { label: "ok", failed: false, exitCode: null };
+}
+
 // The argument that says what a call does, in the order the tools use them.
 const KEY_ARGS = ["command", "path", "file_path", "query", "pattern", "url"];
 const MAX_ARGS = 80;

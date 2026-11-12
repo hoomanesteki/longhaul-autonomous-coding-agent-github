@@ -54,7 +54,21 @@ describe("EventRow", () => {
       { kind: "pr_opened", repo: "acme/widgets", turns: 9, cost_usd: 0, summary: "Fixed it" },
       "Pull request opened after 9 turns: Fixed it",
     ],
-    ["paused", { kind: "hint", reason: "no_progress", pause: 1 }, "Paused: no progress"],
+    ["paused", { kind: "hint", reason: "no_progress", pause: 1 }, "Paused (no progress)"],
+    [
+      "stuck",
+      {
+        reason: "repeated_failure",
+        turn_index: 6,
+        evidence: ["pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5"],
+      },
+      "Stuck: repeated failure (turn 6): pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5",
+    ],
+    [
+      "paused",
+      { kind: "hint", reason: "repeated_failure", question: "Is it fine to change the operator?" },
+      "Paused (repeated failure): Is it fine to change the operator?",
+    ],
     ["resumed", { kind: "hint", via: "hint", by: "alice" }, "Resumed with a hint from alice"],
     ["budget_added", { pause: 1, usd: 2.5, turns: 0, by: "alice" }, "Budget added: $2.50, by alice"],
     [
@@ -70,6 +84,27 @@ describe("EventRow", () => {
     expect(screen.queryByText(SHA)).not.toBeInTheDocument();
     expect(row).not.toHaveTextContent("cost_usd");
     expect(row).not.toHaveTextContent("turn_index:");
+  });
+
+  it("keeps the details toggle and the whole evidence for a stuck event", async () => {
+    const row = renderRow(event("stuck", { reason: "no_progress", turn_index: 2, evidence: ["a", "b"] }));
+    expect(row).not.toHaveTextContent("reason:");
+
+    await userEvent.click(screen.getByRole("button", { name: "Details" }));
+
+    expect(row.querySelector("pre")?.textContent).toContain('"b"');
+  });
+
+  it.each([
+    ["pr_opened", "success"],
+    ["stuck", "warning"],
+    ["error", "warning"],
+    ["budget_exhausted", "warning"],
+    ["cancelled", "other"],
+  ])("gives an outcome of %s the %s tone", (kind, tone) => {
+    const row = renderRow(event("outcome", { kind, turns: 2 }));
+
+    expect(row).toHaveAttribute("data-tone", tone);
   });
 
   it("keeps the key and value fallback for a kind it does not know", () => {

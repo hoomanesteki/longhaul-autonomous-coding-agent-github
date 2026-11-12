@@ -1187,7 +1187,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
     - `temporal`: Temporal dev server via the official `temporalio/temporal` CLI image running `server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db`, with `/data` on a named volume so a restart keeps workflow state. Ports 7233 and 8233 (UI). If the image name differs at project start, use the documented dev-server option and note it in ADR-0002.
     - `minio`: ports 9000 and 9001, plus a `minio-init` one-shot (mc) that creates bucket `longhaul`
     - `otel-collector`: config in `docker/otel/config.yaml`, exporting to `jaeger` (16686)
-    - `prometheus`: scrapes `host.docker.internal:9464` (worker) and `api:8000/metrics`
+    - `prometheus`: scrapes `host.docker.internal:9464` (worker). The API is not scraped: its copy of the worker metrics is always zero
     - `grafana`: port 3000, anonymous viewer, provisioning folder
   - `make up` runs `docker compose up -d --wait`. `make down` runs `docker compose down -v`.
   - `.env.example` lists every variable from section 3.8 with safe local defaults.

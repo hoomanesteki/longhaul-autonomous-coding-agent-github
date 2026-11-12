@@ -743,6 +743,9 @@ async def test_precheck_overrides_model(env: WorkflowEnvironment, tmp_path: Path
     assert [(r["round"], r["passed"]) for r in reviews] == [(1, False), (2, True)]
     assert (reviews[0]["model_passed"], reviews[0]["precheck_passed"]) == (True, False)
     assert (reviews[1]["model_passed"], reviews[1]["precheck_passed"]) == (True, True)
+    # Each verdict names the verifier turn that gave it, the turn the timeline shows it under.
+    verifier_turns = sorted(t.turn_index for t in world.recorder.turns if t.role == "verifier")
+    assert [r["turn_index"] for r in reviews] == verifier_turns
 
     # The verifier was shown the failure, and the coder is told which command to fix.
     seen = [blocks(r.messages[0]) for r in world.provider.of("verifier")]

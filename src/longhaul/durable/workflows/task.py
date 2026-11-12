@@ -2026,9 +2026,12 @@ class TaskWorkflow:
         if isinstance(got, Outcome):
             return got
         review = verifier.judge_review(brief.checks, got)
+        # The verifier has taken at least one turn by now (_out_of_turns above), so the turn that
+        # gave the verdict is the one before the counter, which the timeline shows it under. An
+        # event's payload is not part of the replay check, so an old history replays either way.
         await self._note(
             VERDICT_EVENT,
-            {**verifier.verdict_event(number, review), "turn_index": state.turn_index},
+            {**verifier.verdict_event(number, review), "turn_index": state.turn_index - 1},
         )
         if review.passed:
             # With no command in the pre-check the counts are the model's word only. The work may

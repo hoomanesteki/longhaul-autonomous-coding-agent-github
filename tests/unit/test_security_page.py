@@ -97,6 +97,21 @@ def test_the_ci_audit_covers_every_extra() -> None:
     assert "pip-audit" in exports[0]
 
 
+def test_the_ci_secret_scan_is_the_one_the_page_describes() -> None:
+    # The page says CI repeats the local scan: every branch and tag, with the same version. A
+    # version bump or a return to `gitleaks detect` would make that false without this check.
+    job = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))[
+        "jobs"
+    ]["security"]
+    version = job["env"]["GITLEAKS_VERSION"]
+    scans = [s["run"] for s in job["steps"] if s.get("run", "").startswith("gitleaks ")]
+    section = PAGE.read_text(encoding="utf-8").split("### gitleaks", 1)[1].split("\n## ", 1)[0]
+
+    assert len(scans) == 1
+    assert scans[0].startswith('gitleaks git --log-opts="--all"')
+    assert f"(version {version})" in section
+
+
 # ---------- the stack listens on this machine only ----------
 def published_ports(compose: dict[str, Any]) -> list[tuple[str, str]]:
     return [

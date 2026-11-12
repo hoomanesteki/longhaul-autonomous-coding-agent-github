@@ -255,7 +255,7 @@ The names come from `opentelemetry-semantic-conventions` 0.66b2 (module `opentel
 | both | `longhaul.task_id` | the task id |
 | | `longhaul.turn_index` | the turn |
 | `chat <model>` only | `longhaul.role` | planner, coder, verifier or compactor |
-| | `longhaul.cost_usd` | the price the cost ledger put on the call, and 0.0 only when a run has no ledger |
+| | `longhaul.cost_usd` | the price the cost ledger put on the call, and 0.0 when a run has no ledger or uses a free provider (scripted, replay) |
 | | `longhaul.cache_ratio` | `cache_read / (input + cache_read)`, or 0.0 when both are 0 |
 
 `longhaul.role` is not on tool spans, because a `tool_exec` call does not carry the role of the turn that made it.

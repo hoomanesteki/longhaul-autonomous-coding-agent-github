@@ -3,8 +3,8 @@ name: pages
 # Publishes the docs site (site/) to GitHub Pages. ci.yml already builds the site on every
 # pull request, so a broken page never reaches main. This workflow only runs after a merge.
 #
-# The owner sets Settings > Pages > Source to "GitHub Actions" once (docs/runbook.md). Until
-# then the deploy job fails and the site stays offline.
+# Settings > Pages > Source is "GitHub Actions" (docs/runbook.md), so each push to main publishes
+# the site. The repository variable PAGES_ENABLED set to false turns the deploy off.
 
 on:
   push:
@@ -43,19 +43,18 @@ jobs:
           version: 1.10.18
       - name: Render the docs site
         run: quarto render site
-      # The Pages steps run only once the owner has turned Pages on and set the repository
-      # variable PAGES_ENABLED to true (docs/runbook.md). Until then the site still renders and
-      # the deploy is skipped instead of failing, so main stays green.
+      # The Pages steps run unless the repository variable PAGES_ENABLED is false. With the
+      # deploy turned off the site still renders, so a broken page still fails the run.
       - uses: actions/configure-pages@v6
-        if: vars.PAGES_ENABLED == 'true'
+        if: vars.PAGES_ENABLED != 'false'
       - uses: actions/upload-pages-artifact@v5
-        if: vars.PAGES_ENABLED == 'true'
+        if: vars.PAGES_ENABLED != 'false'
         with:
           path: site/_site
 
   deploy:
     needs: build
-    if: vars.PAGES_ENABLED == 'true'
+    if: vars.PAGES_ENABLED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

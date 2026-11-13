@@ -62,10 +62,11 @@ def test_pages_builds_then_deploys_one_deployment_at_a_time() -> None:
     assert steps_using(deploy, "actions/deploy-pages")
 
 
-def test_pages_deploys_only_after_the_owner_turns_it_on() -> None:
-    # Without Pages turned on, configure-pages and deploy-pages fail and main would show red.
+def test_pages_deploys_unless_the_owner_turns_it_off() -> None:
+    # Pages is on (source GitHub Actions), so every push to main publishes the site. The
+    # repository variable PAGES_ENABLED set to false stops the deploy without a code change.
     pages = workflow("pages.yml")
-    gate = "vars.PAGES_ENABLED == 'true'"
+    gate = "vars.PAGES_ENABLED != 'false'"
     build, deploy = pages["jobs"]["build"], pages["jobs"]["deploy"]
     assert deploy["if"] == gate
     for action in ("actions/configure-pages", "actions/upload-pages-artifact"):

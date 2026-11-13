@@ -1,10 +1,14 @@
 # Longhaul
 
-A background coding agent that survives crashes and tells you when it is stuck. It takes a GitHub issue, works on it for hours in a sandbox, resumes where it stopped after a crash, and ends with a pull request or an honest report of where it got stuck.
+**A background coding agent that survives crashes and tells you when it is stuck.**
+
+Coding agents can fix many small, well-specified issues, but someone still has to watch them: a run that dies loses its work, and a run that loops keeps spending without telling anyone. Longhaul makes an agent safe to leave alone. It takes a GitHub issue, works on it for hours in a sandbox, resumes where it stopped after a crash, asks a person only at checkpoints, and ends with a pull request or an honest report of where it got stuck. In 20 chaos runs, each set to kill the worker, the sandbox, Temporal or Postgres in the middle of a task, all 20 ended with a pull request and the same diff as a run with no kill, and no GitHub write happened twice.
 
 Status: all nine phases are built, and `v1.0.0` is the release. The tag is made at the Phase 9 gate. The repo is public. The docs site is built from `docs/` with Quarto and is not live yet: it goes live at [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/) once the owner turns on GitHub Pages and the next push to `main` deploys it. The runbook's [Publishing](docs/runbook.md#publishing) section has the steps.
 
 [![ci](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml)
+
+[How it works](#how-it-works) · [Proof](#headline-numbers) · [The console](#the-console) · [Quickstart](#quickstart) · [Run on your repo](#run-on-your-repo) · [Docs map](#docs-map)
 
 ## Headline numbers
 
@@ -15,77 +19,68 @@ The only measured result so far is the chaos suite: 20 runs of four recorded tas
 - 39 of 45 planned kills landed. 18 of 20 runs count as survived: in two runs none of the planned kills landed before the run ended, so they show nothing about a crash.
 - Resume latency, from the end of a kill to the start of the next activity: median 2.0 s, 95th percentile 22.1 s.
 
-The model answers in those runs were scripted recordings, not a live model. The suite measures durability, not how well a model codes.
+![Chaos suite chart: kills landed of planned for each kill type, and the median and 95th percentile resume time after a kill. The table under Results holds the same numbers.](docs/media/chaos-results.svg)
 
-The resolve rate against a naive loop on a SWE-bench Verified subset, and the dollars per resolved task, are pending. They need an API key, so the runs are not made yet. The commands that make them are in [docs/results.md](docs/results.md), and the tables appear on that page once the runs exist. Nothing here is estimated.
+What this means: a crash costs a task the step it was in and a short wait, not its work and not a second comment or pull request. The model answers in those runs were scripted recordings, not a live model, so the suite measures durability and not how well a model codes. `scripts/chaos_chart.py` draws the chart from the summary file, and a test checks that the two agree.
+
+The resolve rate against a naive loop on a SWE-bench Verified subset, and the dollars per resolved task, are pending. They need an API key, and the SWE-bench runs need the eval VM, so the runs are not made yet. The commands that make them are in [docs/results.md](docs/results.md), and the tables appear on that page once the runs exist. Nothing here is estimated.
 
 ## Demo
 
-A 30-second GIF of the path from a labeled issue to a pull request will live at `docs/media/demo.gif`. It is not recorded yet. The script for it is [docs/demo-script.md](docs/demo-script.md).
+A 30-second GIF of the path from a labeled issue to a pull request will live at `docs/media/demo.gif`, and a two-minute video will follow it. Neither is recorded yet, because both show a live model on a real repo, which needs an API key and a recording session. The script for them is [docs/demo-script.md](docs/demo-script.md). Until then, `make demo` in the [Quickstart](#quickstart) runs the same path on a toy repo, and [The console](#the-console) shows the screens.
 
 ## How it works
 
+A poller finds the issues that carry the `longhaul` label and starts one Temporal workflow for each. The workflow only decides what runs next. Each model turn, tool call, checkpoint and write to GitHub is an activity of its own, so when a worker dies, Temporal retries that one step from the last checkpoint and the task goes on.
+
 ```mermaid
 flowchart LR
-  subgraph GitHub
-    ISS[Issue labeled 'longhaul']
-    PR[Pull request]
-    CMT[Issue comments: /longhaul approve, hint, budget, cancel]
-  end
-
-  subgraph Longhaul
-    POLL[PollerWorkflow<br/>Temporal Schedule, every 60s]
-    WF[TaskWorkflow<br/>one per issue]
-    W[Worker process<br/>activities]
-    API[FastAPI<br/>console API, health, metrics]
-    CON[Console<br/>React + Vite + TS]
-    CLI[longhaul CLI]
-  end
-
-  subgraph Infra
-    T[(Temporal server)]
-    PG[(Postgres + pgvector)]
-    S3[(MinIO / S3 blobs)]
-    SB[[Docker sandbox<br/>per task]]
-    CK[(Bare checkpoint repo<br/>on the worker host)]
-    OT[OTel collector -> Jaeger]
-    PM[Prometheus -> Grafana]
-  end
-
-  LLM[(Anthropic Messages API<br/>or OpenAI-compatible)]
-
-  ISS --> POLL
-  CMT --> POLL
-  POLL -->|start / signal| WF
-  CLI -->|start| WF
-  WF <--> T
-  T <--> W
-  W --> LLM
-  W --> SB
-  SB <--> CK
-  W --> S3
-  W --> PG
-  W -->|idempotent writes| PR
-  W -->|idempotent writes| CMT
-  CON --> API
-  API --> PG
-  API -->|signals / queries| T
-  W --> OT
-  W --> PM
+  ISSUE(["Issue labeled<br/>longhaul"]) --> PLAN["Planner reads the repo<br/>and posts a plan"]
+  PLAN -->|approved, when the<br/>repo asks for it| CODE["Coder works in turns:<br/>model turn, tool call,<br/>git checkpoint"]
+  CODE -->|finish| VERIFY["Verifier runs the tests<br/>and reviews the diff"]
+  VERIFY -->|send back| CODE
+  VERIFY -->|pass| PR(["Pull request<br/>with a run report"])
+  CODE -->|stuck or<br/>out of budget| PAUSE["Pause and ask<br/>one question"]
+  PAUSE -->|hint or top-up| CODE
+  VERIFY -->|fails 3 times| STUCK(["Report of where<br/>it got stuck"])
+  PAUSE -->|no answer in time| STUCK
 ```
+
+Four ideas carry it:
 
 - **Durable turns.** Every model turn and every tool call is its own Temporal activity with a timeout, a retry policy and a heartbeat. The workflow only schedules them, so a worker that dies loses one step and not the task.
 - **Git checkpoints.** Every change in the workspace becomes a commit in a bare repo per task. A retried tool call starts from its `pre_sha`, so it never runs on half-applied edits.
 - **Two-tier context.** Old tool outputs shrink to a one-line stub with a handle, and old turns become structured progress notes, so a task of a hundred turns fits the window.
 - **Plan, verify, stuck.** A planner, a coder and a verifier run as roles inside one workflow. A stuck detector pauses the task and asks one specific question, and hard budgets stop the spend.
 
-The long form is in [docs/architecture.md](docs/architecture.md). The plan with every story is [docs/plan/longhaul-build-plan.md](docs/plan/longhaul-build-plan.md).
+A person steers from the issue (`/longhaul approve`, `hint`, `budget`, `cancel`) or from the console. Every GitHub write goes through one module with an idempotency key, so a retry never posts twice. The system context, with every service, and each step of the workflow are drawn in [docs/architecture.md](docs/architecture.md). The plan with every story is [docs/plan/longhaul-build-plan.md](docs/plan/longhaul-build-plan.md).
+
+## The console
+
+A React console lists every task, shows its timeline turn by turn, and holds the forms to approve a plan, send a hint, add budget or cancel. These screenshots come from the Phase 8 gate, taken against the demo stack, which runs the scripted provider, so every cost on them is $0.00.
+
+![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that need a person are marked.](docs/gates/media/phase-8/1-tasks.png)
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/gates/media/phase-8/3-timeline.png" alt="A shipped task: summary, plan with its steps done, every turn and tool call, the verdict and the outcome."></td>
+    <td width="50%"><img src="docs/gates/media/phase-8/4-actions.png" alt="A paused task with the hint, budget and cancel forms."></td>
+  </tr>
+  <tr>
+    <td>A shipped task: the plan with its steps done, then every turn and tool call.</td>
+    <td>A paused task with the hint, budget and cancel forms.</td>
+  </tr>
+</table>
+
+The other screens (the Needs you filter, the memory viewer, the sign-in page and the 375 px layout) are in the [Phase 8 gate report](docs/gates/phase-8.md#screenshots). How to run the console is in "The console" in [docs/runbook.md](docs/runbook.md).
 
 ## Quickstart
 
 You need Docker, [uv](https://docs.astral.sh/uv/) and Python 3.12. No API key and no GitHub account are needed: the scripted provider plays a fixed set of model answers.
 
 ```bash
+git clone https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github.git
+cd longhaul-autonomous-coding-agent-github
 make setup && make up && make demo
 ```
 
@@ -133,7 +128,7 @@ The console shows every task, its timeline and the notes it remembers. It needs 
 
 [docs/results.md](docs/results.md) is built by `eval/report/build_report.py` from committed result files, and every number on it comes from those files. It has no tables yet, because the SWE-bench and custom-set runs need an API key and are not made. It lists the commands that make them.
 
-The chaos table below is from `eval/results/chaos-2026-11-07`, with scripted model answers. The method is in [eval/chaos/README.md](eval/chaos/README.md).
+The chaos table below is from `eval/results/chaos-2026-11-07`, with scripted model answers, and the chart under [Headline numbers](#headline-numbers) draws the same numbers. The method is in [eval/chaos/README.md](eval/chaos/README.md).
 
 | Kill type | Kills landed / planned | Runs hit | Completed | Diff equal | Duplicate side effects | Resume p50 / p95 |
 |---|---|---|---|---|---|---|
@@ -143,7 +138,7 @@ The chaos table below is from `eval/results/chaos-2026-11-07`, with scripted mod
 | Postgres restart | 9 / 11 | 6 | 6 / 6 | 6 / 6 | 0 | 1.4 s / 34.6 s |
 | **All** | 39 / 45 | 18 | 20 / 20 | 20 / 20 | 0 | 2.0 s / 22.1 s |
 
-The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
+How to read it: "Runs hit" counts the runs in which a kill of that type landed, and "Completed" and "Diff equal" count those runs. "Duplicate side effects" are the writes on the fake GitHub beyond the ones a task makes. The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
 
 ## Design decisions
 
@@ -181,6 +176,26 @@ The threat model, the test behind each control and the known gaps are in [docs/s
 - Polling delay. A labeled issue waits up to a minute for its task, and a comment command up to a minute for its effect.
 - The eval numbers are pending, and the chaos runs used scripted model answers. When the eval runs are made, they cover a 40-task subset of SWE-bench Verified and a set of 15 custom tasks, which gives wide intervals.
 - The repo is public, but the demo video, the `v1.0.0` tag, the release notes and the live docs site are not done. They are steps at the `v1.0.0` gate.
+
+## Docs map
+
+| Doc | What it holds |
+|---|---|
+| [docs/case-study.md](docs/case-study.md) | The story in one page: the problem, what was built, the proof, what did not work, and the decisions worth defending |
+| [docs/architecture.md](docs/architecture.md) | The system context, the task workflow and the data stores as diagrams, plus the contracts, tracing, logs and metrics |
+| [docs/adr/](docs/adr/) | One record per design choice, with the alternatives that were rejected |
+| [docs/results.md](docs/results.md) | The page the report builder writes from eval results, with the commands that make the pending runs |
+| [eval/chaos/README.md](eval/chaos/README.md) | How the chaos suite kills, counts and measures, and what each field of its results means |
+| [docs/gates/](docs/gates/) | The review at the end of each phase: what passed, what failed and what was fixed |
+| [docs/runbook.md](docs/runbook.md) | How to run, steer, observe, upgrade and publish Longhaul, one task at a time or as a service |
+| [docs/security.md](docs/security.md) | The threat model, each control and the test behind it, and the known gaps |
+| [docs/deploy-aws.md](docs/deploy-aws.md) | The Terraform for AWS: what it builds, what it costs, and how to apply and tear it down |
+| [docs/demo-script.md](docs/demo-script.md) | The two-minute video and the GIF, with the checklist of what is still open |
+| [docs/plan/longhaul-build-plan.md](docs/plan/longhaul-build-plan.md) | The build plan: phases, stories, acceptance criteria and the evaluation method |
+| [docs/progress.md](docs/progress.md) | The status of every story |
+| [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/style.md](docs/style.md) | The working rules and the voice of the docs |
+
+The docs site renders the same files with a grouped navbar, once GitHub Pages is on (see the Status line at the top).
 
 ## Repo layout
 

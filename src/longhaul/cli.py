@@ -56,6 +56,7 @@ item, a missing database setting and a database that cannot be reached exit 2 wi
 
 import asyncio
 import getpass
+import inspect
 import os
 import re
 import signal
@@ -333,7 +334,7 @@ def api_command(
         typer.Option("--port", min=0, max=65535, help="The port. Default: LONGHAUL_API_PORT."),
     ] = None,
 ) -> None:
-    """Serve the console API: tasks, timelines, actions and memory over HTTP (LH-801).
+    """Serve the console API: tasks, timelines, actions and memory over HTTP.
 
     It reads the database and the blob store and sends signals through Temporal, so it needs the
     stack from `make up` and the LONGHAUL_* settings of .env.example. It does not need a worker
@@ -1227,6 +1228,29 @@ def describe(exc: Exception, task_id: str | None = None) -> str:
     if isinstance(exc, SQLAlchemyError):
         return f"database: {str(exc).splitlines()[0] if str(exc) else type(exc).__name__}"
     return str(exc) or type(exc).__name__
+
+
+# ---------- the help ----------
+def reflow(text: str) -> str:
+    """`text` with each paragraph on one line.
+
+    Typer keeps the line breaks inside a paragraph of the help, so a docstring wrapped for the
+    source would come out ragged on a narrow terminal. On one line, the terminal wraps it.
+    """
+    paragraphs = inspect.cleandoc(text).split("\n\n")
+    return "\n\n".join(" ".join(paragraph.split()) for paragraph in paragraphs)
+
+
+def reflow_help(*apps: typer.Typer) -> None:
+    """Give each command of `apps` its docstring, reflowed, as its help."""
+    for each in apps:
+        for info in each.registered_commands:
+            text = info.help if info.help is not None else inspect.getdoc(info.callback)
+            if text:
+                info.help = reflow(text)
+
+
+reflow_help(app, memory_app, poller_app)
 
 
 if __name__ == "__main__":

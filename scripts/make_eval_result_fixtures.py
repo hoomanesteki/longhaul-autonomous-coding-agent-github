@@ -1,4 +1,4 @@
-"""Write the dry-run result fixtures that the report tests read (LH-905).
+"""Write the dry-run result fixtures that the report tests read.
 
     uv run python scripts/make_eval_result_fixtures.py
 

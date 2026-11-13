@@ -1365,11 +1365,18 @@ To run the quick jobs on your machine, use `make ci-local`. To lint the workflow
 | Workflow | Runs on | What it does |
 |---|---|---|
 | `codeql.yml` | pushes to `dev` and `main`, pull requests into them, Mondays at 04:41 UTC, by hand | CodeQL for Python and for JavaScript and TypeScript, with no build. Findings show under Security, Code scanning, and on the pull request. Its job is the only one here with `security-events: write` |
-| `dependency-review.yml` | pull requests into `dev` and `main` | fails when the pull request adds a dependency with a known vulnerability of high or critical severity, in any ecosystem that the dependency graph reads |
+| `dependency-review.yml` | pull requests into `dev` and `main`, when the repository variable `DEPENDENCY_REVIEW` is `true` | fails when the pull request adds a dependency with a known vulnerability of high or critical severity, in any ecosystem that the dependency graph reads |
 | `release.yml` | pushes of a version tag, pushes to `main`, by hand | creates the missing GitHub Releases (see "Releases" below) |
 | `pages.yml` | pushes to `main`, by hand | publishes the docs site (see "Publishing" under "Docs site") |
 
 The `ci` job does not wait for these, so branch protection does not require them. A failed CodeQL or dependency review still shows as a red check on the pull request. `tests/unit/test_workflow_hardening.py` holds every workflow to a read-only top, a list of the jobs that may write, a timeout per job, no `pull_request_target` or `workflow_run` trigger, and concurrency groups that cancel only an older run of the same pull request.
+
+Dependency review needs the dependency graph of the repository, which is off until the owner turns it on, and the action fails every pull request while it is off. So its job is skipped until both of these are done:
+
+1. Turn on the graph: Settings, Code security, Dependency graph, Enable.
+2. Add the repository variable `DEPENDENCY_REVIEW` with the value `true` (Settings, Secrets and variables, Actions, Variables).
+
+The next pull request then runs the review. To stop it again, delete the variable or set it to anything else.
 
 ### Releases
 

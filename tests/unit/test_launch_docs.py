@@ -14,6 +14,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 pytestmark = [pytest.mark.unit, pytest.mark.phase9]
 
@@ -96,6 +97,32 @@ def test_readme_quickstart_is_three_commands_with_no_key() -> None:
     assert "make setup && make up && make demo" in quickstart
     assert "ANTHROPIC_API_KEY" not in quickstart
     assert "scripted" in quickstart
+
+
+# The README name of each service that `make up` starts. minio-init only creates the bucket.
+SERVICE_NAMES = {
+    "postgres": "Postgres",
+    "temporal": "Temporal",
+    "minio": "MinIO",
+    "jaeger": "Jaeger",
+    "otel-collector": "OpenTelemetry collector",
+    "prometheus": "Prometheus",
+    "grafana": "Grafana",
+}
+NOT_A_SERVICE = {"minio-init"}
+
+
+def test_readme_make_up_names_every_service_it_starts() -> None:
+    compose = yaml.safe_load(read(ROOT / "docker-compose.yml"))
+    # `make up` is `docker compose up` with no profile, so a service with a profile stays down.
+    started = {name for name, svc in compose["services"].items() if not svc.get("profiles")}
+    started -= NOT_A_SERVICE
+    assert started <= SERVICE_NAMES.keys(), "give the new service a name in SERVICE_NAMES"
+
+    quickstart = section(read(README), "Quickstart")
+    (bullet,) = [line for line in quickstart.splitlines() if line.startswith("- `make up`")]
+    missing = [SERVICE_NAMES[name] for name in sorted(started) if SERVICE_NAMES[name] not in bullet]
+    assert missing == []
 
 
 def test_readme_embeds_the_gif_only_once_the_file_exists() -> None:

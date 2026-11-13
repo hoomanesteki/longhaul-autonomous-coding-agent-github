@@ -42,7 +42,7 @@ Every row of the control table names a test. A control without a test is listed 
 | The console API | HTTP requests | Bearer token, rate limit on actions, redaction on reads. |
 | Published ports (Postgres, Temporal, MinIO, metrics) | Connections | Bound to `127.0.0.1`. See the gaps below. |
 | Memory notes | Text the agent wrote from a task | Only `approved` items reach a prompt (invariant I7). |
-| Dependencies and images | Third-party code | Locked versions, `pip-audit` and gitleaks in CI, CodeQL on the code, and dependency review on each pull request. |
+| Dependencies and images | Third-party code | Locked versions, `pip-audit` and gitleaks in CI, CodeQL on the code, and dependency review on each pull request once the owner turns on the dependency graph and sets the `DEPENDENCY_REVIEW` variable. |
 
 ## Controls and the tests that prove them
 
@@ -136,7 +136,7 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 | Code from a fork never runs with a write token or a secret: no workflow uses `pull_request_target` or `workflow_run`, and a job that pull requests start writes nothing but code scanning results. | `unit/test_workflow_hardening.py::test_no_workflow_hands_a_write_token_to_a_fork`, `unit/test_ci_config.py::test_no_secrets_in_ci` |
 | Every job has a timeout, and a newer push cancels only the older run of the same pull request, never a run on `dev` or `main`. | `unit/test_workflow_hardening.py::test_every_job_of_every_workflow_has_a_timeout`, `::test_a_newer_push_cancels_only_the_older_run_of_its_pull_request`, `::test_two_workflows_never_share_a_concurrency_group` |
 | The workflow files are linted by actionlint, pinned by version and checksum, in the `lint` job. | `unit/test_workflow_hardening.py::test_the_lint_job_runs_a_pinned_actionlint` |
-| CodeQL scans the Python and the TypeScript on every push to `dev` and `main`, on pull requests and weekly. Dependency review fails a pull request that adds a dependency with a known high or critical vulnerability. | `unit/test_workflow_hardening.py::test_codeql_scans_python_and_typescript_on_every_change_and_weekly`, `::test_dependency_review_runs_on_pull_requests` |
+| CodeQL scans the Python and the TypeScript on every push to `dev` and `main`, on pull requests and weekly. Dependency review fails a pull request that adds a dependency with a known high or critical vulnerability. It runs once the owner turns on the dependency graph of the repository and sets the repository variable `DEPENDENCY_REVIEW` to `true`; until then the job is skipped. | `unit/test_workflow_hardening.py::test_codeql_scans_python_and_typescript_on_every_change_and_weekly`, `::test_dependency_review_runs_on_pull_requests` |
 | Dependabot watches every ecosystem the repo has: uv, npm in `console/`, the workflow actions, Terraform and the Dockerfiles in `docker/`. | `unit/test_workflow_hardening.py::test_dependabot_covers_every_ecosystem_of_the_repo`, `::test_the_ecosystem_walk_finds_a_new_folder_and_skips_the_fixtures` |
 | Releases are made with the run's own token only, from tags that exist (`--verify-tag`), and a second run changes nothing. | `unit/test_sync_releases.py::test_only_the_release_job_writes_and_only_to_contents`, `::test_the_create_command_cannot_make_a_tag_and_says_which_is_latest`, `::test_the_script_creates_each_missing_release_once` |
 

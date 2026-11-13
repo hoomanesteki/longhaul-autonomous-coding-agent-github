@@ -254,7 +254,11 @@ def test_codeql_scans_python_and_typescript_on_every_change_and_weekly() -> None
 def test_dependency_review_runs_on_pull_requests() -> None:
     workflow = load(WORKFLOWS / "dependency-review.yml")
     assert set(triggers(workflow)) == {"pull_request"}
-    steps = [step for job in workflow["jobs"].values() for step in job["steps"]]
+    # The action fails every pull request while the repository's dependency graph is off, so
+    # the job waits for the owner to turn the graph on and set the variable: skipped, not red.
+    jobs = list(workflow["jobs"].values())
+    assert [job.get("if") for job in jobs] == ["vars.DEPENDENCY_REVIEW == 'true'"]
+    steps = [step for job in jobs for step in job["steps"]]
     review = [s for s in steps if str(s.get("uses", "")).startswith("actions/dependency-review")]
     assert len(review) == 1
     assert review[0]["with"]["fail-on-severity"] in {"low", "moderate", "high"}

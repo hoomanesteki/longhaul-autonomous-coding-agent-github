@@ -85,7 +85,7 @@ make setup && make up && make demo
 ```
 
 - `make setup` installs the dependencies and the pre-commit hooks, and copies `.env.example` to `.env` when there is no `.env`.
-- `make up` starts Postgres, Temporal and MinIO, plus Jaeger, Prometheus and Grafana, from `docker-compose.yml`. The first run pulls the images.
+- `make up` starts Postgres, Temporal and MinIO, plus an OpenTelemetry collector, Jaeger, Prometheus and Grafana, from `docker-compose.yml`. The first run pulls the images.
 - `make demo` builds the sandbox image, creates the database tables, starts a worker, and runs one task on the `calc` fixture, a small package whose `add()` subtracts. It prints each status line and the final diff, then stops the worker. Nothing stays running.
 
 The sandbox setup installs pytest from PyPI, so the machine needs outbound network for the first minute of the task. If another project already uses a port, edit the `LH_*_PORT` values in `.env`. A new `LH_POSTGRES_PORT`, `LH_TEMPORAL_PORT` or `LH_MINIO_PORT` also needs the same port in `LONGHAUL_DATABASE_URL`, `LONGHAUL_TEMPORAL_ADDRESS` or `LONGHAUL_BLOB_ENDPOINT`, because those settings keep the default ports otherwise. A new `LH_OTLP_GRPC_PORT` also needs the same port in `OTEL_EXPORTER_OTLP_ENDPOINT`, or the traces go to whatever listens on port 4317. The Grafana, Prometheus and Jaeger ports can change on their own. `make down` stops the stack and removes its volumes.

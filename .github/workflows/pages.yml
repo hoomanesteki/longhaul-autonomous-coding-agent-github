@@ -31,6 +31,8 @@ jobs:
       pages: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The setup downloads Quarto from GitHub; one failed download should not fail the run.
       - id: quarto
         uses: quarto-dev/quarto-actions/setup@v2

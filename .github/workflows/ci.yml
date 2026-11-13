@@ -34,6 +34,8 @@ jobs:
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -58,6 +60,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -70,6 +74,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -127,6 +133,8 @@ jobs:
       LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -234,6 +242,8 @@ jobs:
       LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -345,6 +355,8 @@ jobs:
       LONGHAUL_BLOB_SECRET_KEY: longhaul-secret
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -413,6 +425,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Validate docker-compose.yml
         run: docker compose config -q
 
@@ -423,6 +437,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The setup downloads Quarto from GitHub; one failed download should not fail the run.
       - id: quarto
         uses: quarto-dev/quarto-actions/setup@v2
@@ -448,6 +464,8 @@ jobs:
         working-directory: console
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: "26"
@@ -509,6 +527,8 @@ jobs:
         working-directory: console
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
@@ -605,6 +625,8 @@ jobs:
         working-directory: deploy/terraform/aws
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: 1.17.0
@@ -623,6 +645,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Install gitleaks
         run: |
@@ -667,6 +690,8 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build the worker image
         run: docker build -f docker/worker/Dockerfile -t longhaul-worker:ci .
       - name: Build the API image
@@ -742,6 +767,8 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"

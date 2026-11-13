@@ -116,6 +116,27 @@ _EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 _ALLOWED = re.compile(r"[\w.'\s=!&|/-]*")
 
 
+def test_no_checkout_keeps_the_token_in_the_git_config() -> None:
+    # No job pushes with git, so no checkout needs to leave the token in .git/config, where any
+    # later step of the job could read it.
+    for path in workflow_files():
+        for name, job in load(path)["jobs"].items():
+            for step in job.get("steps", []):
+                if str(step.get("uses", "")).startswith("actions/checkout"):
+                    persist = step.get("with", {}).get("persist-credentials")
+                    assert persist is False, f"{path.name}:{name} keeps the token"
+
+
+def test_the_pre_commit_ruff_is_the_locked_ruff() -> None:
+    # The hook and `make check` must agree, or a commit passes the hook and fails in CI.
+    config = yaml.safe_load((ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8"))
+    (hook,) = [r for r in config["repos"] if r["repo"].endswith("/ruff-pre-commit")]
+    lock = (ROOT / "uv.lock").read_text(encoding="utf-8")
+    locked = re.search(r'name = "ruff"\nversion = "([^"]+)"', lock)
+    assert locked is not None
+    assert hook["rev"] == f"v{locked.group(1)}"
+
+
 def evaluate(value: Any, github: dict[str, str]) -> Any:
     """The value of a workflow field for a run with this `github` context."""
     if not isinstance(value, str):

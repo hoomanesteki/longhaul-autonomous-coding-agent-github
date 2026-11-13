@@ -26,6 +26,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -239,6 +240,10 @@ class World:
 
     def review_comments(self, number: int) -> list[str]:
         return [b for b in self.fake.comment_bodies(REPO, number) if "/longhaul approve" in b]
+
+    def asked(self, number: int, times: int) -> bool:
+        """Whether the issue holds `times` requests for a decision."""
+        return len(self.review_comments(number)) == times
 
     def review_labels(self, number: int) -> list[str]:
         """The needs-human label changes on the issue, in order: "labeled" and "unlabeled"."""
@@ -479,6 +484,7 @@ async def test_reject_revises(env: WorkflowEnvironment, fake: FakeGitHub, tmp_pa
             env.client, spec, task_queue=world.queue, plan=True, tuning=SHORT_HEARTBEAT
         )
         await wait_for_version(handle, 1)
+        await wait_until(lambda: world.review_comments(number), "the request for version 1")
         await reject(handle, "alice", "Run the tests with -x so the first failure shows.")
         revised = await wait_for_version(handle, 2)
         await wait_until(lambda: len(world.review_comments(number)) == 2, "the second request")
@@ -777,6 +783,11 @@ async def test_the_third_rejection_ends_the_task_as_stuck(
         handle = await start_task(env.client, spec, task_queue=world.queue, plan=True)
         for version in (1, 2, 3):
             await wait_for_version(handle, version)
+            # The phase shows before the workflow asks, and a decision that is there before it
+            # asks is taken without a request or a label. Answer the request, as a person does.
+            await wait_until(
+                partial(world.asked, number, version), f"the request for version {version}"
+            )
             await reject(handle, "alice", f"Not yet, round {version}.")
         outcome = await result_of(handle)
         status = await handle.query(TaskWorkflow.status)

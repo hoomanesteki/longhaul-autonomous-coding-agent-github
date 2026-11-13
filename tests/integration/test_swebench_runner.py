@@ -59,7 +59,7 @@ PROJECT = (
     '[tool.setuptools]\npackages = ["calc"]\n'
 )
 DOCKERFILE = """\
-FROM python:3.12.15-slim-trixie
+FROM python:3.12.16-slim-trixie
 RUN apt-get update && apt-get install -y --no-install-recommends git \\
     && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /opt/miniconda3/envs && python -m venv /opt/miniconda3/envs/testbed

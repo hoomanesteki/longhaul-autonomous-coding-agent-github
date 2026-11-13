@@ -415,9 +415,10 @@ def run(
         typer.Option(
             "--window",
             min=1,
-            help="The context window of this run, in tokens, in place of context.window_tokens "
-            "of the worker's config. A small one makes a short task compact its context. The "
-            "cap for one tool result shrinks with it, to 1/32 of the window at most. The prompt "
+            help="The context window of this run, in tokens, in place of the window of the "
+            "worker's config (context.window_tokens). A small one makes a short task compact "
+            "its context. The cap for one tool result shrinks with it, to 1/32 of the window at "
+            "most. The prompt "
             "and the tool list take about 2,000 tokens, so a window under 3,000 leaves no room.",
         ),
     ] = None,

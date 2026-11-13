@@ -416,6 +416,10 @@ jobs:
           version: 1.10.18
       - name: Render the docs site
         run: quarto render site
+      # Pages serves the site under the repository name. The check reads the pages as Pages
+      # serves them and fails on a link, anchor or image that does not resolve there.
+      - name: Check the links of the docs site
+        run: make site-check
 
   # The console (console/): lint, typecheck, test and build. The API types are generated from
   # console/openapi.json, so the job generates them again and fails when the committed file

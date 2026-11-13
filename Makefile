@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate demo
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview site-check site-links gate demo
 
 PHASE ?= 0
 
@@ -90,6 +90,19 @@ site:
 
 site-preview:
 	quarto preview site
+
+# GitHub Pages serves the site under the repository name, so a link that starts with / leaves it.
+# site-check reads the rendered pages as Pages serves them and fails on a link, anchor or image
+# that does not resolve; CI runs it after each render. site-links also asks every external link
+# for an answer, which needs the network, so it only runs on request.
+SITE_URL := https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/
+SITE_CHECK := python3 scripts/check_site.py site/_site --prefix /longhaul-autonomous-coding-agent-github/ --site-url $(SITE_URL)
+
+site-check:
+	$(SITE_CHECK)
+
+site-links:
+	$(SITE_CHECK) --external
 
 # The phases whose gate also runs the console: phase 8 built it, and phase 9 includes it.
 # Integration checkpoint 8 names its unit tests and the Playwright main path (LH-891).

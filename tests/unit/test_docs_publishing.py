@@ -14,6 +14,8 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 SITE_URL = "https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/"
 QUARTO_VERSION = "1.10.18"
+# Render, then check every link, anchor and image under the Pages address (scripts/check_site.py).
+SITE_COMMANDS = ["quarto render site", "make site-check"]
 
 
 def workflow(name: str) -> dict[str, Any]:
@@ -37,7 +39,7 @@ def test_the_docs_job_renders_the_site_with_the_pinned_quarto() -> None:
     for setup in steps_using(job, "quarto-dev/quarto-actions/setup"):
         assert re.search(r"@v\d+$", setup["uses"])
         assert setup["with"]["version"] == QUARTO_VERSION
-    assert run_commands(job) == ["quarto render site"]
+    assert run_commands(job) == SITE_COMMANDS
     assert "docs" in ci["jobs"]["ci"]["needs"]
 
 
@@ -55,7 +57,7 @@ def test_pages_builds_then_deploys_one_deployment_at_a_time() -> None:
     build, deploy = pages["jobs"]["build"], pages["jobs"]["deploy"]
     assert deploy["needs"] == "build"
     assert deploy["environment"]["name"] == "github-pages"
-    assert run_commands(build) == ["quarto render site"]
+    assert run_commands(build) == SITE_COMMANDS
     (artifact,) = steps_using(build, "actions/upload-pages-artifact")
     assert artifact["with"]["path"] == "site/_site"
     assert steps_using(build, "actions/configure-pages")
@@ -72,9 +74,21 @@ def test_pages_deploys_unless_the_owner_turns_it_off() -> None:
     for action in ("actions/configure-pages", "actions/upload-pages-artifact"):
         (step,) = steps_using(build, action)
         assert step["if"] == gate
-    # The render itself is never gated, so a broken page still fails the run.
-    render = [s for s in build["steps"] if s.get("run") == "quarto render site"]
-    assert render and "if" not in render[0]
+    # The render and the check are never gated, so a broken page or link still fails the run.
+    for command in SITE_COMMANDS:
+        step = [s for s in build["steps"] if s.get("run") == command]
+        assert step and "if" not in step[0], command
+
+
+def test_pages_checks_the_site_before_it_uploads_it() -> None:
+    steps = workflow("pages.yml")["jobs"]["build"]["steps"]
+    names = [str(step.get("run") or step.get("uses")).split("@")[0] for step in steps]
+    position = {name: index for index, name in enumerate(names)}
+    assert (
+        position["quarto render site"]
+        < position["make site-check"]
+        < position["actions/upload-pages-artifact"]
+    )
 
 
 def test_only_the_pages_deploy_job_can_mint_a_token() -> None:

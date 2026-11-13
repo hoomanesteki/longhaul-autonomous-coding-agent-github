@@ -42,7 +42,7 @@ Every row of the control table names a test. A control without a test is listed 
 | The console API | HTTP requests | Bearer token, rate limit on actions, redaction on reads. |
 | Published ports (Postgres, Temporal, MinIO, metrics) | Connections | Bound to `127.0.0.1`. See the gaps below. |
 | Memory notes | Text the agent wrote from a task | Only `approved` items reach a prompt (invariant I7). |
-| Dependencies and images | Third-party code | Locked versions, `pip-audit` and gitleaks in CI. |
+| Dependencies and images | Third-party code | Locked versions, `pip-audit` and gitleaks in CI, CodeQL on the code, and dependency review on each pull request. |
 
 ## Controls and the tests that prove them
 
@@ -132,6 +132,13 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 |---|---|
 | Actions in CI are pinned to major versions and the Temporal image to a digest. | `unit/test_ci_config.py::test_actions_use_pinned_major_versions`, `::test_temporal_image_check_accepts_the_pinned_image` |
 | Dependencies are locked and scanned by `pip-audit`, with every extra and the dev group included, and the history is scanned by gitleaks. | The `security` job in `.github/workflows/ci.yml`, and `unit/test_security_page.py::test_the_ci_audit_covers_every_extra`. The results of the pass that wrote this page are below. |
+| Every workflow starts from a read-only token, and only four jobs hold a write scope: the two Pages jobs, the release job (`contents`) and the CodeQL job (`security-events`). A shorthand such as `write-all` is refused. | `unit/test_workflow_hardening.py::test_every_workflow_is_read_only_unless_a_job_says_otherwise`, `::test_the_permission_reader_refuses_the_shorthands` |
+| Code from a fork never runs with a write token or a secret: no workflow uses `pull_request_target` or `workflow_run`, and a job that pull requests start writes nothing but code scanning results. | `unit/test_workflow_hardening.py::test_no_workflow_hands_a_write_token_to_a_fork`, `unit/test_ci_config.py::test_no_secrets_in_ci` |
+| Every job has a timeout, and a newer push cancels only the older run of the same pull request, never a run on `dev` or `main`. | `unit/test_workflow_hardening.py::test_every_job_of_every_workflow_has_a_timeout`, `::test_a_newer_push_cancels_only_the_older_run_of_its_pull_request`, `::test_two_workflows_never_share_a_concurrency_group` |
+| The workflow files are linted by actionlint, pinned by version and checksum, in the `lint` job. | `unit/test_workflow_hardening.py::test_the_lint_job_runs_a_pinned_actionlint` |
+| CodeQL scans the Python and the TypeScript on every push to `dev` and `main`, on pull requests and weekly. Dependency review fails a pull request that adds a dependency with a known high or critical vulnerability. | `unit/test_workflow_hardening.py::test_codeql_scans_python_and_typescript_on_every_change_and_weekly`, `::test_dependency_review_runs_on_pull_requests` |
+| Dependabot watches every ecosystem the repo has: uv, npm in `console/`, the workflow actions, Terraform and the Dockerfiles in `docker/`. | `unit/test_workflow_hardening.py::test_dependabot_covers_every_ecosystem_of_the_repo`, `::test_the_ecosystem_walk_finds_a_new_folder_and_skips_the_fixtures` |
+| Releases are made with the run's own token only, from tags that exist (`--verify-tag`), and a second run changes nothing. | `unit/test_sync_releases.py::test_only_the_release_job_writes_and_only_to_contents`, `::test_the_create_command_cannot_make_a_tag_and_says_which_is_latest`, `::test_the_script_creates_each_missing_release_once` |
 
 ### Controls without a test
 
@@ -139,6 +146,7 @@ Paths are relative to `tests/`. A test marked `integration` needs `make up` and 
 |---|---|
 | Branch protection on `main` and `dev`. | `scripts/protect_branches.sh`, and the settings of the repo on GitHub. It needs an admin with `gh`, so no test can run it. |
 | The container user is `agent` by name, and the image fixes the uid at 10001. | `docker/sandbox/Dockerfile`. `test_inspect_flags` checks the name and `test_the_flags_hold_inside_the_container` checks the uid. |
+| What CodeQL and dependency review find, and the releases the release workflow makes. | Security, Code scanning, the checks of a pull request, and the Releases page on GitHub. The tests pin the workflow files, not what GitHub does when it runs them. |
 
 ## What the checks found
 
@@ -252,4 +260,5 @@ gitleaks git --log-opts="--all" --redact .
 uv export --frozen --all-extras --no-emit-project --no-hashes -o /tmp/audit.txt
 uvx pip-audit -r /tmp/audit.txt --no-deps --disable-pip
 (cd console && npm audit --package-lock-only)
+actionlint                              # from the repo root, release 1.7.12 as in the lint job
 ```

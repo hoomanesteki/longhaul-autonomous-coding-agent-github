@@ -1329,11 +1329,11 @@ With no run ids it writes the placeholder, which says that no real run exists an
 
 ## CI
 
-Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
+Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `main`, on pushes to those branches and to `feat/`, `fix/`, `spike/` and `chore/` branches, and by hand. A new push to a pull request cancels the older run of that pull request. A run on `dev` or `main` is never cancelled, and two runs there never wait for each other, because each has a concurrency group of its own. Every workflow starts from a read-only token (`permissions: contents: read`), and every job has a timeout. CI has no secrets and always uses the scripted provider. A unit test scans every file in `.github/workflows/` and fails on any use of the `secrets` context, including `secrets['NAME']`, `toJSON(secrets)` and `secrets: inherit`.
 
 | Job | What it does |
 |---|---|
-| `lint` | `ruff check` and `ruff format --check` |
+| `lint` | `ruff check` and `ruff format --check`, then `actionlint` (1.7.12, checksum checked) over every file in `.github/workflows/`, with shellcheck on the run steps |
 | `types` | `mypy src eval`. Strict checks apply to `longhaul.contracts`, `longhaul.durable`, `longhaul.context` and `longhaul.cost` only |
 | `unit` | unit tests with coverage, failing under 80 percent; uploads `coverage.xml` |
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
@@ -1351,7 +1351,39 @@ The Temporal server in the `integration` job is the image that `docker-compose.y
 
 Dependabot opens its version-update pull requests against `dev` (`target-branch: dev` in `.github/dependabot.yml`), because `main` moves only through phase-gate pull requests. Updates are grouped, so each ecosystem opens one pull request a week instead of one per package. A major Python bump still opens on its own, because it can need code changes and an ADR-0002 update. Dependabot reads that file from the default branch, so it starts working after the first gate merge puts the file on `main`. The setting does not cover Dependabot security updates, which open against `main`. If you turn those on, treat one like a hotfix: merge it, then merge `main` back into `dev` the same day (plan section 5.2).
 
-To run the quick jobs on your machine, use `make ci-local`.
+Dependabot also watches the base images of the Dockerfiles in `docker/`. It proposes patch releases of `python` only, because the project runs on Python 3.12, and no new `node` major, because the console job pins the same major. Both are changes by hand.
+
+To run the quick jobs on your machine, use `make ci-local`. To lint the workflows as the `lint` job does, run `actionlint` from the repo root with the release from https://github.com/rhysd/actionlint/releases.
+
+### Other workflows
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `codeql.yml` | pushes to `dev` and `main`, pull requests into them, Mondays at 04:41 UTC, by hand | CodeQL for Python and for JavaScript and TypeScript, with no build. Findings show under Security, Code scanning, and on the pull request. Its job is the only one here with `security-events: write` |
+| `dependency-review.yml` | pull requests into `dev` and `main` | fails when the pull request adds a dependency with a known vulnerability of high or critical severity, in any ecosystem that the dependency graph reads |
+| `release.yml` | pushes of a version tag, pushes to `main`, by hand | creates the missing GitHub Releases (see "Releases" below) |
+| `pages.yml` | pushes to `main`, by hand | publishes the docs site (see "Publishing" under "Docs site") |
+
+The `ci` job does not wait for these, so branch protection does not require them. A failed CodeQL or dependency review still shows as a red check on the pull request. `tests/unit/test_workflow_hardening.py` holds every workflow to a read-only top, a list of the jobs that may write, a timeout per job, no `pull_request_target` or `workflow_run` trigger, and concurrency groups that cancel only an older run of the same pull request.
+
+### Releases
+
+`.github/workflows/release.yml` makes sure every version tag has a GitHub Release. It runs `scripts/sync_releases.py`, which reads the tags `vX.Y.Z` and `vX.Y.Z-suffix` with `git for-each-ref` and the releases that exist with `gh`, and creates one release for each tag that has none, oldest version first:
+
+- the title is the tag, and the notes are the annotated message of the tag;
+- the highest version without a suffix is marked as the latest release, and every other new release is not, so a tag for an older line never takes that place;
+- a tag with a suffix, such as `v1.1.0-rc.1`, is a pre-release.
+
+A tag that already has a release is left alone, so a run with nothing new changes nothing and a release edited on GitHub keeps its edits. The job uses the run's own `GITHUB_TOKEN` with `contents: write`, the only write scope of the workflow. No pull request starts it. Runs go one at a time, so two runs never create the same release.
+
+To cut a release, tag the merge commit on `main` with an annotated tag and push the tag:
+
+```bash
+git tag -a v1.0.1 -m "v1.0.1: what changed" -m "Longer notes for the release page."
+git push origin v1.0.1
+```
+
+The tags that were there before the workflow (`v0.0.1` to `v1.0.0`) get their releases on its first run on `main`. To see what a run would create, run `python3 scripts/sync_releases.py --repo OWNER/REPO --dry-run` with `gh` logged in.
 
 ### Test markers and `make gate`
 

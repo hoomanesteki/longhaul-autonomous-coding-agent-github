@@ -615,6 +615,21 @@ def test_dependabot_groups_its_updates() -> None:
         assert "*" in patterns, update["package-ecosystem"]
 
 
+# --- docs: the site renders, and its links resolve where Pages serves it -------------------
+
+
+def test_docs_job_checks_the_links_of_the_rendered_site() -> None:
+    # A link that starts with / renders fine and breaks under the Pages address, so the job
+    # checks the output of the render, after it, on every push and pull request.
+    job = load_workflow()["jobs"]["docs"]
+    render, check = step_index(job, "quarto render site"), step_index(job, "make site-check")
+    assert render is not None and check is not None and render < check
+    target = re.search(r"^site-check:\n\t(.+)$", MAKEFILE.read_text(), re.M)
+    assert target and target.group(1) == "$(SITE_CHECK)"
+    assert "scripts/check_site.py site/_site" in MAKEFILE.read_text()
+    assert "--external" not in target.group(1), "external links are flaky in CI"
+
+
 # --- console: the npm checks run on every pull request ---------------------------------------
 
 

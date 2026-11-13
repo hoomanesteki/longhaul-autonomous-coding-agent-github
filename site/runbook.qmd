@@ -1,12 +1,14 @@
 ---
 title: Runbook
+pagetitle: "Runbook | Longhaul"
+description: "How to run, steer, observe and upgrade Longhaul, and how this site is built."
 toc-depth: 2
 ---
 
-::: {.source-note}
-Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md). To change it, edit that file.
-:::
-
 ::: {.drop-title base="docs"}
 {{< include ../docs/runbook.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md). To change it, edit that file.
 :::

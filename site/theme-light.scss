@@ -1,5 +1,12 @@
 /*-- scss:defaults --*/
 
+// Cosmo's blue (#2780e3) gives white button text a contrast of 3.97, under the 4.5 that WCAG AA
+// asks for. This darker blue reaches 5.3 and still reads as the same color.
+$primary: #1b6ac9;
+// Code blocks. On cosmo's gray (#eceef1) the orange of the a11y highlight style reaches 4.44,
+// just under 4.5. A lighter gray lifts it over.
+$code-block-bg: #f5f6f8;
+
 // Colors for the mermaid diagrams. Quarto derives them from the theme, and for cosmo that
 // paints the subgraph boxes dark gray, so the diagrams get their own values.
 $mermaid-edge-color: #4b5663;

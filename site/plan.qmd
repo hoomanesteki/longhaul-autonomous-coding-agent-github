@@ -1,12 +1,18 @@
 ---
 title: Build plan
+pagetitle: "Build plan | Longhaul"
+description: "The build plan: phases, stories, acceptance criteria and the evaluation method."
 toc-depth: 3
 ---
 
 ::: {.source-note}
-Rendered from [`docs/plan/longhaul-build-plan.md`]({{< meta source-repo >}}/blob/main/docs/plan/longhaul-build-plan.md). To change it, edit that file. The two mermaid diagrams in sections 3.1 and 3.2 show as code here. They are drawn on the [architecture page](architecture.qmd).
+The diagrams of sections 3.1 and 3.2 show as code on this page. The [architecture page](architecture.qmd) draws them.
 :::
 
-::: {.drop-title base="docs/plan"}
+::: {.drop-title base="docs/plan" mermaid="code"}
 {{< include ../docs/plan/longhaul-build-plan.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/plan/longhaul-build-plan.md`]({{< meta source-repo >}}/blob/main/docs/plan/longhaul-build-plan.md). To change it, edit that file.
 :::

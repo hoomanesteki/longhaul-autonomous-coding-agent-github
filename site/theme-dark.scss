@@ -10,6 +10,17 @@ $navbar-hl: #ffffff;
 $code-bg: #1d222a;
 $code-color: #f0a8d0;
 $border-color: #2d343f;
+// Buttons. A light blue takes dark text, and the gray of an outline button must show on the
+// dark page. Cosmo's own values give contrasts of 3.97 and 1.56.
+$primary: #5b9cf0;
+$secondary: #a3aebd;
+// Cosmo lowers the contrast Bootstrap asks of button text, which keeps white text on the light
+// blue. With the WCAG value Bootstrap picks dark text there.
+$min-contrast-ratio: 4.5;
+// Code blocks. Quarto paints them with a light gray by default, which hides the light text of
+// the dark highlight style.
+$code-block-bg: #1d222a;
+$pre-color: #d8dde6;
 
 // Mermaid diagrams: light lines and text, and dark boxes with a blue outline.
 $mermaid-edge-color: #a3aebd;

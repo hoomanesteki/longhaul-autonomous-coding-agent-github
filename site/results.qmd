@@ -1,5 +1,8 @@
 ---
 title: Results
+pagetitle: "Results | Longhaul"
+description: "What the chaos suite measured, what the model evaluation will measure, and where each number comes from."
+hide-description: true
 subtitle: What is measured, what is pending, and where each number comes from
 toc-depth: 2
 ---

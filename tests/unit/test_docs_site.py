@@ -81,8 +81,73 @@ def test_the_navbar_lists_every_page_in_order() -> None:
 
 
 def test_every_top_level_page_is_in_the_navbar() -> None:
+    # 404.qmd is the page GitHub Pages shows for an address it does not have. It is no page to
+    # go to, so it stays out of the navbar.
     pages = {path.name for path in SITE.glob("*.qmd")}
-    assert pages == set(PAGES)
+    assert pages == {*PAGES, "404.qmd"}
+
+
+def test_the_not_found_page_leads_back_into_the_site() -> None:
+    text = (SITE / "404.qmd").read_text(encoding="utf-8")
+    assert "](index.qmd)" in text
+    assert "{{< meta source-repo >}}" in text
+
+
+def front_matter(page: Path) -> dict[str, Any]:
+    data = yaml.safe_load(page.read_text(encoding="utf-8").split("---\n")[1])
+    assert isinstance(data, dict)
+    return data
+
+
+@pytest.mark.parametrize("page", sorted(path.name for path in SITE.glob("*.qmd")))
+def test_every_page_sets_its_tab_and_card_title(page: str) -> None:
+    # Quarto joins the title and the site name with an en dash in the social card unless the
+    # page sets pagetitle. The ADR pages get theirs from scripts/site_pages.py.
+    meta = front_matter(SITE / page)
+    expected = "Longhaul" if meta["title"] == "Longhaul" else f"{meta['title']} | Longhaul"
+    assert meta["pagetitle"] == expected
+    if page != "404.qmd":
+        assert meta["description"].endswith("."), "search engines and the card show it"
+
+
+def test_the_site_has_a_social_card_and_a_favicon() -> None:
+    website = quarto_config()["website"]
+    assert website["open-graph"] is True
+    assert website["twitter-card"] is True
+    assert website["favicon"] == "favicon.svg"
+    card = SITE / website["image"]
+    # A PNG of 1200 by 630, the size the cards are drawn at.
+    header = card.read_bytes()[:24]
+    assert header[:8] == b"\x89PNG\r\n\x1a\n"
+    assert (int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")) == (
+        1200,
+        630,
+    )
+    assert website["image-alt"]
+    # The home page shows screenshots, and Quarto would take the first one for its card.
+    assert front_matter(SITE / "index.qmd")["image"] == website["image"]
+
+
+def test_the_pages_read_markdown_as_github_does() -> None:
+    # Smart typography would turn "--" into an en dash, which the voice guide bans, and the gate
+    # reports hold many command options such as --window.
+    assert quarto_config()["format"]["html"]["from"] == "markdown-smart"
+    fragments = (SITE / "filters" / "fragments.lua").read_text(encoding="utf-8")
+    assert '"markdown-smart"' in fragments
+    assert 'pandoc.read(read(relative), "markdown")' not in fragments
+
+
+def test_the_theme_keeps_code_and_scrolling_boxes_readable() -> None:
+    html = quarto_config()["format"]["html"]
+    assert html["highlight-style"] == "a11y"
+    script = SITE / html["include-after-body"]
+    assert 'setAttribute("tabindex", "0")' in script.read_text(encoding="utf-8")
+    # axe-core found light text on a light gray code block in dark mode, white text on the
+    # light blue button, and orange tokens just under 4.5 on the light code block.
+    dark = (SITE / "theme-dark.scss").read_text(encoding="utf-8")
+    assert "$code-block-bg:" in dark
+    assert "$min-contrast-ratio: 4.5;" in dark
+    assert "$code-block-bg:" in (SITE / "theme-light.scss").read_text(encoding="utf-8")
 
 
 def test_the_overview_links_every_page_of_the_navbar() -> None:
@@ -140,9 +205,28 @@ def test_the_tab_title_is_set_by_the_filter_so_quarto_adds_no_en_dash() -> None:
 def test_makefile_has_the_site_targets() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     phony = re.search(r"^\.PHONY:(.*)$", makefile, re.MULTILINE)
-    assert phony and {"site", "site-preview"} <= set(phony.group(1).split())
+    assert phony and {"site", "site-preview", "site-check", "site-links"} <= set(
+        phony.group(1).split()
+    )
     assert re.search(r"^site:\n\tquarto render site$", makefile, re.MULTILINE)
     assert re.search(r"^site-preview:\n\tquarto preview site$", makefile, re.MULTILINE)
+    assert re.search(r"^site-check:\n\t\$\(SITE_CHECK\)$", makefile, re.MULTILINE)
+    # External links need the network, so only the target run on request asks them.
+    assert re.search(r"^site-links:\n\t\$\(SITE_CHECK\) --external$", makefile, re.MULTILINE)
+
+
+def test_the_site_check_reads_the_site_under_the_address_pages_gives_it() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    command = re.search(r"^SITE_CHECK := (.*)$", makefile, re.MULTILINE)
+    url = re.search(r"^SITE_URL := (.*)$", makefile, re.MULTILINE)
+    assert command and url
+    assert url.group(1) == quarto_config()["website"]["site-url"] == SITE_URL
+    words = command.group(1).split()
+    assert words[:3] == ["python3", "scripts/check_site.py", "site/_site"]
+    prefix = words[words.index("--prefix") + 1]
+    assert SITE_URL.endswith(prefix.lstrip("/"))
+    assert prefix == "/longhaul-autonomous-coding-agent-github/"
+    assert words[words.index("--site-url") + 1] == "$(SITE_URL)"
 
 
 def test_git_ignores_rendered_output_and_generated_pages_but_not_the_sources() -> None:

@@ -1,8 +1,13 @@
 ---
 title: Longhaul
+pagetitle: "Longhaul"
+description: "Longhaul is a background coding agent for GitHub issues. It survives crashes, asks a person only at checkpoints, and ends with a pull request or a report of where it got stuck."
+hide-description: true
 subtitle: A background coding agent that survives crashes and tells you when it is stuck
 toc: false
 lightbox: true
+# Without this the card would show the first screenshot of the page.
+image: social-card.png
 ---
 
 ::: {.lead}
@@ -17,7 +22,7 @@ Coding agents can fix many small, well-specified issues, but people still sit an
 :::
 
 ::: {.callout-note appearance="simple"}
-All nine phases are built, and `v1.0.0` is the release. The chaos suite is measured. The model evaluation (SWE-bench and the custom set) and the demo video are not made yet: they need an API key, the eval VM and a recording. The [results page](results.qmd) says where those numbers will come from.
+The agent is built: phases 1 to 9 are done, and `v1.0.0` is the release. The chaos suite is measured. The model evaluation (SWE-bench and the custom set) and the demo video are not made yet: they need an API key, the eval VM and a recording. The [results page](results.qmd) says where those numbers will come from.
 :::
 
 ## The problem
@@ -117,6 +122,8 @@ make setup && make up && make demo
 `make demo` runs one task on a small package whose `add()` subtracts, prints each status line and the final diff, and stops. To run Longhaul on your own repo, follow "Run on your repo" in the [README]({{< meta source-repo >}}#run-on-your-repo) and the [runbook](runbook.qmd).
 
 ## Where it stands
+
+The table is read from the [progress page](progress.qmd) each time the site is built. Phase 0 has two stories open, and both wait on steps the owner takes on GitHub: branch protection for `dev` and `main`, and the import of the backlog as issues. The [Phase 0 gate report](gates.qmd#phase-0-gate-foundation-and-backlog-import) has the details.
 
 ::: {fragment="_generated/status.md"}
 :::

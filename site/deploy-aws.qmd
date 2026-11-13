@@ -1,12 +1,14 @@
 ---
 title: Deploy to AWS
+pagetitle: "Deploy to AWS | Longhaul"
+description: "The Terraform for AWS: what it builds, what it costs, and how to apply it and tear it down."
 toc-depth: 2
 ---
 
-::: {.source-note}
-Rendered from [`docs/deploy-aws.md`]({{< meta source-repo >}}/blob/main/docs/deploy-aws.md). To change it, edit that file.
-:::
-
 ::: {.drop-title base="docs"}
 {{< include ../docs/deploy-aws.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/deploy-aws.md`]({{< meta source-repo >}}/blob/main/docs/deploy-aws.md). To change it, edit that file.
 :::

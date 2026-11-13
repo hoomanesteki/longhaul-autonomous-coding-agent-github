@@ -45,6 +45,10 @@ jobs:
           version: 1.10.18
       - name: Render the docs site
         run: quarto render site
+      # Fails on a link, anchor or image that does not resolve under the Pages address, before
+      # anything is uploaded. Like the render, it runs whether or not the deploy is on.
+      - name: Check the links of the docs site
+        run: make site-check
       # The Pages steps run unless the repository variable PAGES_ENABLED is false. With the
       # deploy turned off the site still renders, so a broken page still fails the run.
       - uses: actions/configure-pages@v6

@@ -1,11 +1,9 @@
 ---
 title: Architecture
+pagetitle: "Architecture | Longhaul"
+description: "The system context, the life of one task, the components, the data stores, and the traces, logs and metrics."
 toc-depth: 2
 ---
-
-::: {.source-note}
-The diagrams and the component table are read from sections 3.1 to 3.3 of the [plan](plan.qmd) each time the site is built. The notes after them are [`docs/architecture.md`]({{< meta source-repo >}}/blob/main/docs/architecture.md). To change either, edit those files.
-:::
 
 ## System context
 
@@ -38,4 +36,8 @@ One task, from a labeled issue to a pull request or a stuck report. The workflow
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/architecture.md >}}
+:::
+
+::: {.source-note}
+The diagrams and the component table are read from sections 3.1 to 3.3 of the [plan](plan.qmd) each time the site is built. The notes after them are [`docs/architecture.md`]({{< meta source-repo >}}/blob/main/docs/architecture.md). To change either, edit those files.
 :::

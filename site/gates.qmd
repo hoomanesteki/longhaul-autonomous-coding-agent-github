@@ -1,5 +1,7 @@
 ---
 title: Gate reports
+pagetitle: "Gate reports | Longhaul"
+description: "The review at the end of each phase: what passed, what failed and what was fixed."
 toc-depth: 2
 ---
 

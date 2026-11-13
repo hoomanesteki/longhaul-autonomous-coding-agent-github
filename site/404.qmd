@@ -1,0 +1,16 @@
+---
+title: Page not found
+pagetitle: "Page not found | Longhaul"
+toc: false
+---
+
+There is no page at this address. A link may point at a page that moved, or the address may have a typo.
+
+These pages are a good place to start:
+
+- [Overview](index.qmd): what Longhaul is, how it works and what is proven so far
+- [Architecture](architecture.qmd): the system context and the life of one task
+- [Results](results.qmd): the chaos suite and the model evaluation
+- [Runbook](runbook.qmd): how to run, steer and observe Longhaul
+
+The search in the navbar finds a word on any page. The source of every page is in the [repository on GitHub]({{< meta source-repo >}}).

@@ -208,7 +208,8 @@ The docs site renders the same files with a grouped navbar, once GitHub Pages is
 | `config/` | Example `longhaul.yaml` and the pricing table |
 | `docs/` | Architecture, runbook, security, results, decisions, gate reports and the plan |
 | `deploy/` | Terraform for AWS |
-| `scripts/` | The demo, the kill-the-worker script, backlog import and fixture builders |
+| `site/` | The Quarto docs site, which renders the files of `docs/` (`make site`) |
+| `scripts/` | The demo, the kill-the-worker script, backlog import, fixture builders and the docs site scripts |
 
 ## Development
 

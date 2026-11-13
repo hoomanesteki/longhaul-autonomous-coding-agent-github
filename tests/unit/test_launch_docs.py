@@ -23,19 +23,24 @@ README = ROOT / "README.md"
 DOCS = ROOT / "docs"
 CHAOS_SUMMARY = ROOT / "eval" / "results" / "chaos-2026-11-07" / "summary.json"
 
-# Section 11.1 of the plan, in order. Extra sections may sit between these, none may be missing.
+# The README reads as a story: what it does, the proof, the screens, how to run it, how it is
+# built, and where it stands. It holds every part of section 11.1 of the plan: the headline
+# numbers and the results table are both in "Proof", the demo is a subsection of "See it", and
+# safety and the design decisions are subsections of "How it is built". Extra sections may sit
+# between these, none may be missing.
 README_SECTIONS = [
-    "Headline numbers",
-    "Demo",
     "How it works",
+    "Proof",
+    "See it",
     "Quickstart",
     "Run on your repo",
-    "Results",
-    "Design decisions",
-    "Safety",
-    "Limitations",
+    "How it is built",
+    "Status and limitations",
+    "Docs map",
     "License",
 ]
+README_SUBSECTIONS = {"See it": ["Demo"], "How it is built": ["Safety", "Design decisions"]}
+PROGRESS = DOCS / "progress.md"
 
 
 def read(path: Path) -> str:
@@ -55,8 +60,10 @@ def headings(text: str, level: int = 2) -> list[str]:
 
 
 def section(text: str, title: str, level: int = 2) -> str:
-    """The body of the section with this heading, up to the next heading of the same level."""
+    """The body of the section with this heading, up to the next heading of the same or a higher
+    level, so a subsection ends where its parent section does."""
     marker = "#" * level + " "
+    ends = re.compile(rf"#{{1,{level}}} ")
     lines = text.splitlines()
     start = next(i for i, line in enumerate(lines) if line == f"{marker}{title}")
     body: list[str] = []
@@ -64,7 +71,7 @@ def section(text: str, title: str, level: int = 2) -> str:
     for line in lines[start + 1 :]:
         if line.startswith("```"):
             fenced = not fenced
-        if not fenced and line.startswith(marker):
+        if not fenced and ends.match(line):
             break
         body.append(line)
     return "\n".join(body)
@@ -76,9 +83,22 @@ def mermaid_blocks(text: str) -> list[str]:
 
 # ---------- README ----------
 def test_readme_follows_the_launch_outline_in_order() -> None:
-    found = headings(read(README))
+    text = read(README)
+    found = headings(text)
     positions = [found.index(title) for title in README_SECTIONS]
     assert positions == sorted(positions), found
+    for parent, children in README_SUBSECTIONS.items():
+        assert headings(section(text, parent), level=3) == children, parent
+
+
+def progress_statuses() -> dict[str, str]:
+    """The status of every story in docs/progress.md, by story id."""
+    statuses: dict[str, str] = {}
+    for line in read(PROGRESS).splitlines():
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if line.startswith("| LH-"):
+            statuses[cells[0]] = cells[3]
+    return statuses
 
 
 def test_readme_title_status_and_site_link_stay_near_the_top() -> None:
@@ -86,10 +106,24 @@ def test_readme_title_status_and_site_link_stay_near_the_top() -> None:
     top = text.splitlines()[:12]
     assert top[0] == "# Longhaul"
     status = next(line for line in top if line.startswith("Status:"))
-    # Phase 0 keeps two stories that wait on the owner on GitHub, so the status names them.
-    assert "phases 1 to 9 are done" in status and "LH-003" in status and "LH-006" in status
-    assert "v1.0.0" in status
+    # The status says every phase is done, which holds only while every story in the progress
+    # file is Done and the progress file has the ten phases, 0 to 9.
+    assert "all ten phases (0 to 9) are done" in status and "v1.0.0" in status
+    phases = re.findall(r"^## Phase (\d+):", read(PROGRESS), flags=re.MULTILINE)
+    assert phases == [str(n) for n in range(10)]
+    statuses = progress_statuses()
+    assert statuses and set(statuses.values()) == {"Done"}, statuses
     assert any("actions/workflows/ci.yml/badge.svg" in line for line in top)
+
+
+def test_readme_names_the_owner_steps_once_and_not_as_open_stories() -> None:
+    text = read(README)
+    status = section(text, "Status and limitations")
+    for anchor in ("docs/runbook.md#branch-protection", "docs/runbook.md#backlog-import"):
+        assert text.count(anchor) == 1 and anchor in status, anchor
+    runbook = headings(read(DOCS / "runbook.md"), level=3)
+    assert {"Branch protection", "Backlog import"} <= set(runbook)
+    assert "LH-003" not in text and "LH-006" not in text
 
 
 def test_readme_quickstart_is_three_commands_with_no_key() -> None:
@@ -129,7 +163,7 @@ def test_readme_embeds_the_gif_only_once_the_file_exists() -> None:
     # Before the recording the section names the path and embeds nothing. The recording checklist
     # tells the owner to save the file and add the image, and this check must accept that step.
     text = read(README)
-    demo = section(text, "Demo")
+    demo = section(text, "Demo", level=3)
     assert "docs/media/demo.gif" in text
     if (ROOT / "docs" / "media" / "demo.gif").exists():
         assert "![" in demo
@@ -138,10 +172,11 @@ def test_readme_embeds_the_gif_only_once_the_file_exists() -> None:
         assert "![" not in demo
 
 
-def test_readme_diagram_is_mermaid_with_the_four_ideas_beside_it() -> None:
-    how = section(read(README), "How it works")
-    assert len(mermaid_blocks(how)) == 1
-    bullets = [line for line in how.splitlines() if line.startswith("- ")]
+def test_readme_diagram_is_mermaid_and_the_four_ideas_open_how_it_is_built() -> None:
+    text = read(README)
+    assert len(mermaid_blocks(section(text, "How it works"))) == 1
+    ideas = section(text, "How it is built").split("\n### ", 1)[0]
+    bullets = [line for line in ideas.splitlines() if line.startswith("- ")]
     assert len(bullets) == 4
 
 
@@ -154,7 +189,7 @@ def test_readme_run_on_your_repo_uses_commands_the_cli_has() -> None:
 
 
 def test_readme_links_every_adr_with_one_line_each() -> None:
-    decisions = section(read(README), "Design decisions")
+    decisions = section(read(README), "Design decisions", level=3)
     for adr in sorted((DOCS / "adr").glob("[0-9][0-9][0-9][0-9]-*.md")):
         if adr.name.startswith("0000-"):
             continue
@@ -190,13 +225,13 @@ def test_readme_images_are_files_in_the_repo() -> None:
 
 
 def test_readme_shows_the_console_with_its_scripted_costs() -> None:
-    console = section(read(README), "The console")
+    console = section(read(README), "See it")
     assert "scripted provider" in console
     assert "$0.00" in console
 
 
 def test_readme_shows_the_chaos_chart_next_to_the_headline_numbers() -> None:
-    headline = section(read(README), "Headline numbers")
+    headline = section(read(README), "Proof")
     assert "](docs/media/chaos-results.svg)" in headline
     assert "scripts/chaos_chart.py" in headline
 
@@ -223,11 +258,11 @@ def test_readme_docs_map_links_every_doc_with_a_line_each() -> None:
 
 def test_readme_says_what_is_not_made_yet_and_why() -> None:
     text = read(README)
-    headline = section(text, "Headline numbers")
+    headline = section(text, "Proof")
     assert "API key" in headline and "eval VM" in headline
-    demo = section(text, "Demo")
+    demo = section(text, "Demo", level=3)
     assert "recorded yet" in demo and "API key" in demo
-    status = text.splitlines()[6]
+    status = next(line for line in text.splitlines()[:12] if line.startswith("Status:"))
     assert (
         "Docs site:" in status and "hoomanesteki.github.io" in status and "not live" not in status
     )
@@ -236,7 +271,10 @@ def test_readme_says_what_is_not_made_yet_and_why() -> None:
 def test_readme_quotes_the_chaos_results_as_the_summary_has_them() -> None:
     summary = json.loads(read(CHAOS_SUMMARY))
     text = read(README)
-    assert f"{summary['completed']} of {summary['runs']} runs" in text
+    runs, survived = summary["runs"], summary["survived"]
+    assert f"chaos suite of {runs} runs, {survived} took a kill" in text
+    assert f"and all {summary['completed']} still ended with a pull request" in text
+    assert f"{survived} of {runs} runs took a kill, and all {survived} finished" in text
     assert f"{summary['duplicate_side_effects']} duplicate" in text
     assert f"{summary['missing_side_effects']} missing" in text
     assert f"{summary['survived']} of {summary['runs']}" in text
@@ -245,7 +283,7 @@ def test_readme_quotes_the_chaos_results_as_the_summary_has_them() -> None:
     assert f"{kills_landed} / {kills_planned}" in text
     # The recordings were scripted, and the README says so next to the numbers.
     assert set(summary["recordings"].values()) == {"scripted"}
-    assert "scripted" in section(text, "Headline numbers")
+    assert "scripted" in section(text, "Proof")
 
 
 KILL_TYPES = {
@@ -310,7 +348,7 @@ def table_lines(text: str) -> list[str]:
 
 def test_readme_chaos_table_matches_the_summary_row_by_row() -> None:
     summary = json.loads(read(CHAOS_SUMMARY))
-    lines = table_lines(section(read(README), "Results"))
+    lines = table_lines(section(read(README), "Proof"))
     for row in chaos_table_rows(summary, runs_hit=True):
         assert row in lines, row
 
@@ -323,7 +361,7 @@ def test_readme_chaos_note_says_the_all_row_counts_every_run() -> None:
     missed = sum(1 for r in results if not any(k["landed"] for k in r["kills"]))
     assert missed == 2
     text = read(README)
-    note = section(text, "Results")
+    note = section(text, "Proof")
     every_run = (
         "The All row counts every run in those two columns, including the two that no kill hit"
     )
@@ -340,7 +378,7 @@ def test_case_study_chaos_table_matches_the_summary_row_by_row() -> None:
 
 
 def test_readme_says_where_the_eval_numbers_will_come_from() -> None:
-    headline = section(read(README), "Headline numbers")
+    headline = section(read(README), "Proof")
     assert "docs/results.md" in headline
     assert "pending" in headline
 

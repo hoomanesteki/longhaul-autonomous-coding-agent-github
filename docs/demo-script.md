@@ -46,7 +46,7 @@ Cut from the same take, in this order: the label on the issue, the plan comment,
 These are the owner's steps. The repo is public, its secrets check is done, the docs site is live and `v1.0.0` is tagged. The rest is open.
 
 - [ ] Run the evaluation commands in `docs/results.md` with a live model, and rebuild that page.
-- [ ] Replace the pending lines in the README (headline numbers and limitations), `docs/case-study.md` and the 1:40 row above with the numbers on the rebuilt page.
+- [ ] Replace the pending lines in the README (Proof, and Status and limitations), `docs/case-study.md` and the 1:40 row above with the numbers on the rebuilt page.
 - [ ] Record the video from the timeline above on `lh-demo-inventory`.
 - [ ] Cut the 30-second GIF and save it as `docs/media/demo.gif`, then add the image to the README Demo section.
 - [ ] Put the video link in the README and in `docs/case-study.md`.

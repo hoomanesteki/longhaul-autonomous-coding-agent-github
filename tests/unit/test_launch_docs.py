@@ -143,6 +143,65 @@ def test_readme_relative_links_point_at_files_that_exist() -> None:
     assert not missing, missing
 
 
+def readme_images(text: str) -> list[str]:
+    """The images of a page: Markdown ones and the src of an HTML img tag."""
+    markdown = re.findall(r"!\[[^\]]*\]\(([^)\s]+)\)", text)
+    return markdown + re.findall(r'<img [^>]*src="([^"]+)"', text)
+
+
+def test_readme_images_are_files_in_the_repo() -> None:
+    images = readme_images(read(README))
+    # The chaos chart and the console screenshots.
+    assert "docs/media/chaos-results.svg" in images
+    assert any(image.startswith("docs/gates/media/") for image in images)
+    for image in images:
+        if "actions/workflows/ci.yml/badge.svg" in image:
+            continue  # the CI badge is the one image GitHub serves
+        assert "://" not in image, image
+        assert (ROOT / image).is_file(), image
+
+
+def test_readme_shows_the_console_with_its_scripted_costs() -> None:
+    console = section(read(README), "The console")
+    assert "scripted provider" in console
+    assert "$0.00" in console
+
+
+def test_readme_shows_the_chaos_chart_next_to_the_headline_numbers() -> None:
+    headline = section(read(README), "Headline numbers")
+    assert "](docs/media/chaos-results.svg)" in headline
+    assert "scripts/chaos_chart.py" in headline
+
+
+def test_readme_docs_map_links_every_doc_with_a_line_each() -> None:
+    docs_map = section(read(README), "Docs map")
+    rows = [line for line in docs_map.splitlines() if line.startswith("| [")]
+    for doc in (
+        "docs/case-study.md",
+        "docs/architecture.md",
+        "docs/adr/",
+        "docs/results.md",
+        "docs/gates/",
+        "docs/runbook.md",
+        "docs/security.md",
+        "docs/deploy-aws.md",
+        "docs/demo-script.md",
+        "docs/plan/longhaul-build-plan.md",
+        "docs/progress.md",
+    ):
+        (row,) = [line for line in rows if f"]({doc})" in line]
+        assert row.rstrip(" |").split(" | ")[-1].strip(), doc
+
+
+def test_readme_says_what_is_not_made_yet_and_why() -> None:
+    text = read(README)
+    headline = section(text, "Headline numbers")
+    assert "API key" in headline and "eval VM" in headline
+    demo = section(text, "Demo")
+    assert "recorded yet" in demo and "API key" in demo
+    assert "is not live yet" in text.splitlines()[6]
+
+
 def test_readme_quotes_the_chaos_results_as_the_summary_has_them() -> None:
     summary = json.loads(read(CHAOS_SUMMARY))
     text = read(README)

@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="chaos-chart" viewBox="0 0 880 344" width="880" height="344" role="img" aria-labelledby="chaos-chart-title chaos-chart-desc">
+<title id="chaos-chart-title">Chaos suite: 20 of 20 runs completed, 20 of 20 with the same diff, 0 duplicate writes</title>
+<desc id="chaos-chart-desc">chaos-2026-11-07, seed 7. 39 of 45 planned kills landed. The model answers were scripted recordings. The README holds the same numbers as a table.</desc>
+<style>
+svg.chaos-chart { --chaos-surface: #ffffff; --chaos-ink: #1f2933; --chaos-muted: #59626e;
+  --chaos-grid: #dfe3e8; --chaos-track: #e3e7ec; --chaos-mark: #2a78d6; }
+@media (prefers-color-scheme: dark) {
+  svg.chaos-chart { --chaos-surface: #1b2028; --chaos-ink: #e3e8ef; --chaos-muted: #a3aebd;
+    --chaos-grid: #2d343f; --chaos-track: #2d343f; --chaos-mark: #5b9cf0; }
+}
+svg.chaos-chart text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+svg.chaos-chart .surface { fill: var(--chaos-surface); }
+svg.chaos-chart .title { fill: var(--chaos-ink); font-size: 17px; font-weight: 600; }
+svg.chaos-chart .head { fill: var(--chaos-ink); font-size: 13px; font-weight: 600; }
+svg.chaos-chart .label { fill: var(--chaos-ink); font-size: 13px; }
+svg.chaos-chart .note { fill: var(--chaos-muted); font-size: 12px; }
+svg.chaos-chart .grid { stroke: var(--chaos-grid); stroke-width: 1; }
+svg.chaos-chart .track { fill: var(--chaos-track); }
+svg.chaos-chart .bar { fill: var(--chaos-mark); }
+svg.chaos-chart .range { stroke: var(--chaos-mark); stroke-width: 2; }
+svg.chaos-chart .median { fill: var(--chaos-mark); }
+svg.chaos-chart .p95 { fill: var(--chaos-surface); stroke: var(--chaos-mark); stroke-width: 2; }
+</style>
+<rect x="0" y="0" width="880" height="344" rx="10" class="surface"/>
+<text x="24" y="36" class="title" text-anchor="start">Chaos suite: 20 of 20 runs completed, 20 of 20 with the same diff, 0 duplicate writes</text>
+<text x="24" y="60" class="note" text-anchor="start">chaos-2026-11-07, seed 7. 39 of 45 planned kills landed. The model answers were scripted recordings.</text>
+<text x="158" y="98" class="head" text-anchor="start">Kills landed of planned</text>
+<text x="482" y="98" class="head" text-anchor="start">Resume after a kill (seconds)</text>
+<circle cx="487" cy="110" r="5" class="median"/>
+<text x="498" y="114" class="note" text-anchor="start">median</text>
+<circle cx="557" cy="110" r="5" class="p95"/>
+<text x="568" y="114" class="note" text-anchor="start">95th percentile</text>
+<line x1="482" y1="134" x2="482" y2="302" class="grid"/>
+<text x="482" y="320" class="note" text-anchor="middle">0 s</text>
+<line x1="554.5" y1="134" x2="554.5" y2="302" class="grid"/>
+<text x="554.5" y="320" class="note" text-anchor="middle">10 s</text>
+<line x1="627" y1="134" x2="627" y2="302" class="grid"/>
+<text x="627" y="320" class="note" text-anchor="middle">20 s</text>
+<line x1="699.5" y1="134" x2="699.5" y2="302" class="grid"/>
+<text x="699.5" y="320" class="note" text-anchor="middle">30 s</text>
+<line x1="772" y1="134" x2="772" y2="302" class="grid"/>
+<text x="772" y="320" class="note" text-anchor="middle">40 s</text>
+<text x="142" y="153" class="label" text-anchor="end">Worker SIGKILL</text>
+<rect x="158" y="142" width="166.7" height="14" rx="4" class="track"/>
+<rect x="158" y="142" width="166.7" height="14" rx="4" class="bar"/>
+<text x="332.667" y="153" class="label" text-anchor="start">10 / 10</text>
+<line x1="602.3" y1="149" x2="640.3" y2="149" class="range"/>
+<circle cx="640.3" cy="149" r="5" class="p95"/>
+<circle cx="602.3" cy="149" r="5" class="median"/>
+<text x="652.317" y="153" class="label" text-anchor="start">16.6 s / 21.8 s</text>
+<text x="142" y="187" class="label" text-anchor="end">Sandbox kill</text>
+<rect x="158" y="176" width="200.0" height="14" rx="4" class="track"/>
+<rect x="158" y="176" width="183.3" height="14" rx="4" class="bar"/>
+<text x="366" y="187" class="label" text-anchor="start">11 / 12</text>
+<line x1="484.6" y1="183" x2="642.4" y2="183" class="range"/>
+<circle cx="642.4" cy="183" r="5" class="p95"/>
+<circle cx="484.6" cy="183" r="5" class="median"/>
+<text x="654.399" y="187" class="label" text-anchor="start">0.4 s / 22.1 s</text>
+<text x="142" y="221" class="label" text-anchor="end">Temporal restart</text>
+<rect x="158" y="210" width="200.0" height="14" rx="4" class="track"/>
+<rect x="158" y="210" width="150.0" height="14" rx="4" class="bar"/>
+<text x="366" y="221" class="label" text-anchor="start">9 / 12</text>
+<line x1="496.7" y1="217" x2="558.4" y2="217" class="range"/>
+<circle cx="558.4" cy="217" r="5" class="p95"/>
+<circle cx="496.7" cy="217" r="5" class="median"/>
+<text x="570.369" y="221" class="label" text-anchor="start">2.0 s / 10.5 s</text>
+<text x="142" y="255" class="label" text-anchor="end">Postgres restart</text>
+<rect x="158" y="244" width="183.3" height="14" rx="4" class="track"/>
+<rect x="158" y="244" width="150.0" height="14" rx="4" class="bar"/>
+<text x="349.333" y="255" class="label" text-anchor="start">9 / 11</text>
+<line x1="491.9" y1="251" x2="732.8" y2="251" class="range"/>
+<circle cx="732.8" cy="251" r="5" class="p95"/>
+<circle cx="491.9" cy="251" r="5" class="median"/>
+<text x="744.815" y="255" class="label" text-anchor="start">1.4 s / 34.6 s</text>
+<text x="142" y="289" class="label" text-anchor="end">All kills</text>
+<text x="158" y="289" class="label" text-anchor="start">39 / 45 in all</text>
+<line x1="496.7" y1="285" x2="642.4" y2="285" class="range"/>
+<circle cx="642.4" cy="285" r="5" class="p95"/>
+<circle cx="496.7" cy="285" r="5" class="median"/>
+<text x="654.399" y="289" class="label" text-anchor="start">2.0 s / 22.1 s</text>
+</svg>

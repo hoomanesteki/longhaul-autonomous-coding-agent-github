@@ -1,0 +1,12 @@
+---
+title: Demo script
+toc-depth: 2
+---
+
+::: {.source-note}
+Rendered from [`docs/demo-script.md`]({{< meta source-repo >}}/blob/main/docs/demo-script.md). To change it, edit that file.
+:::
+
+::: {.drop-title base="docs"}
+{{< include ../docs/demo-script.md >}}
+:::

@@ -32,6 +32,7 @@ SiteError = site_pages.SiteError
 INCLUDE_RE = re.compile(r"\{\{< include (\S+) >\}\}")
 # The attributes of a div that site/filters/fragments.lua replaces with a generated file.
 FRAGMENT_RE = re.compile(r'\b(fragments?)="([^"]+)"')
+IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
 PLAN = """\
 # Plan
@@ -246,7 +247,9 @@ def test_adr_page_title_carries_a_colon_and_quotes_safely() -> None:
 
 def test_adr_page_includes_the_doc_and_drops_its_own_heading() -> None:
     page = site_pages.adr_page(_record("0004"), "../../docs/adr/0004-t.md", None, None)
-    assert "::: {.drop-title}\n{{< include ../../docs/adr/0004-t.md >}}\n:::" in page
+    # base names the folder of the doc, so docs.lua can point its relative links at the site.
+    include = "{{< include ../../docs/adr/0004-t.md >}}"
+    assert f'::: {{.drop-title base="docs/adr"}}\n{include}\n:::' in page
     assert "{{< meta source-repo >}}/blob/main/docs/adr/0004-t.md" in page
 
 
@@ -278,13 +281,16 @@ def test_the_gate_list_has_one_path_per_line() -> None:
 def tree(tmp_path: Path) -> Path:
     """A copy of docs/ with an empty site/, so build() never writes into the repo."""
     shutil.copytree(ROOT / "docs", tmp_path / "docs")
+    summary = tmp_path / site_pages.CHAOS_SUMMARY
+    summary.parent.mkdir(parents=True)
+    shutil.copy(ROOT / site_pages.CHAOS_SUMMARY, summary)
     (tmp_path / "site").mkdir()
     return tmp_path
 
 
 def _generated(tree: Path) -> dict[str, str]:
     folder = tree / "site" / "_generated"
-    return {p.name: p.read_text(encoding="utf-8") for p in sorted(folder.iterdir())}
+    return {p.name: p.read_text(encoding="utf-8") for p in sorted(folder.iterdir()) if p.is_file()}
 
 
 def test_build_writes_a_page_for_every_adr_and_none_for_the_template(tree: Path) -> None:
@@ -418,8 +424,10 @@ def test_every_include_and_fragment_in_every_page_resolves(site_tree: Path) -> N
     pages = [*site.glob("*.qmd"), *(site / "adr").glob("*.qmd")]
     assert len(pages) >= 9
     for page in pages:
-        # Both helpers fail on the first path that points at nothing. Every page uses one.
-        assert _pulled_in(page) or _embedded(page, site), page.name
+        # Both helpers fail on the first path that points at nothing. Every page uses one,
+        # except the console page, which is screenshots and text (checked further down).
+        shows = IMAGE_RE.findall(page.read_text(encoding="utf-8"))
+        assert _pulled_in(page) or _embedded(page, site) or shows, page.name
 
 
 def test_pages_embed_the_files_the_script_writes_and_do_not_include_them() -> None:
@@ -434,12 +442,21 @@ def test_pages_embed_the_files_the_script_writes_and_do_not_include_them() -> No
 def test_the_pages_pull_in_the_docs_they_stand_for(site_tree: Path) -> None:
     site = site_tree / "site"
     docs = site_tree / "docs"
+    # Every doc with a page of its own, except the README, which the overview retells.
     included = {
-        "progress.qmd": docs / "progress.md",
-        "runbook.qmd": docs / "runbook.md",
-        "architecture.qmd": docs / "architecture.md",
-        "plan.qmd": docs / "plan" / "longhaul-build-plan.md",
+        page: site_tree / doc for doc, page in site_pages.DOC_PAGES.items() if doc != "README.md"
     }
+    assert {
+        "architecture.qmd",
+        "case-study.qmd",
+        "demo.qmd",
+        "deploy-aws.qmd",
+        "plan.qmd",
+        "progress.qmd",
+        "results.qmd",
+        "runbook.qmd",
+        "security.qmd",
+    } == set(included)
     for name, doc in included.items():
         assert doc.resolve() in _pulled_in(site / name), name
     assert (docs / "gates" / "phase-0.md").resolve() in _embedded(site / "gates.qmd", site)
@@ -490,3 +507,118 @@ def test_the_script_stays_valid_on_python_3_9() -> None:
     source = (ROOT / "scripts" / "site_pages.py").read_text(encoding="utf-8")
     ast.parse(source, feature_version=(3, 9))
     assert "from __future__ import annotations" in source
+
+
+# --- links, images and the chaos results ---------------------------------------------------
+
+DROP_TITLE_RE = re.compile(r"^::: \{\.drop-title(?: base=\"([^\"]+)\")?\}$", re.MULTILINE)
+
+
+def test_every_doc_in_the_map_exists_and_has_its_page() -> None:
+    for doc, page in site_pages.DOC_PAGES.items():
+        assert (ROOT / doc).is_file(), doc
+        assert (ROOT / "site" / page).is_file(), page
+
+
+def test_the_map_sends_adrs_and_gate_reports_to_their_pages(tree: Path) -> None:
+    site_pages.build(tree)
+    lines = _generated(tree)["doc-pages.txt"].splitlines()
+    pairs = dict(line.split(" ") for line in lines)
+    assert pairs["docs/case-study.md"] == "case-study.qmd"
+    for adr in site_pages.adr_files(tree / "docs" / "adr"):
+        assert pairs[f"docs/adr/{adr.name}"] == f"adr/{adr.stem}.qmd"
+    for gate in site_pages.gate_files(tree / "docs" / "gates"):
+        assert pairs[f"docs/gates/{gate.name}"] == "gates.qmd"
+
+
+def test_every_included_doc_names_its_folder_so_its_links_reach_the_site(site_tree: Path) -> None:
+    # Without base, a relative link or image of the doc would resolve from site/ and break.
+    site = site_tree / "site"
+    for page in [*site.glob("*.qmd"), *(site / "adr").glob("*.qmd")]:
+        text = page.read_text(encoding="utf-8")
+        targets = INCLUDE_RE.findall(text)
+        if not targets:
+            continue
+        bases = DROP_TITLE_RE.findall(text)
+        assert len(bases) == len(targets), page.name
+        for base, target in zip(bases, targets, strict=True):
+            doc = (page.parent / target).resolve()
+            assert base == doc.parent.relative_to(site_tree).as_posix(), page.name
+
+
+def test_every_image_under_docs_is_copied_for_the_site(tree: Path) -> None:
+    site_pages.build(tree)
+    images = site_pages.doc_images(tree / "docs")
+    assert any("phase-8" in p.parts for p in images)
+    for image in images:
+        copy = tree / "site" / "_generated" / image.relative_to(tree)
+        assert copy.read_bytes() == image.read_bytes(), image.name
+
+
+def test_every_image_a_page_shows_exists_after_the_build(site_tree: Path) -> None:
+    site = site_tree / "site"
+    shown = 0
+    for page in site.glob("*.qmd"):
+        for target in IMAGE_RE.findall(page.read_text(encoding="utf-8")):
+            assert (page.parent / target).is_file(), f"{page.name}: {target}"
+            shown += 1
+    assert shown >= 5, "the overview and the console page show the console screenshots"
+
+
+def test_the_images_of_the_gate_reports_exist_beside_them() -> None:
+    # docs.lua points them at their copies, which only exist when the originals do.
+    for report in (ROOT / "docs" / "gates").glob("*.md"):
+        for target in IMAGE_RE.findall(report.read_text(encoding="utf-8")):
+            assert (report.parent / target).is_file(), f"{report.name}: {target}"
+
+
+def _readme_chaos_rows() -> list[str]:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    return [line.replace("**", "") for line in readme.splitlines() if line.startswith("| ")]
+
+
+def test_the_chaos_table_of_the_site_is_the_table_of_the_readme(tree: Path) -> None:
+    site_pages.build(tree)
+    rows = [
+        line.replace("**", "")
+        for line in _generated(tree)["chaos-table.md"].splitlines()
+        if line.startswith("| ")
+    ]
+    assert len(rows) == 1 + len(site_pages.KILL_TYPES) + 1
+    readme = _readme_chaos_rows()
+    for row in rows:
+        assert row in readme, row
+
+
+def test_the_chaos_table_follows_the_summary(tree: Path) -> None:
+    import json
+
+    path = tree / site_pages.CHAOS_SUMMARY
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    summary["kills_landed"]["worker"] = 7
+    summary["duplicate_side_effects"] = 3
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    site_pages.build(tree)
+    table = _generated(tree)["chaos-table.md"]
+    assert "| Worker SIGKILL | 7 / 10 |" in table
+    assert table.splitlines()[-1].split(" | ")[5] == "3"
+
+
+def test_the_chaos_chart_of_the_site_is_the_committed_chart(tree: Path) -> None:
+    site_pages.build(tree)
+    chart = _generated(tree)["chaos-chart.md"]
+    assert chart.startswith("```{=html}\n")
+    assert (ROOT / site_pages.CHAOS_CHART).read_text(encoding="utf-8").strip() in chart
+
+
+def test_the_overview_only_claims_what_the_chaos_summary_shows() -> None:
+    import json
+
+    summary = json.loads((ROOT / site_pages.CHAOS_SUMMARY).read_text(encoding="utf-8"))
+    overview = (ROOT / "site" / "index.qmd").read_text(encoding="utf-8")
+    assert "Every run ended with a pull request and the same diff" in overview
+    assert summary["completed"] == summary["diff_matches"] == summary["runs"]
+    assert "no duplicate and no missing write" in overview
+    assert summary["duplicate_side_effects"] == summary["missing_side_effects"] == 0
+    assert "scripted recordings" in overview
+    assert set(summary["recordings"].values()) == {"scripted"}

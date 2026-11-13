@@ -1,0 +1,12 @@
+---
+title: Case study
+toc-depth: 2
+---
+
+::: {.source-note}
+Rendered from [`docs/case-study.md`]({{< meta source-repo >}}/blob/main/docs/case-study.md). To change it, edit that file.
+:::
+
+::: {.drop-title base="docs"}
+{{< include ../docs/case-study.md >}}
+:::

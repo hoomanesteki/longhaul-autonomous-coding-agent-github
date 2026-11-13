@@ -1,0 +1,12 @@
+---
+title: Deploy to AWS
+toc-depth: 2
+---
+
+::: {.source-note}
+Rendered from [`docs/deploy-aws.md`]({{< meta source-repo >}}/blob/main/docs/deploy-aws.md). To change it, edit that file.
+:::
+
+::: {.drop-title base="docs"}
+{{< include ../docs/deploy-aws.md >}}
+:::

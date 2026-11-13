@@ -15,17 +15,36 @@ SITE = ROOT / "site"
 REPO_URL = "https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github"
 SITE_URL = "https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/"
 
-# The navbar, in order. Results is not a doc of its own, but it is where Phase 9 numbers land.
-NAVBAR = [
-    ("Overview", "index.qmd"),
-    ("Architecture", "architecture.qmd"),
-    ("Decisions", "decisions.qmd"),
-    ("Progress", "progress.qmd"),
-    ("Gate reports", "gates.qmd"),
-    ("Results", "results.qmd"),
-    ("Runbook", "runbook.qmd"),
-    ("Plan", "plan.qmd"),
+# The navbar, in order: the overview, then four menus grouped by what a reader is after.
+NAVBAR: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Overview", [("Overview", "index.qmd")]),
+    (
+        "How it works",
+        [
+            ("Architecture", "architecture.qmd"),
+            ("Decisions", "decisions.qmd"),
+            ("Console", "console.qmd"),
+        ],
+    ),
+    (
+        "Proof",
+        [
+            ("Results", "results.qmd"),
+            ("Gate reports", "gates.qmd"),
+            ("Case study", "case-study.qmd"),
+        ],
+    ),
+    (
+        "Operate",
+        [
+            ("Runbook", "runbook.qmd"),
+            ("Security", "security.qmd"),
+            ("Deploy to AWS", "deploy-aws.qmd"),
+        ],
+    ),
+    ("Project", [("Plan", "plan.qmd"), ("Progress", "progress.qmd"), ("Demo script", "demo.qmd")]),
 ]
+PAGES = [href for _, links in NAVBAR for _, href in links]
 
 
 def quarto_config() -> dict[str, Any]:
@@ -42,16 +61,36 @@ def test_the_project_is_a_website_rendered_into_site_underscore_site() -> None:
     assert config["website"]["site-url"] == SITE_URL
 
 
+def navbar() -> list[tuple[str, list[tuple[str, str]]]]:
+    """The navbar as (label, [(text, href)]): a plain link is a group of one."""
+    found = []
+    for item in quarto_config()["website"]["navbar"]["left"]:
+        if "menu" in item:
+            links = [(entry["text"], entry["href"]) for entry in item["menu"]]
+        else:
+            links = [(item["text"], item["href"])]
+        found.append((item["text"], links))
+    return found
+
+
 def test_the_navbar_lists_every_page_in_order() -> None:
-    items = quarto_config()["website"]["navbar"]["left"]
-    assert [(item["text"], item["href"]) for item in items] == NAVBAR
-    for _, href in NAVBAR:
+    assert navbar() == NAVBAR
+    for href in PAGES:
         assert (SITE / href).is_file(), href
+    assert len(PAGES) == len(set(PAGES)), "a page sits in two menus"
 
 
 def test_every_top_level_page_is_in_the_navbar() -> None:
     pages = {path.name for path in SITE.glob("*.qmd")}
-    assert pages == {href for _, href in NAVBAR}
+    assert pages == set(PAGES)
+
+
+def test_the_overview_links_every_page_of_the_navbar() -> None:
+    # The "Find your way" table of the home page is the map of the site.
+    overview = (SITE / "index.qmd").read_text(encoding="utf-8")
+    for href in PAGES:
+        if href != "index.qmd":
+            assert f"]({href})" in overview, href
 
 
 def test_the_footer_and_the_navbar_link_to_the_repository() -> None:

@@ -5,8 +5,11 @@ docs/ and writes only to two places that git ignores:
 
 * site/adr/         one page per architecture decision record
 * site/_generated/  fragments that the hand-written pages embed: the ADR index, the list of
-                    gate reports, the phase status table, and the diagrams and tables that
-                    live in the build plan
+                    gate reports, the phase status table, the diagrams and tables that live
+                    in the build plan, and the chaos table and chart. It also holds a copy of
+                    every image under docs/, at the same path, so the pages can show them, and
+                    the map from each doc to its page, which site/filters/docs.lua uses to
+                    point the links of an included doc at the site
 
 A new ADR or gate report therefore reaches the site with no edit under site/, and nothing is
 copied by hand. The pages embed the fragments with site/filters/fragments.lua and not with the
@@ -25,10 +28,39 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PLAN_FILE = Path("docs/plan/longhaul-build-plan.md")
 PROGRESS_FILE = Path("docs/progress.md")
+# The chaos run the README quotes. scripts/chaos_chart.py draws CHAOS_CHART from the same file.
+CHAOS_SUMMARY = Path("eval/results/chaos-2026-11-07/summary.json")
+CHAOS_CHART = Path("docs/media/chaos-results.svg")
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+
+# The site page of each doc, by its path in the repo. A link in an included doc that points at
+# one of these goes to the page. Any other link to a file of the repo goes to GitHub. ADRs and
+# gate reports are added by doc_pages(), because their pages follow the files in docs/.
+DOC_PAGES = {
+    "README.md": "index.qmd",
+    "docs/architecture.md": "architecture.qmd",
+    "docs/case-study.md": "case-study.qmd",
+    "docs/demo-script.md": "demo.qmd",
+    "docs/deploy-aws.md": "deploy-aws.qmd",
+    "docs/plan/longhaul-build-plan.md": "plan.qmd",
+    "docs/progress.md": "progress.qmd",
+    "docs/results.md": "results.qmd",
+    "docs/runbook.md": "runbook.qmd",
+    "docs/security.md": "security.qmd",
+}
+
+# The kill types of the chaos summary, in the order and with the labels of the README table.
+KILL_TYPES = (
+    ("worker", "Worker SIGKILL"),
+    ("sandbox", "Sandbox kill"),
+    ("temporal", "Temporal restart"),
+    ("postgres", "Postgres restart"),
+)
 # Pandoc turns the heading "3.4 Architecture decisions (ADR summaries)" into this anchor.
 PLAN_ADR_LINK = "plan.qmd#architecture-decisions-adr-summaries"
 
@@ -302,8 +334,9 @@ def adr_page(adr: Adr, doc_path: str, before: Adr | None, after: Adr | None) -> 
         f"title: {json.dumps(adr.heading, ensure_ascii=False)}\n"
         "---\n\n"
         f"{source_note(f'docs/adr/{adr.stem}.md')}\n"
-        # The ADR starts with its own H1, which the page title already shows.
-        "::: {.drop-title}\n"
+        # The ADR starts with its own H1, which the page title already shows. Its links are
+        # relative to docs/adr/, and docs.lua points them at the site from there.
+        '::: {.drop-title base="docs/adr"}\n'
         f"{include(doc_path)}\n"
         ":::\n\n"
         f"::: {{.page-links}}\n{' · '.join(links)}\n:::\n"
@@ -361,6 +394,69 @@ def status_fragment(phases: list[Phase]) -> str:
     )
 
 
+def doc_pages(adrs: list[Adr], gates: list[Path]) -> str:
+    """The map from doc to page for site/filters/docs.lua: one "doc page" pair per line."""
+    pages = dict(DOC_PAGES)
+    pages.update({f"docs/adr/{a.stem}.md": f"adr/{a.stem}.qmd" for a in adrs})
+    pages.update({f"docs/gates/{path.name}": "gates.qmd" for path in gates})
+    return "".join(f"{doc} {page}\n" for doc, page in sorted(pages.items()))
+
+
+def _seconds(value: float) -> str:
+    return f"{value:.1f} s"
+
+
+def chaos_table(summary: dict[str, Any]) -> str:
+    """The chaos table of the README, row for row, built from the summary of the run.
+
+    A run counts as hit by a kill type when a kill of that type landed in it.
+    """
+    results = summary["results"]
+    header = (
+        "| Kill type | Kills landed / planned | Runs hit | Completed | Diff equal "
+        "| Duplicate side effects | Resume p50 / p95 |"
+    )
+    rows = [header, "|---|---|---|---|---|---|---|"]
+    for kind, label in KILL_TYPES:
+        hit = [r for r in results if any(k["type"] == kind and k["landed"] for k in r["kills"])]
+        latency = summary["resume_latency_by_type"][kind]
+        cells = [
+            label,
+            f"{summary['kills_landed'][kind]} / {summary['kills_planned'][kind]}",
+            str(len(hit)),
+            f"{sum(1 for r in hit if r['completed'])} / {len(hit)}",
+            f"{sum(1 for r in hit if r['diff_equals_reference'])} / {len(hit)}",
+            str(sum(r["duplicate_side_effects"] for r in hit)),
+            f"{_seconds(latency['median_s'])} / {_seconds(latency['p95_s'])}",
+        ]
+        rows.append("| " + " | ".join(cells) + " |")
+    hit_any = [r for r in results if any(k["landed"] for k in r["kills"])]
+    overall, runs = summary["resume_latency"], summary["runs"]
+    cells = [
+        "**All**",
+        f"{sum(summary['kills_landed'].values())} / {sum(summary['kills_planned'].values())}",
+        str(len(hit_any)),
+        f"{summary['completed']} / {runs}",
+        f"{summary['diff_matches']} / {runs}",
+        str(summary["duplicate_side_effects"]),
+        f"{_seconds(overall['median_s'])} / {_seconds(overall['p95_s'])}",
+    ]
+    rows.append("| " + " | ".join(cells) + " |")
+    return "\n".join(rows) + "\n"
+
+
+def chaos_chart(svg: str) -> str:
+    """The committed chart as a raw HTML block, so the page can set its colors from the theme."""
+    return '```{=html}\n<figure class="chaos-figure">\n' + svg.strip() + "\n</figure>\n```\n"
+
+
+def doc_images(docs: Path) -> list[Path]:
+    """Every image under docs/, which the pages show from their copies in site/_generated/."""
+    return sorted(
+        path for path in docs.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+
+
 # --- writing --------------------------------------------------------------------------------
 
 
@@ -383,6 +479,8 @@ def build(root: Path) -> list[Path]:
     planned = planned_adrs(plan, {a.number for a in adrs})
     phases = read_phases(progress)
     gates = gate_files(docs / "gates")
+    summary = json.loads((root / CHAOS_SUMMARY).read_text(encoding="utf-8"))
+    chart = (root / CHAOS_CHART).read_text(encoding="utf-8")
 
     adr_dir, generated = site / "adr", site / "_generated"
     # Both folders belong to this script. Clearing them drops pages of renamed or removed docs.
@@ -407,10 +505,19 @@ def build(root: Path) -> list[Path]:
         "task-lifecycle.mmd": plan_diagram(plan, "3.2"),
         "components.md": plan_table(plan, "3.3"),
         "eval-questions.md": plan_table(plan, "8.1"),
+        "doc-pages.txt": doc_pages(adrs, gates),
+        "chaos-table.md": chaos_table(summary),
+        "chaos-chart.md": chaos_chart(chart),
     }
     for name, text in fragments.items():
         _write(generated / name, text)
         written.append(generated / name)
+    # A page shows an image of docs/ from this copy, at the same path under _generated/.
+    for image in doc_images(docs):
+        copy = generated / image.relative_to(root)
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(image, copy)
+        written.append(copy)
     return written
 
 

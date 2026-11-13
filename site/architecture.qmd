@@ -36,6 +36,6 @@ One task, from a labeled issue to a pull request or a stuck report. The workflow
 
 ## Workflow, activities and shared types
 
-::: {.drop-title}
+::: {.drop-title base="docs"}
 {{< include ../docs/architecture.md >}}
 :::

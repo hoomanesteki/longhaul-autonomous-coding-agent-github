@@ -1,0 +1,48 @@
+---
+title: Console
+subtitle: Watch every task, and step in when one needs a person
+toc-depth: 2
+lightbox: true
+---
+
+The console is a React, Vite and TypeScript app in `console/` (ADR-0011). It reads the console API and nothing else, so it can show a task and send it a signal, and it cannot touch a sandbox or GitHub. It lists every task, shows the timeline of one task turn by turn, and holds the forms a person uses to approve a plan, send a hint, add budget or cancel. It also has the memory viewer, where a person approves or rejects the notes the agent wants to keep.
+
+The screenshots come from the Phase 8 gate. They were taken with Playwright against the demo stack, which runs the scripted provider, so every cost on them is $0.00.
+
+## Tasks
+
+![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that need a person are marked.](_generated/docs/gates/media/phase-8/1-tasks.png){.screenshot}
+
+The tasks list polls every 10 seconds. The "Needs you" filter keeps the tasks that wait on a person: a paused task and a task whose plan waits for approval.
+
+![The Needs you filter: the task waiting on its plan and the paused task.](_generated/docs/gates/media/phase-8/2-needs-you.png){.screenshot}
+
+## One task, turn by turn
+
+![A shipped task: summary, plan with its steps done, every turn and tool call, the verdict and the outcome.](_generated/docs/gates/media/phase-8/3-timeline.png){.screenshot}
+
+The task page shows the summary (phase, cost, turns, tokens, cache ratio, pull request, and the plan with the status of each step) and the timeline. The timeline groups the rows by turn with the tool calls inside, marks each checkpoint on the turn that made it, and colours the events by type: compaction, pause, hint, verdict, recovery and error.
+
+## Steer a task
+
+![A paused task with the hint, budget and cancel forms.](_generated/docs/gates/media/phase-8/4-actions.png){.screenshot}
+
+Approve plan and Reject plan show while a task waits on its plan. Send hint, Add budget and Cancel task show until the task ends. For a task of an issue, the workflow repeats each action as a short comment on the issue, so the issue shows every steer.
+
+## Memory
+
+![The memory viewer on the candidates tab.](_generated/docs/gates/media/phase-8/5-memory.png){.screenshot}
+
+A note that the agent drafts is a candidate, and only approved notes reach a prompt (ADR-0010). The memory page shows the approved, candidate and rejected notes of one repo, and a person approves or rejects a candidate here.
+
+## Sign in, and small screens
+
+![The sign-in page.](_generated/docs/gates/media/phase-8/6-login.png){.screenshot}
+
+The console asks for the admin token of the API and keeps it only after the API accepts it.
+
+![The tasks list at 375 px: the table scrolls inside its box and the page does not.](_generated/docs/gates/media/phase-8/7-tasks-375.png){.screenshot .screenshot-narrow}
+
+## Run it
+
+The commands, the demo stack and the browser test are in [The console](runbook.qmd#the-console) section of the runbook. The routes it calls are in [The console API](runbook.qmd#the-console-api).

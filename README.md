@@ -175,7 +175,7 @@ The threat model, the test behind each control and the known gaps are in [docs/s
 - One host. A worker needs a Docker daemon next to it. The Terraform in `deploy/terraform/aws` is checked for validity in CI and applied by hand ([docs/deploy-aws.md](docs/deploy-aws.md)).
 - Polling delay. A labeled issue waits up to a minute for its task, and a comment command up to a minute for its effect.
 - The eval numbers are pending, and the chaos runs used scripted model answers. When the eval runs are made, they cover a 40-task subset of SWE-bench Verified and a set of 15 custom tasks, which gives wide intervals.
-- The repo is public, but the demo video, the `v1.0.0` tag, the release notes and the live docs site are not done. They are steps at the `v1.0.0` gate.
+- The demo video and the README GIF are not recorded yet; [docs/demo-script.md](docs/demo-script.md) has the script and the checklist. The repo is public, `v1.0.0` is tagged, `.github/workflows/release.yml` gives each version tag a GitHub Release with the tag's notes, and the docs site is live.
 
 ## Docs map
 
@@ -195,7 +195,7 @@ The threat model, the test behind each control and the known gaps are in [docs/s
 | [docs/progress.md](docs/progress.md) | The status of every story |
 | [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/style.md](docs/style.md) | The working rules and the voice of the docs |
 
-The docs site renders the same files with a grouped navbar, once GitHub Pages is on (see the Status line at the top).
+The [docs site](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/) renders the same files with a grouped navbar.
 
 ## Repo layout
 

@@ -5,8 +5,9 @@ docs/ and writes only to two places that git ignores:
 
 * site/adr/         one page per architecture decision record
 * site/_generated/  fragments that the hand-written pages embed: the ADR index, the list of
-                    gate reports, the phase status table, the diagrams and tables that live
-                    in the build plan, and the chaos table and chart. It also holds a copy of
+                    gate reports and their summary, the phase strip, the diagrams and tables
+                    that live in the build plan, the chaos tiles, table and chart, and the
+                    diagram of the CI jobs. It also holds a copy of
                     every image under docs/, at the same path, so the pages can show them, and
                     the map from each doc to its page, which site/filters/docs.lua uses to
                     point the links of an included doc at the site
@@ -27,6 +28,7 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +43,8 @@ PROGRESS_FILE = Path("docs/progress.md")
 # The chaos run the README quotes. scripts/chaos_chart.py draws CHAOS_CHART from the same file.
 CHAOS_SUMMARY = Path("eval/results/chaos-2026-11-07/summary.json")
 CHAOS_CHART = Path("docs/media/chaos-results.svg")
+# The CI workflow whose jobs the runbook page draws.
+CI_WORKFLOW = Path(".github/workflows/ci.yml")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
 
 # The site page of each doc, by its path in the repo. A link in an included doc that points at
@@ -66,7 +70,7 @@ KILL_TYPES = (
     ("temporal", "Temporal restart"),
     ("postgres", "Postgres restart"),
 )
-# How the list of open stories under the status table words a status of docs/progress.md.
+# How the list of open stories under the phase strip words a status of docs/progress.md.
 OPEN_STATUS = {"Todo": "not started"}
 # Pandoc turns the heading "3.4 Architecture decisions (ADR summaries)" into this anchor.
 PLAN_ADR_LINK = "plan.qmd#architecture-decisions-adr-summaries"
@@ -77,6 +81,8 @@ ADR_STATUS_RE = re.compile(r"^- Status: (.+)$", re.MULTILINE)
 ADR_DATE_RE = re.compile(r"^- Date: (.+)$", re.MULTILINE)
 PLANNED_ADR_RE = re.compile(r"^- \*\*ADR-(\d{4}) (.+?)\.\*\*", re.MULTILINE)
 GATE_FILE_RE = re.compile(r"^phase-(\d+)\.md$")
+GATE_HEADING_RE = re.compile(r"^# (Phase (\d+) gate: (.+))$", re.MULTILINE)
+GATE_RESULT_RE = re.compile(r"^- Result: \*\*(.+?)\*\*", re.MULTILINE)
 PHASE_HEADING_RE = re.compile(r"^## Phase (\d+): (.+) \(tag (v[\d.]+)\)$")
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 HEADING_RE = re.compile(r"^(#{1,6}) ")
@@ -311,6 +317,103 @@ def read_phases(progress: str) -> list[Phase]:
     ]
 
 
+@dataclass(frozen=True)
+class Gate:
+    phase: int
+    heading: str
+    date: str
+    result: str
+
+
+def read_gate(path: Path) -> Gate:
+    """The phase, heading, date and result line of a gate report in docs/gates/."""
+    text = path.read_text(encoding="utf-8")
+    heading, date, result = (
+        pattern.search(text) for pattern in (GATE_HEADING_RE, ADR_DATE_RE, GATE_RESULT_RE)
+    )
+    if not heading:
+        raise SiteError(f"{path.name}: the first line must read '# Phase N gate: Name'")
+    if not date:
+        raise SiteError(f"{path.name}: no '- Date:' line")
+    if not result:
+        raise SiteError(f"{path.name}: no '- Result: **...**' line")
+    return Gate(
+        phase=int(heading.group(2)),
+        heading=heading.group(1),
+        date=date.group(1).strip(),
+        result=result.group(1).strip().rstrip("."),
+    )
+
+
+@dataclass(frozen=True)
+class CiJob:
+    name: str
+    needs: tuple[str, ...]
+    # The job's own `if:` expression, or an empty string when it runs on every run.
+    condition: str
+
+
+JOB_KEY_RE = re.compile(r"^  ([A-Za-z0-9_-]+):\s*(?:#.*)?$")
+JOB_FIELD_RE = re.compile(r"^    (needs|if):\s*(.*?)\s*$")
+LIST_ITEM_RE = re.compile(r"^\s+-\s+(.+?)\s*$")
+EVENT_RE = re.compile(r"github\.event_name\s*==\s*'([a-z_]+)'")
+# How the CI diagram words an event that a job's `if:` names. Any other event shows its name.
+EVENT_WORDS = {"schedule": "the schedule", "workflow_dispatch": "a manual run"}
+
+
+def _unquote(value: str) -> str:
+    return value.strip().strip("'\"")
+
+
+def read_ci_jobs(workflow: str) -> list[CiJob]:
+    """The jobs of a GitHub Actions workflow, with what each one needs, in file order.
+
+    Quarto runs this script with the standard library only, so it reads the YAML by its
+    indentation: a job is a key two spaces in under `jobs:`, and `needs` and `if` sit four
+    spaces in. `needs` may be a flow list, a block list or a single name.
+    """
+    lines = workflow.splitlines()
+    try:
+        start = lines.index("jobs:")
+    except ValueError:
+        raise SiteError(f"{CI_WORKFLOW}: no top-level 'jobs:' key") from None
+    jobs: list[tuple[str, list[str], str]] = []
+    in_needs = False
+    for line in lines[start + 1 :]:
+        if line and not line[0].isspace() and not line.startswith("#"):
+            break
+        key = JOB_KEY_RE.match(line)
+        if key:
+            jobs.append((key.group(1), [], ""))
+            in_needs = False
+            continue
+        if not jobs:
+            continue
+        field = JOB_FIELD_RE.match(line)
+        if field:
+            name, value = field.groups()
+            in_needs = name == "needs" and not value
+            if name == "needs" and value:
+                inner = value[1:-1] if value.startswith("[") and value.endswith("]") else value
+                jobs[-1][1].extend(_unquote(item) for item in inner.split(",") if item.strip())
+            elif name == "if":
+                jobs[-1] = (jobs[-1][0], jobs[-1][1], value)
+            continue
+        item = LIST_ITEM_RE.match(line) if in_needs else None
+        if item:
+            jobs[-1][1].append(_unquote(item.group(1)))
+        elif line.strip() and not line.strip().startswith("#"):
+            in_needs = False
+    if not jobs:
+        raise SiteError(f"{CI_WORKFLOW}: no jobs under 'jobs:'")
+    names = {name for name, _, _ in jobs}
+    for name, needs, _ in jobs:
+        for other in needs:
+            if other not in names:
+                raise SiteError(f"{CI_WORKFLOW}: job {name} needs {other}, which is not a job")
+    return [CiJob(name, tuple(needs), condition) for name, needs, condition in jobs]
+
+
 # --- rendering ------------------------------------------------------------------------------
 
 
@@ -403,22 +506,56 @@ def gates_list(doc_paths: list[str]) -> str:
     return "".join(f"{path}\n" for path in doc_paths)
 
 
-def status_fragment(phases: list[Phase]) -> str:
+# The badge class of a phase state, as site/filters/docs.lua gives it to the same words.
+STATE_BADGE = {"Done": "done", "In progress": "active", "Not started": "idle"}
+
+
+def _raw_html(markup: str) -> str:
+    """A raw HTML block that Pandoc passes through untouched."""
+    return "```{=html}\n" + markup.strip() + "\n```\n"
+
+
+def phase_strip(phases: list[Phase]) -> str:
+    """One line per phase with its number, name, tag, stories done and a bar, as a real list.
+
+    The bar is decoration for sighted readers. The text of each item says the same, so a
+    screen reader hears "Phase 3 GitHub integration v0.3.0 9 of 9 stories done".
+    """
     stories = sum(p.stories for p in phases)
     done = sum(p.done for p in phases)
     points = sum(p.points for p in phases)
     points_done = sum(p.points_done for p in phases)
-    rows = [
-        "| Phase | What it covers | Tag | Stories done | State |",
-        "|---|---|---|---|---|",
-        *(
-            f"| {p.number} | {cell(p.name)} | {p.tag} | {p.done} of {p.stories} | {p.state} |"
-            for p in phases
-        ),
-    ]
-    text = (
+    summary = (
         f"{done} of {stories} stories are done, which is {points_done} of {points} points, "
-        f"across {len(phases)} phases.\n\n" + "\n".join(rows) + "\n"
+        f"across {len(phases)} phases."
+    )
+    if all(p.state == "Done" for p in phases):
+        summary += " Every phase is done."
+    items = []
+    for p in phases:
+        share = round(100 * p.done / p.stories) if p.stories else 0
+        badge = (
+            ""
+            if p.state == "Done"
+            else f' <span class="badge-status {STATE_BADGE[p.state]}">{p.state}</span>'
+        )
+        items.append(
+            f'<li class="phase-item">'
+            f'<span class="phase-title"><span class="phase-num">'
+            f'<span class="visually-hidden">Phase </span>{p.number}</span> '
+            f'<span class="phase-name">{escape(p.name)}</span></span> '
+            f'<span class="phase-meta"><code>{escape(p.tag)}</code> '
+            f"<span>{p.done} of {p.stories} stories done</span>{badge}</span>"
+            f'<span class="phase-bar" aria-hidden="true">'
+            f'<span style="width: {share}%"></span></span>'
+            "</li>"
+        )
+    text = _raw_html(
+        '<div class="phase-strip">\n'
+        f'<p class="phase-summary">{summary}</p>\n'
+        '<ol class="phase-list" aria-label="Stories done in each phase">\n'
+        + "\n".join(items)
+        + "\n</ol>\n</div>"
     )
     still_open = [(p.number, story) for p in phases for story in p.open_stories]
     if still_open:
@@ -427,6 +564,123 @@ def status_fragment(phases: list[Phase]) -> str:
             for number, (story, title, status) in still_open
         )
     return text
+
+
+def heading_id(text: str) -> str:
+    """The id Pandoc gives a heading: lower case, punctuation dropped, spaces as hyphens."""
+    kept = "".join(c for c in text.lower() if c.isalnum() or c in "_-. ")
+    return re.sub(r"^[^a-z]+", "", re.sub(r"\s+", "-", kept.strip()))
+
+
+def gates_summary(gates: list[Gate], phases: list[Phase]) -> str:
+    """One row per gate report: the phase, its tag, the stories now, the date and the result.
+
+    The name, tag and stories come from docs/progress.md, so they say where a phase stands
+    today. The date and result are quoted from the report, as they stood on the gate day.
+    """
+    by_number = {p.number: p for p in phases}
+
+    def row(g: Gate) -> str:
+        phase = by_number.get(g.phase)
+        name = phase.name if phase else g.heading.split(": ", 1)[1]
+        tag, state = (phase.tag, phase.state) if phase else ("", "")
+        return (
+            f"| [{g.phase}: {cell(name)}](#{heading_id(g.heading)}) | {tag} | {state} "
+            f"| {g.date} | {cell(g.result)} |"
+        )
+
+    rows = [
+        "| Phase | Tag | Stories | Gate day | Result on the gate day |",
+        "|---|---|---|---|---|",
+        *(row(g) for g in gates),
+    ]
+    return "\n".join(rows) + "\n"
+
+
+def stat_tiles(summary: dict[str, Any]) -> str:
+    """The headline numbers of the chaos run as tiles: a label, a value and one line of context."""
+    runs = summary["runs"]
+    landed = sum(summary["kills_landed"].values())
+    planned = sum(summary["kills_planned"].values())
+    latency = summary["resume_latency"]
+    tiles = (
+        (
+            "Runs that ended with a pull request",
+            f"{summary['completed']} of {runs}",
+            f"{summary['diff_matches']} of {runs} with the diff of a run with no kill",
+        ),
+        (
+            "Duplicate GitHub writes",
+            str(summary["duplicate_side_effects"]),
+            f"{summary['missing_side_effects']} missing, counted on a fake GitHub",
+        ),
+        (
+            "Kills that landed",
+            f"{landed} of {planned}",
+            f"of the planned kills, across {len(summary['kills_planned'])} kill types",
+        ),
+        (
+            "Median resume after a kill",
+            _seconds(latency["median_s"]),
+            # A no-break space keeps the unit on the line of its number.
+            f"95th percentile {_seconds(latency['p95_s']).replace(' ', '&nbsp;')}",
+        ),
+    )
+    cells = "\n".join(
+        f'<div class="stat-tile"><dt>{label}</dt>'
+        f'<dd class="stat-value">{value}</dd><dd class="stat-note">{note}</dd></div>'
+        for label, value, note in tiles
+    )
+    scripted = set(summary["recordings"].values()) == {"scripted"}
+    caption = (
+        f"Chaos run <code>{escape(summary['name'])}</code>: {runs} runs of "
+        f"{len(summary['tasks'])} recorded tasks, seed {summary['seed']}."
+        + (
+            " The model answers were scripted, so these numbers measure durability."
+            if scripted
+            else ""
+        )
+    )
+    return _raw_html(
+        '<div class="stat-block">\n'
+        f'<dl class="stat-tiles">\n{cells}\n</dl>\n'
+        f'<p class="stat-caption">{caption}</p>\n'
+        "</div>"
+    )
+
+
+def ci_diagram(jobs: list[CiJob]) -> str:
+    """A mermaid flowchart of the CI jobs: each arrow goes from a job to the job that needs it.
+
+    A job that no job needs and that needs none sits apart, with the events its `if:` allows.
+    """
+    ids = {job.name: f"job{index}" for index, job in enumerate(jobs)}
+    needed = {name for job in jobs for name in job.needs}
+    apart = [job for job in jobs if not job.needs and job.name not in needed]
+    # Tighter spacing than mermaid's default, because the jobs stack in one tall column.
+    lines = ['%%{init: {"flowchart": {"nodeSpacing": 14, "rankSpacing": 60}}}%%', "flowchart LR"]
+    for job in jobs:
+        if job in apart:
+            continue
+        label = job.name
+        if job.needs:
+            label += f"<br/>needs {len(job.needs)} jobs"
+        lines.append(f'  {ids[job.name]}["{label}"]')
+    for job in jobs:
+        if job.needs:
+            sources = " & ".join(ids[name] for name in job.needs)
+            lines.append(f"  {sources} --> {ids[job.name]}")
+            lines.append(f"  class {ids[job.name]} gate")
+    if apart:
+        lines.append('  subgraph apart["Needed by no job"]')
+        for job in apart:
+            events = EVENT_RE.findall(job.condition)
+            words = [EVENT_WORDS.get(event, event) for event in events]
+            note = f"only on {' or '.join(words)}" if words else "on its own"
+            lines.append(f'    {ids[job.name]}["{job.name}<br/>{note}"]')
+        lines.append("  end")
+    lines.append("  classDef gate stroke-width:3px")
+    return "\n".join(lines) + "\n"
 
 
 def doc_pages(adrs: list[Adr], gates: list[Path]) -> str:
@@ -517,6 +771,8 @@ def build(root: Path) -> list[Path]:
     gates = gate_files(docs / "gates")
     summary = json.loads((root / CHAOS_SUMMARY).read_text(encoding="utf-8"))
     chart = (root / CHAOS_CHART).read_text(encoding="utf-8")
+    ci_jobs = read_ci_jobs((root / CI_WORKFLOW).read_text(encoding="utf-8"))
+    gate_reports = [read_gate(path) for path in gates if GATE_FILE_RE.match(path.name)]
 
     adr_dir, generated = site / "adr", site / "_generated"
     # Both folders belong to this script. Clearing them drops pages of renamed or removed docs.
@@ -536,7 +792,8 @@ def build(root: Path) -> list[Path]:
     fragments = {
         "adr-index.md": adr_index(adrs, planned),
         "gates.txt": gates_list([_relative(path, site) for path in gates]),
-        "status.md": status_fragment(phases),
+        "gates-summary.md": gates_summary(gate_reports, phases),
+        "phase-strip.md": phase_strip(phases),
         "system-context.mmd": plan_diagram(plan, "3.1"),
         "task-lifecycle.mmd": plan_diagram(plan, "3.2"),
         "components.md": plan_table(plan, "3.3"),
@@ -544,6 +801,8 @@ def build(root: Path) -> list[Path]:
         "doc-pages.txt": doc_pages(adrs, gates),
         "chaos-table.md": chaos_table(summary),
         "chaos-chart.md": chaos_chart(chart),
+        "chaos-tiles.md": stat_tiles(summary),
+        "ci-jobs.mmd": ci_diagram(ci_jobs),
     }
     for name, text in fragments.items():
         _write(generated / name, text)

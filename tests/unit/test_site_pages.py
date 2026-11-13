@@ -1,6 +1,7 @@
 """scripts/site_pages.py: the pre-render step that turns docs/ into pages for the Quarto site."""
 
 import ast
+import html
 import importlib.util
 import re
 import shutil
@@ -8,6 +9,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import pytest
 
@@ -221,15 +223,42 @@ def test_read_phases_keeps_the_stories_that_are_not_done() -> None:
     assert second.open_stories == (("LH-101", "Contracts", "Todo"),)
 
 
-def test_the_status_lists_the_stories_that_are_not_done() -> None:
-    status = site_pages.status_fragment(site_pages.read_phases(PROGRESS))
-    assert status.endswith(
+def test_the_strip_lists_the_stories_that_are_not_done() -> None:
+    strip = site_pages.phase_strip(site_pages.read_phases(PROGRESS))
+    assert strip.endswith(
         "The stories that are not done:\n\n"
         "- LH-002 Stack (Phase 0, in progress)\n"
         "- LH-101 Contracts (Phase 1, not started)\n"
     )
+    # A phase that is not done says so in words, not by the color of its bar alone.
+    assert '<span class="badge-status active">In progress</span>' in strip
+    assert '<span class="badge-status idle">Not started</span>' in strip
+    assert '<span style="width: 50%">' in strip
+    assert "Every phase is done" not in strip
     done = site_pages.read_phases(PROGRESS.replace("In progress", "Done").replace("Todo", "Done"))
-    assert "not done" not in site_pages.status_fragment(done)
+    finished = site_pages.phase_strip(done)
+    assert "not done" not in finished
+    assert "badge-status" not in finished
+    assert "3 of 3 stories are done, which is 10 of 10 points, across 2 phases." in finished
+    assert "Every phase is done." in finished
+
+
+def test_the_strip_is_a_list_a_screen_reader_can_read() -> None:
+    strip = site_pages.phase_strip(site_pages.read_phases(PROGRESS))
+    assert strip.startswith("```{=html}\n")
+    assert '<ol class="phase-list" aria-label="Stories done in each phase">' in strip
+    assert strip.count('<li class="phase-item">') == 2
+    # The bar is decoration. The words beside it carry the same numbers.
+    assert strip.count('<span class="phase-bar" aria-hidden="true">') == 2
+    item = re.sub(r"<[^>]+>", "", strip.split('<li class="phase-item">')[1].split("</li>")[0])
+    assert item == "Phase 0 Foundation v0.0.1 1 of 2 stories done In progress"
+
+
+def test_the_strip_escapes_a_phase_name() -> None:
+    (phase,) = site_pages.read_phases(
+        PROGRESS.split("\n## Phase 1")[0].replace("Foundation", "A <b> & C")
+    )
+    assert "A &lt;b&gt; &amp; C" in site_pages.phase_strip([phase])
 
 
 def test_a_phase_with_every_story_done_is_done() -> None:
@@ -252,7 +281,7 @@ def test_read_phases_names_the_problem(text: str, message: str) -> None:
 # --- rendering ------------------------------------------------------------------------------
 
 
-def _record(number: str, title: str = "T") -> site_pages.Adr:
+def _record(number: str, title: str = "T") -> Any:
     return site_pages.Adr(number, f"ADR-{number}: {title}", title, "Accepted", "d", f"{number}-t")
 
 
@@ -316,9 +345,10 @@ def test_the_gate_list_has_one_path_per_line() -> None:
 def tree(tmp_path: Path) -> Path:
     """A copy of docs/ with an empty site/, so build() never writes into the repo."""
     shutil.copytree(ROOT / "docs", tmp_path / "docs")
-    summary = tmp_path / site_pages.CHAOS_SUMMARY
-    summary.parent.mkdir(parents=True)
-    shutil.copy(ROOT / site_pages.CHAOS_SUMMARY, summary)
+    for source in (site_pages.CHAOS_SUMMARY, site_pages.CI_WORKFLOW):
+        copy = tmp_path / source
+        copy.parent.mkdir(parents=True)
+        shutil.copy(ROOT / source, copy)
     (tmp_path / "site").mkdir()
     return tmp_path
 
@@ -375,25 +405,46 @@ def test_a_new_gate_report_reaches_the_site(tree: Path) -> None:
     site_pages.build(tree)
     before = _generated(tree)["gates.txt"].splitlines()
     assert before, "the repo should hold at least one gate report"
-    (tree / "docs" / "gates" / "phase-98.md").write_text("# Phase 98 gate\n", encoding="utf-8")
+    report = "# Phase 98 gate: Later\n\n- Date: 2026-12-01\n- Result: **Pass.**\n"
+    (tree / "docs" / "gates" / "phase-98.md").write_text(report, encoding="utf-8")
     site_pages.build(tree)
     assert _generated(tree)["gates.txt"].splitlines() == [*before, "../docs/gates/phase-98.md"]
+    assert (
+        "| [98: Later](#phase-98-gate-later) |  |  | 2026-12-01 | Pass |"
+        in _generated(tree)["gates-summary.md"]
+    )
 
 
-def test_the_status_table_matches_the_progress_file(tree: Path) -> None:
+def test_the_gate_summary_names_each_phase_and_its_stories_as_progress_does() -> None:
+    gate = site_pages.Gate(phase=7, heading="Phase 7 gate: Old", date="2026-11-08", result="Pass")
+    phase = site_pages.Phase(7, "New name", "v0.7.0", 2, 2, 2, 5, 5)
+    row = site_pages.gates_summary([gate], [phase]).splitlines()[2]
+    assert row == "| [7: New name](#phase-7-gate-old) | v0.7.0 | Done | 2026-11-08 | Pass |"
+
+
+def test_the_phase_strip_matches_the_progress_file(tree: Path) -> None:
     site_pages.build(tree)
     progress = (ROOT / "docs" / "progress.md").read_text(encoding="utf-8")
-    rows = [
-        [cell.strip() for cell in line.strip().strip("|").split("|")]
-        for line in progress.splitlines()
-        if line.startswith("| LH-")
-    ]
-    done = sum(1 for row in rows if row[3] == "Done")
-    status = _generated(tree)["status.md"]
-    assert status.startswith(f"{done} of {len(rows)} stories are done")
-    phases = len(re.findall(r"^## Phase \d", progress, re.MULTILINE))
-    table = [line for line in status.splitlines() if line.startswith("| ")]
-    assert len(table) == phases + 1
+    strip = _generated(tree)["phase-strip.md"]
+    # Read the file again here, apart from read_phases, so a mistake in it cannot hide.
+    headings = re.findall(r"^## Phase (\d+): (.+) \(tag (v[\d.]+)\)$", progress, re.MULTILINE)
+    sections = re.split(r"^## Phase \d+: .+$", progress, flags=re.MULTILINE)[1:]
+    assert len(headings) == len(sections) == strip.count('<li class="phase-item">')
+    total = done = 0
+    for (number, name, tag), body in zip(headings, sections, strict=True):
+        statuses = [
+            line.split("|")[4].strip() for line in body.splitlines() if line.startswith("| LH-")
+        ]
+        finished = statuses.count("Done")
+        total, done = total + len(statuses), done + finished
+        item = (
+            f'<span class="visually-hidden">Phase </span>{number}</span> '
+            f'<span class="phase-name">{html.escape(name)}</span></span> '
+            f'<span class="phase-meta"><code>{tag}</code> '
+            f"<span>{finished} of {len(statuses)} stories done</span>"
+        )
+        assert item in strip, name
+    assert f"{done} of {total} stories are done" in strip
 
 
 def test_diagrams_and_tables_are_the_plans_own_text(tree: Path) -> None:
@@ -652,17 +703,55 @@ def test_the_chaos_chart_of_the_site_is_the_committed_chart(tree: Path) -> None:
     assert (ROOT / site_pages.CHAOS_CHART).read_text(encoding="utf-8").strip() in chart
 
 
-def test_the_overview_only_claims_what_the_chaos_summary_shows() -> None:
+def test_the_tiles_match_the_chaos_summary(tree: Path) -> None:
     import json
 
+    site_pages.build(tree)
     summary = json.loads((ROOT / site_pages.CHAOS_SUMMARY).read_text(encoding="utf-8"))
-    overview = (ROOT / "site" / "index.qmd").read_text(encoding="utf-8")
-    assert "Every run ended with a pull request and the same diff" in overview
-    assert summary["completed"] == summary["diff_matches"] == summary["runs"]
-    assert "no duplicate and no missing write" in overview
-    assert summary["duplicate_side_effects"] == summary["missing_side_effects"] == 0
-    assert "scripted recordings" in overview
+    tiles = _generated(tree)["chaos-tiles.md"]
+    values = dict(re.findall(r'<dt>([^<]+)</dt><dd class="stat-value">([^<]+)</dd>', tiles))
+    runs = summary["runs"]
+    landed = sum(summary["kills_landed"].values())
+    planned = sum(summary["kills_planned"].values())
+    assert values == {
+        "Runs that ended with a pull request": f"{summary['completed']} of {runs}",
+        "Duplicate GitHub writes": str(summary["duplicate_side_effects"]),
+        "Kills that landed": f"{landed} of {planned}",
+        "Median resume after a kill": f"{summary['resume_latency']['median_s']:.1f} s",
+    }
+    assert f"{summary['diff_matches']} of {runs} with the diff of a run with no kill" in tiles
+    assert f"{summary['missing_side_effects']} missing" in tiles
+    assert f"95th percentile {summary['resume_latency']['p95_s']:.1f}&nbsp;s" in tiles
     assert set(summary["recordings"].values()) == {"scripted"}
+    assert "The model answers were scripted" in tiles
+
+
+def test_the_tiles_follow_the_summary(tree: Path) -> None:
+    import json
+
+    path = tree / site_pages.CHAOS_SUMMARY
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    summary["completed"] = 17
+    summary["recordings"]["calc-01"] = "recorded"
+    path.write_text(json.dumps(summary), encoding="utf-8")
+    site_pages.build(tree)
+    tiles = _generated(tree)["chaos-tiles.md"]
+    assert '<dd class="stat-value">17 of 20</dd>' in tiles
+    assert "scripted" not in tiles
+
+
+def test_the_overview_and_results_show_the_tiles_and_type_no_chaos_number() -> None:
+    # The headline numbers come from the summary at build time. A number typed into a page
+    # would stay behind when a new run changes the file.
+    for name in ("index.qmd", "results.qmd"):
+        text = (ROOT / "site" / name).read_text(encoding="utf-8")
+        assert '::: {fragment="_generated/chaos-tiles.md"}' in text, name
+    overview = (ROOT / "site" / "index.qmd").read_text(encoding="utf-8")
+    for typed in ("20 of 20", "39 of 45", "2.0 s", "18 runs", "22.1 s"):
+        assert typed not in overview, typed
+    assert '::: {fragment="_generated/chaos-chart.md"}' in overview
+    assert '::: {fragment="_generated/phase-strip.md"}' in overview
+    assert "status.md" not in overview
 
 
 def test_the_results_page_says_what_each_row_of_the_chaos_table_counts() -> None:
@@ -681,7 +770,155 @@ def test_the_results_page_says_what_each_row_of_the_chaos_table_counts() -> None
     assert "is hit with one to three kills" not in results
     assert "The **All** row counts every run, including the two that no kill hit." in results
     assert "count the runs that a kill of that type hit." not in results
-    overview = (ROOT / "site" / "index.qmd").read_text(encoding="utf-8")
-    assert "each run had one to three kills planned" in overview
-    hit = summary["runs"] - missed
-    assert f"in {hit} runs at least one of them landed" in overview
+    assert "in two runs none of them landed before the run ended" in results
+
+
+# --- the CI diagram and the gate summary ----------------------------------------------------
+
+WORKFLOW = """\
+name: ci
+on:
+  push:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "needs: [not, a, field]"
+  # A comment between jobs.
+  unit:
+    needs: lint
+  e2e:
+    needs:
+      - lint
+      - "unit"
+  nightly:
+    if: github.event_name == 'schedule'
+  ci:
+    if: always()
+    needs: [lint, unit, 'e2e']
+
+other: value
+"""
+
+
+def test_read_ci_jobs_reads_every_form_of_needs() -> None:
+    jobs = {job.name: job for job in site_pages.read_ci_jobs(WORKFLOW)}
+    assert list(jobs) == ["lint", "unit", "e2e", "nightly", "ci"]
+    assert jobs["lint"].needs == ()
+    assert jobs["unit"].needs == ("lint",)
+    assert jobs["e2e"].needs == ("lint", "unit")
+    assert jobs["ci"].needs == ("lint", "unit", "e2e")
+    assert jobs["nightly"].condition == "github.event_name == 'schedule'"
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ("name: ci\n", "no top-level 'jobs:' key"),
+        ("jobs:\nother: 1\n", "no jobs under 'jobs:'"),
+        ("jobs:\n  ci:\n    needs: [gone]\n", "job ci needs gone, which is not a job"),
+    ],
+)
+def test_read_ci_jobs_names_the_problem(text: str, message: str) -> None:
+    with pytest.raises(SiteError, match=re.escape(message)):
+        site_pages.read_ci_jobs(text)
+
+
+def test_the_ci_diagram_draws_each_need_and_sets_a_lone_job_apart() -> None:
+    diagram = site_pages.ci_diagram(site_pages.read_ci_jobs(WORKFLOW))
+    assert diagram.splitlines()[1] == "flowchart LR"
+    assert "  job0 --> job1\n" in diagram
+    assert "  job0 & job1 --> job2\n" in diagram
+    assert "  job0 & job1 & job2 --> job4\n" in diagram
+    assert 'job4["ci<br/>needs 3 jobs"]' in diagram
+    assert '    job3["nightly<br/>only on the schedule"]' in diagram
+
+
+def test_the_ci_diagram_covers_every_job_of_the_workflow(tree: Path) -> None:
+    import yaml
+
+    site_pages.build(tree)
+    diagram = _generated(tree)["ci-jobs.mmd"]
+    workflow = yaml.safe_load((ROOT / site_pages.CI_WORKFLOW).read_text(encoding="utf-8"))
+    jobs = workflow["jobs"]
+    labels = re.findall(r'^\s+job\d+\["([^"<]+)', diagram, re.MULTILINE)
+    # Each job is drawn once. One that no job needs sits apart, after the others.
+    assert sorted(labels) == sorted(jobs)
+    assert len(labels) == len(set(labels))
+    ids = dict(re.findall(r'^\s+(job\d+)\["([^"<]+)', diagram, re.MULTILINE))
+    names = {name: key for key, name in ids.items()}
+    for name, job in jobs.items():
+        needs = job.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        if needs:
+            edge = " & ".join(names[other] for other in needs) + f" --> {names[name]}"
+            assert f"  {edge}\n" in diagram, name
+
+
+def test_the_runbook_draws_the_ci_diagram(site_tree: Path) -> None:
+    text = (site_tree / "site" / "runbook.qmd").read_text(encoding="utf-8")
+    assert "%%| file: _generated/ci-jobs.mmd" in text
+    assert (site_tree / "site" / "_generated" / "ci-jobs.mmd").is_file()
+
+
+GATE = """\
+# Phase 3 gate: GitHub integration
+
+- Date: 2026-11-07
+- Result: **Pass on code, pending one manual step.** The smoke needs a token.
+"""
+
+
+def test_read_gate_takes_the_heading_date_and_bold_result(tmp_path: Path) -> None:
+    path = tmp_path / "phase-3.md"
+    path.write_text(GATE, encoding="utf-8")
+    gate = site_pages.read_gate(path)
+    assert gate == site_pages.Gate(
+        3, "Phase 3 gate: GitHub integration", "2026-11-07", "Pass on code, pending one manual step"
+    )
+
+
+@pytest.mark.parametrize(
+    ("edit", "message"),
+    [
+        (lambda t: t.replace("# Phase 3 gate: ", "# "), "first line must read"),
+        (lambda t: t.replace("- Date: 2026-11-07\n", ""), "no '- Date:' line"),
+        (lambda t: t.replace("**Pass", "Pass"), "no '- Result: **...**' line"),
+    ],
+    ids=["heading", "date", "result"],
+)
+def test_read_gate_names_the_problem(
+    tmp_path: Path, edit: Callable[[str], str], message: str
+) -> None:
+    path = tmp_path / "phase-3.md"
+    path.write_text(edit(GATE), encoding="utf-8")
+    with pytest.raises(SiteError, match=re.escape(message)):
+        site_pages.read_gate(path)
+
+
+def test_heading_id_follows_pandoc() -> None:
+    assert (
+        site_pages.heading_id("Phase 5 gate: Planner, verifier and stuck handling")
+        == "phase-5-gate-planner-verifier-and-stuck-handling"
+    )
+    assert site_pages.heading_id("3.4 Architecture decisions") == "architecture-decisions"
+
+
+def test_the_gate_summary_has_a_row_per_report(tree: Path) -> None:
+    site_pages.build(tree)
+    summary = _generated(tree)["gates-summary.md"]
+    rows = [line for line in summary.splitlines() if line.startswith("| [")]
+    reports = sorted((ROOT / "docs" / "gates").glob("phase-*.md"))
+    assert len(rows) == len(reports)
+    tags = {
+        p.number: p.tag
+        for p in site_pages.read_phases((ROOT / "docs" / "progress.md").read_text(encoding="utf-8"))
+    }
+    for report in reports:
+        text = report.read_text(encoding="utf-8")
+        number = int(re.search(r"^# Phase (\d+) gate", text, re.MULTILINE).group(1))  # type: ignore[union-attr]
+        result = re.search(r"^- Result: \*\*(.+?)\*\*", text, re.MULTILINE).group(1)  # type: ignore[union-attr]
+        row = next(r for r in rows if r.startswith(f"| [{number}: "))
+        assert f"| {tags[number]} |" in row
+        assert result.rstrip(".") in row

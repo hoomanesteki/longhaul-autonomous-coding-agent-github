@@ -82,7 +82,7 @@ The top-level system prompt holds only the static blocks 1 to 4 and is frozen fo
 
 ## Appendix: API facts (LH-102)
 
-Drafted on 2026-10-30 from the Claude API documentation. Every fact names its page and section, written as "API docs, <page>: <section>"; the pages are listed under Sources below. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. After a run, replace "pending" with the result and the date.
+Drafted on 2026-10-30 from the Claude API documentation. Every fact names its page and section, written as `API docs, <page>: <section>`; the pages are listed under Sources below. "Confirmed live: pending" marks a fact that needs a call with a real key. The spike items S1 to S10 are listed in the log at the end. After a run, replace "pending" with the result and the date.
 
 - Model scope: planner, coder and verifier use `claude-sonnet-5-5`. The compactor and `summarize_for_human` use `claude-haiku-5-5`. A fact that names no model applies to both.
 - SDK: `anthropic` 2.3.0 is locked (LH-104, ADR-0002). It sends `anthropic-version` 2026-10-21, pinned by `test_the_sdk_sends_the_api_version_adr_0003_records`.

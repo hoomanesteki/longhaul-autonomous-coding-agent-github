@@ -2,13 +2,23 @@
 title: Gate reports
 pagetitle: "Gate reports | Longhaul"
 description: "The review at the end of each phase: what passed, what failed and what was fixed."
+hide-description: true
 toc-depth: 2
 ---
 
-Each phase ends with a gate. The reviewer runs `make gate PHASE=N`, checks every acceptance criterion and invariant, and writes a report. The reports below are the evidence that a phase is done, including what failed and what was fixed.
+::: {.lead}
+The evidence behind each phase. At the end of a phase the reviewer runs `make gate PHASE=N`, checks every acceptance criterion and invariant, and writes down what passed, what failed and what was fixed.
+:::
+
+Every story in every phase is done. The result column quotes each report on the day of its gate. The steps a report left open need a live model, a real GitHub account or the eval VM, and each report lists them under "Steps to close the gate".
+
+::: {.gates-summary}
+::: {fragment="_generated/gates-summary.md"}
+:::
+:::
 
 ::: {.source-note}
-The reports are the files in [`docs/gates/`]({{< meta source-repo >}}/tree/main/docs/gates). A new report appears here when it is added to that folder.
+The reports are the files in [`docs/gates/`]({{< meta source-repo >}}/tree/main/docs/gates). The table and the reports are read from that folder on every build.
 :::
 
 ::: {fragments="_generated/gates.txt" wrap="demote" empty="No gate report has been written yet."}

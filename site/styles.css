@@ -73,12 +73,27 @@ figure.quarto-float-fig > div::-webkit-scrollbar-thumb,
     scrollbar-width: thin;
   }
 }
-/* The overview diagram of the home page is smaller, so it fits the page down to tablet width. */
+/* The overview diagram of the home page, and the diagrams of the security and AWS pages, are
+   smaller, so they fit the page down to tablet width. */
 .diagram-fit svg.mermaid-js {
   min-width: 0;
 }
 @media (max-width: 760px) {
   .diagram-fit svg.mermaid-js {
+    min-width: 720px;
+  }
+  /* The overview is twice as wide as the others, so it needs more room to stay readable. */
+  #fig-overview svg.mermaid-js {
+    min-width: 1000px;
+  }
+}
+/* The task workflow of docs/architecture.md is tall and narrow. The 1300px floor would blow it
+   up, so it fits its column like the diagrams above. */
+#task-workflow svg.mermaid-js {
+  min-width: 0;
+}
+@media (max-width: 760px) {
+  #task-workflow svg.mermaid-js {
     min-width: 720px;
   }
 }
@@ -117,6 +132,24 @@ svg.mermaid-js .edgeLabel p {
   color: var(--bs-secondary-color);
 }
 
+/* Colors of the cards, tiles and the phase strip. Quarto compiles the light and the dark theme
+   apart, so Bootstrap's tertiary colors would be the light ones in both; these are set per theme.
+   Each text color keeps a contrast of 4.5 or more on the card, and the bar 3 or more on its track. */
+body.quarto-light {
+  --lh-card-bg: #f6f8fb;
+  --lh-card-border: #d5dce5;
+  --lh-muted: #4f5b67;
+  --lh-accent: #1b6ac9;
+  --lh-track: #dbe6f5;
+}
+body.quarto-dark {
+  --lh-card-bg: #1a1f27;
+  --lh-card-border: #2d343f;
+  --lh-muted: #a9b3c1;
+  --lh-accent: #5b9cf0;
+  --lh-track: #2a3a52;
+}
+
 /* The home page. */
 .lead {
   font-size: 1.15rem;
@@ -128,20 +161,179 @@ svg.mermaid-js .edgeLabel p {
   gap: 0.5rem;
   margin: 1.25rem 0 1.5rem;
 }
-.idea-grid,
-.shot-grid {
+
+/* Cards: the five failures of the home page and the map of the site. */
+.answer-grid,
+.page-grid {
   display: grid;
-  gap: 1rem;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  margin-bottom: 1rem;
+  gap: 0.75rem;
+  margin: 1rem 0 1.25rem;
 }
-.idea {
-  border: 1px solid var(--bs-border-color);
+.answer-grid {
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+.page-grid {
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+}
+.answer-card,
+.page-card {
+  background: var(--lh-card-bg);
+  border: 1px solid var(--lh-card-border);
   border-radius: 0.5rem;
-  padding: 0.9rem 1rem;
+  padding: 0.75rem 1rem;
 }
-.idea p:last-child {
+.answer-card {
+  border-left: 3px solid var(--lh-accent);
+}
+.answer-card p,
+.page-card p {
+  margin-bottom: 0.25rem;
+}
+.answer-card p:last-child,
+.page-card p:last-child {
+  color: var(--lh-muted);
+  font-size: 0.95rem;
   margin-bottom: 0;
+}
+/* The whole card is the link, and a keyboard focus ring shows around it. */
+.page-card {
+  position: relative;
+}
+.page-card a {
+  font-weight: 600;
+  text-decoration: none;
+}
+.page-card a::after {
+  content: "";
+  inset: 0;
+  position: absolute;
+}
+.page-card:hover {
+  border-color: var(--lh-accent);
+}
+.page-card:focus-within {
+  outline: 2px solid var(--lh-accent);
+  outline-offset: 2px;
+}
+.page-card a:focus-visible {
+  outline: none;
+}
+
+/* Stat tiles of the chaos run (scripts/site_pages.py, stat_tiles). */
+.stat-block {
+  margin: 1rem 0 1.25rem;
+}
+.stat-tiles {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0;
+}
+@media (min-width: 768px) {
+  .stat-tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+.stat-tile {
+  background: var(--lh-card-bg);
+  border: 1px solid var(--lh-card-border);
+  border-radius: 0.5rem;
+  min-width: 0;
+  padding: 0.7rem 0.85rem;
+}
+.stat-tile dt {
+  color: var(--lh-muted);
+  font-size: 0.85rem;
+  font-weight: 500;
+  line-height: 1.3;
+  /* Two lines, so the values line up when one label wraps and its neighbour does not. */
+  min-height: 2.6em;
+}
+.stat-tile dd {
+  margin: 0;
+}
+.stat-tile .stat-value {
+  font-size: clamp(1.4rem, 5vw, 1.75rem);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  line-height: 1.2;
+  margin: 0.3rem 0 0.2rem;
+}
+.stat-tile .stat-note,
+.stat-caption {
+  color: var(--lh-muted);
+  font-size: 0.85rem;
+  line-height: 1.4;
+}
+.stat-caption {
+  margin: 0.6rem 0 0;
+}
+
+/* The phase strip: one line per phase with a bar of the stories done (phase_strip). */
+.phase-strip {
+  margin: 1rem 0 1.25rem;
+}
+.phase-summary {
+  font-weight: 600;
+  margin-bottom: 0.5rem;
+}
+.phase-list {
+  display: grid;
+  gap: 0 1.5rem;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.phase-item {
+  border-bottom: 1px solid var(--lh-card-border);
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  padding: 0.55rem 0;
+}
+.phase-title {
+  font-weight: 600;
+  line-height: 1.35;
+}
+.phase-num {
+  background: var(--lh-track);
+  border-radius: 0.3rem;
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+  margin-right: 0.35rem;
+  min-width: 1.6rem;
+  text-align: center;
+}
+.phase-meta {
+  color: var(--lh-muted);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: 0.85rem;
+  gap: 0.25rem 0.75rem;
+}
+.phase-strip .phase-meta code {
+  background: none;
+  color: inherit;
+  padding: 0;
+}
+.phase-bar {
+  background: var(--lh-track);
+  border-radius: 3px;
+  display: block;
+  height: 6px;
+  overflow: hidden;
+}
+.phase-bar > span {
+  background: var(--lh-accent);
+  border-radius: 3px;
+  display: block;
+  height: 100%;
+}
+
+/* Small diagrams (the CI jobs) fit their column at every width. */
+.diagram-small svg.mermaid-js {
+  min-width: 0;
 }
 
 /* Console screenshots: a thin frame so a white page does not melt into a white site. */
@@ -150,9 +342,10 @@ img.screenshot {
   border-radius: 0.5rem;
   max-width: 100%;
 }
-/* Side by side, a tall screenshot shows its top part. The lightbox opens it whole. */
-.shot-grid img.screenshot {
-  aspect-ratio: 4 / 3;
+/* A wide screenshot with empty space below its rows shows its top part. The lightbox opens it
+   whole. */
+img.screenshot-top {
+  aspect-ratio: 16 / 7;
   object-fit: cover;
   object-position: top left;
   width: 100%;
@@ -221,4 +414,10 @@ figcaption,
 .navbar .dropdown-item.active:hover,
 .navbar .dropdown-item.active:focus {
   background-color: var(--bs-dropdown-link-hover-bg);
+}
+
+/* The tag and the date of the gate summary stay on one line (site/gates.qmd). */
+.gates-summary td:nth-child(2),
+.gates-summary td:nth-child(4) {
+  white-space: nowrap;
 }

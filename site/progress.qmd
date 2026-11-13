@@ -2,13 +2,21 @@
 title: Progress
 pagetitle: "Progress | Longhaul"
 description: "The status of every story of the build plan."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+Where every story of the build plan stands.
+:::
+
+::: {fragment="_generated/phase-strip.md"}
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/progress.md >}}
 :::
 
 ::: {.source-note}
-Rendered from [`docs/progress.md`]({{< meta source-repo >}}/blob/main/docs/progress.md). To change it, edit that file.
+Rendered from [`docs/progress.md`]({{< meta source-repo >}}/blob/main/docs/progress.md). The strip is read from its tables on every build. To change it, edit that file.
 :::

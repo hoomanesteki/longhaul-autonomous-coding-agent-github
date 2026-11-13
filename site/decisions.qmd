@@ -2,12 +2,17 @@
 title: Decisions
 pagetitle: "Decisions | Longhaul"
 description: "One record per design choice, with its context, its consequences and the alternatives that were rejected."
+hide-description: true
 toc: false
 ---
 
-Choices that are not obvious get a short architecture decision record (ADR) in `docs/adr/`, in the same pull request as the code. Each record states the context, the decision, its consequences and the alternatives that were rejected.
+::: {.lead}
+Why Longhaul is built the way it is. Each choice that is not obvious has a short record: its context, the decision, its consequences and the alternatives that were rejected.
+:::
 
-New records appear here as soon as they are added to that folder. To write one, start from [`0000-template.md`]({{< meta source-repo >}}/blob/main/docs/adr/0000-template.md).
+The records live in `docs/adr/` and land in the same pull request as the code they explain.
+
+To write one, start from [`0000-template.md`]({{< meta source-repo >}}/blob/main/docs/adr/0000-template.md).
 
 ::: {fragment="_generated/adr-index.md"}
 :::

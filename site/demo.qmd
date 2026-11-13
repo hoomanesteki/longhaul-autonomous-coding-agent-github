@@ -2,8 +2,13 @@
 title: Demo script
 pagetitle: "Demo script | Longhaul"
 description: "The script of the two-minute video and the GIF, which are not recorded yet."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+What the two-minute video and the GIF will show, shot by shot. Neither is recorded yet.
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/demo-script.md >}}

@@ -4,7 +4,7 @@
 
 Coding agents can fix many small, well-specified issues, but someone still has to watch them: a run that dies loses its work, and a run that loops keeps spending without telling anyone. Longhaul makes an agent safe to leave alone. It takes a GitHub issue, works on it for hours in a sandbox, resumes where it stopped after a crash, asks a person only at checkpoints, and ends with a pull request or an honest report of where it got stuck. In 20 chaos runs, each set to kill the worker, the sandbox, Temporal or Postgres in the middle of a task, all 20 ended with a pull request and the same diff as a run with no kill, and no GitHub write happened twice.
 
-Status: all nine phases are built, and `v1.0.0` is the release. The tag is made at the Phase 9 gate. The repo is public. Docs site: [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/), built from `docs/` with Quarto and published by GitHub Pages on each push to `main` (the runbook's [Publishing](docs/runbook.md#publishing) section).
+Status: phases 1 to 9 are done, and `v1.0.0` is the release. Two Phase 0 stories (LH-003 and LH-006) wait on the owner's steps on GitHub. The repo is public. Docs site: [hoomanesteki.github.io/longhaul-autonomous-coding-agent-github](https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/), built from `docs/` with Quarto and published by GitHub Pages on each push to `main` (the runbook's [Publishing](docs/runbook.md#publishing) section).
 
 [![ci](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github/actions/workflows/ci.yml)
 

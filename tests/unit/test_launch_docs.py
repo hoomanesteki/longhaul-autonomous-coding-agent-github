@@ -85,7 +85,8 @@ def test_readme_title_status_and_site_link_stay_near_the_top() -> None:
     top = text.splitlines()[:12]
     assert top[0] == "# Longhaul"
     status = next(line for line in top if line.startswith("Status:"))
-    assert "all nine phases" in status
+    # Phase 0 keeps two stories that wait on the owner on GitHub, so the status names them.
+    assert "phases 1 to 9 are done" in status and "LH-003" in status and "LH-006" in status
     assert "v1.0.0" in status
     assert any("actions/workflows/ci.yml/badge.svg" in line for line in top)
 

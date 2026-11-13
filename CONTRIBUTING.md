@@ -4,12 +4,14 @@
 Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Progress: docs/progress.md.
 
 ## Commands
-- make setup        # uv sync, pre-commit install, .env from .env.example
-- make up / make down   # local stack via docker compose
-- make check        # ruff, format check, mypy, unit tests
-- make itest        # integration tests (needs make up)
-- make e2e          # end-to-end with scripted provider
-- make gate PHASE=N # everything for phases 0..N
+```bash
+make setup          # uv sync, pre-commit install, .env from .env.example
+make up             # local stack via docker compose (make down stops it)
+make check          # ruff, format check, mypy, unit tests
+make itest          # integration tests (needs make up)
+make e2e            # end-to-end with scripted provider
+make gate PHASE=N   # everything for phases 0..N
+```
 
 ## Working rules
 1. One story per branch: feat/lh-<id>-<slug> from dev. PR into dev. Squash merge. Delete the branch once it is merged.

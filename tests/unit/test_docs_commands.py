@@ -43,8 +43,11 @@ READ_ELSEWHERE = {
     "LONGHAUL_API_URL": "console/vite.config.ts",
 }
 
+# A fence may be indented, as it is inside a list item. The closing fence has the same indent.
 _FENCE = re.compile(
-    r"^(?P<fence>`{3,}|~{3,})(?P<lang>\S*)[^\n]*\n(?P<body>.*?)^(?P=fence)\s*$", re.M | re.S
+    r"^(?P<indent>[ \t]*)(?P<fence>`{3,}|~{3,})(?P<lang>\S*)[^\n]*\n(?P<body>.*?)"
+    r"^(?P=indent)(?P=fence)\s*$",
+    re.M | re.S,
 )
 _SPAN = re.compile(r"`([^`\n]+)`")
 _ASSIGNMENT = re.compile(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)=")
@@ -83,7 +86,9 @@ def line_of(text: str, offset: int) -> int:
 def shell_blocks(text: str) -> Iterator[tuple[int, str]]:
     for match in _FENCE.finditer(text):
         if match["lang"] in SHELL_LANGS:
-            yield line_of(text, match.start("body")), match["body"]
+            indent = len(match["indent"])
+            body = "\n".join(line[indent:] for line in match["body"].split("\n"))
+            yield line_of(text, match.start("body")), body
 
 
 def inline_spans(text: str) -> Iterator[tuple[int, str]]:
@@ -274,6 +279,22 @@ def test_the_extraction_finds_the_commands_of_the_pages() -> None:
     assert "longhaul memory approve|reject" in shown
     assert len(commands_of("longhaul")) >= 30
     assert len(commands_of("make")) >= 30
+
+
+def test_every_page_gives_the_check_some_commands() -> None:
+    # A page whose commands the reader cannot see (a list instead of a block, an unread fence)
+    # would pass every check below without being checked at all.
+    docs = {c.doc for c in all_commands()}
+    assert docs == set(DOCS)
+
+
+def test_a_fence_inside_a_list_item_is_read() -> None:
+    # The README shows the worker and the poller inside the steps of "Run on your repo".
+    readme = {" ".join(c.words) for c in block_commands("README.md")}
+    assert "uv run longhaul worker" in readme
+    assert "uv run longhaul poller install" in readme
+    text = "1. Start it:\n\n   ```bash\n   make demo\n   ```\n"
+    assert list(shell_blocks(text)) == [(4, "make demo\n")]
 
 
 @pytest.mark.parametrize(

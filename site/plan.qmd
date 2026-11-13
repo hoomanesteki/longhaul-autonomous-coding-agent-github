@@ -2,8 +2,13 @@
 title: Build plan
 pagetitle: "Build plan | Longhaul"
 description: "The build plan: phases, stories, acceptance criteria and the evaluation method."
+hide-description: true
 toc-depth: 3
 ---
+
+::: {.lead}
+The plan every story came from: the phases, each story with its acceptance criteria, and the method of the evaluation.
+:::
 
 ::: {.source-note}
 The diagrams of sections 3.1 and 3.2 show as code on this page. The [architecture page](architecture.qmd) draws them.

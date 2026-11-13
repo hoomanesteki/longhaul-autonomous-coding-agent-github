@@ -8,7 +8,11 @@ toc-depth: 2
 lightbox: true
 ---
 
-The console is a React, Vite and TypeScript app in `console/` (ADR-0011). It reads the console API and nothing else, so it can show a task and send it a signal, and it cannot touch a sandbox or GitHub. It lists every task, shows the timeline of one task turn by turn, and holds the forms a person uses to approve a plan, send a hint, add budget or cancel. It also has the memory viewer, where a person approves or rejects the notes the agent wants to keep.
+::: {.lead}
+What a person sees while Longhaul works: every task, its timeline turn by turn, and the forms to steer it.
+:::
+
+The console is a React, Vite and TypeScript app in `console/` (ADR-0011). It reads the console API and nothing else, so it can show a task and send it a signal, but it cannot touch a sandbox or GitHub. It also has the memory viewer, where a person approves or rejects the notes the agent wants to keep.
 
 The screenshots come from the Phase 8 and Phase 9 gates. They were taken with Playwright against the demo stack, which runs the scripted provider, so every cost on them is $0.00.
 

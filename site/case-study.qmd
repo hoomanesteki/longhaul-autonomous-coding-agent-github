@@ -2,8 +2,13 @@
 title: Case study
 pagetitle: "Case study | Longhaul"
 description: "Longhaul in one page: the problem, what was built, the proof, what did not work and the decisions worth defending."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+The whole project on one page: the problem, what was built, the proof, what did not work and the decisions worth defending.
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/case-study.md >}}

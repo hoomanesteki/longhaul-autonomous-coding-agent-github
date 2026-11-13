@@ -183,11 +183,26 @@ def test_the_wide_diagrams_fit_a_desktop_page_and_show_their_scroll_bar() -> Non
 
 
 def test_the_overview_links_every_page_of_the_navbar() -> None:
-    # The "Find your way" table of the home page is the map of the site.
+    # The "Where to go" cards of the home page are the map of the site.
     overview = (SITE / "index.qmd").read_text(encoding="utf-8")
     for href in PAGES:
         if href != "index.qmd":
             assert f"]({href})" in overview, href
+
+
+def test_the_cards_tiles_and_strip_have_colors_for_both_themes() -> None:
+    # Quarto compiles the light and the dark theme apart, so Bootstrap's own tertiary colors
+    # would be the light ones in both. styles.css sets each color the cards use per theme.
+    css = (SITE / "styles.css").read_text(encoding="utf-8")
+    tokens = ("--lh-card-bg:", "--lh-card-border:", "--lh-muted:", "--lh-accent:", "--lh-track:")
+    for theme in ("body.quarto-light {", "body.quarto-dark {"):
+        block = css[css.index(theme) : css.index("}", css.index(theme))]
+        for token in tokens:
+            assert token in block, (theme, token)
+    for selector in (".answer-card", ".page-card", ".stat-tile", ".phase-bar > span"):
+        assert selector in css, selector
+    # The whole card is the link, so a keyboard user needs a ring around it.
+    assert ".page-card:focus-within" in css
 
 
 def test_the_footer_and_the_navbar_link_to_the_repository() -> None:

@@ -12,41 +12,60 @@ image-alt: "Longhaul: a background coding agent that survives crashes and tells 
 ---
 
 ::: {.lead}
-Coding agents can fix many small, well-specified issues, but people still sit and watch them, because a run that dies loses its work and a run that loops quietly burns money. Longhaul is the harness that makes an agent safe to leave alone. It takes a GitHub issue, works on it for hours in a sandbox, resumes where it stopped after a crash, and asks a person only at checkpoints. It ends with a pull request or an honest report of where it got stuck.
+Give Longhaul a GitHub issue and walk away. It works for hours in a sandbox, picks up where it stopped after a crash, asks a person only at checkpoints, and ends with a pull request or an honest report of where it got stuck.
 :::
 
 ::: {.hero-links}
 [See the proof](results.qmd){.btn .btn-primary}
-[How it works](architecture.qmd){.btn .btn-outline-primary}
-[Read the case study](case-study.qmd){.btn .btn-outline-primary}
+[Architecture](architecture.qmd){.btn .btn-outline-primary}
 [Source on GitHub]({{< meta source-repo >}}){.btn .btn-outline-secondary}
-:::
-
-::: {.callout-note appearance="simple"}
-The agent is built: phases 1 to 9 are done, and `v1.0.0` is the release. The chaos suite is measured. The model evaluation (SWE-bench and the custom set) and the demo video are not made yet: they need an API key, the eval VM and a recording. The [results page](results.qmd) says where those numbers will come from.
 :::
 
 ## The problem
 
-Teams have a long tail of small, well-specified issues: a bug with a clear repro, a missing flag, a test that fails after a dependency bump. Run by hand in a terminal, an agent fails in five predictable ways.
+Agents can fix small, well-specified issues, yet people still sit and watch them. Left alone, an agent fails in five ways:
 
-::: {.failure-list}
-1. **Runs die.** A laptop sleeps, a container is killed, the API returns 529 for ten minutes. The agent loses its state and pays for the same tokens twice.
-2. **Context fills up.** A long task overflows the context window. The agent forgets what it already tried and loops.
-3. **Nobody knows it is stuck.** The agent keeps editing the same three lines for forty minutes. Cost climbs and nobody is told.
-4. **Side effects repeat.** A retry posts the same comment twice or opens a second pull request.
-5. **Cost is a surprise.** With no per-task budget and no ledger, the bill is the first signal.
+::: {.answer-grid}
+::: {.answer-card}
+**Runs die**
+
+Every model turn and tool call is a separate step in Temporal, a workflow engine that replays work after a crash, so a crash costs one step, not the task.
+:::
+
+::: {.answer-card}
+**Context fills up**
+
+Old tool outputs shrink to stubs and old turns to progress notes, so a hundred turns fit the window.
+:::
+
+::: {.answer-card}
+**Nobody knows it is stuck**
+
+A stuck detector pauses the run and asks a person one specific question.
+:::
+
+::: {.answer-card}
+**Side effects repeat**
+
+Every GitHub write carries an idempotency key, so a retry never posts twice.
+:::
+
+::: {.answer-card}
+**Cost is a surprise**
+
+Each task has hard limits on dollars, turns and wall time, and the cost of every model call is recorded.
+:::
 :::
 
 ## How it works
 
-A poller finds the issues that carry the `longhaul` label and starts one Temporal workflow for each. The workflow only decides what runs next. Each model turn, tool call, checkpoint and write to GitHub is an activity of its own, so when a worker dies, Temporal retries that one step from the last checkpoint and the task goes on.
+A poller picks up issues labeled `longhaul` and starts one Temporal workflow for each. A planner, a coder and a verifier work inside it, and every change in the workspace is a git checkpoint, so a retried tool call never runs on half-applied edits.
 
 ::: {.diagram-fit}
 ```{mermaid}
 %%| label: fig-overview
 %%| column: page
-%%| fig-cap: "The life of one task. The architecture page has the system context and every step of the workflow."
+%%| fig-cap: "The life of one task. The architecture page has every step."
 flowchart LR
   ISSUE(["Issue labeled<br/>longhaul"]) --> PLAN["Planner reads the repo<br/>and posts a plan"]
   PLAN -->|approved, when the<br/>repo asks for it| CODE["Coder works in turns:<br/>model turn, tool call,<br/>git checkpoint"]
@@ -60,59 +79,31 @@ flowchart LR
 ```
 :::
 
-A person steers from the issue (`/longhaul approve`, `hint`, `budget`, `cancel`) or from the console, and the agent writes to GitHub through one module with an idempotency key, so a retry never posts twice.
-
-Four ideas carry it.
-
-::: {.idea-grid}
-::: {.idea}
-**Durable turns.** Every model turn and every tool call is its own Temporal activity, with its own timeout, retry and heartbeat. A worker that dies loses one step and not the task.
-:::
-
-::: {.idea}
-**Git checkpoints.** Every change in the workspace is a commit in a bare repo per task. A retried tool call starts from its `pre_sha`, so it never runs on half-applied edits.
-:::
-
-::: {.idea}
-**Two-tier context.** Old tool outputs shrink to a one-line stub with a handle, and older turns become structured progress notes, so a task of a hundred turns fits the window.
-:::
-
-::: {.idea}
-**Plan, verify, stuck.** A planner, a coder and a verifier work inside one workflow. A stuck detector pauses the run and asks one specific question, and hard budgets stop the spend.
-:::
-:::
-
-Around them: a hardened Docker sandbox with no credentials inside, a cost ledger with a row for every model call, a memory that only a merged pull request or a person can write to, traces, metrics, and a console. The agent never pushes to a default branch, and a person merges every pull request. The [architecture page](architecture.qmd) shows how the pieces connect, and the [decisions page](decisions.qmd) records why they were chosen.
+Repo code runs only in a sandbox that holds no credentials. The agent never pushes to a default branch, and a person merges every pull request. The [architecture page](architecture.qmd) shows the parts, and the [decisions page](decisions.qmd) says why each was chosen.
 
 ## The proof
 
-The chaos suite puts a number behind "survives crashes". It ran four recorded tasks 20 times, and each run had one to three kills planned, of the worker, the sandbox, Temporal or Postgres, timed to land while the task works; in 18 runs at least one of them landed. Every run ended with a pull request and the same diff as a run with no kill, and the fake GitHub that each run wrote to showed no duplicate and no missing write.
+The chaos suite kills the worker, the sandbox, Temporal and Postgres while recorded tasks run. Then it checks the pull request, the diff, and every write on a fake GitHub set up for that run.
+
+::: {fragment="_generated/chaos-tiles.md"}
+:::
 
 ::: {fragment="_generated/chaos-chart.md"}
 :::
 
-::: {fragment="_generated/chaos-table.md"}
-:::
+The model evaluation (SWE-bench Verified and a custom task set) has not run yet, so this site makes no claim about how well the agent codes. The [results page](results.qmd) has the method, the limits and the full table.
 
-The model answers in these runs were scripted recordings, so the suite measures durability and not how well a model codes. The [results page](results.qmd) explains each column, the limits, and the model evaluation that is still to run. The [gate reports](gates.qmd) hold the evidence that each phase is done, including what failed and what was fixed.
+## See it
 
-## The console
+The console lists every task, shows each one turn by turn, and holds the forms to approve a plan, send a hint, add budget or cancel. The screenshots come from the demo stack, so every cost on them is $0.00.
 
-A person watches every task, reads its timeline turn by turn, and steps in from the console: approve a plan, send a hint, add budget or cancel. These screenshots come from the demo stack, which runs the scripted provider, so every cost on them is $0.00.
+![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that wait on a person say what they need. Select it to see it whole.](_generated/docs/gates/media/phase-9/1-tasks-1280.png){.screenshot .screenshot-top}
 
-![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that wait on a person say what they need.](_generated/docs/gates/media/phase-9/1-tasks-1280.png){.screenshot}
-
-::: {.shot-grid}
-![A shipped task: each event reads as one line (step updates with the short sha, the verdict, the outcome), with a checkpoint marker on the turn that made it.](_generated/docs/gates/media/phase-9/2-timeline-1280.png){.screenshot}
-
-![A paused task with the hint, budget and cancel forms.](_generated/docs/gates/media/phase-8/4-actions.png){.screenshot}
-:::
-
-Select a screenshot to see it whole. The [console page](console.qmd) has every screen.
+The [console page](console.qmd) has every screen.
 
 ## Try it
 
-You need Docker, [uv](https://docs.astral.sh/uv/) and Python 3.12. No API key and no GitHub account are needed: the scripted provider plays a fixed set of model answers.
+You need Docker, [uv](https://docs.astral.sh/uv/) and Python 3.12. No API key and no GitHub account: a scripted provider plays a fixed set of model answers.
 
 ```bash
 git clone {{< meta source-repo >}}.git
@@ -120,28 +111,91 @@ cd longhaul-autonomous-coding-agent-github
 make setup && make up && make demo
 ```
 
-`make demo` runs one task on a small package whose `add()` subtracts, prints each status line and the final diff, and stops. To run Longhaul on your own repo, follow "Run on your repo" in the [README]({{< meta source-repo >}}#run-on-your-repo) and the [runbook](runbook.qmd).
+`make demo` runs one task on a small package whose `add()` subtracts, prints the final diff and stops. To point Longhaul at your own repo, follow [Run on your repo]({{< meta source-repo >}}#run-on-your-repo) in the README.
 
 ## Where it stands
 
-The table is read from the [progress page](progress.qmd) each time the site is built. The stories still open in Phase 0 wait on steps the owner takes on GitHub: branch protection for `dev` and `main`, and the import of the backlog as issues. The [Phase 0 gate report](gates.qmd#phase-0-gate-foundation-and-backlog-import) has the details.
-
-::: {fragment="_generated/status.md"}
+::: {.callout-note appearance="simple"}
+`v1.0.0` is the release, and every story is done. What is left needs an API key, a real GitHub account or a recording: the model evaluation, the live smoke runs each [gate report](gates.qmd) lists, and the demo video. [Branch protection](runbook.qmd#branch-protection) and the [backlog import](runbook.qmd#backlog-import) are one-time steps for the repo owner.
 :::
 
-## Find your way
+::: {fragment="_generated/phase-strip.md"}
+:::
 
-| Page | What it holds |
-|---|---|
-| [Architecture](architecture.qmd) | The system context, the task lifecycle, the components, the data stores, tracing, logs and metrics |
-| [Decisions](decisions.qmd) | One record per design choice, with the alternatives that were rejected |
-| [Console](console.qmd) | Every screen of the console, and how to run it |
-| [Results](results.qmd) | The chaos suite, and the model evaluation that is pending |
-| [Gate reports](gates.qmd) | The review at the end of each phase: what passed, what failed, what was fixed |
-| [Case study](case-study.qmd) | The story in one page: problem, build, proof, what did not work |
-| [Runbook](runbook.qmd) | How to run, steer, observe and upgrade Longhaul, and how this site is built |
-| [Security](security.qmd) | The threat model, each control and the test behind it, and the known gaps |
-| [Deploy to AWS](deploy-aws.qmd) | The Terraform, what it builds and what it costs |
-| [Demo script](demo.qmd) | The two-minute video and the GIF, which are not recorded yet |
-| [Plan](plan.qmd) | The build plan with every story |
-| [Progress](progress.qmd) | The status of every story |
+The [progress page](progress.qmd) lists every story, and the [gate reports](gates.qmd) hold the evidence that each phase is done.
+
+## Where to go
+
+::: {.page-grid}
+::: {.page-card}
+[Architecture](architecture.qmd)
+
+The system, the life of one task, and its parts.
+:::
+
+::: {.page-card}
+[Decisions](decisions.qmd)
+
+One record per design choice, with what was rejected.
+:::
+
+::: {.page-card}
+[Console](console.qmd)
+
+Every screen a person uses to watch and steer.
+:::
+
+::: {.page-card}
+[Results](results.qmd)
+
+The chaos suite, and the model evaluation still to run.
+:::
+
+::: {.page-card}
+[Gate reports](gates.qmd)
+
+What passed, failed and was fixed in each phase.
+:::
+
+::: {.page-card}
+[Case study](case-study.qmd)
+
+The whole project on one page.
+:::
+
+::: {.page-card}
+[Runbook](runbook.qmd)
+
+How to run, steer, observe and upgrade Longhaul.
+:::
+
+::: {.page-card}
+[Security](security.qmd)
+
+The threat model, and the test behind each control.
+:::
+
+::: {.page-card}
+[Deploy to AWS](deploy-aws.qmd)
+
+The Terraform, what it builds and what it costs.
+:::
+
+::: {.page-card}
+[Plan](plan.qmd)
+
+The build plan with every story.
+:::
+
+::: {.page-card}
+[Progress](progress.qmd)
+
+The status of every story.
+:::
+
+::: {.page-card}
+[Demo script](demo.qmd)
+
+The two-minute video and the GIF, not recorded yet.
+:::
+:::

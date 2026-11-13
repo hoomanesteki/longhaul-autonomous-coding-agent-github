@@ -2,8 +2,13 @@
 title: Architecture
 pagetitle: "Architecture | Longhaul"
 description: "The system context, the life of one task, the components, the data stores, and the traces, logs and metrics."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+How a labeled issue becomes a pull request: the services around Longhaul, the life of one task, and the parts that carry it.
+:::
 
 ## System context
 

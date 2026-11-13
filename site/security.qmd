@@ -2,8 +2,41 @@
 title: Security
 pagetitle: "Security | Longhaul"
 description: "The threat model, each control and the test behind it, and the known gaps."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+Where the secrets live and where untrusted code runs, then each control with the test that proves it, and the gaps that are known.
+:::
+
+::: {.diagram-fit}
+```{mermaid}
+%%| label: fig-trust
+%%| fig-cap: "Trust boundaries. The secrets stay on the worker host. Repo code and model commands run in a sandbox with none."
+flowchart LR
+  ISSUES["GitHub issues<br/>read by the poller"]
+  subgraph BOX["Sandbox: untrusted code"]
+    SANDBOX["Docker container<br/>runs repo code<br/>no secrets, no capabilities<br/>network for setup only"]
+  end
+  MODEL["Model API"]
+  subgraph HOST["Worker host: trusted"]
+    WORKER["Worker<br/>holds the GitHub token<br/>and the model API keys"]
+    WRITES["github/side_effects.py<br/>every write carries<br/>an idempotency key"]
+    PUSH["Branch guard and push<br/>never a default branch"]
+  end
+  GITHUB["GitHub repo<br/>branch, comments, PR"]
+  PERSON(["A person reviews<br/>and merges"])
+  ISSUES -->|issue text, untrusted| WORKER
+  WORKER --> WRITES
+  WORKER --> PUSH
+  WORKER --> SANDBOX
+  WORKER --> MODEL
+  WRITES -->|comments, labels, PR| GITHUB
+  PUSH -->|task branch| GITHUB
+  GITHUB --> PERSON
+```
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/security.md >}}

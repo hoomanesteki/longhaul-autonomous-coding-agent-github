@@ -2,8 +2,41 @@
 title: Deploy to AWS
 pagetitle: "Deploy to AWS | Longhaul"
 description: "The Terraform for AWS: what it builds, what it costs, and how to apply it and tear it down."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+What `deploy/terraform/aws` builds in one AWS account, what it costs while it exists, and how to apply it and tear it down.
+:::
+
+::: {.diagram-fit}
+```{mermaid}
+%%| label: fig-aws
+%%| fig-cap: "What the Terraform builds. The worker and the services start only with services_enabled = true, and the API also needs api_enabled. Temporal is Temporal Cloud or a server you run: the Terraform builds no server."
+flowchart LR
+  subgraph VPC["VPC"]
+    subgraph PRIVATE["Two private subnets"]
+      WORKER["Worker service<br/>ECS on EC2,<br/>starts Docker sandboxes"]
+      API["API service<br/>Fargate, off by default"]
+      TASKS["Poller and migrate<br/>Fargate tasks, on request"]
+      DB[("RDS PostgreSQL 17<br/>pgvector, TLS only")]
+    end
+    subgraph PUBLIC["Public subnet"]
+      NAT["NAT gateway"]
+    end
+    ENDPOINT["S3 gateway endpoint"]
+  end
+  S3[("S3 blob bucket")]
+  SHARED["ECR images,<br/>Secrets Manager,<br/>CloudWatch logs"]
+  OUT(["GitHub, model APIs,<br/>Temporal"])
+  WORKER --> DB
+  API --> DB
+  PRIVATE --> ENDPOINT --> S3
+  PRIVATE --> NAT -->|internet gateway| OUT
+  SHARED -.-> PRIVATE
+```
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/deploy-aws.md >}}

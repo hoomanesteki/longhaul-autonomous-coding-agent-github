@@ -7,11 +7,16 @@ subtitle: What is measured, what is pending, and where each number comes from
 toc-depth: 2
 ---
 
-Longhaul has two kinds of result. The chaos suite is measured: it shows what a crash costs a running task. The model evaluation, which shows how well the agent fixes issues and what a fix costs, is pending. The chaos chart and table on this page are read from the committed result file each time the site is built.
+::: {.lead}
+The chaos suite is measured: it shows what a crash costs a running task. The model evaluation, which shows how well the agent fixes issues and what a fix costs, has not run yet.
+:::
+
+::: {fragment="_generated/chaos-tiles.md"}
+:::
 
 ## The chaos suite: measured
 
-The suite runs four recorded tasks 20 times. Each run has one to three kills planned, of four kinds: the worker process, the task's sandbox, the Temporal server and Postgres. Delivery goes to a fake GitHub that the run owns, and the suite counts the comments, labels and pull requests it finds there. It does not count them from Longhaul's own tables, because a table that decides whether a write happened cannot also be the witness.
+The suite runs four recorded tasks 20 times. Each run has one to three kills planned, of four kinds: the worker process, the task's sandbox, the Temporal server and Postgres. Delivery goes to a fake GitHub set up for each run, and the suite counts the comments, labels and pull requests it finds there. It does not count them from Longhaul's own tables, because a table that decides whether a write happened cannot also be the witness.
 
 ::: {fragment="_generated/chaos-chart.md"}
 :::
@@ -27,11 +32,11 @@ How to read it:
 
 Two limits go with the table. The model answers were scripted recordings, so it measures durability and says nothing about how well a model codes. And not every planned kill landed: in two runs none of them landed before the run ended, so those runs show nothing about a crash.
 
-The method is in [`eval/chaos/README.md`]({{< meta source-repo >}}/blob/main/eval/chaos/README.md), and the numbers are in [`eval/results/chaos-2026-11-07/summary.json`]({{< meta source-repo >}}/blob/main/eval/results/chaos-2026-11-07/summary.json). `scripts/chaos_chart.py` draws the chart from that file.
+The method is in [`eval/chaos/README.md`]({{< meta source-repo >}}/blob/main/eval/chaos/README.md), and the numbers are in [`eval/results/chaos-2026-11-07/summary.json`]({{< meta source-repo >}}/blob/main/eval/results/chaos-2026-11-07/summary.json). The tiles, chart and table are read from that file on every build.
 
 ## The model evaluation: pending
 
-The resolve rate on a 40-task subset of SWE-bench Verified and on a set of 15 custom tasks, compared with a naive loop and a single-shot baseline, the dollars per resolved task, and the two ablations (compaction and memory) are not measured yet. The runs call a live model, so they need an API key, and the SWE-bench runs need the eval VM, because the harness pulls several GB of images for each task. Until those runs exist this page makes no claim about them.
+Nothing here is measured yet. The runs will give the resolve rate on a 40-task subset of SWE-bench Verified and on 15 custom tasks, against a naive loop and a single-shot baseline. They will also give the dollars per resolved task and two ablations (compaction and memory). The runs call a live model, so they need an API key, and the SWE-bench runs need the eval VM, because the harness pulls several GB of images for each task. Until those runs exist this page makes no claim about them.
 
 These are the questions the runs answer. Each one needs a number from a recorded run before the README can claim an answer, and every result file records the config hash, the model id, the git sha and the seed. The [result tables in the plan](plan.qmd#results-table-templates-filled-only-from-result-files) stay empty until a result file fills them.
 

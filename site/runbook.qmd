@@ -2,13 +2,30 @@
 title: Runbook
 pagetitle: "Runbook | Longhaul"
 description: "How to run, steer, observe and upgrade Longhaul, and how this site is built."
+hide-description: true
 toc-depth: 2
 ---
+
+::: {.lead}
+How to start Longhaul, run and steer tasks, watch them and operate an install, then how CI and this site work. [CI at a glance](#ci-at-a-glance), at the end, shows the jobs the required `ci` check waits on, and the `chaos-lite` job that runs apart.
+:::
 
 ::: {.drop-title base="docs"}
 {{< include ../docs/runbook.md >}}
 :::
 
+## CI at a glance
+
+Each arrow goes from a job to the job that needs it. The diagram is read from `.github/workflows/ci.yml` each time the site is built, so a new job shows up here on its own.
+
+::: {.diagram-small}
+```{mermaid}
+%%| label: fig-ci-jobs
+%%| fig-cap: "The jobs of ci.yml. The required check is the job named ci."
+%%| file: _generated/ci-jobs.mmd
+```
+:::
+
 ::: {.source-note}
-Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md). To change it, edit that file.
+Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md) and [`.github/workflows/ci.yml`]({{< meta source-repo >}}/blob/main/.github/workflows/ci.yml). To change it, edit those files.
 :::

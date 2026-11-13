@@ -8,16 +8,16 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.1",
-    "anthropic>=2.6.0,<3",
+    "anthropic>=2.7.0,<3",
     "asyncpg>=0.32.0",
-    "boto3>=1.43.126",
+    "boto3>=1.43.127",
     "cryptography>=50.0.2",
     "docker>=7.2.0",
-    "fastapi>=0.162.0",
+    "fastapi>=0.162.2",
     "jinja2>=3.1.6",
     "jsonschema>=4.26.0",
     "mcp>=2.3.0",
-    "openai>=3.46.0",
+    "openai>=3.48.0",
     "opentelemetry-api>=1.45.2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.45.2",
     "opentelemetry-sdk>=1.45.2",
@@ -31,7 +31,7 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.1.6",
     "structlog>=26.1.0",
     "temporalio>=1.35.0",
-    "typer>=0.28.0",
+    "typer>=0.29.0",
     "uvicorn>=0.54.0",
 ]
 
@@ -46,7 +46,7 @@ memory = [
 # `uv sync --extra eval`. It is large, so CI and the worker image leave it out. What every eval
 # run needs is the `eval` dependency group below.
 eval = [
-    "datasets>=5.1.0",
+    "datasets>=5.2.0",
     "matplotlib>=3.10",
     "swebench==5.0.2",
 ]

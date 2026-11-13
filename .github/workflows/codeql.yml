@@ -1,0 +1,48 @@
+name: codeql
+
+# Code scanning for the Python package, the eval harness and scripts, and the TypeScript of the
+# console. Neither language needs a build (build-mode none), so the job reads the source as it is.
+# Findings show under Security, Code scanning, and on the pull request that adds them.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+  # Once a week, so a new query finds old code that no push touches.
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  contents: read
+
+# A newer push to a pull request cancels the older scan. A run on dev or main has its own group,
+# so it is never cancelled or replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # The upload of the results needs security-events. Nothing else here writes.
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

@@ -1,0 +1,33 @@
+name: dependency-review
+
+# Compares the dependencies of a pull request with those of its base, as GitHub's dependency
+# graph reads them from the manifests, the lock files and the workflow actions. It fails when
+# the pull request adds a package with a known vulnerability of high severity or worse. The
+# pip-audit step of ci.yml checks the whole Python lock on every run; this checks what a change
+# brings in, in every ecosystem, before it merges.
+#
+# The repo is public, so the dependency graph is on and the check needs no extra setting. It
+# lives in its own workflow because it has nothing to compare on a push, and the `ci` job of
+# ci.yml counts a job that did not run as a failure.
+
+on:
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high

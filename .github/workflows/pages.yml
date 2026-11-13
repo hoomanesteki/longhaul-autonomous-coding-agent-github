@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 # Only this workflow may write to Pages or mint an OIDC token, and only in the deploy job.
-# Every other workflow keeps the read-only default.
+# tests/unit/test_workflow_hardening.py lists every job of every workflow that may write.
 permissions:
   contents: read
 

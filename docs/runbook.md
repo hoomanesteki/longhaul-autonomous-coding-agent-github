@@ -5,8 +5,9 @@
 Run these from the repo root on a fresh clone. You need `uv`, Docker and `gh`.
 
 ```bash
-make setup    # uv sync and pre-commit hooks
+make setup    # uv sync, pre-commit hooks, and .env from .env.example when there is none
 make up       # local stack via docker compose
+make demo     # one task on the calc fixture with the scripted model; stops its worker after
 make check    # ruff, format check, mypy, unit tests
 ```
 
@@ -14,7 +15,7 @@ The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/prog
 
 ## Local stack
 
-`make up` starts Postgres with pgvector, Temporal, MinIO, an OpenTelemetry collector, Jaeger, Prometheus and Grafana. To change anything below, copy `.env.example` to `.env` first. Docker Compose and the Python code both read `.env` from the repo root, so they see the same ports and URLs. A variable set in your shell wins over `.env`, and a blank value in `.env` counts as unset.
+`make up` starts Postgres with pgvector, Temporal, MinIO, an OpenTelemetry collector, Jaeger, Prometheus and Grafana. To change anything below, edit `.env`, which `make setup` copies from `.env.example` when there is none. Docker Compose and the Python code both read `.env` from the repo root, so they see the same ports and URLs. A variable set in your shell wins over `.env`, and a blank value in `.env` counts as unset.
 
 | Setting | Where | Notes |
 |---|---|---|
@@ -448,7 +449,7 @@ The limits are the `stuck` section of the config. The workflow cannot read the c
 SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
 ```
 
-The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run-local` does not use it.
 
 ### The pause and the hint
 

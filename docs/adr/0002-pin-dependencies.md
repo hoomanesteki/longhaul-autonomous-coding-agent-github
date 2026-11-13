@@ -16,15 +16,15 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | Package | Pinned version |
 |---|---|
 | temporalio | 1.35.0 (runtime since LH-203, see ADR-0004) |
-| anthropic | 2.6.0 (`anthropic>=2.6.0,<3`, see ADR-0003) |
-| openai | 3.46.0 |
+| anthropic | 2.7.0 (`anthropic>=2.7.0,<3`, see ADR-0003) |
+| openai | 3.48.0 |
 | httpx2 | 2.16.0 |
 | httpcore2 | 2.16.0 |
 | docker | 7.2.0 |
-| fastapi | 0.162.0 (runtime since LH-801, the console API, see ADR-0011; before that a dev dependency for the FakeGitHub) |
+| fastapi | 0.162.2 (runtime since LH-801, the console API, see ADR-0011; before that a dev dependency for the FakeGitHub) |
 | uvicorn | 0.54.0 (runtime since LH-801, serves `longhaul api`) |
 | jsonschema | 4.26.0 |
-| typer | 0.28.0 (`typer>=0.28.0`, for the `longhaul` command; it bundles its own Click, so `click` is not installed) |
+| typer | 0.29.0 (`typer>=0.29.0`, for the `longhaul` command; it bundles its own Click, so `click` is not installed) |
 | pydantic | 2.14.3 |
 | pydantic-settings | 2.16.2 |
 | pyyaml | 6.0.3 |
@@ -35,14 +35,14 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | asyncpg | 0.32.0 |
 | pgvector | 0.5.1 |
 | fastembed | 0.9.1 (optional `memory` extra, see ADR-0010) |
-| psycopg | 3.3.6 |
+| psycopg | 3.3.8 |
 | opentelemetry-api, opentelemetry-sdk | 1.45.2 (runtime since LH-703, see docs/architecture.md) |
 | opentelemetry-exporter-otlp-proto-grpc | 1.45.2 |
 | opentelemetry-semantic-conventions | 0.66b2 (a pre-release; the GenAI names are checked again on each upgrade) |
-| boto3 | 1.43.126 (runtime since LH-202, see ADR-0005) |
+| boto3 | 1.43.127 (runtime since LH-202, see ADR-0005) |
 | structlog | 26.1.0 (runtime since LH-706, JSON logs, see docs/architecture.md) |
 
-`psycopg` sits in the `dev` dependency group of `pyproject.toml` today. `boto3` moved to the runtime dependencies with LH-202, and its type stubs sit in the `dev` group. `temporalio` moved to the runtime dependencies with LH-203, because the workflow and the client in `longhaul.durable` import it, and a worker image built without the `dev` group needs it. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.6.0 requires `httpx2` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`. `anthropic` 2.6.0 sends API version `2026-10-21` unless told otherwise. A test in `tests/unit/test_anthropic_provider.py` fails when an upgrade moves that version, so the change is read before it merges.
+`psycopg` sits in the `dev` dependency group of `pyproject.toml` today. `boto3` moved to the runtime dependencies with LH-202, and its type stubs sit in the `dev` group. `temporalio` moved to the runtime dependencies with LH-203, because the workflow and the client in `longhaul.durable` import it, and a worker image built without the `dev` group needs it. `httpx2` and `httpcore2` are not declared by us: `openai` pulls them in, and `anthropic` 2.7.0 requires `httpx2` as well. The old `httpx` package is not installed, so test doubles for either SDK use `httpx2.MockTransport`. `anthropic` 2.7.0 sends API version `2026-10-21` unless told otherwise. A test in `tests/unit/test_anthropic_provider.py` fails when an upgrade moves that version, so the change is read before it merges.
 
 `fastembed` is the one optional dependency. It sits in the `memory` extra of `pyproject.toml`, so `uv sync --locked` and CI do not install it, and `uv sync --extra memory` does. It brings 14 more packages, among them onnxruntime 1.31.1, numpy 2.5.4, tokenizers 0.23.3 and huggingface-hub 1.33.0, which needs the plain `httpx` that the base install lacks. ADR-0010 explains the choice.
 
@@ -52,7 +52,7 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 |---|---|
 | mypy | 2.4.1 |
 | pytest | 9.2.0 |
-| pytest-asyncio | 1.4.1 |
+| pytest-asyncio | 1.4.1.post1 |
 | pytest-cov | 7.1.0 |
 | hypothesis | 6.170.15 (property tests, since LH-403) |
 | ruff | 0.17.4 |
@@ -60,7 +60,7 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 | types-boto3 | 1.43.123 |
 | types-docker | 7.2.0.20261006 |
 | types-jsonschema | 4.26.0.20261006 |
-| types-pyyaml | 6.0.12.20260906 |
+| types-pyyaml | 6.0.12.20261103 |
 
 ### Container images (docker-compose.yml)
 

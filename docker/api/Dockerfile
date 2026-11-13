@@ -14,7 +14,7 @@ COPY console/ ./
 RUN npm run build
 
 # Same base as the worker image, pinned to a patch release for the same reason.
-FROM python:3.12.15-slim-trixie
+FROM python:3.12.16-slim-trixie
 
 RUN pip install --no-cache-dir uv==0.12.3
 

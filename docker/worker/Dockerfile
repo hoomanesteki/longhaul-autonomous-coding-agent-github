@@ -7,7 +7,7 @@
 # note about the socket.
 
 # Same base as the sandbox image, pinned to a patch release for the same reason.
-FROM python:3.12.15-slim-trixie
+FROM python:3.12.16-slim-trixie
 
 # The checkpoint store runs git on the host side of each task's bare repo.
 RUN apt-get update \

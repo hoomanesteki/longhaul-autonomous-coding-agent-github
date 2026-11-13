@@ -1,6 +1,6 @@
 # Base image for every task sandbox. Pinned to a patch release so a rebuild
 # does not silently pick up a different Debian or Python.
-FROM python:3.12.15-slim-trixie
+FROM python:3.12.16-slim-trixie
 
 # Only the tools the agent needs. Every extra package is attack surface and
 # image size, so keep this list short.

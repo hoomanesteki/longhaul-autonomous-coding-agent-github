@@ -4,7 +4,7 @@
 Background coding agent on Temporal. Plan: docs/plan/longhaul-build-plan.md. Progress: docs/progress.md.
 
 ## Commands
-- make setup        # uv sync, pre-commit install
+- make setup        # uv sync, pre-commit install, .env from .env.example
 - make up / make down   # local stack via docker compose
 - make check        # ruff, format check, mypy, unit tests
 - make itest        # integration tests (needs make up)

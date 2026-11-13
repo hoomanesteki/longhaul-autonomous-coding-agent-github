@@ -5,8 +5,9 @@
 Run these from the repo root on a fresh clone. You need `uv`, Docker and `gh`.
 
 ```bash
-make setup    # uv sync and pre-commit hooks
+make setup    # uv sync, pre-commit hooks, and .env from .env.example when there is none
 make up       # local stack via docker compose
+make demo     # one task on the calc fixture with the scripted model; stops its worker after
 make check    # ruff, format check, mypy, unit tests
 ```
 
@@ -14,7 +15,7 @@ The plan is in `docs/plan/longhaul-build-plan.md`. Story status is in `docs/prog
 
 ## Local stack
 
-`make up` starts Postgres with pgvector, Temporal, MinIO, an OpenTelemetry collector, Jaeger, Prometheus and Grafana. To change anything below, copy `.env.example` to `.env` first. Docker Compose and the Python code both read `.env` from the repo root, so they see the same ports and URLs. A variable set in your shell wins over `.env`, and a blank value in `.env` counts as unset.
+`make up` starts Postgres with pgvector, Temporal, MinIO, an OpenTelemetry collector, Jaeger, Prometheus and Grafana. To change anything below, edit `.env`, which `make setup` copies from `.env.example` when there is none. Docker Compose and the Python code both read `.env` from the repo root, so they see the same ports and URLs. A variable set in your shell wins over `.env`, and a blank value in `.env` counts as unset.
 
 | Setting | Where | Notes |
 |---|---|---|
@@ -35,7 +36,7 @@ Loopback binding does not keep out containers. On Docker Desktop a container on 
 
 `make migrate` runs `alembic upgrade head` against `LONGHAUL_DATABASE_URL`, taken from your shell or from `.env`. There is no default URL, so a missing value stops with an error instead of touching a database you did not mean. To migrate another database from Python, set `sqlalchemy.url` on the Alembic `Config`. Code that already runs inside an event loop must instead set `config.attributes["connection"]` to an open connection and call the command from `AsyncConnection.run_sync`, because Alembic cannot start a second loop there.
 
-`make itest` does not use your database for migration tests. They create a database named `longhaul_migtest_<random>` on the same server, run on it and drop it, so a downgrade never touches your rows. The database role needs the `CREATEDB` privilege, which the compose superuser has. If a test run is killed, a `longhaul_migtest_*` database can stay behind. It is safe to drop.
+`make itest` does not use your database for migration tests. They create a database named `longhaul_migtest_<random>` on the same server, run on it and drop it, so a downgrade never touches your rows. The database role needs the `CREATEDB` privilege, which the compose superuser has. One of them takes every revision up, down and up again, one at a time, and fails when the schema after a downgrade differs from the schema before the upgrade, so a new migration needs an exact `downgrade()`. If a test run is killed, a `longhaul_migtest_*` database can stay behind. It is safe to drop.
 
 A pooled database connection belongs to the event loop that opened it. Code that runs more than one loop in a process, such as a CLI that calls `asyncio.run` twice or tests that each get their own loop, must `await dispose_engine()` before each loop ends. Code that builds its own engine can pass `pooled=False` to `make_engine` instead.
 
@@ -448,7 +449,7 @@ The limits are the `stuck` section of the config. The workflow cannot read the c
 SELECT ts, payload->>'reason', payload->'evidence' FROM events WHERE task_id = 'lh-acme-calc-42' AND type = 'stuck' ORDER BY id;
 ```
 
-The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run` without a worker does not use it.
+The count by reason is `longhaul_stuck_total{reason}` (see "Metrics and the dashboard"). Evidence reads like `pytest tests/test_inv.py failed 3 times with the same KeyError at inv.py:42`. The detector runs in the durable workflow only. The in-process loop of `longhaul run-local` does not use it.
 
 ### The pause and the hint
 
@@ -1342,6 +1343,10 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `security` | gitleaks over the full git history of the clone (`gitleaks git --log-opts="--all"`, every branch and tag), and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
+| `console` | `npm ci`, then the API types generated again from `console/openapi.json` and compared with the committed `console/src/api/schema.ts`, then lint, typecheck, unit tests and build of the console (see "The console") |
+| `console-e2e` | the Playwright main path of the console against the seeded demo stack (`scripts/seed_demo.sh`), on the services of `e2e` with the sandbox image built |
+| `images` | `docker build` of `docker/worker/Dockerfile` and `docker/api/Dockerfile` from the repo root, as `docker compose --profile full` builds them, with no push. The worker image then runs `longhaul --help`, and the API image must stop at its start without `LONGHAUL_ADMIN_TOKEN` and answer `/healthz` with a Postgres service |
+| `quickstart` | the README quickstart on a clean runner: `make setup`, then `make demo`, with Postgres, MinIO and the Temporal dev server of `e2e` in place of `make up`. It sets no `LONGHAUL_*` variable, so the demo runs on the `.env` that `make setup` copies, and it fails when the demo leaves a worker or a sandbox behind |
 | `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 

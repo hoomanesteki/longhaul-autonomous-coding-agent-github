@@ -38,6 +38,8 @@ REQUIRED_JOBS = {
     "terraform",
     "console",
     "console-e2e",
+    "images",
+    "quickstart",
     "ci",
 }
 
@@ -341,6 +343,107 @@ def test_actions_use_pinned_major_versions() -> None:
     assert uses
     for ref in uses:
         assert re.search(r"@v\d+$", ref), f"{ref} is not pinned to a major version"
+
+
+# --- images, the quickstart and the migrations ----------------------------------------------
+
+README = ROOT / "README.md"
+MIGRATION_TESTS = ROOT / "tests" / "integration" / "test_migrations.py"
+
+
+def test_the_images_job_builds_the_worker_and_api_images_without_pushing() -> None:
+    job = load_workflow()["jobs"]["images"]
+    commands = run_commands(job)
+    compose = yaml.safe_load(COMPOSE.read_text(encoding="utf-8"))["services"]
+    # The Dockerfiles that `docker compose --profile full` builds, from the same context.
+    for service in ("worker", "api"):
+        build = compose[service]["build"]
+        assert build["context"] == "."
+        wanted = f"docker build -f {build['dockerfile']} "
+        found = command_index(commands, wanted)
+        assert found is not None, f"the images job never runs `{wanted}`"
+        assert commands[found].endswith(" ."), commands[found]
+    text = "\n".join(commands)
+    assert "docker push" not in text and "--push" not in text
+    assert "login" not in text
+
+
+def test_the_images_job_starts_each_image_once() -> None:
+    commands = run_commands(load_workflow()["jobs"]["images"])
+    worker = command_index(commands, "docker run --rm longhaul-worker:ci longhaul --help")
+    assert worker is not None
+    refused = next((c for c in commands if "LONGHAUL_ADMIN_TOKEN is not set" in c), None)
+    assert refused is not None, "the images job never checks that the API needs a token"
+    healthz = next((c for c in commands if "/healthz" in c), None)
+    assert healthz is not None and "longhaul-api:ci" in healthz
+    # The images are built before anything runs them.
+    builds = [i for i, c in enumerate(commands) if c.startswith("docker build")]
+    runs = [i for i, c in enumerate(commands) if "docker run" in c]
+    assert max(builds) < min(runs)
+
+
+def readme_quickstart() -> list[str]:
+    """The make targets of the README quickstart, in the order the README runs them."""
+    text = README.read_text(encoding="utf-8")
+    section = text.split("## Quickstart", 1)[1].split("\n## ", 1)[0]
+    block = re.search(r"```bash\n(.*?)```", section, re.S)
+    assert block, "the README quickstart has no bash block"
+    return re.findall(r"\bmake ([a-z][\w-]*)", block.group(1))
+
+
+def test_the_quickstart_job_runs_the_readme_quickstart() -> None:
+    steps = readme_quickstart()
+    assert steps == ["setup", "up", "demo"]
+    job = load_workflow()["jobs"]["quickstart"]
+    commands = run_commands(job)
+    made = [c.removeprefix("make ") for c in commands if c.startswith("make ")]
+    # `make up` is the one step CI does in its own way: the services of the e2e job.
+    assert made == [step for step in steps if step != "up"]
+    jobs = load_workflow()["jobs"]
+    assert job["services"] == jobs["e2e"]["services"]
+    temporal = [s for s in jobs["e2e"]["steps"] if s.get("name") == "Start Temporal dev server"]
+    assert temporal and temporal[0] in job["steps"]
+    demo = next(s for s in job["steps"] if s.get("run") == "make demo")
+    assert isinstance(demo.get("timeout-minutes"), int) and demo["timeout-minutes"] <= 20
+
+
+def test_the_quickstart_job_reads_the_settings_from_the_env_file_that_setup_writes() -> None:
+    # A LONGHAUL_* variable in the job would win over .env, and the job would no longer show
+    # that a fresh clone works with the values of .env.example.
+    job = load_workflow()["jobs"]["quickstart"]
+    assert not [name for name in job.get("env", {}) if name.startswith("LONGHAUL_")]
+    for step in job["steps"]:
+        assert not [n for n in step.get("env", {}) if n.startswith("LONGHAUL_")], step
+    assert "uv sync --locked" not in run_commands(job), "the README runs make setup, not uv sync"
+
+
+def test_the_quickstart_job_checks_that_the_demo_left_nothing_running() -> None:
+    commands = run_commands(load_workflow()["jobs"]["quickstart"])
+    demo = command_index(commands, "make demo")
+    check = next((i for i, c in enumerate(commands) if "label=longhaul.task_id" in c), None)
+    assert demo is not None and check is not None and demo < check
+    assert "longhaul worker" in commands[check]
+
+
+def test_the_integration_job_runs_the_migration_round_trip() -> None:
+    # A separate migrations job would repeat what the integration job already runs: every
+    # revision up, down and up again on a scratch database.
+    text = MIGRATION_TESTS.read_text(encoding="utf-8")
+    assert "def test_every_migration_round_trips_on_its_own(" in text
+    marks = re.search(r"^pytestmark = \[(.*)\]$", text, re.M)
+    assert marks, "test_migrations.py has no pytestmark"
+    assert "pytest.mark.integration" in marks.group(1)
+    assert not re.search(r"pytest\.mark\.(slow|live|chaos)\b", text)
+    selection = job_selection(load_workflow()["jobs"]["integration"])
+    assert selection is not None and selection.startswith("integration and ")
+
+
+def test_the_runbook_lists_every_ci_job() -> None:
+    # The CI table of the runbook is where a reader learns what a red job means.
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    section = runbook.split("\n## CI\n", 1)[1].split("\n### ", 1)[0]
+    listed = set(re.findall(r"^\| `([\w-]+)` \|", section, re.M))
+    assert listed == set(load_workflow()["jobs"])
 
 
 # --- terraform: the AWS deploy is checked without an AWS account ---------------------------

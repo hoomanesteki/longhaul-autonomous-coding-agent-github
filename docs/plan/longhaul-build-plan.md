@@ -3386,7 +3386,7 @@ The first `make gate PHASE=5` and the independent gate review found the problems
   - The chaos table counts in its All row the runs that a kill hit (18 of 20), as the rows per kill type do.
   - Prometheus scrapes the worker only.
   - The timeline reads stuck events as one line with their evidence, shows a failed tool call with its exit code, keeps words whole at 375 px, and colours an outcome by how it ended. A verdict is recorded under the verifier turn that gave it.
-  - The README, runbook, architecture page, AWS page, security page, case study and demo script say what is true today: the repo is public, the docs site waits for Pages to be turned on, and the eval numbers and the video are not made yet. The CI secret scan covers every branch and tag with the version the security page names.
+  - The README, runbook, architecture page, AWS page, security page, case study and demo script say what was true when this story was written: the repo is public, the docs site waits for Pages to be turned on (it went live on 2026-11-12), and the eval numbers and the video are not made yet. The CI secret scan covers every branch and tag with the version the security page names.
 - **Acceptance criteria:**
   - [ ] No worker or run process is left after `make demo` ends, whichever way it ends.
   - [ ] Every finding of the gate review is fixed or listed in the gate report with a reason.

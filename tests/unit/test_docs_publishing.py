@@ -108,10 +108,11 @@ def test_the_readme_links_the_docs_site_near_the_top() -> None:
     assert SITE_URL in top
 
 
-def test_the_runbook_tells_the_owner_how_the_site_goes_live() -> None:
+def test_the_runbook_says_how_the_site_is_published_and_stopped() -> None:
     runbook = (ROOT / "docs" / "runbook.md").read_text(encoding="utf-8")
-    assert "Source, GitHub Actions" in runbook
-    assert "first push to `main`" in runbook
+    assert "Build and deployment, Source" in runbook
+    assert "each push to `main` publishes the site" in runbook
+    assert "`PAGES_ENABLED` with the value `false`" in runbook
     assert SITE_URL in runbook
     assert QUARTO_VERSION in runbook
     assert "| `docs` |" in runbook, "the CI job table must list the docs job"

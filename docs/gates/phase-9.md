@@ -135,5 +135,5 @@ LH-994 (the README and the docs site) and the dependency updates of the week lan
 - docs/results.md built from committed result files, footer run ids matching eval/results/: docs/results.md says no real run has been made and holds no numbers; build_report.py refuses the scripted chaos run as headline data. eval/results/ holds only chaos-2026-11-07. The headline runs need an API key, the eval VM and the eval budget.
 - Fresh-clone quickstart under 10 minutes: Not on a clean VM; see LH-907 above (118 s on this machine with warm caches).
 - README, case study and demo video done: README and case-study.md are done, with chaos numbers only and pending eval numbers stated. The demo video is not recorded.
-- Turn on GitHub Pages (Pages source GitHub Actions, and the repository variable `PAGES_ENABLED=true`), as the runbook's Publishing section says. The next push to main deploys the site.
+- Turn on GitHub Pages. Done on 2026-11-12: the Pages source is GitHub Actions, `pages.yml` now deploys on each push to `main`, and the site is live at https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/.
 - LH-003 and LH-006: run `gh auth login`, then `scripts/protect_branches.sh` and the backlog import.

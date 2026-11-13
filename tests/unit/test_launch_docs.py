@@ -199,7 +199,10 @@ def test_readme_says_what_is_not_made_yet_and_why() -> None:
     assert "API key" in headline and "eval VM" in headline
     demo = section(text, "Demo")
     assert "recorded yet" in demo and "API key" in demo
-    assert "is not live yet" in text.splitlines()[6]
+    status = text.splitlines()[6]
+    assert (
+        "Docs site:" in status and "hoomanesteki.github.io" in status and "not live" not in status
+    )
 
 
 def test_readme_quotes_the_chaos_results_as_the_summary_has_them() -> None:
@@ -444,14 +447,17 @@ def test_demo_script_has_the_timeline_of_plan_section_11_3() -> None:
 
 
 def test_demo_script_lists_the_owner_steps_as_open() -> None:
-    # The repo is public and its secrets check is done. The video, the GIF and the Pages site
-    # are not, and the page must not claim they are.
+    # The repo is public, its secrets check is done, the site is live and v1.0.0 is tagged. The
+    # video and the GIF are not made, and the page must not claim they are.
     text = read(DOCS / "demo-script.md")
     checklist = section(text, "Recording checklist")
     done = [line for line in checklist.splitlines() if line.startswith("- [x] ")]
-    assert len(done) == 1 and "public" in done[0] and "gitleaks" in done[0]
+    assert len(done) == 3
+    assert any("public" in line and "gitleaks" in line for line in done)
+    assert any("GitHub Pages" in line for line in done)
+    assert any("v1.0.0" in line for line in done)
     open_steps = [line for line in checklist.splitlines() if line.startswith("- [ ] ")]
-    for word in ("Record the video", "30-second GIF", "GitHub Pages"):
+    for word in ("Record the video", "30-second GIF"):
         assert any(word in line for line in open_steps), word
     assert "docs/media/demo.gif" in checklist
     assert "not public" not in text

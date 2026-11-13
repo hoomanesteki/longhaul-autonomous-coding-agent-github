@@ -1,6 +1,6 @@
 # Two-minute demo script
 
-The script for the demo video and the 30-second GIF. The video and the GIF are not recorded yet, and GitHub Pages is not live. The repo is public. The open steps are listed in the checklist at the end.
+The script for the demo video and the 30-second GIF. The video and the GIF are not recorded yet. The repo is public and the docs site is live. The open steps are listed in the checklist at the end.
 
 ## What the video shows
 
@@ -43,7 +43,7 @@ Cut from the same take, in this order: the label on the issue, the plan comment,
 
 ## Recording checklist
 
-These are the owner's steps. The repo is public and its secrets check is done. The rest is open.
+These are the owner's steps. The repo is public, its secrets check is done, the docs site is live and `v1.0.0` is tagged. The rest is open.
 
 - [ ] Run the evaluation commands in `docs/results.md` with a live model, and rebuild that page.
 - [ ] Replace the pending lines in the README (headline numbers and limitations), `docs/case-study.md` and the 1:40 row above with the numbers on the rebuilt page.
@@ -51,6 +51,6 @@ These are the owner's steps. The repo is public and its secrets check is done. T
 - [ ] Cut the 30-second GIF and save it as `docs/media/demo.gif`, then add the image to the README Demo section.
 - [ ] Put the video link in the README and in `docs/case-study.md`.
 - [x] Check the repo for secrets and private paths, then make the repo public. The repo is public. `gitleaks git --log-opts=--all` found no leaks in 583 commits on 2026-11-11.
-- [ ] Turn on GitHub Pages as the runbook says ("Docs site").
-- [ ] Merge `dev` into `main` at the Phase 9 gate and tag `v1.0.0`.
+- [x] Turn on GitHub Pages as the runbook says ("Docs site"). The site is live since 2026-11-12.
+- [x] Merge `dev` into `main` at the Phase 9 gate and tag `v1.0.0`.
 - [ ] Add the project card and page to the portfolio site from `docs/case-study.md`.

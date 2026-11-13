@@ -73,6 +73,6 @@ These come from the gate reports and the chaos suite, and they are the cases whe
 ## Links
 
 - Repository: https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github
-- Docs site: https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/ (not live yet: it goes up once GitHub Pages is turned on, as the runbook's Publishing section says)
+- Docs site: https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/
 - Results and method: [results.md](results.md) and [the chaos method](../eval/chaos/README.md)
 - Demo video: not recorded yet. The script is [demo-script.md](demo-script.md).

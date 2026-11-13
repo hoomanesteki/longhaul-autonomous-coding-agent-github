@@ -7,8 +7,8 @@ name: dependency-review
 # brings in, in every ecosystem, before it merges.
 #
 # The action needs the dependency graph of the repository, which is a setting (Settings, Code
-# security, Dependency graph) that is not on by default, and it fails every pull request while
-# the graph is off. So the job runs only when the repository variable DEPENDENCY_REVIEW is
+# security, Dependency graph) that can be off and is off on this repository, and the action
+# fails every pull request while the graph is off. So the job runs only when the repository variable DEPENDENCY_REVIEW is
 # true, which the owner sets after turning the graph on. Until then the job is skipped, not
 # failed. It lives in its own workflow because it has nothing to compare on a push, and the
 # `ci` job of ci.yml counts a job that did not run as a failure.

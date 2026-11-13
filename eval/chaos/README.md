@@ -1,6 +1,6 @@
 # Full chaos suite
 
-Twenty runs of recorded custom tasks, each killed one to three times, with a count of what they
+Twenty runs of recorded custom tasks, each with one to three kills planned, with a count of what they
 leave behind. It puts a number behind "survives crashes".
 
 ```bash

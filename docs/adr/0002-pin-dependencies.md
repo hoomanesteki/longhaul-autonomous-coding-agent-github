@@ -11,7 +11,7 @@ The agent's behavior depends on the exact versions of its SDKs, the Temporal ser
 
 Pin the latest stable versions at project start with `uv lock` and commit `uv.lock`. The key versions are recorded below so a reader can see them without opening the lock file. Upgrades go in their own `chore/` PR.
 
-Key packages, as locked in `uv.lock` on 2026-10-30:
+Key packages, as `uv.lock` locks them (`tests/unit/test_adr_pins.py` keeps the rows in step):
 
 | Package | Pinned version |
 |---|---|
@@ -46,7 +46,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 
 `fastembed` is the one optional dependency. It sits in the `memory` extra of `pyproject.toml`, so `uv sync --locked` and CI do not install it, and `uv sync --extra memory` does. It brings 14 more packages, among them onnxruntime 1.31.1, numpy 2.5.4, tokenizers 0.23.3 and huggingface-hub 1.33.0, which needs the plain `httpx` that the base install lacks. ADR-0010 explains the choice.
 
-Development tools, as locked in `uv.lock` on 2026-10-30:
+Development tools, as `uv.lock` locks them:
 
 | Package | Pinned version |
 |---|---|

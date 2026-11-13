@@ -62,7 +62,7 @@
 | Phase gate 9 | Hardening tests pass, and docs/security.md is complete | test_sandbox_hardening.py passed (2). test_security_page.py passed (10). Threat model, controls with tests, known gaps, rotation runbook, gitleaks, pip-audit and npm audit are all present. | Pass |
 | Phase gate 9 | Fresh-clone quickstart under 10 minutes | Not on a clean VM; see LH-907 above (118 s on this machine with warm caches). | Manual |
 | Phase gate 9 | README, case study and demo video done | README and case-study.md are done, with chaos numbers only and pending eval numbers stated. The demo video is not recorded. | Manual |
-| Phase gate 9 | Repo public. Tag v1.0.0. Release notes per phase | The repo is public. v1.0.0 is tagged at the dev to main merge of this gate, and the tag message lists each phase's tag and highlights. Each tag from v0.0.1 to v1.0.0 has a GitHub release since 2026-11-13, made by the `release` workflow from the tag's message, and v1.0.0 is marked latest. | Pass |
+| Phase gate 9 | Repo public. Tag v1.0.0. Release notes per phase | The repo is public. v1.0.0 is tagged at the dev to main merge of this gate, and the tag message lists each phase's tag and highlights. Each tag from v0.0.1 to v1.0.0 has had a GitHub release since 2026-11-13, made by the `release` workflow from the tag's message, and v1.0.0 is marked latest. | Pass |
 
 ## Invariants
 

@@ -792,7 +792,7 @@ Each of the first three asserts the kill point from the last activity line in th
 
 ## The full chaos suite
 
-`eval/chaos/chaos.py` puts a number behind "survives crashes": 20 runs of four recorded custom tasks, each killed one to three times, with a count of what each run left behind. It is the Phase 9 suite (LH-904). `eval/chaos/README.md` has the details, and this section has what an operator needs.
+`eval/chaos/chaos.py` puts a number behind "survives crashes": 20 runs of four recorded custom tasks, each with one to three kills planned, with a count of what each run left behind. It is the Phase 9 suite (LH-904). `eval/chaos/README.md` has the details, and this section has what an operator needs.
 
 ```bash
 make up && make sandbox-image
@@ -1371,7 +1371,7 @@ To run the quick jobs on your machine, use `make ci-local`. To lint the workflow
 
 The `ci` job does not wait for these, so branch protection does not require them. A failed CodeQL or dependency review still shows as a red check on the pull request. `tests/unit/test_workflow_hardening.py` holds every workflow to a read-only top, a list of the jobs that may write, a timeout per job, no `pull_request_target` or `workflow_run` trigger, and concurrency groups that cancel only an older run of the same pull request.
 
-Dependency review needs the dependency graph of the repository, which is off until the owner turns it on, and the action fails every pull request while it is off. So its job is skipped until both of these are done:
+Dependency review needs the dependency graph of the repository, a setting that can be off and is off on this repository, and the action fails every pull request while it is off. So its job is skipped until both of these are done:
 
 1. Turn on the graph: Settings, Code security, Dependency graph, Enable.
 2. Add the repository variable `DEPENDENCY_REVIEW` with the value `true` (Settings, Secrets and variables, Actions, Variables).

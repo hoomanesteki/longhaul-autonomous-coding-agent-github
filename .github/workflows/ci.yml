@@ -429,7 +429,7 @@ jobs:
         working-directory: console
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "26"
           cache: npm
@@ -550,7 +550,7 @@ jobs:
       - name: Build sandbox image
         working-directory: .
         run: make sandbox-image
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: "26"
           cache: npm

@@ -144,9 +144,16 @@ def test_upgrade_downgrade_roundtrip(scratch: Scratch) -> None:
 
 # What a schema snapshot reads: every column, index, constraint, sequence and type of the public
 # schema. The vector extension is not in it, because the baseline leaves it in place on purpose.
+# Columns come from pg_attribute with format_type, so a length, a precision or the dimension of a
+# vector is part of the type: a downgrade that restores numeric(12, 6) as numeric(10, 2) differs.
 SCHEMA_QUERIES: tuple[LiteralString, ...] = (
-    "SELECT table_name, column_name, data_type, is_nullable, column_default"
-    " FROM information_schema.columns WHERE table_schema = 'public'",
+    "SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull,"
+    " pg_get_expr(d.adbin, d.adrelid)"
+    " FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid"
+    " JOIN pg_namespace n ON n.oid = c.relnamespace"
+    " LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum"
+    " WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm')"
+    " AND a.attnum > 0 AND NOT a.attisdropped",
     "SELECT tablename, indexdef FROM pg_indexes WHERE schemaname = 'public'",
     "SELECT c.conrelid::regclass::text, c.conname, pg_get_constraintdef(c.oid)"
     " FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace"
@@ -168,6 +175,11 @@ def schema_snapshot(scratch: Scratch) -> list[list[tuple[Any, ...]]]:
     ]
 
 
+# Revisions that only move data (an UPDATE or a backfill) and leave the schema as it was. Every
+# other revision must change the schema, which catches a migration whose body never ran.
+DATA_ONLY: frozenset[str] = frozenset()
+
+
 def revisions_in_order(cfg: Config) -> list[str]:
     """Every revision id from the first to the head, along the one line of history."""
     revisions = list(ScriptDirectory.from_config(cfg).walk_revisions("base", "heads"))
@@ -187,7 +199,8 @@ def test_every_migration_round_trips_on_its_own(scratch: Scratch) -> None:
     for revision in revisions:
         command.upgrade(cfg, revision)
         after = schema_snapshot(scratch)
-        assert after != before, f"{revision} changed nothing"
+        if revision not in DATA_ONLY:
+            assert after != before, f"{revision} changed nothing (DATA_ONLY lists data moves)"
 
         command.downgrade(cfg, previous)
         assert schema_snapshot(scratch) == before, f"the downgrade of {revision} is not exact"

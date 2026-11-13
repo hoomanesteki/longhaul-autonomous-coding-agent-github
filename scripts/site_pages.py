@@ -32,6 +32,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 SITE_NAME = "Longhaul"
+# The alt text of the social card, as _quarto.yml gives it to every page that keeps the default.
+SOCIAL_ALT = (
+    "Longhaul: a background coding agent that survives crashes and tells you when it is stuck."
+)
 PLAN_FILE = Path("docs/plan/longhaul-build-plan.md")
 PROGRESS_FILE = Path("docs/progress.md")
 # The chaos run the README quotes. scripts/chaos_chart.py draws CHAOS_CHART from the same file.
@@ -355,6 +359,7 @@ def adr_page(adr: Adr, doc_path: str, before: Adr | None, after: Adr | None) -> 
         "hide-description: true\n"
         # Quarto reads the image path from the page's folder.
         "image: ../social-card.png\n"
+        f"image-alt: {json.dumps(SOCIAL_ALT)}\n"
         "---\n\n"
         # The ADR starts with its own H1, which the page title already shows. Its links are
         # relative to docs/adr/, and docs.lua points them at the site from there.

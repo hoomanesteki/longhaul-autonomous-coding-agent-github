@@ -83,7 +83,8 @@ format:
     # The docs are written for GitHub, which prints -- and --- as typed. Pandoc's smart
     # typography would turn them into en and em dashes, which the voice guide bans, and an
     # option such as --window would read as a dash and a word.
-    from: markdown-smart
+    # GitHub starts a list without a blank line before it, so the pages do too.
+    from: markdown-smart+lists_without_preceding_blankline
     theme:
       light: [cosmo, theme-light.scss]
       dark: [cosmo, theme-dark.scss]

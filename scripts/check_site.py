@@ -49,6 +49,9 @@ REFERENCE_ATTRS = {
 }
 # <meta> tags whose content is a URL (the social card) or text a reader sees in a card.
 META_URLS = {"og:image", "og:url", "twitter:image"}
+# The image of a card and the tag that holds its alt text.
+CARD_IMAGES = {"og:image": "og:image:alt", "twitter:image": "twitter:image:alt"}
+CARD_ALTS = set(CARD_IMAGES.values())
 META_TEXT = {"description", "og:title", "og:description", "twitter:title", "twitter:description"}
 # Links of these kinds are not files of the site.
 SKIPPED_SCHEMES = {"mailto", "tel", "javascript", "data"}
@@ -77,6 +80,9 @@ class _PageParser(HTMLParser):
         self.urls: list[str] = []
         self.text: list[str] = []
         self.unnamed_images: list[str] = []
+        # A social card with an image needs the text a reader of the card hears in its place.
+        self.card_images: list[str] = []
+        self.card_alts: set[str] = set()
         self._skipping = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -111,6 +117,10 @@ class _PageParser(HTMLParser):
             kind = values.get("property", values.get("name"))
             if kind in META_URLS:
                 self.urls.append(values["content"])
+            if kind in CARD_IMAGES:
+                self.card_images.append(kind)
+            elif kind in CARD_ALTS:
+                self.card_alts.add(kind)
             elif kind in META_TEXT:
                 self.text.append(values["content"])
         if values.get("alt"):
@@ -188,6 +198,9 @@ class Site:
                     found.append(Problem(page, url, reason))
             for src in parser.unnamed_images:
                 found.append(Problem(page, src, "an image with no alt attribute"))
+            for kind in parser.card_images:
+                if CARD_IMAGES[kind] not in parser.card_alts:
+                    found.append(Problem(page, kind, f"a card image with no {CARD_IMAGES[kind]}"))
             for text in parser.text:
                 for dash in DASHES.finditer(text):
                     start = max(dash.start() - 30, 0)

@@ -31,12 +31,16 @@ def _load() -> ModuleType:
 
 check_site = _load()
 
+ALT = '<meta property="og:image:alt" content="The card">'
+TWITTER_ALT = '<meta name="twitter:image:alt" content="The card">'
+
 INDEX = """<!doctype html>
 <html><head>
 <title>Longhaul</title>
 <link href="./styles.css" rel="stylesheet">
 <link href="https://fonts.googleapis.com" rel="preconnect">
 <meta property="og:image" content="{site_url}card.png">
+<meta property="og:image:alt" content="The card">
 </head><body>
 <h1 id="top">Longhaul</h1>
 <a href="guide/setup.html#install">setup</a>
@@ -125,13 +129,21 @@ def test_a_missing_image_or_stylesheet_is_caught(tmp_path: Path) -> None:
 
 
 def test_the_social_card_image_must_exist_on_the_site(tmp_path: Path) -> None:
-    meta = f'<meta property="og:image" content="{SITE_URL}adr/card.png">'
+    meta = f'<meta property="og:image" content="{SITE_URL}adr/card.png">{ALT}'
     site = _site(tmp_path, **{"card.html": _page(meta)})
     assert _problems(site) == [f"card.html: {SITE_URL}adr/card.png: no such file"]
 
 
+def test_a_card_image_with_no_alt_text_is_caught(tmp_path: Path) -> None:
+    # A page that sets its own card image loses the alt text the site gives the default one.
+    meta = f'<meta property="og:image" content="{SITE_URL}card.png">'
+    assert _problems(_site(tmp_path, **{"card.html": _page(meta)})) == [
+        "card.html: og:image: a card image with no og:image:alt"
+    ]
+
+
 def test_a_double_slash_in_a_site_url_is_caught(tmp_path: Path) -> None:
-    meta = f'<meta name="twitter:image" content="{SITE_URL}/card.png">'
+    meta = f'<meta name="twitter:image" content="{SITE_URL}/card.png">{TWITTER_ALT}'
     (problem,) = _problems(_site(tmp_path, **{"card.html": _page(meta)}))
     assert problem.endswith("the path has an empty part (//)")
 

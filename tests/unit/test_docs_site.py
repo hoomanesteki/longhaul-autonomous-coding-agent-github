@@ -130,10 +130,12 @@ def test_the_site_has_a_social_card_and_a_favicon() -> None:
 
 def test_the_pages_read_markdown_as_github_does() -> None:
     # Smart typography would turn "--" into an en dash, which the voice guide bans, and the gate
-    # reports hold many command options such as --window.
-    assert quarto_config()["format"]["html"]["from"] == "markdown-smart"
+    # reports hold many command options such as --window. GitHub also starts a list right after
+    # a line of text, and the plan has many lists that follow a line ending in a colon.
+    reader = "markdown-smart+lists_without_preceding_blankline"
+    assert quarto_config()["format"]["html"]["from"] == reader
     fragments = (SITE / "filters" / "fragments.lua").read_text(encoding="utf-8")
-    assert '"markdown-smart"' in fragments
+    assert fragments.count(f'"{reader}"') == 2
     assert 'pandoc.read(read(relative), "markdown")' not in fragments
 
 

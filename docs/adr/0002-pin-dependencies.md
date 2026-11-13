@@ -30,7 +30,7 @@ Key packages, as locked in `uv.lock` on 2026-10-30:
 | pyyaml | 6.0.3 |
 | pyjwt | 2.15.1 (see ADR-0012) |
 | cryptography | 50.0.2 (RS256 signing for pyjwt, see ADR-0012) |
-| sqlalchemy | 2.1.6 |
+| sqlalchemy | 2.1.8 |
 | alembic | 1.20.1 |
 | asyncpg | 0.32.0 |
 | pgvector | 0.5.1 |
@@ -57,8 +57,8 @@ Development tools, as locked in `uv.lock` on 2026-10-30:
 | hypothesis | 6.170.15 (property tests, since LH-403) |
 | ruff | 0.17.4 |
 | pre-commit | 4.7.0 |
-| types-boto3 | 1.43.123 |
-| types-docker | 7.2.0.20261006 |
+| types-boto3 | 1.43.127 |
+| types-docker | 7.2.0.20261102 |
 | types-jsonschema | 4.26.0.20261006 |
 | types-pyyaml | 6.0.12.20261103 |
 

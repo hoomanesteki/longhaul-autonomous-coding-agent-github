@@ -78,9 +78,10 @@ def test_pages_deploys_unless_the_owner_turns_it_off() -> None:
 
 
 def test_only_the_pages_deploy_job_can_mint_a_token() -> None:
-    # The write scopes belong to one workflow. The id-token scope, which lets a job ask GitHub
-    # for an OIDC token, belongs to its deploy job alone. Every other job keeps what the
-    # workflow gives it, which is read access to the repository.
+    # The Pages scopes belong to this workflow. The id-token scope, which lets a job ask GitHub
+    # for an OIDC token, belongs to its deploy job alone. Every job of ci.yml keeps what the
+    # workflow gives it, which is read access to the repository. test_workflow_hardening.py
+    # lists the few jobs of other workflows that may write.
     ci = workflow("ci.yml")
     assert ci["permissions"] == {"contents": "read"}
     assert all("permissions" not in job for job in ci["jobs"].values())

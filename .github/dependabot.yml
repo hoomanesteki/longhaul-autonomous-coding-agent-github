@@ -52,3 +52,21 @@ updates:
     groups:
       terraform:
         patterns: ["*"]
+  # The base images in docker/: python for the sandbox, the worker and the API, and node for the
+  # console stage of the API image. The project runs on Python 3.12 (.python-version, and the
+  # py312 tag of the sandbox image in the Makefile), so only patch releases of python are
+  # proposed; a new minor is a change by hand. The node tag names a major only, and the console job of ci.yml
+  # pins the same major, so a new node major is a change by hand to both as well.
+  - package-ecosystem: docker
+    directories: [/docker/api, /docker/sandbox, /docker/worker]
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      docker:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]

@@ -1,0 +1,46 @@
+name: release
+
+# Makes sure every version tag has a GitHub Release (scripts/sync_releases.py). A release is
+# titled with its tag and takes the tag's annotated message as its notes, and the highest version
+# is marked as the latest. A tag that already has a release is left alone, so a run with nothing
+# new changes nothing, and running it again by hand is safe.
+#
+# It runs on a push of a version tag, on each push to main and by hand. The push to main also
+# covers a tag pushed before this workflow existed. No pull request starts it, so the write
+# token never meets code from a fork.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+# Read-only by default. Only the job that creates releases may write, and only to contents.
+permissions:
+  contents: read
+
+# Two runs at once could both see a tag without a release and both try to create it. A
+# running one is never cancelled halfway; the next one waits and then finds nothing to do.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  releases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # On a tag push the checkout can hold the pushed tag as a plain ref without its message.
+      # Fetching the tags again with --force brings back the annotated tag objects.
+      - name: Fetch the annotated tags
+        run: git fetch --force --tags origin
+      - name: Create the missing releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/sync_releases.py --repo "$GITHUB_REPOSITORY"

@@ -99,6 +99,9 @@ format:
     code-copy: true
     # Its light and dark variants keep every token at a contrast of 4.5 or more.
     highlight-style: a11y
-    # Lets a keyboard reach the boxes that scroll sideways (see the file).
-    include-after-body: _scroll-regions.html
+    # The first lets a keyboard reach the boxes that scroll sideways, and the second marks the
+    # current page inside the navbar menus (see each file).
+    include-after-body:
+      - _scroll-regions.html
+      - _nav-current.html
     lang: en

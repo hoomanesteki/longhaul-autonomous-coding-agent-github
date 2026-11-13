@@ -142,7 +142,8 @@ def test_the_pages_read_markdown_as_github_does() -> None:
 def test_the_theme_keeps_code_and_scrolling_boxes_readable() -> None:
     html = quarto_config()["format"]["html"]
     assert html["highlight-style"] == "a11y"
-    script = SITE / html["include-after-body"]
+    script = SITE / "_scroll-regions.html"
+    assert script.name in html["include-after-body"]
     assert 'setAttribute("tabindex", "0")' in script.read_text(encoding="utf-8")
     # axe-core found light text on a light gray code block in dark mode, white text on the
     # light blue button, and orange tokens just under 4.5 on the light code block.
@@ -150,6 +151,35 @@ def test_the_theme_keeps_code_and_scrolling_boxes_readable() -> None:
     assert "$code-block-bg:" in dark
     assert "$min-contrast-ratio: 4.5;" in dark
     assert "$code-block-bg:" in (SITE / "theme-light.scss").read_text(encoding="utf-8")
+
+
+def test_the_navbar_marks_the_current_page_inside_its_menus() -> None:
+    # Quarto marks only a top-level link as the current page, so a page in a menu showed none.
+    html = quarto_config()["format"]["html"]
+    assert "_nav-current.html" in html["include-after-body"]
+    script = (SITE / "_nav-current.html").read_text(encoding="utf-8")
+    assert ".dropdown-item" in script
+    assert 'setAttribute("aria-current", "page")' in script
+    assert 'toggle.classList.add("active")' in script
+    # An ADR page has no menu item of its own and belongs to Decisions.
+    assert '"/adr/"' in script
+    assert '"/decisions.html"' in script
+    assert ("Decisions", "decisions.qmd") in NAVBAR[1][1]
+    # The marked item takes the color of the current top-level link, not Bootstrap's filled blue.
+    css = (SITE / "styles.css").read_text(encoding="utf-8")
+    assert ".dropdown-item.active" in css
+    assert "var(--bs-navbar-active-color)" in css
+
+
+def test_the_wide_diagrams_fit_a_desktop_page_and_show_their_scroll_bar() -> None:
+    # A min-width of 1300px cut the system context diagram at a 1280px screen, where its frame
+    # is 1229px wide, and macOS hid the scroll bar that would have said so.
+    css = (SITE / "styles.css").read_text(encoding="utf-8")
+    wide = css.index("@media (min-width: 1200px)")
+    assert "figure.quarto-float-fig svg.mermaid-js {\n    min-width: 0;" in css[wide:]
+    assert ".mermaid-frame::-webkit-scrollbar {" in css
+    assert "figure.quarto-float-fig > div::-webkit-scrollbar-thumb" in css
+    assert "scrollbar-color:" in css
 
 
 def test_the_overview_links_every_page_of_the_navbar() -> None:

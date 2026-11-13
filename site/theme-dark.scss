@@ -6,7 +6,11 @@ $body-color: #d8dde6;
 $link-color: #7fb4ff;
 $navbar-bg: #1b2028;
 $navbar-fg: #e8ebf1;
-$navbar-hl: #ffffff;
+// The current page in the navbar, and in its menus, takes the light blue of the links. White
+// was too close to the other links to show which page is open.
+$navbar-hl: #7fb4ff;
+// A menu item under the pointer got a light gray box, which hid its light text.
+$dropdown-link-hover-bg: #262d38;
 $code-bg: #1d222a;
 $code-color: #f0a8d0;
 $border-color: #2d343f;

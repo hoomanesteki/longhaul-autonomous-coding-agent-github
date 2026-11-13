@@ -3,8 +3,9 @@
 // Cosmo's blue (#2780e3) gives white button text a contrast of 3.97, under the 4.5 that WCAG AA
 // asks for. This darker blue reaches 5.3 and still reads as the same color.
 $primary: #1b6ac9;
-// Quarto paints the navbar with a $primary that the theme sets. Keep the light gray bar, so the
-// current page keeps its blue highlight.
+// Quarto paints the navbar with the $primary that a theme sets, and on that blue bar the link of
+// the current page would look like the others. On the light gray bar it is dark blue, and so are
+// the current item of a menu and its toggle (styles.css, _nav-current.html).
 $navbar-bg: #f8f9fa;
 // Code blocks. On cosmo's gray (#eceef1) the orange of the a11y highlight style reaches 4.44,
 // just under 4.5. A lighter gray lifts it over.

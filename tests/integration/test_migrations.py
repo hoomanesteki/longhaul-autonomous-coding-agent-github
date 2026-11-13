@@ -17,6 +17,7 @@ from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from psycopg import sql
 from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
@@ -139,6 +140,74 @@ def test_upgrade_downgrade_roundtrip(scratch: Scratch) -> None:
 
     command.upgrade(cfg, "head")
     assert scratch.tables() >= WANTED_TABLES
+
+
+# What a schema snapshot reads: every column, index, constraint, sequence and type of the public
+# schema. The vector extension is not in it, because the baseline leaves it in place on purpose.
+SCHEMA_QUERIES: tuple[LiteralString, ...] = (
+    "SELECT table_name, column_name, data_type, is_nullable, column_default"
+    " FROM information_schema.columns WHERE table_schema = 'public'",
+    "SELECT tablename, indexdef FROM pg_indexes WHERE schemaname = 'public'",
+    "SELECT c.conrelid::regclass::text, c.conname, pg_get_constraintdef(c.oid)"
+    " FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace"
+    " WHERE n.nspname = 'public'",
+    "SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public'",
+    "SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace"
+    " WHERE n.nspname = 'public' AND t.typtype IN ('e', 'd')",
+)
+
+
+def schema_snapshot(scratch: Scratch) -> list[list[tuple[Any, ...]]]:
+    """The schema of the scratch database, without the alembic_version table."""
+    return [
+        sorted(
+            (row for row in scratch.query(statement) if "alembic_version" not in map(str, row)),
+            key=repr,
+        )
+        for statement in SCHEMA_QUERIES
+    ]
+
+
+def revisions_in_order(cfg: Config) -> list[str]:
+    """Every revision id from the first to the head, along the one line of history."""
+    revisions = list(ScriptDirectory.from_config(cfg).walk_revisions("base", "heads"))
+    assert all(not isinstance(r.down_revision, tuple) for r in revisions), "a merge revision"
+    return [r.revision for r in reversed(revisions)]
+
+
+def test_every_migration_round_trips_on_its_own(scratch: Scratch) -> None:
+    # The roundtrip above checks the end points only. Here each revision goes up, down and up
+    # again, and the schema must be the same each time it is at a revision: a downgrade that
+    # leaves a column, an index or a type behind fails here, and so does one that drops too much.
+    cfg = scratch.config()
+    revisions = revisions_in_order(cfg)
+    assert len(revisions) >= 12
+    before = schema_snapshot(scratch)
+    previous = "base"
+    for revision in revisions:
+        command.upgrade(cfg, revision)
+        after = schema_snapshot(scratch)
+        assert after != before, f"{revision} changed nothing"
+
+        command.downgrade(cfg, previous)
+        assert schema_snapshot(scratch) == before, f"the downgrade of {revision} is not exact"
+
+        command.upgrade(cfg, revision)
+        assert schema_snapshot(scratch) == after, f"{revision} upgrades differently the second time"
+        before, previous = after, revision
+    assert scratch.query("SELECT version_num FROM alembic_version") == [(revisions[-1],)]
+
+
+def test_the_snapshot_notices_what_a_downgrade_leaves_behind(scratch: Scratch) -> None:
+    command.upgrade(scratch.config(), "head")
+    clean = schema_snapshot(scratch)
+    with psycopg.connect(scratch.url) as conn:
+        conn.execute("CREATE INDEX ix_left_over ON tasks (title)")
+    assert schema_snapshot(scratch) != clean
+    with psycopg.connect(scratch.url) as conn:
+        conn.execute("DROP INDEX ix_left_over")
+        conn.execute("ALTER TABLE tasks ADD COLUMN left_over text")
+    assert schema_snapshot(scratch) != clean
 
 
 def test_migrated_schema_matches_models(scratch: Scratch) -> None:

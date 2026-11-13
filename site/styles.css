@@ -164,3 +164,16 @@ body.quarto-light svg.chaos-chart {
 body.quarto-dark svg.chaos-chart {
   --chaos-mark: #5b9cf0;
 }
+
+/* Figure captions. Cosmo's gray (#6d7a86) gives 4.39 on white, under the 4.5 of WCAG AA. */
+figcaption,
+.figure-caption {
+  color: var(--bs-secondary-color);
+}
+
+/* The note that names the source file of a page closes the page, under a rule. */
+.source-note:last-child {
+  border-top: 1px solid var(--bs-border-color);
+  margin-top: 2.5rem;
+  padding-top: 1rem;
+}

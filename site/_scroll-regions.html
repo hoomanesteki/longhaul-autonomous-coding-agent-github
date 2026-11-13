@@ -1,0 +1,22 @@
+<script>
+// A box that scrolls sideways (a wide table, a diagram, a long code line) has to take keyboard
+// focus, or a reader without a mouse cannot scroll it (WCAG 2.1.1). Quarto writes the code
+// blocks and the figures, so the attribute is set here, on each box that is wider than its
+// frame. Mermaid draws after the page loads, so the boxes are measured again a little later.
+(function () {
+  var boxes = "main .table-scroll, main .mermaid-frame, main .quarto-float > figure > div, " +
+    "main .chaos-figure, main div.sourceCode, main pre";
+  function mark() {
+    document.querySelectorAll(boxes).forEach(function (box) {
+      if (box.scrollWidth > box.clientWidth && !box.hasAttribute("tabindex")) {
+        box.setAttribute("tabindex", "0");
+      }
+    });
+  }
+  window.addEventListener("load", function () {
+    mark();
+    window.setTimeout(mark, 1500);
+  });
+  window.addEventListener("resize", mark);
+})();
+</script>

@@ -45,8 +45,9 @@ local function repo_folder(relative)
   return table.concat(parts, "/")
 end
 
+-- Without smart typography, as the pages are read (site/_quarto.yml), so -- stays as typed.
 local function blocks_of(relative)
-  return pandoc.read(read(relative), "markdown").blocks
+  return pandoc.read(read(relative), "markdown-smart").blocks
 end
 
 function Div(div)
@@ -65,7 +66,7 @@ function Div(div)
       result:extend({ pandoc.Div(blocks_of(path), attr) })
     end
     if #result == 0 and div.attributes["empty"] then
-      return pandoc.read(div.attributes["empty"], "markdown").blocks
+      return pandoc.read(div.attributes["empty"], "markdown-smart").blocks
     end
     return result
   end

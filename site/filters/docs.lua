@@ -105,8 +105,37 @@ local function site_target(base, target, image)
   return REPO .. (folder and "tree" or "blob") .. "/main/" .. repo_path .. (folder and "/" or "") .. anchor
 end
 
+-- A ```mermaid fence in an included file draws on GitHub, but Quarto only draws the cells it
+-- writes itself (pre.mermaid-js, from a {mermaid} cell), and it loads the mermaid runtime only on
+-- a page that has such a cell. The element and its class are the ones Quarto's runtime looks for,
+-- and the text goes in escaped because the runtime reads textContent. The frame scrolls
+-- sideways, as a figure of a {mermaid} cell does (styles.css), because the diagram keeps a
+-- readable width that can be wider than the page.
+local function mermaid_block(block)
+  local escaped = block.text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+  return pandoc.RawBlock(
+    "html",
+    '<div class="mermaid-frame"><pre class="mermaid mermaid-js">' .. escaped .. "</pre></div>"
+  )
+end
+
+-- `mermaid="code"` on the div keeps the fences as code. A page with no {mermaid} cell of its own
+-- has no runtime to draw them, and would show the bare diagram text.
 local function point_at_site(div, base)
+  local draw = div.attributes["mermaid"] ~= "code"
   return div:walk({
+    CodeBlock = function(block)
+      if block.classes:includes("mermaid") then
+        if draw then
+          return mermaid_block(block)
+        end
+        -- Without the class the fence is a plain code block, styled as the others are.
+        block.classes = block.classes:filter(function(name)
+          return name ~= "mermaid"
+        end)
+        return block
+      end
+    end,
     Link = function(link)
       local target = site_target(base, link.target, false)
       if target then
@@ -115,16 +144,46 @@ local function point_at_site(div, base)
       end
     end,
     Image = function(image)
+      -- Pandoc leaves the alt text out of a figure whose caption says the same, which leaves
+      -- a screen reader with no name for the image. Quarto sets it on its own figures.
+      if not image.attributes["alt"] and #image.caption > 0 then
+        image.attributes["alt"] = pandoc.utils.stringify(image.caption)
+      end
       local target = site_target(base, image.src, true)
       if target then
         image.src = target
-        return image
       end
+      return image
     end,
   })
 end
 
+-- A heading may go down only one level at a time, or a screen reader user loses the outline
+-- (WCAG 1.3.1). The docs were written for GitHub, and some skip a level: the build plan puts its
+-- stories (####) right under the phases (##). Each heading takes the level one below the heading
+-- it sits under, which changes nothing in a doc that skips no level, and keeps siblings level
+-- with each other. A heading that moves up leaves the table of contents, which it was not in
+-- before, so the contents of the page stay as they were. The page title is the H1.
+local function close_heading_gaps(blocks)
+  local open = { { from = 1, to = 1 } }
+  for _, block in ipairs(blocks) do
+    if block.t == "Header" then
+      while #open > 1 and open[#open].from >= block.level do
+        table.remove(open)
+      end
+      local level = math.min(block.level, open[#open].to + 1)
+      table.insert(open, { from = block.level, to = level })
+      if level < block.level then
+        block.level = level
+        block.classes:insert("unlisted")
+      end
+    end
+  end
+  return blocks
+end
+
 function Pandoc(doc)
+  doc.blocks = close_heading_gaps(doc.blocks)
   local repo = doc.meta["source-repo"] and pandoc.utils.stringify(doc.meta["source-repo"])
   return doc:walk({
     Link = function(link)
@@ -246,19 +305,3 @@ function Table(tbl)
   return pandoc.Div({ marked }, pandoc.Attr("", { "table-scroll" }))
 end
 
--- A ```mermaid fence in an included file draws on GitHub, but Quarto only draws the cells it
--- writes itself (pre.mermaid-js, from a {mermaid} cell). Without this, the diagrams of
--- docs/architecture.md would show as code. The element and its class are the ones Quarto's
--- own runtime looks for, and the text goes in escaped because the runtime reads textContent.
-function CodeBlock(block)
-  if not block.classes:includes("mermaid") then
-    return nil
-  end
-  local escaped = block.text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-  -- The frame scrolls sideways, as a figure of a {mermaid} cell does (styles.css), because the
-  -- diagram keeps a readable width that can be wider than the page.
-  return pandoc.RawBlock(
-    "html",
-    '<div class="mermaid-frame"><pre class="mermaid mermaid-js">' .. escaped .. "</pre></div>"
-  )
-end

@@ -94,10 +94,10 @@ The model answers in these runs were scripted recordings, so the suite measures 
 
 A person watches every task, reads its timeline turn by turn, and steps in from the console: approve a plan, send a hint, add budget or cancel. These screenshots come from the demo stack, which runs the scripted provider, so every cost on them is $0.00.
 
-![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that need a person are marked.](_generated/docs/gates/media/phase-8/1-tasks.png){.screenshot}
+![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that wait on a person say what they need.](_generated/docs/gates/media/phase-9/1-tasks-1280.png){.screenshot}
 
 ::: {.shot-grid}
-![A shipped task: the plan with its steps done, then every turn and tool call.](_generated/docs/gates/media/phase-8/3-timeline.png){.screenshot}
+![A shipped task: each event reads as one line (step updates with the short sha, the verdict, the outcome), with a checkpoint marker on the turn that made it.](_generated/docs/gates/media/phase-9/2-timeline-1280.png){.screenshot}
 
 ![A paused task with the hint, budget and cancel forms.](_generated/docs/gates/media/phase-8/4-actions.png){.screenshot}
 :::

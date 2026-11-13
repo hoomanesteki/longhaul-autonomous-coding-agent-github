@@ -57,22 +57,22 @@ A person steers from the issue (`/longhaul approve`, `hint`, `budget`, `cancel`)
 
 ## The console
 
-A React console lists every task, shows its timeline turn by turn, and holds the forms to approve a plan, send a hint, add budget or cancel. These screenshots come from the Phase 8 gate, taken against the demo stack, which runs the scripted provider, so every cost on them is $0.00.
+A React console lists every task, shows its timeline turn by turn, and holds the forms to approve a plan, send a hint, add budget or cancel. These screenshots come from the Phase 8 and Phase 9 gates, taken against the demo stack, which runs the scripted provider, so every cost on them is $0.00.
 
-![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that need a person are marked.](docs/gates/media/phase-8/1-tasks.png)
+![The tasks list: each row shows the task's phase, turns, cost and outcome, and the two tasks that wait on a person say what they need.](docs/gates/media/phase-9/1-tasks-1280.png)
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/gates/media/phase-8/3-timeline.png" alt="A shipped task: summary, plan with its steps done, every turn and tool call, the verdict and the outcome."></td>
+    <td width="50%"><img src="docs/gates/media/phase-9/2-timeline-1280.png" alt="A shipped task: each event reads as one line (step updates with the short sha, the verdict, the outcome), with a checkpoint marker on the turn that made it."></td>
     <td width="50%"><img src="docs/gates/media/phase-8/4-actions.png" alt="A paused task with the hint, budget and cancel forms."></td>
   </tr>
   <tr>
-    <td>A shipped task: the plan with its steps done, then every turn and tool call.</td>
+    <td>A shipped task: each event reads as one line, with a checkpoint marker on the turn that made it.</td>
     <td>A paused task with the hint, budget and cancel forms.</td>
   </tr>
 </table>
 
-The other screens (the Needs you filter, the memory viewer, the sign-in page and the 375 px layout) are in the [Phase 8 gate report](docs/gates/phase-8.md#screenshots). How to run the console is in "The console" in [docs/runbook.md](docs/runbook.md).
+The other screens (the Needs you filter, the memory viewer, the sign-in page and the 375 px layout) are in the [Phase 8](docs/gates/phase-8.md#screenshots) and [Phase 9](docs/gates/phase-9.md#screenshots) gate reports. How to run the console is in "The console" in [docs/runbook.md](docs/runbook.md).
 
 ## Quickstart
 

@@ -27,6 +27,11 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # actionlint checks every workflow file, and runs shellcheck (on the runner image) on their
+    # run steps. The binary is pinned by version and checksum, as gitleaks is in `security`.
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
@@ -36,6 +41,17 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
+      - name: Install actionlint
+        run: |
+          base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+          tarball="$RUNNER_TEMP/actionlint.tar.gz"
+          curl -sSfL --retry 5 --retry-all-errors "${base}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" -o "$tarball"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+      - name: Lint the workflows
+        run: actionlint
 
   types:
     runs-on: ubuntu-latest

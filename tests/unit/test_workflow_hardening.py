@@ -195,6 +195,25 @@ def test_two_workflows_never_share_a_concurrency_group() -> None:
         assert len(groups) == len(set(groups)), groups
 
 
+# ---------- actionlint in the lint job ----------
+def test_the_lint_job_runs_a_pinned_actionlint() -> None:
+    job = load(WORKFLOWS / "ci.yml")["jobs"]["lint"]
+    version, digest = job["env"]["ACTIONLINT_VERSION"], job["env"]["ACTIONLINT_SHA256"]
+    assert re.fullmatch(r"\d+\.\d+\.\d+", version)
+    assert re.fullmatch(r"[0-9a-f]{64}", digest)
+
+    runs = [str(step.get("run", "")) for step in job["steps"]]
+    install = next(i for i, text in enumerate(runs) if "rhysd/actionlint/releases" in text)
+    lint = next(i for i, text in enumerate(runs) if text.strip().startswith("actionlint"))
+    # The download is the pinned release, and nothing runs it before its checksum is checked.
+    assert "v${ACTIONLINT_VERSION}" in runs[install]
+    assert "actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" in runs[install]
+    assert 'echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -' in runs[install]
+    assert install < lint
+    # With no argument it checks every file in .github/workflows.
+    assert runs[lint].strip() == "actionlint"
+
+
 # ---------- the scanners ----------
 def test_codeql_scans_python_and_typescript_on_every_change_and_weekly() -> None:
     workflow = load(WORKFLOWS / "codeql.yml")

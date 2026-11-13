@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+SITE_NAME = "Longhaul"
 PLAN_FILE = Path("docs/plan/longhaul-build-plan.md")
 PROGRESS_FILE = Path("docs/progress.md")
 # The chaos run the README quotes. scripts/chaos_chart.py draws CHAOS_CHART from the same file.
@@ -61,6 +62,8 @@ KILL_TYPES = (
     ("temporal", "Temporal restart"),
     ("postgres", "Postgres restart"),
 )
+# How the list of open stories under the status table words a status of docs/progress.md.
+OPEN_STATUS = {"Todo": "not started"}
 # Pandoc turns the heading "3.4 Architecture decisions (ADR summaries)" into this anchor.
 PLAN_ADR_LINK = "plan.qmd#architecture-decisions-adr-summaries"
 
@@ -259,6 +262,8 @@ class Phase:
     started: int
     points: int
     points_done: int
+    # (id, title, status) of each story that is not done, in the order of the file.
+    open_stories: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def state(self) -> str:
@@ -269,8 +274,9 @@ class Phase:
 
 def read_phases(progress: str) -> list[Phase]:
     """One summary per phase table in docs/progress.md."""
-    # Each entry holds a phase heading and the (points, status) of every story row below it.
-    entries: list[tuple[int, str, str, list[tuple[int, str]]]] = []
+    # Each entry holds a phase heading and the (id, title, points, status) of every story row
+    # below it.
+    entries: list[tuple[int, str, str, list[tuple[str, str, int, str]]]] = []
     for line in progress.splitlines():
         heading = PHASE_HEADING_RE.match(line)
         if heading:
@@ -280,7 +286,7 @@ def read_phases(progress: str) -> list[Phase]:
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
             if len(cells) < 4 or not cells[2].isdigit():
                 raise SiteError(f"{PROGRESS_FILE}: cannot read the row {line!r}")
-            entries[-1][3].append((int(cells[2]), cells[3]))
+            entries[-1][3].append((cells[0], cells[1], int(cells[2]), cells[3]))
     if not entries:
         raise SiteError(f"{PROGRESS_FILE}: no '## Phase N: Name (tag vX.Y.Z)' headings")
     return [
@@ -289,10 +295,13 @@ def read_phases(progress: str) -> list[Phase]:
             name=name,
             tag=tag,
             stories=len(stories),
-            done=sum(status == "Done" for _, status in stories),
-            started=sum(status != "Todo" for _, status in stories),
-            points=sum(points for points, _ in stories),
-            points_done=sum(points for points, status in stories if status == "Done"),
+            done=sum(status == "Done" for *_, status in stories),
+            started=sum(status != "Todo" for *_, status in stories),
+            points=sum(points for _, _, points, _ in stories),
+            points_done=sum(points for _, _, points, status in stories if status == "Done"),
+            open_stories=tuple(
+                (story, title, status) for story, title, _, status in stories if status != "Done"
+            ),
         )
         for number, name, tag, stories in entries
     ]
@@ -306,7 +315,10 @@ def include(path: str) -> str:
 
 
 def source_note(doc: str) -> str:
-    """A line that tells a reader where the page text lives. `source-repo` is in _quarto.yml."""
+    """A line that tells a reader where the page text lives. `source-repo` is in _quarto.yml.
+
+    The pages put it at the end, where it does not stand between a reader and the text.
+    """
     url = "{{< meta source-repo >}}/blob/main/" + doc
     return (
         "::: {.source-note}\n"
@@ -329,16 +341,27 @@ def adr_page(adr: Adr, doc_path: str, before: Adr | None, after: Adr | None) -> 
     links.append("[All decisions](../decisions.qmd)")
     if after:
         links.append(f"[Next: ADR-{after.number}]({after.stem}.qmd)")
+    # pagetitle keeps Quarto from joining the title and the site name with an en dash in the
+    # social card. The description is for search engines and the card, not for the page.
+    description = (
+        f"The decision record {adr.heading}: its context, the decision, its consequences "
+        "and the alternatives that were rejected."
+    )
     return (
         "---\n"
         f"title: {json.dumps(adr.heading, ensure_ascii=False)}\n"
+        f"pagetitle: {json.dumps(adr.heading + ' | ' + SITE_NAME, ensure_ascii=False)}\n"
+        f"description: {json.dumps(description, ensure_ascii=False)}\n"
+        "hide-description: true\n"
+        # Quarto reads the image path from the page's folder.
+        "image: ../social-card.png\n"
         "---\n\n"
-        f"{source_note(f'docs/adr/{adr.stem}.md')}\n"
         # The ADR starts with its own H1, which the page title already shows. Its links are
         # relative to docs/adr/, and docs.lua points them at the site from there.
         '::: {.drop-title base="docs/adr"}\n'
         f"{include(doc_path)}\n"
         ":::\n\n"
+        f"{source_note(f'docs/adr/{adr.stem}.md')}\n"
         f"::: {{.page-links}}\n{' · '.join(links)}\n:::\n"
     )
 
@@ -348,7 +371,7 @@ def adr_index(adrs: list[Adr], planned: list[tuple[str, str]]) -> str:
         "| ADR | Decision | Status | Date |",
         "|---|---|---|---|",
         *(
-            f"| [{a.number}](adr/{a.stem}.qmd) | {cell(a.title)} | {cell(a.status)} | {a.date} |"
+            f"| {a.number} | [{cell(a.title)}](adr/{a.stem}.qmd) | {cell(a.status)} | {a.date} |"
             for a in adrs
         ),
     ]
@@ -388,10 +411,17 @@ def status_fragment(phases: list[Phase]) -> str:
             for p in phases
         ),
     ]
-    return (
+    text = (
         f"{done} of {stories} stories are done, which is {points_done} of {points} points, "
         f"across {len(phases)} phases.\n\n" + "\n".join(rows) + "\n"
     )
+    still_open = [(p.number, story) for p in phases for story in p.open_stories]
+    if still_open:
+        text += "\nThe stories that are not done:\n\n" + "".join(
+            f"- {story} {title} (Phase {number}, {OPEN_STATUS.get(status, status.lower())})\n"
+            for number, (story, title, status) in still_open
+        )
+    return text
 
 
 def doc_pages(adrs: list[Adr], gates: list[Path]) -> str:

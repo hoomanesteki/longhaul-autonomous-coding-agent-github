@@ -1,5 +1,7 @@
 ---
 title: Decisions
+pagetitle: "Decisions | Longhaul"
+description: "One record per design choice, with its context, its consequences and the alternatives that were rejected."
 toc: false
 ---
 

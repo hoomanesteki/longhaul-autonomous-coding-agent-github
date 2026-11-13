@@ -1,12 +1,14 @@
 ---
 title: Case study
+pagetitle: "Case study | Longhaul"
+description: "Longhaul in one page: the problem, what was built, the proof, what did not work and the decisions worth defending."
 toc-depth: 2
 ---
 
-::: {.source-note}
-Rendered from [`docs/case-study.md`]({{< meta source-repo >}}/blob/main/docs/case-study.md). To change it, edit that file.
-:::
-
 ::: {.drop-title base="docs"}
 {{< include ../docs/case-study.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/case-study.md`]({{< meta source-repo >}}/blob/main/docs/case-study.md). To change it, edit that file.
 :::

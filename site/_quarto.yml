@@ -23,6 +23,14 @@ website:
   description: A durable background coding agent for GitHub issues. How it works, the proof, and how to run it.
   site-url: https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/
   favicon: favicon.svg
+  # The card a link to the site shows on social sites and in chat apps. Quarto makes the image
+  # URL absolute from site-url, but reads the path from the page's folder, so the ADR pages
+  # (scripts/site_pages.py) name ../social-card.png. 404.qmd is the page GitHub Pages shows for
+  # a missing path.
+  image: social-card.png
+  image-alt: "Longhaul: a background coding agent that survives crashes and tells you when it is stuck."
+  open-graph: true
+  twitter-card: true
   navbar:
     search: true
     # Grouped by what a reader is after. tests/unit/test_docs_site.py holds the same list.
@@ -72,6 +80,10 @@ website:
 
 format:
   html:
+    # The docs are written for GitHub, which prints -- and --- as typed. Pandoc's smart
+    # typography would turn them into en and em dashes, which the voice guide bans, and an
+    # option such as --window would read as a dash and a word.
+    from: markdown-smart
     theme:
       light: [cosmo, theme-light.scss]
       dark: [cosmo, theme-dark.scss]
@@ -84,4 +96,8 @@ format:
     toc-title: On this page
     smooth-scroll: true
     code-copy: true
+    # Its light and dark variants keep every token at a contrast of 4.5 or more.
+    highlight-style: a11y
+    # Lets a keyboard reach the boxes that scroll sideways (see the file).
+    include-after-body: _scroll-regions.html
     lang: en

@@ -1,12 +1,14 @@
 ---
 title: Progress
+pagetitle: "Progress | Longhaul"
+description: "The status of every story of the build plan."
 toc-depth: 2
 ---
 
-::: {.source-note}
-Rendered from [`docs/progress.md`]({{< meta source-repo >}}/blob/main/docs/progress.md). To change it, edit that file.
-:::
-
 ::: {.drop-title base="docs"}
 {{< include ../docs/progress.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/progress.md`]({{< meta source-repo >}}/blob/main/docs/progress.md). To change it, edit that file.
 :::

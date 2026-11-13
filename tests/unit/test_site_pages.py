@@ -215,6 +215,23 @@ def test_read_phases_counts_stories_and_points() -> None:
     assert (second.stories, second.done, second.state) == (1, 0, "Not started")
 
 
+def test_read_phases_keeps_the_stories_that_are_not_done() -> None:
+    first, second = site_pages.read_phases(PROGRESS)
+    assert first.open_stories == (("LH-002", "Stack", "In progress"),)
+    assert second.open_stories == (("LH-101", "Contracts", "Todo"),)
+
+
+def test_the_status_lists_the_stories_that_are_not_done() -> None:
+    status = site_pages.status_fragment(site_pages.read_phases(PROGRESS))
+    assert status.endswith(
+        "The stories that are not done:\n\n"
+        "- LH-002 Stack (Phase 0, in progress)\n"
+        "- LH-101 Contracts (Phase 1, not started)\n"
+    )
+    done = site_pages.read_phases(PROGRESS.replace("In progress", "Done").replace("Todo", "Done"))
+    assert "not done" not in site_pages.status_fragment(done)
+
+
 def test_a_phase_with_every_story_done_is_done() -> None:
     done = PROGRESS.replace("In progress", "Done")
     assert site_pages.read_phases(done)[0].state == "Done"
@@ -251,6 +268,24 @@ def test_adr_page_includes_the_doc_and_drops_its_own_heading() -> None:
     include = "{{< include ../../docs/adr/0004-t.md >}}"
     assert f'::: {{.drop-title base="docs/adr"}}\n{include}\n:::' in page
     assert "{{< meta source-repo >}}/blob/main/docs/adr/0004-t.md" in page
+
+
+def test_adr_page_names_its_source_after_the_record() -> None:
+    # The note is for whoever edits the page, so it comes after the text and not before it.
+    page = site_pages.adr_page(_record("0004"), "../../docs/adr/0004-t.md", None, None)
+    assert page.index("{{< include") < page.index(".source-note") < page.index(".page-links")
+
+
+def test_adr_page_sets_the_titles_and_the_image_of_its_social_card() -> None:
+    # Without pagetitle Quarto joins the title and the site name with an en dash in the card,
+    # and it reads the image path from the page's folder, which is adr/.
+    page = site_pages.adr_page(_record("0004", "Temporal"), "x.md", None, None)
+    front = page.split("---\n")[1]
+    assert 'pagetitle: "ADR-0004: Temporal | Longhaul"\n' in front
+    assert 'description: "The decision record ADR-0004: Temporal:' in front
+    assert "hide-description: true\n" in front
+    assert "image: ../social-card.png\n" in front
+    assert (ROOT / "site" / "social-card.png").is_file()
 
 
 def test_adr_page_links_only_the_neighbours_that_exist() -> None:
@@ -321,7 +356,7 @@ def test_a_new_adr_reaches_the_site_without_an_edit_under_site(tree: Path) -> No
     page = (tree / "site" / "adr" / "0099-use-a-queue.qmd").read_text(encoding="utf-8")
     assert 'title: "ADR-0099: Use a queue"' in page
     index = _generated(tree)["adr-index.md"]
-    assert "| [0099](adr/0099-use-a-queue.qmd) | Use a queue | Accepted | 2026-10-30 |" in index
+    assert "| 0099 | [Use a queue](adr/0099-use-a-queue.qmd) | Accepted | 2026-10-30 |" in index
     # The last record is the one before it, so its page links forward to the new one.
     previous = sorted((tree / "site" / "adr").glob("*.qmd"))[-2]
     assert "[Next: ADR-0099](0099-use-a-queue.qmd)" in previous.read_text(encoding="utf-8")
@@ -425,7 +460,10 @@ def test_every_include_and_fragment_in_every_page_resolves(site_tree: Path) -> N
     assert len(pages) >= 9
     for page in pages:
         # Both helpers fail on the first path that points at nothing. Every page uses one,
-        # except the console page, which is screenshots and text (checked further down).
+        # except the console page, which is screenshots and text (checked further down), and
+        # the 404 page, which is a few links.
+        if page.name == "404.qmd":
+            continue
         shows = IMAGE_RE.findall(page.read_text(encoding="utf-8"))
         assert _pulled_in(page) or _embedded(page, site) or shows, page.name
 
@@ -511,7 +549,10 @@ def test_the_script_stays_valid_on_python_3_9() -> None:
 
 # --- links, images and the chaos results ---------------------------------------------------
 
-DROP_TITLE_RE = re.compile(r"^::: \{\.drop-title(?: base=\"([^\"]+)\")?\}$", re.MULTILINE)
+# A div may also carry mermaid="code" (plan.qmd), which site/filters/docs.lua reads.
+DROP_TITLE_RE = re.compile(
+    r"^::: \{\.drop-title(?: base=\"([^\"]+)\")?(?: mermaid=\"code\")?\}$", re.MULTILINE
+)
 
 
 def test_every_doc_in_the_map_exists_and_has_its_page() -> None:

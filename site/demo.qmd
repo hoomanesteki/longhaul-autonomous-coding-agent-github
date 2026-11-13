@@ -1,12 +1,14 @@
 ---
 title: Demo script
+pagetitle: "Demo script | Longhaul"
+description: "The script of the two-minute video and the GIF, which are not recorded yet."
 toc-depth: 2
 ---
 
-::: {.source-note}
-Rendered from [`docs/demo-script.md`]({{< meta source-repo >}}/blob/main/docs/demo-script.md). To change it, edit that file.
-:::
-
 ::: {.drop-title base="docs"}
 {{< include ../docs/demo-script.md >}}
+:::
+
+::: {.source-note}
+Rendered from [`docs/demo-script.md`]({{< meta source-repo >}}/blob/main/docs/demo-script.md). To change it, edit that file.
 :::

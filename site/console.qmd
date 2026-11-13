@@ -1,5 +1,8 @@
 ---
 title: Console
+pagetitle: "Console | Longhaul"
+description: "The Longhaul console: every task, its timeline turn by turn, and the forms a person uses to steer it."
+hide-description: true
 subtitle: Watch every task, and step in when one needs a person
 toc-depth: 2
 lightbox: true

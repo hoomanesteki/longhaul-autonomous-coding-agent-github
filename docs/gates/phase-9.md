@@ -111,7 +111,8 @@ The tasks list at 375 px: the first column says the phase and what the task need
 6. **The CI secret scan covered less than the security page said.** CI now runs `gitleaks git --log-opts="--all"` with the version the page names, and a test ties the two together.
 7. **An outage of the GitHub artifact store failed the unit job** after its tests passed. The coverage upload can no longer fail the job.
 8. **A paused task said only "Paused" under Needs you.** It now says "Send a hint or budget", what a person does to resume it.
-9. Minor items fixed along the way: the Prometheus scrape of the API, `memory list` without `--repo` in two hints, the worker test command in the runbook, the hand-over sentence in the workflow docstring, and the smoke commands of Integration checkpoint 9.
+9. **A race in two plan gate tests showed up on the merge to main.** The tests sent a rejection as soon as the status showed the wait for a decision. The status shows that phase while the workflow still writes its task row, and a decision that is there before the workflow asks is taken without a request or a label, as designed. On the tag commit both CI runs hit that window in `test_the_third_rejection_ends_the_task_as_stuck`. The tests now answer the request once it is on the issue, as a person does (3440dce). The code did not change.
+10. Minor items fixed along the way: the Prometheus scrape of the API, `memory list` without `--repo` in two hints, the worker test command in the runbook, the hand-over sentence in the workflow docstring, and the smoke commands of Integration checkpoint 9.
 
 ## Fix stories created
 

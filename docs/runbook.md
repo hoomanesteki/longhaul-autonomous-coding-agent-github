@@ -1343,6 +1343,10 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `security` | gitleaks over the full git history of the clone (`gitleaks git --log-opts="--all"`, every branch and tag), and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
+| `console` | `npm ci`, then the API types generated again from `console/openapi.json` and compared with the committed `console/src/api/schema.ts`, then lint, typecheck, unit tests and build of the console (see "The console") |
+| `console-e2e` | the Playwright main path of the console against the seeded demo stack (`scripts/seed_demo.sh`), on the services of `e2e` with the sandbox image built |
+| `images` | `docker build` of `docker/worker/Dockerfile` and `docker/api/Dockerfile` from the repo root, as `docker compose --profile full` builds them, with no push. The worker image then runs `longhaul --help`, and the API image must stop at its start without `LONGHAUL_ADMIN_TOKEN` and answer `/healthz` with a Postgres service |
+| `quickstart` | the README quickstart on a clean runner: `make setup`, then `make demo`, with Postgres, MinIO and the Temporal dev server of `e2e` in place of `make up`. It sets no `LONGHAUL_*` variable, so the demo runs on the `.env` that `make setup` copies, and it fails when the demo leaves a worker or a sandbox behind |
 | `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 

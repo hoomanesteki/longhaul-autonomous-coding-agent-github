@@ -625,9 +625,184 @@ jobs:
             > requirements-audit.txt
           uvx pip-audit -r requirements-audit.txt --disable-pip --no-deps --timeout 60
 
+  # Builds the images that `docker compose --profile full` runs, without pushing them, and starts
+  # each once: the worker image runs the CLI, and the API image refuses to start without a token
+  # and answers /healthz with a database. A Dockerfile that no longer builds, or an image that
+  # cannot start its command, then fails the pull request instead of the first deploy.
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the worker image
+        run: docker build -f docker/worker/Dockerfile -t longhaul-worker:ci .
+      - name: Build the API image
+        run: docker build -f docker/api/Dockerfile -t longhaul-api:ci .
+      - name: The worker image runs the CLI
+        run: docker run --rm longhaul-worker:ci longhaul --help
+      - name: The API image stops at its start without a token
+        run: |
+          if docker run --rm longhaul-api:ci > api.log 2>&1; then
+            echo "the API started without LONGHAUL_ADMIN_TOKEN" >&2
+            exit 1
+          fi
+          grep -F "LONGHAUL_ADMIN_TOKEN is not set" api.log
+      # /healthz asks the database only, so the blob store and Temporal may be absent here.
+      - name: The API image answers /healthz
+        run: |
+          # A fresh token each run, so no fixed value sits in the file.
+          LONGHAUL_ADMIN_TOKEN="$(openssl rand -hex 32)"
+          export LONGHAUL_ADMIN_TOKEN
+          docker run -d --name api --network host \
+            -e LONGHAUL_ADMIN_TOKEN \
+            -e LONGHAUL_DATABASE_URL=postgresql://longhaul:longhaul@localhost:5432/longhaul \
+            -e LONGHAUL_BLOB_ENDPOINT=http://localhost:9000 \
+            -e LONGHAUL_BLOB_BUCKET=longhaul \
+            -e LONGHAUL_BLOB_ACCESS_KEY=longhaul \
+            -e LONGHAUL_BLOB_SECRET_KEY=longhaul-secret \
+            longhaul-api:ci
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/healthz; then
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "the API did not answer /healthz within 60s" >&2
+          docker logs api >&2
+          exit 1
+
+  # The README quickstart on a clean runner: `make setup`, then `make demo`, with the services
+  # that `make up` would start provided the way the e2e job provides them. The job sets no
+  # LONGHAUL_* variable, so the demo reads the .env that `make setup` copies from .env.example,
+  # as it does on a laptop. The demo stops its worker and removes its sandbox, and the last step
+  # checks that nothing of it is left.
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.0-pg17
+        env:
+          POSTGRES_DB: longhaul
+          POSTGRES_USER: longhaul
+          POSTGRES_PASSWORD: longhaul
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U longhaul -d longhaul"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+      minio:
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r3
+        env:
+          MINIO_ROOT_USER: longhaul
+          MINIO_ROOT_PASSWORD: longhaul-secret
+          MINIO_DEFAULT_BUCKETS: longhaul
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/live"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      # The image docker-compose.yml uses (ADR-0002), pinned by digest. A tag can be moved to
+      # other content and a digest cannot, so CI and `make up` run the same server.
+      - name: Start Temporal dev server
+        env:
+          TEMPORAL_IMAGE: temporalio/temporal:1.5.1@sha256:597a5dbbcc6e7716b326dde4a51622d5ea0879eb0cf06ff8a94381361d0a987d
+        run: |
+          docker run -d --name temporal -p 7233:7233 "$TEMPORAL_IMAGE" \
+            server start-dev --ip 0.0.0.0 --headless
+          for _ in $(seq 1 60); do
+            if docker exec temporal temporal operator cluster health \
+              --address localhost:7233 > /dev/null 2>&1; then
+              echo "temporal is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "temporal did not start within 60s" >&2
+          docker logs temporal >&2
+          exit 1
+      - name: make setup
+        run: make setup
+      # minio-init makes the bucket under `make up`. Here the service makes it, and this step
+      # waits until it is there, with the settings of the .env that `make setup` wrote.
+      - name: Wait for the blob bucket
+        run: |
+          uv run python - <<'PY'
+          import time
+
+          import boto3
+          from botocore.exceptions import BotoCoreError, ClientError
+
+          from longhaul.settings import EnvSettings
+
+          settings = EnvSettings()
+          assert settings.blob_access_key and settings.blob_secret_key
+          s3 = boto3.client(
+              "s3",
+              endpoint_url=settings.blob_endpoint,
+              aws_access_key_id=settings.blob_access_key.get_secret_value(),
+              aws_secret_access_key=settings.blob_secret_key.get_secret_value(),
+              region_name="us-east-1",
+          )
+          for _ in range(30):
+              try:
+                  names = [b["Name"] for b in s3.list_buckets()["Buckets"]]
+                  if settings.blob_bucket not in names:
+                      s3.create_bucket(Bucket=settings.blob_bucket)
+                  print("bucket ready")
+                  break
+              except (BotoCoreError, ClientError) as exc:
+                  print("waiting for minio:", exc)
+                  time.sleep(2)
+          else:
+              raise SystemExit("minio bucket was not ready in time")
+          PY
+      - name: make demo
+        timeout-minutes: 15
+        run: make demo
+      - name: Nothing of the demo is left running
+        run: |
+          left="$(docker ps -aq --filter label=longhaul.task_id)"
+          if [ -n "$left" ]; then
+            docker ps -a --filter label=longhaul.task_id >&2
+            exit 1
+          fi
+          if pgrep -af "longhaul worker"; then
+            echo "a worker of the demo is still running" >&2
+            exit 1
+          fi
+      - name: Show Temporal log on failure
+        if: failure()
+        run: docker logs temporal || true
+
   ci:
     if: always()
-    needs: [lint, types, unit, integration, e2e, security, compose, docs, console, console-e2e, terraform]
+    needs: [lint, types, unit, integration, e2e, security, compose, docs, console, console-e2e, terraform, images, quickstart]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -41,7 +41,7 @@ Around them sit a hardened Docker sandbox with no credentials inside, a cost led
 
 ## Proof
 
-The chaos suite is the one result that exists today. It runs four recorded tasks 20 times, with one to three kills each, of four kinds: the worker, the sandbox, Temporal and Postgres. It counts what each run leaves on a fake GitHub.
+The chaos suite is the one result that exists today. It runs four recorded tasks 20 times, with one to three kills planned for each, of four kinds: the worker, the sandbox, Temporal and Postgres. It counts what each run leaves on a fake GitHub.
 
 | Kill type | Kills landed / planned | Completed | Diff equal | Duplicate side effects | Resume p50 / p95 |
 |---|---|---|---|---|---|

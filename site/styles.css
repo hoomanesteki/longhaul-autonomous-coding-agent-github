@@ -33,13 +33,45 @@ main.content {
 }
 
 /* The two architecture diagrams are about 2200px wide. Fitted to a narrow page their text is
-   too small to read, so below 1300px they keep that width and scroll sideways in their frame. */
+   too small to read, so on a screen under 1200px they keep a width of 1300px and scroll sideways
+   in their frame. From 1200px up their wide frame holds them whole. The diagrams of the included
+   docs sit in the text column, which is too narrow for them at any width, so they always scroll. */
 figure.quarto-float-fig > div,
 .mermaid-frame {
   overflow-x: auto;
 }
 svg.mermaid-js {
   min-width: 1300px;
+}
+@media (min-width: 1200px) {
+  figure.quarto-float-fig svg.mermaid-js {
+    min-width: 0;
+  }
+}
+/* macOS hides a scroll bar until the reader scrolls, so a diagram cut at the edge of its frame
+   looked whole. These frames keep a scroll bar in view. Firefox has no ::-webkit-scrollbar and
+   takes the standard properties instead. Chrome must not see those: on a box that sets them it
+   ignores the ::-webkit-scrollbar rules. */
+figure.quarto-float-fig > div::-webkit-scrollbar,
+.mermaid-frame::-webkit-scrollbar {
+  height: 10px;
+}
+figure.quarto-float-fig > div::-webkit-scrollbar-track,
+.mermaid-frame::-webkit-scrollbar-track {
+  background: var(--bs-border-color);
+  border-radius: 5px;
+}
+figure.quarto-float-fig > div::-webkit-scrollbar-thumb,
+.mermaid-frame::-webkit-scrollbar-thumb {
+  background: var(--bs-secondary-color);
+  border-radius: 5px;
+}
+@supports not selector(::-webkit-scrollbar) {
+  figure.quarto-float-fig > div,
+  .mermaid-frame {
+    scrollbar-color: var(--bs-secondary-color) var(--bs-border-color);
+    scrollbar-width: thin;
+  }
 }
 /* The overview diagram of the home page is smaller, so it fits the page down to tablet width. */
 .diagram-fit svg.mermaid-js {
@@ -176,4 +208,17 @@ figcaption,
   border-top: 1px solid var(--bs-border-color);
   margin-top: 2.5rem;
   padding-top: 1rem;
+}
+
+/* Quarto marks the current page in the navbar only on a top-level link. _nav-current.html marks
+   the item in a menu too, and its toggle, which Bootstrap colors as a current top-level link.
+   The item takes the same blue, in place of Bootstrap's filled blue box. */
+.navbar .dropdown-item.active {
+  background-color: transparent;
+  color: var(--bs-navbar-active-color);
+  font-weight: 600;
+}
+.navbar .dropdown-item.active:hover,
+.navbar .dropdown-item.active:focus {
+  background-color: var(--bs-dropdown-link-hover-bg);
 }

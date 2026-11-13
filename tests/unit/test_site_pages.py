@@ -663,3 +663,25 @@ def test_the_overview_only_claims_what_the_chaos_summary_shows() -> None:
     assert summary["duplicate_side_effects"] == summary["missing_side_effects"] == 0
     assert "scripted recordings" in overview
     assert set(summary["recordings"].values()) == {"scripted"}
+
+
+def test_the_results_page_says_what_each_row_of_the_chaos_table_counts() -> None:
+    # The rows per kill type count the runs that a kill of that type hit, but the All row counts
+    # every run, also the ones that no kill hit. A note that says otherwise reads 20 / 20 next to
+    # 18 runs hit as a mistake.
+    import json
+
+    summary = json.loads((ROOT / site_pages.CHAOS_SUMMARY).read_text(encoding="utf-8"))
+    planned = {len(r["kills_planned"]) for r in summary["results"]}
+    assert (min(planned), max(planned)) == (1, 3)
+    missed = sum(1 for r in summary["results"] if not any(k["landed"] for k in r["kills"]))
+    assert missed == 2
+    results = (ROOT / "site" / "results.qmd").read_text(encoding="utf-8")
+    assert "Each run has one to three kills planned" in results
+    assert "is hit with one to three kills" not in results
+    assert "The **All** row counts every run, including the two that no kill hit." in results
+    assert "count the runs that a kill of that type hit." not in results
+    overview = (ROOT / "site" / "index.qmd").read_text(encoding="utf-8")
+    assert "each run had one to three kills planned" in overview
+    hit = summary["runs"] - missed
+    assert f"in {hit} runs at least one of them landed" in overview

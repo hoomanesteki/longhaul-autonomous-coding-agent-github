@@ -11,7 +11,7 @@ Longhaul has two kinds of result. The chaos suite is measured: it shows what a c
 
 ## The chaos suite: measured
 
-The suite runs four recorded tasks 20 times. Each run is hit with one to three kills of four kinds: the worker process, the task's sandbox, the Temporal server and Postgres. Delivery goes to a fake GitHub that the run owns, and the suite counts the comments, labels and pull requests it finds there. It does not count them from Longhaul's own tables, because a table that decides whether a write happened cannot also be the witness.
+The suite runs four recorded tasks 20 times. Each run has one to three kills planned, of four kinds: the worker process, the task's sandbox, the Temporal server and Postgres. Delivery goes to a fake GitHub that the run owns, and the suite counts the comments, labels and pull requests it finds there. It does not count them from Longhaul's own tables, because a table that decides whether a write happened cannot also be the witness.
 
 ::: {fragment="_generated/chaos-chart.md"}
 :::
@@ -21,7 +21,7 @@ The suite runs four recorded tasks 20 times. Each run is hit with one to three k
 
 How to read it:
 
-- **Completed** and **Diff equal** count the runs that a kill of that type hit. A run counts as completed when the task ended with a pull request, and as diff equal when its final diff is the diff of the same task run with no kill.
+- **Runs hit** counts the runs in which a kill of that type landed, and in that row **Completed** and **Diff equal** count those runs. The **All** row counts every run, including the two that no kill hit. A run counts as completed when the task ended with a pull request, and as diff equal when its final diff is the diff of the same task run with no kill.
 - **Duplicate side effects** are the writes on the fake GitHub beyond the ones a task makes.
 - **Resume** is the time from the end of a kill to the start of the next activity, from the timestamps in Temporal's history. The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
 

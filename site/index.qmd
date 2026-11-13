@@ -86,7 +86,7 @@ Around them: a hardened Docker sandbox with no credentials inside, a cost ledger
 
 ## The proof
 
-The chaos suite puts a number behind "survives crashes". It ran four recorded tasks 20 times, and each run was given one to three kills of the worker, the sandbox, Temporal or Postgres, timed to land while the task works. Every run ended with a pull request and the same diff as a run with no kill, and the fake GitHub that each run wrote to showed no duplicate and no missing write.
+The chaos suite puts a number behind "survives crashes". It ran four recorded tasks 20 times, and each run had one to three kills planned, of the worker, the sandbox, Temporal or Postgres, timed to land while the task works; in 18 runs at least one of them landed. Every run ended with a pull request and the same diff as a run with no kill, and the fake GitHub that each run wrote to showed no duplicate and no missing write.
 
 ::: {fragment="_generated/chaos-chart.md"}
 :::

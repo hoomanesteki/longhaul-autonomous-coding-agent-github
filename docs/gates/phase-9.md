@@ -62,7 +62,7 @@
 | Phase gate 9 | Hardening tests pass, and docs/security.md is complete | test_sandbox_hardening.py passed (2). test_security_page.py passed (10). Threat model, controls with tests, known gaps, rotation runbook, gitleaks, pip-audit and npm audit are all present. | Pass |
 | Phase gate 9 | Fresh-clone quickstart under 10 minutes | Not on a clean VM; see LH-907 above (118 s on this machine with warm caches). | Manual |
 | Phase gate 9 | README, case study and demo video done | README and case-study.md are done, with chaos numbers only and pending eval numbers stated. The demo video is not recorded. | Manual |
-| Phase gate 9 | Repo public. Tag v1.0.0. Release notes per phase | The repo is public. v1.0.0 is tagged at the dev to main merge of this gate, and the tag message lists each phase's tag and highlights. A GitHub release object needs a logged-in gh, which this machine does not have. | Pass |
+| Phase gate 9 | Repo public. Tag v1.0.0. Release notes per phase | The repo is public. v1.0.0 is tagged at the dev to main merge of this gate, and the tag message lists each phase's tag and highlights. Each tag from v0.0.1 to v1.0.0 has a GitHub release since 2026-11-13, made by the `release` workflow from the tag's message, and v1.0.0 is marked latest. | Pass |
 
 ## Invariants
 
@@ -135,5 +135,6 @@ LH-994 (the README and the docs site) and the dependency updates of the week lan
 - docs/results.md built from committed result files, footer run ids matching eval/results/: docs/results.md says no real run has been made and holds no numbers; build_report.py refuses the scripted chaos run as headline data. eval/results/ holds only chaos-2026-11-07. The headline runs need an API key, the eval VM and the eval budget.
 - Fresh-clone quickstart under 10 minutes: Not on a clean VM; see LH-907 above (118 s on this machine with warm caches).
 - README, case study and demo video done: README and case-study.md are done, with chaos numbers only and pending eval numbers stated. The demo video is not recorded.
+- Create the GitHub releases. Done on 2026-11-13: `.github/workflows/release.yml` runs `scripts/sync_releases.py`, which made one release per version tag, v0.0.1 to v1.0.0, each titled with its tag and noted with the tag's message, and marked v1.0.0 as the latest.
 - Turn on GitHub Pages. Done on 2026-11-12: the Pages source is GitHub Actions, `pages.yml` now deploys on each push to `main`, and the site is live at https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/.
 - LH-003 and LH-006: run `gh auth login`, then `scripts/protect_branches.sh` and the backlog import.

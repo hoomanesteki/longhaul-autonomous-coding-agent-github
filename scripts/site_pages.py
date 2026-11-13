@@ -444,7 +444,8 @@ def _seconds(value: float) -> str:
 def chaos_table(summary: dict[str, Any]) -> str:
     """The chaos table of the README, row for row, built from the summary of the run.
 
-    A run counts as hit by a kill type when a kill of that type landed in it.
+    A run counts as hit by a kill type when a kill of that type landed in it. The All row counts
+    every run in Completed and Diff equal, also the runs that no kill hit.
     """
     results = summary["results"]
     header = (

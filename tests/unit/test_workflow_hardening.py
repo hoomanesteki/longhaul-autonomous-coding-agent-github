@@ -7,6 +7,7 @@ newer push cancels, and the linter, scanners and update coverage that guard the 
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.phase9]
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
+DEPENDABOT = ROOT / ".github" / "dependabot.yml"
 
 # The only write scopes a job may hold, by workflow and job. Everything else reads, and the top
 # of every workflow grants `contents: read` alone, so a new job starts read-only.
@@ -235,3 +237,72 @@ def test_dependency_review_runs_on_pull_requests() -> None:
     review = [s for s in steps if str(s.get("uses", "")).startswith("actions/dependency-review")]
     assert len(review) == 1
     assert review[0]["with"]["fail-on-severity"] in {"low", "moderate", "high"}
+
+
+# ---------- dependabot covers what the repo has ----------
+# Ecosystems by the file that marks one. The agent's own target repos under tests/fixtures and
+# eval/custom are code it works on, not dependencies of this project.
+MARKERS = {
+    "uv.lock": "uv",
+    "package-lock.json": "npm",
+    ".terraform.lock.hcl": "terraform",
+    "Dockerfile": "docker",
+}
+NOT_OURS = {Path("tests/fixtures"), Path("eval/custom")}
+
+
+def ecosystems_in(root: Path) -> set[tuple[str, str]]:
+    """Each (ecosystem, directory) of the repo, in the form dependabot.yml names them."""
+    found = {("github-actions", "/")}
+    for folder, dirs, files in os.walk(root):
+        here = Path(folder).relative_to(root)
+        dirs[:] = [
+            d
+            for d in dirs
+            if not d.startswith(".") and d != "node_modules" and here / d not in NOT_OURS
+        ]
+        for name in files:
+            if name in MARKERS:
+                found.add((MARKERS[name], "/" + here.as_posix() if here.parts else "/"))
+    return found
+
+
+def configured(updates: list[dict[str, Any]]) -> set[tuple[str, str]]:
+    return {
+        (update["package-ecosystem"], directory.rstrip("/") or "/")
+        for update in updates
+        for directory in update.get("directories", [update.get("directory")])
+    }
+
+
+def test_dependabot_covers_every_ecosystem_of_the_repo() -> None:
+    updates = yaml.safe_load(DEPENDABOT.read_text(encoding="utf-8"))["updates"]
+    missing = ecosystems_in(ROOT) - configured(updates)
+    assert missing == set()
+    # The Dockerfiles, the console and the lock files: the walk must find them, or it proves
+    # nothing.
+    assert {"docker", "npm", "terraform", "uv"} <= {e for e, _ in ecosystems_in(ROOT)}
+
+
+def test_the_ecosystem_walk_finds_a_new_folder_and_skips_the_fixtures(tmp_path: Path) -> None:
+    for rel in (
+        "uv.lock",
+        "docker/api/Dockerfile",
+        "web/package-lock.json",
+        "web/node_modules/x/package-lock.json",
+        "tests/fixtures/repos/calc/uv.lock",
+        ".venv/lib/Dockerfile",
+    ):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).touch()
+
+    assert ecosystems_in(tmp_path) == {
+        ("github-actions", "/"),
+        ("uv", "/"),
+        ("docker", "/docker/api"),
+        ("npm", "/web"),
+    }
+    assert configured([{"package-ecosystem": "docker", "directories": ["/a/", "/b"]}]) == {
+        ("docker", "/a"),
+        ("docker", "/b"),
+    }

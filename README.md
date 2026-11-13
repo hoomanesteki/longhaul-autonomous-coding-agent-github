@@ -12,7 +12,7 @@ Status: phases 1 to 9 are done, and `v1.0.0` is the release. Two Phase 0 stories
 
 ## Headline numbers
 
-The only measured result so far is the chaos suite: 20 runs of four recorded tasks, each hit with one to three kills of the worker, the sandbox, Temporal or Postgres (`eval/results/chaos-2026-11-07`, seed 7).
+The only measured result so far is the chaos suite: 20 runs of four recorded tasks, each with one to three kills planned, of the worker, the sandbox, Temporal or Postgres (`eval/results/chaos-2026-11-07`, seed 7).
 
 - 20 of 20 runs ended with a pull request, and each had the same final diff as the same task run with no kill.
 - 0 duplicate GitHub writes and 0 missing ones, counted from the state of a fake GitHub and not from our own tables.
@@ -138,7 +138,7 @@ The chaos table below is from `eval/results/chaos-2026-11-07`, with scripted mod
 | Postgres restart | 9 / 11 | 6 | 6 / 6 | 6 / 6 | 0 | 1.4 s / 34.6 s |
 | **All** | 39 / 45 | 18 | 20 / 20 | 20 / 20 | 0 | 2.0 s / 22.1 s |
 
-How to read it: "Runs hit" counts the runs in which a kill of that type landed, and "Completed" and "Diff equal" count those runs. "Duplicate side effects" are the writes on the fake GitHub beyond the ones a task makes. The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
+How to read it: "Runs hit" counts the runs in which a kill of that type landed, and in that row "Completed" and "Diff equal" count those runs. The All row counts every run in those two columns, including the two that no kill hit. "Duplicate side effects" are the writes on the fake GitHub beyond the ones a task makes. The worker latency is mostly the 20 second heartbeat timeout of these runs, which is how long Temporal waits before it decides the activity is dead.
 
 ## Design decisions
 

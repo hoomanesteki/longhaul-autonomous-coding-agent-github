@@ -288,6 +288,23 @@ def test_readme_chaos_table_matches_the_summary_row_by_row() -> None:
         assert row in lines, row
 
 
+def test_readme_chaos_note_says_the_all_row_counts_every_run() -> None:
+    # The All row reads 20 / 20 next to 18 runs hit, because it counts the two runs that no kill
+    # hit as well. The note under the table has to say so.
+    summary = json.loads(read(CHAOS_SUMMARY))
+    results = summary["results"]
+    missed = sum(1 for r in results if not any(k["landed"] for k in r["kills"]))
+    assert missed == 2
+    text = read(README)
+    note = section(text, "Results")
+    every_run = (
+        "The All row counts every run in those two columns, including the two that no kill hit"
+    )
+    assert every_run in note
+    assert "each with one to three kills planned" in text
+    assert "each hit with one to three kills" not in text
+
+
 def test_case_study_chaos_table_matches_the_summary_row_by_row() -> None:
     summary = json.loads(read(CHAOS_SUMMARY))
     lines = table_lines(section(read(DOCS / "case-study.md"), "Proof"))

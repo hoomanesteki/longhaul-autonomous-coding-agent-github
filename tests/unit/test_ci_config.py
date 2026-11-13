@@ -410,7 +410,12 @@ def test_the_quickstart_job_runs_the_readme_quickstart() -> None:
 def test_the_quickstart_job_reads_the_settings_from_the_env_file_that_setup_writes() -> None:
     # A LONGHAUL_* variable in the job would win over .env, and the job would no longer show
     # that a fresh clone works with the values of .env.example.
-    job = load_workflow()["jobs"]["quickstart"]
+    workflow = load_workflow()
+    job = workflow["jobs"]["quickstart"]
+    # The workflow env reaches every job. It holds the provider only, which .env.example and
+    # demo.sh set to the same value, so it changes nothing the quickstart reads.
+    shared = [n for n in workflow.get("env", {}) if n.startswith("LONGHAUL_")]
+    assert shared == ["LONGHAUL_PROVIDER"] and workflow["env"]["LONGHAUL_PROVIDER"] == "scripted"
     assert not [name for name in job.get("env", {}) if name.startswith("LONGHAUL_")]
     for step in job["steps"]:
         assert not [n for n in step.get("env", {}) if n.startswith("LONGHAUL_")], step

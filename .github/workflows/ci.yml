@@ -736,8 +736,8 @@ jobs:
 
   # The README quickstart on a clean runner: `make setup`, then `make demo`, with the services
   # that `make up` would start provided the way the e2e job provides them. The job sets no
-  # LONGHAUL_* variable, so the demo reads the .env that `make setup` copies from .env.example,
-  # as it does on a laptop. The demo stops its worker and removes its sandbox, and the last step
+  # LONGHAUL_* variable beyond the workflow's provider, which .env.example sets to the same
+  # value, so the demo reads the .env that `make setup` copies, as it does on a laptop. The demo stops its worker and removes its sandbox, and the last step
   # checks that nothing of it is left.
   quickstart:
     runs-on: ubuntu-latest

@@ -164,10 +164,10 @@ describe("tasks page", () => {
     renderPage();
 
     await screen.findByText("Fix the parser");
-    expect(within(rowOf("Speed up the build")).getByText("Paused")).toBeInTheDocument();
+    expect(within(rowOf("Speed up the build")).getByText("Send a hint or budget")).toBeInTheDocument();
     expect(within(rowOf("Add a retry")).getByText("Approve the plan")).toBeInTheDocument();
-    expect(within(rowOf("Fix the parser")).queryByText("Paused")).not.toBeInTheDocument();
-    expect(within(rowOf("Rename the flag")).queryByText("Paused")).not.toBeInTheDocument();
+    expect(within(rowOf("Fix the parser")).queryByText("Send a hint or budget")).not.toBeInTheDocument();
+    expect(within(rowOf("Rename the flag")).queryByText("Send a hint or budget")).not.toBeInTheDocument();
   });
 
   it("repeats the phase and what needs you under the repo, for a screen too narrow for the columns", async () => {
@@ -181,7 +181,7 @@ describe("tasks page", () => {
     expect(line("Fix the parser").getByTestId("status-line")).toHaveTextContent("Phase: coding");
     expect(line("Fix the parser").queryByText(/Needs you/)).not.toBeInTheDocument();
     expect(line("Speed up the build").getByTestId("status-line")).toHaveTextContent("Phase: paused");
-    expect(line("Speed up the build").getByText("Needs you: Paused")).toBeInTheDocument();
+    expect(line("Speed up the build").getByText("Needs you: Send a hint or budget")).toBeInTheDocument();
     expect(line("Add a retry").getByText("Needs you: Approve the plan")).toBeInTheDocument();
     expect(line("Add a retry").getByTestId("status-line").className).toContain("lg:hidden");
   });

@@ -4,7 +4,7 @@ import { formatAge, formatCost, issueUrl, needsYou, phaseWords } from "../tasks"
 
 describe("needsYou", () => {
   it("names what a waiting task needs", () => {
-    expect(needsYou({ phase: "paused" })).toBe("Paused");
+    expect(needsYou({ phase: "paused" })).toBe("Send a hint or budget");
     expect(needsYou({ phase: "awaiting_plan_approval" })).toBe("Approve the plan");
   });
 

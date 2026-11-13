@@ -61,7 +61,7 @@ test("the main path of the console", async ({ page }) => {
 
     const stuck = rowOf(page, STUCK.title);
     await expect(stuck).toContainText("paused", SETTLED);
-    await expect(stuck.locator("td").last()).toHaveText("Paused");
+    await expect(stuck.locator("td").last()).toHaveText("Send a hint or budget");
     await expect(stuck.locator("td").nth(5)).toHaveText(/^[1-9]/);
 
     const plan = rowOf(page, PLAN.title);
@@ -75,7 +75,7 @@ test("the main path of the console", async ({ page }) => {
     await expect(stuck.getByTestId("status-line")).toBeVisible();
     const box = page.getByRole("region", { name: "Tasks table" });
     for (const [row, text] of [
-      [stuck, "Needs you: Paused"],
+      [stuck, "Needs you: Send a hint or budget"],
       [plan, "Needs you: Approve the plan"],
       [plan, "Phase: awaiting plan approval"],
     ] as const) {

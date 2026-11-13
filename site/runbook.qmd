@@ -7,6 +7,6 @@ toc-depth: 2
 Rendered from [`docs/runbook.md`]({{< meta source-repo >}}/blob/main/docs/runbook.md). To change it, edit that file.
 :::
 
-::: {.drop-title}
+::: {.drop-title base="docs"}
 {{< include ../docs/runbook.md >}}
 :::

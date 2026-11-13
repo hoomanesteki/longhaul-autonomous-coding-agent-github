@@ -1383,7 +1383,9 @@ It requires a pull request and an up-to-date `ci` check, and blocks force pushes
 
 ## Docs site
 
-The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy nothing, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview, is short and leaves the numbers that change to tables generated from `docs/`.
+The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy no text, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview and the console page, is short and leaves the numbers that change to tables and charts generated from committed files.
+
+The navbar groups the pages by what a reader is after: Overview; How it works (architecture, decisions, console); Proof (results, gate reports, case study); Operate (runbook, security, deploy to AWS); Project (plan, progress, demo script). `tests/unit/test_docs_site.py` holds the same list, and fails when a page is missing from the navbar or from the "Find your way" table of the overview.
 
 | Command | What it does |
 |---|---|
@@ -1392,13 +1394,15 @@ The site in `site/` is a Quarto project. Its pages include the Markdown in `docs
 
 You need [Quarto](https://quarto.org/docs/download/) 1.10.18, which is the version CI pins, and `python3` on the PATH. View the pages through the preview server or any local web server. Opening an `.html` file straight from disk can break the table of contents.
 
-Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, and the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
+Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan, the chaos table (from `eval/results/chaos-2026-11-07/summary.json`) and the chaos chart. It also copies every image under `docs/` to the same path under `site/_generated/`, and writes `doc-pages.txt`, the map from each doc to its page. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
 
 Things that are easy to trip over:
 
 - `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.worktrees`.
 - A page cannot include a file from `site/_generated/` with the include shortcode. Quarto expands that shortcode while it scans the project, before `scripts/site_pages.py` has run, so on a clean checkout the file is missing and the render stops. `site/filters/fragments.lua` embeds those files later instead, and `tests/unit/test_site_pages.py` fails a page that includes one.
 - `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content.
+- An included doc keeps its links and images relative to its own folder, as GitHub reads them. The div around the include names that folder (`::: {.drop-title base="docs"}`), and `docs.lua` then sends a link to a doc with a page to that page, a link to any other file to the file on GitHub, and an image to its copy in `site/_generated/`. A new page for a doc needs its line in `DOC_PAGES` of `scripts/site_pages.py`.
+- The chaos chart is `docs/media/chaos-results.svg`, which `uv run python scripts/chaos_chart.py` draws from the summary of the chaos run. `tests/unit/test_chaos_chart.py` fails when the committed file differs from a fresh drawing. The site embeds it inline, so `site/styles.css` can give it the colors of the light or dark theme.
 - `tests/unit/test_docs_style.py` applies the voice rules to the `.qmd` pages as it does to the docs.
 
 ### Publishing

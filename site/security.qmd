@@ -1,0 +1,12 @@
+---
+title: Security
+toc-depth: 2
+---
+
+::: {.source-note}
+Rendered from [`docs/security.md`]({{< meta source-repo >}}/blob/main/docs/security.md). To change it, edit that file.
+:::
+
+::: {.drop-title base="docs"}
+{{< include ../docs/security.md >}}
+:::

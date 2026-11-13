@@ -15,8 +15,9 @@
 --   :::
 --
 -- is replaced by the files that the list names, one path per line. Each file goes into a div
--- with the class given by `wrap`, which docs.lua then acts on. When the list is empty the
--- `empty` text is shown instead.
+-- with the class given by `wrap`, which docs.lua then acts on. The div also carries the folder
+-- of the file in the repo as `base`, so docs.lua can point its relative links and images at the
+-- site. When the list is empty the `empty` text is shown instead.
 
 local function read(relative)
   local root = quarto.project.directory or "."
@@ -27,6 +28,21 @@ local function read(relative)
   local text = handle:read("a")
   handle:close()
   return text
+end
+
+-- The folder of a file in the repo, from its path relative to the project folder (site/):
+-- "../docs/gates/phase-8.md" gives "docs/gates".
+local function repo_folder(relative)
+  local parts = { "site" }
+  for part in relative:gmatch("[^/]+") do
+    if part == ".." then
+      table.remove(parts)
+    elseif part ~= "." then
+      table.insert(parts, part)
+    end
+  end
+  table.remove(parts)
+  return table.concat(parts, "/")
 end
 
 local function blocks_of(relative)
@@ -43,12 +59,10 @@ function Div(div)
   if list then
     local result = pandoc.Blocks({})
     for path in read(list):gmatch("[^\r\n]+") do
-      local blocks = blocks_of(path)
       local wrap = div.attributes["wrap"]
-      if wrap then
-        blocks = pandoc.Blocks({ pandoc.Div(blocks, pandoc.Attr("", { wrap })) })
-      end
-      result:extend(blocks)
+      local classes = wrap and { wrap } or {}
+      local attr = pandoc.Attr("", classes, { base = repo_folder(path) })
+      result:extend({ pandoc.Div(blocks_of(path), attr) })
     end
     if #result == 0 and div.attributes["empty"] then
       return pandoc.read(div.attributes["empty"], "markdown").blocks

@@ -7,6 +7,6 @@ toc-depth: 2
 Rendered from [`docs/progress.md`]({{< meta source-repo >}}/blob/main/docs/progress.md). To change it, edit that file.
 :::
 
-::: {.drop-title}
+::: {.drop-title base="docs"}
 {{< include ../docs/progress.md >}}
 :::

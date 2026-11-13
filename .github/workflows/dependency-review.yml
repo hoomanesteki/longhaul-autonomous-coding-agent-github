@@ -6,9 +6,12 @@ name: dependency-review
 # pip-audit step of ci.yml checks the whole Python lock on every run; this checks what a change
 # brings in, in every ecosystem, before it merges.
 #
-# The repo is public, so the dependency graph is on and the check needs no extra setting. It
-# lives in its own workflow because it has nothing to compare on a push, and the `ci` job of
-# ci.yml counts a job that did not run as a failure.
+# The action needs the dependency graph of the repository, which is a setting (Settings, Code
+# security, Dependency graph) that is not on by default, and it fails every pull request while
+# the graph is off. So the job runs only when the repository variable DEPENDENCY_REVIEW is
+# true, which the owner sets after turning the graph on. Until then the job is skipped, not
+# failed. It lives in its own workflow because it has nothing to compare on a push, and the
+# `ci` job of ci.yml counts a job that did not run as a failure.
 
 on:
   pull_request:
@@ -23,6 +26,7 @@ concurrency:
 
 jobs:
   dependency-review:
+    if: vars.DEPENDENCY_REVIEW == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

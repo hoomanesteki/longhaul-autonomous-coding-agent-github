@@ -1341,7 +1341,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
 | `security` | gitleaks over the full git history of the clone (`gitleaks git --log-opts="--all"`, every branch and tag), and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
-| `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
+| `docs` | `quarto render site`, then `make site-check`, so a broken include, page, diagram, link, anchor or image fails the pull request (see "Docs site" below) |
 | `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
 | `ci` | waits for all the jobs above and fails unless every one succeeded |
 
@@ -1391,6 +1391,8 @@ The navbar groups the pages by what a reader is after: Overview; How it works (a
 |---|---|
 | `make site` | renders the site to `site/_site/` |
 | `make site-preview` | serves the site with live reload |
+| `make site-check` | checks the rendered site as GitHub Pages serves it, under `/longhaul-autonomous-coding-agent-github/`: every link, anchor and image must resolve, every image needs an alt attribute, and the text must hold no en or em dash. CI runs it after each render |
+| `make site-links` | the same, and asks every external link for an answer. It needs the network, so CI leaves it out |
 
 You need [Quarto](https://quarto.org/docs/download/) 1.10.18, which is the version CI pins, and `python3` on the PATH. View the pages through the preview server or any local web server. Opening an `.html` file straight from disk can break the table of contents.
 
@@ -1400,7 +1402,11 @@ Things that are easy to trip over:
 
 - `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.worktrees`.
 - A page cannot include a file from `site/_generated/` with the include shortcode. Quarto expands that shortcode while it scans the project, before `scripts/site_pages.py` has run, so on a clean checkout the file is missing and the render stops. `site/filters/fragments.lua` embeds those files later instead, and `tests/unit/test_site_pages.py` fails a page that includes one.
-- `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content.
+- `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content. It also moves a heading that skips a level (the build plan puts its stories under the phases with `####`) up to one level below the heading before it, so the outline of the page stays whole for a screen reader.
+- A link that starts with `/` works in `make site-preview` and breaks on GitHub Pages, which serves the site under the repository name. Link to a page by its relative path (`runbook.qmd#publishing`), and run `make site-check` after a render.
+- A ```` ```mermaid ```` fence in an included doc draws only on a page that has a `{mermaid}` cell of its own, because Quarto loads the mermaid runtime nowhere else. The plan page has none, so its include carries `mermaid="code"` and shows the diagrams as code.
+- The pages read Markdown without smart typography (`from: markdown-smart`), as GitHub does. With it, Pandoc turns `--window` into an en dash and a word.
+- Each page sets `pagetitle` and `description` in its front matter. Without `pagetitle`, Quarto joins the title and the site name with an en dash in the social card. `site/social-card.png` is the image of that card.
 - An included doc keeps its links and images relative to its own folder, as GitHub reads them. The div around the include names that folder (`::: {.drop-title base="docs"}`), and `docs.lua` then sends a link to a doc with a page to that page, a link to any other file to the file on GitHub, and an image to its copy in `site/_generated/`. A new page for a doc needs its line in `DOC_PAGES` of `scripts/site_pages.py`.
 - The chaos chart is `docs/media/chaos-results.svg`, which `uv run python scripts/chaos_chart.py` draws from the summary of the chaos run. `tests/unit/test_chaos_chart.py` fails when the committed file differs from a fresh drawing. The site embeds it inline, so `site/styles.css` can give it the colors of the light or dark theme.
 - `tests/unit/test_docs_style.py` applies the voice rules to the `.qmd` pages as it does to the docs.

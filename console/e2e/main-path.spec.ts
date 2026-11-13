@@ -61,12 +61,37 @@ test("the main path of the console", async ({ page }) => {
 
     const stuck = rowOf(page, STUCK.title);
     await expect(stuck).toContainText("paused", SETTLED);
-    await expect(stuck.locator("td").last()).toHaveText("Paused");
+    await expect(stuck.locator("td").last()).toHaveText("Send a hint or budget");
     await expect(stuck.locator("td").nth(5)).toHaveText(/^[1-9]/);
 
     const plan = rowOf(page, PLAN.title);
     await expect(plan).toContainText("awaiting_plan_approval", SETTLED);
     await expect(plan.locator("td").last()).toHaveText("Approve the plan");
+
+    // On a phone the Needs you column is off screen, so the line in the first column has to say it.
+    // toBeInViewport sees the window and not the clip of the scroll box, so each line is also
+    // measured against the box.
+    await page.setViewportSize({ width: 375, height: 800 });
+    await expect(stuck.getByTestId("status-line")).toBeVisible();
+    const box = page.getByRole("region", { name: "Tasks table" });
+    for (const [row, text] of [
+      [stuck, "Needs you: Send a hint or budget"],
+      [plan, "Needs you: Approve the plan"],
+      [plan, "Phase: awaiting plan approval"],
+    ] as const) {
+      const line = row.getByText(text);
+      await expect(line).toBeInViewport({ ratio: 1 });
+      const inner = await line.boundingBox();
+      const outer = await box.boundingBox();
+      expect(inner).not.toBeNull();
+      expect(outer).not.toBeNull();
+      expect(inner!.x).toBeGreaterThanOrEqual(outer!.x);
+      expect(inner!.x + inner!.width).toBeLessThanOrEqual(outer!.x + outer!.width);
+    }
+    // The scroll box shows that there is more to the right.
+    await expect(page.getByTestId("edge-right")).toBeVisible();
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(stuck.getByTestId("status-line")).toBeHidden();
 
     // The box follows the address, so it changes a moment after the click and not during it.
     await page.getByLabel("Needs you").click();

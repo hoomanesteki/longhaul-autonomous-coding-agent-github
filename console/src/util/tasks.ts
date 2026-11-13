@@ -14,13 +14,19 @@ export type TaskSummary = components["schemas"]["TaskSummary"];
  * else is the agent's turn. A phase that is not here never raises the "needs you" flag.
  */
 const WAITING_FOR: Record<string, string> = {
-  paused: "Paused",
+  // A pause asks a question or waits on the budget, and a hint or a top-up both resume it.
+  paused: "Send a hint or budget",
   awaiting_plan_approval: "Approve the plan",
 };
 
 /** What the task waits for from a person, or null when it waits for nothing. */
 export function needsYou(task: Pick<TaskSummary, "phase">): string | null {
   return WAITING_FOR[task.phase] ?? null;
+}
+
+/** A phase as words, `awaiting plan approval`, so that a narrow line can wrap between them. */
+export function phaseWords(phase: string): string {
+  return phase.replaceAll("_", " ");
 }
 
 // Phases a task does not leave.

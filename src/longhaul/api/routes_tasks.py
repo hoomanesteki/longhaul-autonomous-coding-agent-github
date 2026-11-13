@@ -147,7 +147,7 @@ async def get_timeline(
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=MAX_TIMELINE_PAGE)] = DEFAULT_TIMELINE_PAGE,
 ) -> TimelinePage:
-    """Events, model calls and tool calls of a task, merged by time, oldest first."""
+    """Events, model calls, tool calls and checkpoints of a task, merged by time, oldest first."""
     try:
         page = await queries.timeline(ctx.sessions, task_id, limit=limit, cursor=cursor)
     except paging.CursorError as exc:

@@ -22,8 +22,10 @@ from typing import Any
 
 import httpx2
 import pytest
+from sqlalchemy import event as sa_event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from temporalio.client import Client, WorkflowHandle
+from temporalio.service import RPCError, RPCStatusCode
 from temporalio.testing import WorkflowEnvironment
 from tests.integration import test_run_report as report_tests
 from tests.integration import test_task_workflow as workflow_tests
@@ -67,7 +69,7 @@ from longhaul.contracts import (
     ToolUseBlock,
     Usage,
 )
-from longhaul.db.models import Event, PlanRow, RepoSetting, Task, ToolCallRow
+from longhaul.db.models import Checkpoint, Event, PlanRow, RepoSetting, Task, ToolCallRow
 from longhaul.db.records import SqlRecorder, TurnRecord
 from longhaul.db.session import make_engine
 from longhaul.db.tasks import MemoryTaskStore, SqlTaskStore, TaskState
@@ -544,6 +546,8 @@ def label(item: dict[str, Any]) -> str:
     kind = item["kind"]
     if kind == "event":
         return f"event:{item['type']}"
+    if kind == "checkpoint":
+        return f"checkpoint:{item['sha'][:7]}"
     if kind == "turn":
         return f"turn:{item['turn_index']}/{item['attempt']}"
     return f"call:{item['id']}"
@@ -619,6 +623,66 @@ async def test_timeline_order(api: Stack) -> None:
             if cursor is None:
                 break
         assert paged == TIMELINE, f"page size {size}"
+
+
+async def add_checkpoint(
+    sessions: Sessions, sha: str, kind: str, seconds: int, turn_index: int, **fields: Any
+) -> None:
+    async with sessions.begin() as session:
+        session.add(
+            Checkpoint(
+                task_id=fields.pop("task_id", TASK),
+                sha=sha,
+                kind=kind,
+                turn_index=turn_index,
+                created_at=at(seconds),
+                **fields,
+            )
+        )
+
+
+async def test_timeline_has_a_row_for_each_checkpoint(api: Stack) -> None:
+    await add_task(api.sessions, TASK)
+    await add_task(api.sessions, "lh-acme-other-1")
+    first, second = "a" * 40, "b" * 40
+    await add_turn(api.sessions, 0, 1, 10)
+    await add_call(api.sessions, "toolu_a", 12, post_sha=first)
+    await add_checkpoint(api.sessions, first, "tool", 12, 0)
+    await add_event(api.sessions, 14, "step_updated", step_id="s1", status="done")
+    await add_checkpoint(api.sessions, second, "step", 14, 0, step_id="s1")
+    # The checkpoint of another task sits between the times and must not show.
+    await add_checkpoint(api.sessions, "c" * 40, "tool", 13, 0, task_id="lh-acme-other-1")
+
+    full = (await api.get(f"/api/tasks/{TASK}/timeline")).json()
+
+    assert [label(i) for i in full["items"]] == [
+        "turn:0/1",
+        "call:toolu_a",
+        "checkpoint:aaaaaaa",
+        "event:step_updated",
+        "checkpoint:bbbbbbb",
+    ]
+    by_label = {label(i): i for i in full["items"]}
+    assert by_label["checkpoint:aaaaaaa"]["sha"] == first
+    assert by_label["checkpoint:aaaaaaa"]["checkpoint_kind"] == "tool"
+    assert by_label["checkpoint:aaaaaaa"]["turn_index"] == 0
+    assert by_label["checkpoint:aaaaaaa"]["step_id"] is None
+    assert by_label["checkpoint:bbbbbbb"]["checkpoint_kind"] == "step"
+    assert by_label["checkpoint:bbbbbbb"]["step_id"] == "s1"
+
+    # A page can end on a checkpoint, and the next one carries on after it.
+    seen: list[str] = []
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": 2}
+        if cursor:
+            params["cursor"] = cursor
+        page = (await api.get(f"/api/tasks/{TASK}/timeline", **params)).json()
+        seen += [label(i) for i in page["items"]]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            break
+    assert seen == [label(i) for i in full["items"]]
 
 
 async def test_timeline_refuses_bad_input(api: Stack) -> None:
@@ -1022,6 +1086,40 @@ async def test_actions_report_unreachable_temporal(api: Stack) -> None:
     assert response.status_code == 503
 
 
+class RefusingTemporal:
+    """A Temporal client whose server answers every signal with the status it was given."""
+
+    def __init__(self, status: RPCStatusCode) -> None:
+        self.status = status
+
+    def get_workflow_handle_for(self, *args: Any, **kwargs: Any) -> RefusingTemporal:
+        return self
+
+    async def signal(self, *args: Any, **kwargs: Any) -> None:
+        raise RPCError("host 10.1.2.3 refused", self.status, b"")
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (RPCStatusCode.UNAVAILABLE, 503),
+        (RPCStatusCode.DEADLINE_EXCEEDED, 503),
+        (RPCStatusCode.INVALID_ARGUMENT, 400),
+        (RPCStatusCode.FAILED_PRECONDITION, 409),
+        (RPCStatusCode.PERMISSION_DENIED, 502),
+        (RPCStatusCode.INTERNAL, 502),
+    ],
+)
+async def test_an_action_maps_the_status_temporal_answered_with(
+    sessions: Sessions, status: RPCStatusCode, expected: int
+) -> None:
+    async with serving(sessions, RefusingTemporal(status)) as api:  # type: ignore[arg-type]
+        response = await api.post(f"/api/tasks/{TASK}/cancel", {"reason": "stop"})
+
+    assert response.status_code == expected
+    assert "10.1.2.3" not in response.text
+
+
 async def test_cancel_action_takes_a_null_body_like_the_console_sends(api: Stack) -> None:
     # The console sends the JSON text `null` when it has no reason to give. Reaching Temporal
     # (and failing there, 503) means the body passed validation.
@@ -1087,6 +1185,29 @@ async def test_memory_list_filters(api: Stack) -> None:
 
     assert (await api.get("/api/memory", status="maybe")).status_code == 422
     assert (await api.get("/api/memory", kind="note")).status_code == 422
+
+
+async def test_memory_list_cuts_at_the_limit_in_the_query(api: Stack, sessions: Sessions) -> None:
+    """The limit is part of the SELECT, so a busy repo is not loaded whole to show 200 rows."""
+    ids = await seed_memory(api)
+    engine = sessions.kw["bind"].sync_engine
+    statements: list[str] = []
+
+    def keep(conn: Any, cursor: Any, statement: str, *rest: Any) -> None:
+        if "FROM memory_items" in statement:
+            statements.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", keep)
+    try:
+        limited = (await api.get("/api/memory", repo=REPO, limit=2)).json()
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", keep)
+
+    # The oldest two, which is the order of the list, and nothing past them was read.
+    assert [i["id"] for i in limited] == [ids["lesson"], ids["pitfall"]]
+    (select_,) = statements
+    assert "LIMIT" in select_ and "ORDER BY" in select_
+    assert (await api.get("/api/memory", repo=REPO, limit=0)).status_code == 422
 
 
 async def test_memory_approve_and_reject(api: Stack) -> None:

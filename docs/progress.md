@@ -132,6 +132,9 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 | LH-904 | Full chaos suite | 5 | Done | merge | 2026-11-08 |
 | LH-905 | Results report | 3 | Done | merge | 2026-11-08 |
 | LH-906 | Security hardening pass | 3 | Done | merge | 2026-11-08 |
-| LH-907 | Docs, README and demo | 3 | Todo | | |
+| LH-907 | Docs, README and demo | 3 | Done | merge | 2026-11-11 |
 | LH-908 | Terraform for AWS (Could) | 5 | Done | merge | 2026-11-04 |
 | LH-909 | Route tool calls through Keystone (Could) | 3 | Done | merge | 2026-11-08 |
+| LH-991 | Loose ends in the worker, the API and memory | 5 | Done | merge | 2026-11-11 |
+| LH-992 | A readable timeline and a complete security page | 3 | Done | merge | 2026-11-11 |
+| LH-993 | Release fixes from the gate review | 3 | Done | merge | 2026-11-12 |

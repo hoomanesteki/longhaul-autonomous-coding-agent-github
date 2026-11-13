@@ -1,4 +1,4 @@
-.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate
+.PHONY: setup check ci-local itest e2e fake-github up down migrate sandbox-image api-types console-check console-e2e site site-preview gate demo
 
 PHASE ?= 0
 
@@ -7,9 +7,12 @@ PHASE ?= 0
 # the short chaos run that gates and CI keep.
 OPT_IN := not live and not slow and not (chaos and not chaos_lite)
 
+# A fresh clone has no .env, and the database URL has no built-in default, so setup copies the
+# local defaults once. An existing .env is never touched.
 setup:
 	uv sync
 	uv run pre-commit install
+	test -f .env || cp .env.example .env
 
 # ruff runs without its cache. The cache keeps the import order of a test that was linted before
 # the module it imports existed, so a local check passes while CI, which has no cache, fails.
@@ -72,6 +75,13 @@ console-e2e: sandbox-image
 	npm --prefix console run build
 	npm --prefix console exec -- playwright install chromium
 	npm --prefix console run e2e
+
+# One finished task on the calc fixture with the scripted model, so no GitHub account or key is
+# needed. `make up` starts the services. The sandbox image and the tables are built here because
+# `make up` does not cover them. scripts/demo.sh starts the worker, runs the task, prints the diff
+# and stops the worker.
+demo: sandbox-image migrate
+	./scripts/demo.sh
 
 # The docs site in site/. It needs Quarto (CI pins 1.10.18) and python3 on the PATH. The pages
 # are read from docs/, so there is nothing to copy before a render.

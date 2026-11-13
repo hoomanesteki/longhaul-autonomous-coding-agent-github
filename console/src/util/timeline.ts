@@ -1,9 +1,10 @@
 /**
  * What the task page shows of a timeline, worked out from the rows of the API.
  *
- * The API sends events, model calls and tool calls as one flat list in the order they happened.
- * The page wants one block per turn, with its tool calls inside, so the grouping and the small
- * formats live here as plain functions and are tested without a browser.
+ * The API sends events, model calls, tool calls and checkpoints (the commits a turn saved) as one
+ * flat list in the order they happened. The page wants one block per turn, with its tool calls and
+ * checkpoints inside, so the grouping and the small formats live here as plain functions and are
+ * tested without a browser.
  */
 
 import type { components } from "../api/schema";
@@ -13,6 +14,7 @@ export type TimelineItem = Schemas["TimelinePage"]["items"][number];
 export type TimelineTurn = Schemas["TimelineTurn"];
 export type TimelineToolCall = Schemas["TimelineToolCall"];
 export type TimelineEvent = Schemas["TimelineEvent"];
+export type TimelineCheckpoint = Schemas["TimelineCheckpoint"];
 
 export type TurnRow = {
   kind: "turn";
@@ -21,9 +23,13 @@ export type TurnRow = {
   /** One entry for each time the turn was asked, oldest first. Empty if only its tool calls are known. */
   attempts: TimelineTurn[];
   calls: TimelineToolCall[];
+  /** The commits saved while the turn ran, oldest first. */
+  checkpoints: TimelineCheckpoint[];
 };
 export type EventRow = { kind: "event"; key: string; event: TimelineEvent };
-export type Row = TurnRow | EventRow;
+/** A hand-over bundle, in the place it was made. It belongs to no turn, see `groupTimeline`. */
+export type CheckpointRow = { kind: "checkpoint"; key: string; checkpoint: TimelineCheckpoint };
+export type Row = TurnRow | EventRow | CheckpointRow;
 
 /**
  * One row for each turn and each event, in the order they first appear.
@@ -39,7 +45,7 @@ export function groupTimeline(items: readonly TimelineItem[]): Row[] {
   function groupOf(turnIndex: number): TurnRow {
     let group = turns.get(turnIndex);
     if (group === undefined) {
-      group = { kind: "turn", key: `turn:${turnIndex}`, turnIndex, attempts: [], calls: [] };
+      group = { kind: "turn", key: `turn:${turnIndex}`, turnIndex, attempts: [], calls: [], checkpoints: [] };
       turns.set(turnIndex, group);
       rows.push(group);
     }
@@ -49,6 +55,12 @@ export function groupTimeline(items: readonly TimelineItem[]): Row[] {
   for (const item of items) {
     if (item.kind === "event") rows.push({ kind: "event", key: `event:${item.id}`, event: item });
     else if (item.kind === "turn") groupOf(item.turn_index).attempts.push(item);
+    // The hand-over records a bundle with the number of turns done, which is the index of the next
+    // turn, run by the next workflow run. Grouping it by that index would open an empty block for a
+    // turn that has not started and put it before the hand-over event, so it keeps its own row.
+    else if (item.kind === "checkpoint" && item.checkpoint_kind === "bundle")
+      rows.push({ kind: "checkpoint", key: `checkpoint:${item.id}`, checkpoint: item });
+    else if (item.kind === "checkpoint") groupOf(item.turn_index).checkpoints.push(item);
     else groupOf(item.turn_index).calls.push(item);
   }
   return rows;
@@ -60,6 +72,8 @@ export type EventTone =
   | "pause"
   | "hint"
   | "verdict"
+  | "success"
+  | "warning"
   | "recovery"
   | "error"
   | "other";
@@ -77,8 +91,22 @@ const TONES: Record<string, EventTone> = {
   error: "error",
 };
 
-/** The colour family of an event type. A type the console does not know is plain. */
-export function eventTone(type: string): EventTone {
+// How a run ended, for the outcome row. A cancel is the operator's own choice, so it stays plain.
+const OUTCOME_TONES: Record<string, EventTone> = {
+  pr_opened: "success",
+  stuck: "warning",
+  budget_exhausted: "warning",
+  error: "warning",
+};
+
+/**
+ * The colour family of an event. A type the console does not know is plain.
+ *
+ * Most types have one colour. An outcome takes it from its `kind`, so that a pull request reads
+ * like a passed review and a run that gave up does not look like a step update.
+ */
+export function eventTone(type: string, payload: Record<string, unknown> = {}): EventTone {
+  if (type === "outcome") return OUTCOME_TONES[text(payload.kind) ?? ""] ?? "other";
   return TONES[type] ?? "other";
 }
 
@@ -96,7 +124,162 @@ export function eventSummary(payload: Record<string, unknown>): string {
   return parts.join(", ");
 }
 
+// ---------- readable events ----------
+const MAX_LINE_TEXT = 140;
+
+function text(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+function count(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function words(name: string): string {
+  return name.replaceAll("_", " ");
+}
+
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? "" : "s"}`;
+}
+
+/** Text from a person or a model, cut to what one line holds. The details have all of it. */
+function clip(value: string): string {
+  const line = value.split("\n")[0] ?? "";
+  return line.length > MAX_LINE_TEXT ? `${line.slice(0, MAX_LINE_TEXT)}…` : line;
+}
+
+const OUTCOMES: Record<string, string> = {
+  pr_opened: "Pull request opened",
+  stuck: "Stopped as stuck",
+  budget_exhausted: "Stopped, the budget ran out",
+  cancelled: "Cancelled",
+  error: "Ended with an error",
+};
+
+function stepLine(p: Record<string, unknown>): string | null {
+  const id = text(p.step_id);
+  const status = text(p.status);
+  if (id === null || status === null) return null;
+  const note = text(p.note);
+  const sha = shortSha(text(p.head_sha));
+  return `Step ${id} ${words(status)}${note === null ? "" : `: ${clip(note)}`}${sha === null ? "" : ` (${sha})`}`;
+}
+
+function verdictLine(p: Record<string, unknown>): string | null {
+  if (typeof p.passed !== "boolean") return null;
+  const round = count(p.round);
+  const head = `Verifier ${p.passed ? "passed" : "failed"}${round === null ? "" : ` (round ${round})`}`;
+  if (p.passed) {
+    const tests = text(p.tests_summary);
+    return tests === null ? head : `${head}: ${clip(tests)}`;
+  }
+  const issues = Array.isArray(p.issues) ? p.issues.filter((i): i is string => typeof i === "string") : [];
+  const [first, ...rest] = issues;
+  if (first === undefined) return head;
+  return `${head}: ${clip(first)}${rest.length > 0 ? `, and ${rest.length} more` : ""}`;
+}
+
+function outcomeLine(p: Record<string, unknown>): string | null {
+  const kind = text(p.kind);
+  if (kind === null) return null;
+  const turns = count(p.turns);
+  const summary = text(p.summary);
+  const head = OUTCOMES[kind] ?? `Ended (${words(kind)})`;
+  return `${head}${turns === null ? "" : ` after ${plural(turns, "turn")}`}${summary === null ? "" : `: ${clip(summary)}`}`;
+}
+
+function pausedLine(p: Record<string, unknown>): string | null {
+  const reason = text(p.reason);
+  if (reason === null) return null;
+  const question = text(p.question);
+  // The reason is a label and the question is a sentence, so they read as two parts.
+  return `Paused (${words(reason)})${question === null ? "" : `: ${clip(question)}`}`;
+}
+
+function stuckLine(p: Record<string, unknown>): string | null {
+  const reason = text(p.reason);
+  if (reason === null) return null;
+  const turn = count(p.turn_index);
+  // The evidence is the useful part of the event. The first line is enough for the row and the
+  // details show the rest.
+  const [first] = Array.isArray(p.evidence) ? p.evidence.filter((e): e is string => text(e) !== null) : [];
+  return `Stuck: ${words(reason)}${turn === null ? "" : ` (turn ${turn})`}${first === undefined ? "" : `: ${clip(first)}`}`;
+}
+
+const ANSWERS: Record<string, string> = { hint: "a hint", budget: "a budget top-up" };
+
+function resumedLine(p: Record<string, unknown>): string {
+  const via = text(p.via);
+  if (via === "midnight") return "Resumed at midnight UTC, when the daily limit reset";
+  const answer = via === null ? null : (ANSWERS[via] ?? null);
+  if (answer === null) return "Resumed";
+  const by = text(p.by);
+  const reason = text(p.reason);
+  return `Resumed with ${answer}${by === null ? "" : ` from ${by}`}${reason === null ? "" : ` (${words(reason)})`}`;
+}
+
+function budgetLine(p: Record<string, unknown>): string | null {
+  const usd = count(p.usd);
+  const turns = count(p.turns);
+  if (usd === null && turns === null) return null;
+  const parts: string[] = [];
+  if (usd !== null && usd !== 0) parts.push(`$${usd.toFixed(2)}`);
+  if (turns !== null && turns !== 0) parts.push(plural(turns, "turn"));
+  const by = text(p.by);
+  return `Budget added: ${parts.join(" and ") || "nothing"}${by === null ? "" : `, by ${by}`}`;
+}
+
+function compactionLine(p: Record<string, unknown>): string | null {
+  const before = count(p.tokens_before);
+  const after = count(p.tokens_after);
+  if (before === null || after === null) return null;
+  const folded = count(p.folded_turns);
+  return (
+    `Compaction saved ${formatCount(before - after)} tokens (${formatCount(before)} to ${formatCount(after)})` +
+    `${folded === null ? "" : `, ${plural(folded, "turn")} folded`}${p.forced === true ? ", forced" : ""}`
+  );
+}
+
+const LINES: Record<string, (payload: Record<string, unknown>) => string | null> = {
+  step_updated: stepLine,
+  verdict: verdictLine,
+  outcome: outcomeLine,
+  paused: pausedLine,
+  stuck: stuckLine,
+  resumed: resumedLine,
+  budget_added: budgetLine,
+  compaction: compactionLine,
+};
+
+/**
+ * One readable line for an event of a kind the console knows, or null.
+ *
+ * The caller falls back to `eventSummary` on null: for a kind that is not here, and for a known
+ * kind whose payload lacks what the line needs (an older run, or a writer that changed), so a row
+ * never reads "undefined" or hides what the payload holds.
+ */
+export function describeEvent(type: string, payload: Record<string, unknown>): string | null {
+  return LINES[type]?.(payload) ?? null;
+}
+
 // ---------- tool calls ----------
+export type ToolCallStatus = { label: "ok" | "failed" | "error"; failed: boolean; exitCode: number | null };
+
+/**
+ * Whether a tool call worked, from its row.
+ *
+ * `ok` is false only for a call that did not finish (a timeout, a bad argument). A command that ran
+ * and exited with a non-zero code, such as a failing test run, is `ok` with that exit code, and
+ * reading `ok` alone showed it as a success. So a non-zero exit code is a failure too.
+ */
+export function toolCallStatus(call: Pick<TimelineToolCall, "ok" | "exit_code">): ToolCallStatus {
+  if (!call.ok) return { label: "error", failed: true, exitCode: call.exit_code };
+  if (call.exit_code !== null && call.exit_code !== 0)
+    return { label: "failed", failed: true, exitCode: call.exit_code };
+  return { label: "ok", failed: false, exitCode: null };
+}
+
 // The argument that says what a call does, in the order the tools use them.
 const KEY_ARGS = ["command", "path", "file_path", "query", "pattern", "url"];
 const MAX_ARGS = 80;
@@ -117,7 +300,7 @@ export function argsSummary(input: Record<string, unknown>): string {
 
 /** The first seven characters of a commit, the length git shows. */
 export function shortSha(sha: string | null): string | null {
-  return sha === null ? null : sha.slice(0, 7);
+  return sha === null || sha === "" ? null : sha.slice(0, 7);
 }
 
 // ---------- numbers ----------

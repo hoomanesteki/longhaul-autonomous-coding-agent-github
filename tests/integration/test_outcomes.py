@@ -153,6 +153,12 @@ class Stubs(Boxes):
         self.with_memory = False
         self.blobs: MemoryBlobStore | None = None
         self.lessons: list[tuple[int, acts.ExtractLessonsInput]] = []
+        self.lessons_answer = acts.ExtractLessonsOutput(status="skipped", source_ref="")
+        # LH-991: the stored report is written again once the task has ended. Each ask is kept
+        # with the types of the events that were recorded before it.
+        self.recorder: MemoryRecorder | None = None
+        self.reports: list[tuple[list[str], acts.RunReportInput]] = []
+        self.report_error: ApplicationError | None = None
 
     @activity.defn(name=acts.PREPARE_WORKSPACE.name)
     async def prepare_workspace(self, spec: TaskSpec) -> acts.PrepareWorkspaceOutput:
@@ -168,7 +174,15 @@ class Stubs(Boxes):
     @activity.defn(name=acts.EXTRACT_LESSONS.name)
     async def extract_lessons(self, inp: acts.ExtractLessonsInput) -> acts.ExtractLessonsOutput:
         self.lessons.append((len(self.deliveries), inp))
-        return acts.ExtractLessonsOutput(status="skipped", source_ref="")
+        return self.lessons_answer
+
+    @activity.defn(name=acts.WRITE_RUN_REPORT.name)
+    async def write_run_report(self, inp: acts.RunReportInput) -> BlobRef:
+        assert self.recorder is not None and self.blobs is not None
+        self.reports.append(([e.type for e in self.recorder.events], inp))
+        if self.report_error is not None:
+            raise self.report_error
+        return await self.blobs.put(b"", key=f"tasks/{inp.task_id}/report/run-report.md")
 
     @activity.defn(name=acts.CLEANUP.name)
     async def cleanup(self, inp: acts.CleanupInput) -> None:
@@ -318,6 +332,7 @@ async def rig(
     )
     stubs = CalcStubs() if reviewed else Stubs()
     stubs.blobs = blobs
+    stubs.recorder = recorder
     tools = ToolActivities(registry, stubs, blobs, recorder, checkpoints=NoCheckpoints())
     fake = FakeGitHub()
     seed_calc(fake, tmp_path / "gh")
@@ -353,6 +368,7 @@ async def rig(
                 stubs.deliver,
                 stubs.load_memory,
                 stubs.extract_lessons,
+                stubs.write_run_report,
             ],
             workflow_runner=workflow_runner(),
         ):
@@ -455,6 +471,67 @@ async def test_each_outcome_reports_once(
             assert later == []
         # The note the metrics count from is made once.
         assert [e["kind"] for e in world.events("outcome")] == [ending.kind.value]
+
+
+# ---------- the stored report is written after the end is known (LH-991) ----------
+@pytest.mark.parametrize("kind", KINDS)
+async def test_the_stored_report_is_written_after_the_outcome_is_recorded(
+    env: WorkflowEnvironment, tmp_path: Path, kind: str
+) -> None:
+    """`deliver` stores the report before the outcome event exists, so the wind-up writes it again.
+
+    The stub keeps the event types that were on the table when it was asked.
+    """
+    ending = ENDINGS[kind]
+    async with rig(env, ending.steps, tmp_path) as world:
+        spec = world.spec()
+        await end_the_task(env, world, spec, kind)
+
+        ((seen, asked),) = world.stubs.reports
+        assert asked.task_id == spec.task_id
+        assert asked.outcome == ending.kind.value
+        assert seen[-1] == "outcome"
+
+
+async def test_the_stored_report_is_written_after_the_lessons(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, DELIVERS, tmp_path) as world:
+        world.stubs.with_memory = True
+        world.stubs.lessons_answer = acts.ExtractLessonsOutput(
+            status="ok",
+            source_ref="7",
+            items=[acts.LessonNote(content="Run the tests before the diff.", kind="lesson")],
+        )
+        await end_the_task(env, world, world.spec(), "pr_opened")
+
+        ((seen, _),) = world.stubs.reports
+        assert seen.index("lessons") < seen.index("outcome") < len(seen)
+        assert seen[-1] == "outcome"
+
+
+async def test_a_local_task_has_no_stored_report_to_replace(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, DELIVERS, tmp_path) as world:
+        spec = world.spec(local=True)
+        handle = await start_task(env.client, spec, task_queue=world.queue)
+        await result_of(handle)
+
+        assert world.stubs.reports == []
+
+
+async def test_a_report_that_cannot_be_written_does_not_change_the_outcome(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    async with rig(env, DELIVERS, tmp_path) as world:
+        world.stubs.report_error = ApplicationError(
+            "no template", type="TemplateError", non_retryable=True
+        )
+        outcome = await end_the_task(env, world, world.spec(), "pr_opened")
+
+        assert outcome.kind is OutcomeKind.PR_OPENED and outcome.pr_url == PR_URL
+        assert len(world.stubs.reports) == 1
 
 
 async def test_a_delivered_task_links_its_pull_request_in_the_comment(

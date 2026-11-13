@@ -34,6 +34,12 @@ updates:
       console:
         patterns: ["*"]
         update-types: [minor, patch]
+    # No TypeScript major after 5 installs yet: typescript-eslint 8.72 accepts typescript below
+    # 6.1 and openapi-typescript 7.13 asks for typescript 5, so `npm ci` stops on a peer
+    # conflict (the 7.0.2 bump did). Drop this rule once both accept the new major.
+    ignore:
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
   # The AWS provider and the Terraform lock file. A bump also needs its row in ADR-0002, which
   # tests/unit/test_deploy_aws.py checks. Terraform itself is pinned in versions.tf and in the
   # terraform job of ci.yml, which dependabot does not read, so a new release is a manual

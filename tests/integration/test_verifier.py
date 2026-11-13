@@ -33,7 +33,7 @@ from typing import Any
 import pytest
 import yaml
 from temporalio import activity
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import Client, WorkflowHandle, WorkflowHistory
 from temporalio.contrib.pydantic import pydantic_data_converter
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer, Worker
@@ -77,7 +77,7 @@ from longhaul.durable.activities.workspace import WorkspaceActivities
 from longhaul.durable.client import start_task
 from longhaul.durable.payload_converter import guarded_data_converter
 from longhaul.durable.workflow_sandbox import workflow_runner
-from longhaul.durable.workflows.task import TaskWorkflow
+from longhaul.durable.workflows.task import FINISH_REVIEWED_PATCH, TaskWorkflow
 from longhaul.github.inputs import CommentInput, LabelInput
 from longhaul.github.side_effects import MemoryLedger, SideEffectActivities
 from longhaul.providers.base import parse_role_line
@@ -743,6 +743,9 @@ async def test_precheck_overrides_model(env: WorkflowEnvironment, tmp_path: Path
     assert [(r["round"], r["passed"]) for r in reviews] == [(1, False), (2, True)]
     assert (reviews[0]["model_passed"], reviews[0]["precheck_passed"]) == (True, False)
     assert (reviews[1]["model_passed"], reviews[1]["precheck_passed"]) == (True, True)
+    # Each verdict names the verifier turn that gave it, the turn the timeline shows it under.
+    verifier_turns = sorted(t.turn_index for t in world.recorder.turns if t.role == "verifier")
+    assert [r["turn_index"] for r in reviews] == verifier_turns
 
     # The verifier was shown the failure, and the coder is told which command to fix.
     seen = [blocks(r.messages[0]) for r in world.provider.of("verifier")]
@@ -1083,6 +1086,22 @@ async def test_a_pull_request_is_a_draft_when_the_review_ran_no_command(
     assert verifier_role.NO_PRECHECK in shown
 
 
+# ---------- the log of a harness without the row activity (LH-991) ----------
+async def test_a_harness_without_the_row_activity_logs_no_warning_per_write(
+    env: WorkflowEnvironment, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`light` registers no record_task_state. tests/conftest.py adds a no-op, so the workflow does
+    not log "row of task ... not written" for every change of phase."""
+    async with light(env, write_script(tmp_path, clean_run())) as world:
+        handle = await start_task(
+            env.client, local_spec(HAS_ADD), task_queue=world.queue, plan=True
+        )
+        await result_of(handle)
+
+    warned = [r.getMessage() for r in caplog.records if "not written" in r.getMessage()]
+    assert warned == []
+
+
 # ---------- tasks that are not verified ----------
 async def test_a_task_without_a_plan_is_not_verified(
     env: WorkflowEnvironment, tmp_path: Path
@@ -1099,23 +1118,81 @@ async def test_a_task_without_a_plan_is_not_verified(
     assert verdict_events(world.recorder) == []
 
 
-async def test_finish_in_a_task_with_a_plan_still_ends_it_without_a_review(
+FINISH = tool("finish", summary="Nothing to change.")
+
+
+async def test_finish_in_a_task_with_a_plan_is_reviewed_like_a_submission(
     env: WorkflowEnvironment, tmp_path: Path
 ) -> None:
-    """The coder is not offered `finish`. A history that ends on it replays as it was.
+    """A planned coder that calls `finish` gets the review that `submit_for_review` gets (LH-991).
 
-    A worker from before LH-503 offers a planned coder the tools it had, `finish` among them.
+    This test asserted the old path for a new run: LH-504 let a planned `finish` end the task with
+    no review, so that histories from before the verifier ended as they did. Those histories keep
+    that path through the patch marker and have their own replay test below. A new run has to be
+    reviewed before a ready pull request, so the same script now meets the verifier.
     """
-    steps = [*plan_run(), coder_turn(0, tool("finish", summary="Nothing to change."))]
+    steps = [*plan_run(), coder_turn(0, FINISH), verifier_turn(0, PASS)]
     async with light(env, write_script(tmp_path, steps), step_tools=False) as world:
-        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        handle = await start_task(
+            env.client, local_spec(HAS_ADD), task_queue=world.queue, plan=True
+        )
         outcome = await result_of(handle)
         status = await planned_status(handle)
 
     assert outcome == Outcome(kind=OutcomeKind.PR_OPENED, summary="Nothing to change.")
     assert status.phase is Phase.DONE
-    assert world.provider.of("verifier") == []
-    assert verdict_events(world.recorder) == []
+    assert len(world.provider.of("verifier")) == 1
+    (event,) = verdict_events(world.recorder)
+    assert event["passed"] is True
+
+
+async def test_a_finish_that_fails_its_review_goes_back_to_the_coder(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The review of a `finish` can fail and send the coder back, as one of a submission can."""
+    steps = [
+        *plan_run(),
+        coder_turn(0, FIX),
+        coder_turn(1, FINISH),
+        coder_turn(2, ADD_TEST),
+        coder_turn(3, FINISH),
+        verifier_turn(1, PASS, request_contains="+def test_add_negative"),
+        verifier_turn(1, verdict(False, "1 passed", UNTESTED, send_back_step="s1")),
+        verifier_turn(0, tool("git_diff")),
+    ]
+    async with light(env, write_script(tmp_path, steps), step_tools=False) as world:
+        handle = await start_task(
+            env.client, local_spec(HAS_ADD), task_queue=world.queue, plan=True
+        )
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    assert [e["passed"] for e in verdict_events(world.recorder)] == [False, True]
+
+
+async def test_a_task_without_a_plan_that_finishes_never_asks_for_the_marker(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The marker belongs to planned tasks only: a task without a plan never asks for it."""
+    steps = [coder_turn(0, FINISH)]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, local_spec(HAS_ADD), task_queue=world.queue)
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert not any(FINISH_REVIEWED_PATCH in text for text in patch_markers(history))
+
+
+def patch_markers(history: WorkflowHistory) -> set[str]:
+    """The ids of the patches a history recorded: the texts in the details of its patch markers."""
+    return {
+        payload.data.decode()
+        for e in history.events
+        if e.HasField("marker_recorded_event_attributes")
+        and e.marker_recorded_event_attributes.marker_name == "core_patch"
+        for payloads in e.marker_recorded_event_attributes.details.values()
+        for payload in payloads.payloads
+    }
 
 
 # ---------- replay ----------
@@ -1146,3 +1223,40 @@ async def test_histories_of_a_verified_run_replay(env: WorkflowEnvironment, tmp_
     )
     for history in histories:
         await replayer.replay_workflow(history)
+
+
+async def test_a_new_planned_finish_records_the_marker(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    steps = [*plan_run(), coder_turn(0, FINISH), verifier_turn(0, PASS)]
+    async with light(env, write_script(tmp_path, steps), step_tools=False) as world:
+        handle = await start_task(
+            env.client, local_spec(HAS_ADD), task_queue=world.queue, plan=True
+        )
+        await result_of(handle)
+        history = await handle.fetch_history()
+
+    assert any(FINISH_REVIEWED_PATCH in text for text in patch_markers(history))
+
+
+async def test_a_history_that_ends_on_a_planned_finish_from_before_the_review_replays() -> None:
+    """Recorded with the workflow of dev at v0.8.0 plus the Phase 8 report, before LH-991.
+
+    A planned coder of a worker from before LH-503 calls `finish`, and the task ends with no
+    review and no verifier turn. The history has no marker for FINISH_REVIEWED_PATCH, so the new
+    code must take the old path at the same place and make the same commands (F13).
+    """
+    path = ROOT / "tests" / "fixtures" / "histories" / "planned_finish_before_review.json"
+    history = WorkflowHistory.from_json("replay-planned-finish", path.read_text(encoding="utf-8"))
+    assert not any(FINISH_REVIEWED_PATCH in text for text in patch_markers(history))
+    assert "llm_turn" in {
+        e.activity_task_scheduled_event_attributes.activity_type.name
+        for e in history.events
+        if e.HasField("activity_task_scheduled_event_attributes")
+    }
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)

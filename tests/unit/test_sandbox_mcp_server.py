@@ -194,6 +194,39 @@ async def test_the_context_is_not_passed_on_to_the_tool(sandbox: FakeSandbox) ->
     assert "one" in text_of(result)
 
 
+async def test_run_tests_runs_the_test_command_the_context_names(sandbox: FakeSandbox) -> None:
+    # The worker registry has no test command here, as a repo without one. The task's own
+    # command arrives with the call and is what runs, as it does in direct mode.
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_tests", {CONTEXT_KEY: {**context(), "test_command": "echo ran-the-task-command"}}
+        )
+
+    assert not result.is_error
+    assert "ran-the-task-command" in text_of(result)
+
+
+async def test_a_test_command_in_the_context_changes_only_run_tests(sandbox: FakeSandbox) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool(
+            "run_command",
+            {"command": "echo plain", CONTEXT_KEY: {**context(), "test_command": "false"}},
+        )
+
+    assert text_of(result).startswith("exit code: 0")
+    assert "plain" in text_of(result)
+
+
+async def test_run_tests_without_a_command_in_the_context_uses_the_worker_default(
+    sandbox: FakeSandbox,
+) -> None:
+    async with connected(sandbox) as client:
+        result = await client.call_tool("run_tests", {CONTEXT_KEY: context()})
+
+    assert result.is_error
+    assert "no test command" in text_of(result)
+
+
 # ---------- the key ----------
 async def test_a_request_without_the_key_is_refused(sandbox: FakeSandbox) -> None:
     app = build_app(default_registry(), Boxes(sandbox), key=KEY)

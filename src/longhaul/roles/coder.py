@@ -20,10 +20,11 @@ for them, and the workflow handles each call itself:
   the issue, waits for a hint, and puts the coder back to work with the answer in front of it.
   With no answer in 24 hours the task ends as stuck, with the question in the summary.
 
-A call to `finish` in a task with a plan is still honoured, and it ends the task as it did before
-the verifier: the work is not reviewed, and the pull request stays a draft. The coder is not
-offered it, but a worker or a history from before this story may still send it, and running a tool
-that does nothing would loop the task. `CoderCalls.review` tells the two apart.
+A call to `finish` in a task with a plan is still honoured. The coder is not offered it, but a
+worker or a history from before the verifier may still send it, and running a tool that does
+nothing would loop the task. `CoderCalls.review` tells the two apart: it says which call ended the
+turn. The workflow reviews both (LH-991), and only a history recorded before that change ends a
+planned task on `finish` without a review.
 
 The three tools are not in the registry, so a coder without a plan is never offered them.
 `tool_specs` builds the list of a coder with a plan from the registry's: the same tools in the same
@@ -251,8 +252,8 @@ class CoderCalls:
     `results` has one result for each call, in call order. `submitted` is the summary of a good
     `submit_for_review` or `finish`, and `question` the text of a good `ask_human`. Either one
     ends the turn. `review` is true when the summary came with `submit_for_review`, whose work is
-    reviewed before it is delivered, and false for the `finish` of a history from before the
-    verifier.
+    reviewed before it is delivered, and false for a `finish`. The workflow reviews a planned
+    `finish` too, behind a patch marker, so this flag only tells which call it was.
     """
 
     results: list[ToolResult]

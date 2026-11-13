@@ -5,6 +5,8 @@ import {
   argsSummary,
   cacheRatio,
   costSeries,
+  describeEvent,
+  toolCallStatus,
   eventSummary,
   eventTone,
   formatDuration,
@@ -110,6 +112,22 @@ describe("eventTone", () => {
   });
 });
 
+describe("eventTone for an outcome", () => {
+  it("is green for a pull request and a warning for a run that did not deliver", () => {
+    expect(eventTone("outcome", { kind: "pr_opened" })).toBe("success");
+    for (const kind of ["stuck", "error", "budget_exhausted"]) {
+      expect(eventTone("outcome", { kind })).toBe("warning");
+    }
+  });
+
+  it("keeps the plain tone for a cancel, an unknown kind and a payload with no kind", () => {
+    expect(eventTone("outcome", { kind: "cancelled" })).toBe("other");
+    expect(eventTone("outcome", { kind: "something_new" })).toBe("other");
+    expect(eventTone("outcome", {})).toBe("other");
+    expect(eventTone("outcome")).toBe("other");
+  });
+});
+
 describe("eventSummary", () => {
   it("lists the short values of a payload and leaves out the long ones", () => {
     const text = eventSummary({ reason: "stuck", count: 3, trace: "x".repeat(500), nested: { a: 1 } });
@@ -170,5 +188,208 @@ describe("costSeries", () => {
     expect(series.map((point) => point.turn)).toEqual([0, 1]);
     expect(series[0]?.total).toBeCloseTo(0.1);
     expect(series[1]?.total).toBeCloseTo(0.6);
+  });
+});
+
+describe("describeEvent", () => {
+  const SHA = "0123456789abcdef0123456789abcdef01234567";
+
+  it("writes a step update as the step, its status, the note and the short commit", () => {
+    expect(
+      describeEvent("step_updated", {
+        step_id: "s1",
+        status: "done",
+        note: "Added the parser test",
+        head_sha: SHA,
+        turn_index: 4,
+      }),
+    ).toBe("Step s1 done: Added the parser test (0123456)");
+    expect(describeEvent("step_updated", { step_id: "s2", status: "in_progress", note: "", head_sha: null })).toBe(
+      "Step s2 in progress",
+    );
+  });
+
+  it("writes a verdict with its round and the tests, or with the first reason it failed", () => {
+    expect(describeEvent("verdict", { round: 1, passed: true, tests_summary: "pytest -q" })).toBe(
+      "Verifier passed (round 1): pytest -q",
+    );
+    expect(describeEvent("verdict", { round: 1, passed: true, tests_summary: null })).toBe(
+      "Verifier passed (round 1)",
+    );
+    expect(
+      describeEvent("verdict", { round: 2, passed: false, issues: ["test_add still fails", "no docs"] }),
+    ).toBe("Verifier failed (round 2): test_add still fails, and 1 more");
+    expect(describeEvent("verdict", { round: 3, passed: false, issues: [] })).toBe("Verifier failed (round 3)");
+  });
+
+  it("writes an outcome with its turns and summary, and leaves the cost out", () => {
+    expect(
+      describeEvent("outcome", {
+        kind: "pr_opened",
+        repo: "acme/widgets",
+        turns: 9,
+        cost_usd: 0,
+        summary: "Fixed the parser",
+      }),
+    ).toBe("Pull request opened after 9 turns: Fixed the parser");
+    expect(describeEvent("outcome", { kind: "stuck", turns: 1, summary: "" })).toBe("Stopped as stuck after 1 turn");
+    expect(describeEvent("outcome", { kind: "budget_exhausted", turns: 30 })).toBe(
+      "Stopped, the budget ran out after 30 turns",
+    );
+    expect(describeEvent("outcome", { kind: "cancelled", turns: 2, summary: "cancelled by alice" })).toBe(
+      "Cancelled after 2 turns: cancelled by alice",
+    );
+    expect(describeEvent("outcome", { kind: "error", turns: 2, summary: "boom" })).toBe(
+      "Ended with an error after 2 turns: boom",
+    );
+  });
+
+  it("cuts a long summary and leaves the rest to the details", () => {
+    const line = describeEvent("outcome", { kind: "pr_opened", turns: 3, summary: "x".repeat(400) });
+
+    expect(line).not.toBeNull();
+    expect(line!.length).toBeLessThan(200);
+    expect(line!.endsWith("…")).toBe(true);
+  });
+
+  it("writes a stuck event with its reason, the turn and the first line of evidence", () => {
+    expect(
+      describeEvent("stuck", {
+        reason: "repeated_failure",
+        turn_index: 6,
+        evidence: ["pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5", "more"],
+      }),
+    ).toBe(
+      "Stuck: repeated failure (turn 6): pytest -q failed 3 times with the same AssertionError at tests/test_calc.py:5",
+    );
+    expect(describeEvent("stuck", { reason: "no_progress", turn_index: 0, evidence: [] })).toBe(
+      "Stuck: no progress (turn 0)",
+    );
+    expect(describeEvent("stuck", { reason: "no_progress" })).toBe("Stuck: no progress");
+    expect(describeEvent("stuck", { reason: "x", evidence: ["y".repeat(400)] })?.length).toBeLessThan(200);
+    expect(describeEvent("stuck", {})).toBeNull();
+  });
+
+  it("writes a pause with its reason and a resume with how it ended", () => {
+    expect(describeEvent("paused", { kind: "hint", reason: "repeated_failure", pause: 1 })).toBe(
+      "Paused (repeated failure)",
+    );
+    expect(describeEvent("paused", { kind: "hint", reason: "agent_asked", question: "Which API?" })).toBe(
+      "Paused (agent asked): Which API?",
+    );
+    expect(describeEvent("resumed", { kind: "hint", via: "hint", by: "alice" })).toBe(
+      "Resumed with a hint from alice",
+    );
+    expect(describeEvent("resumed", { kind: "budget", via: "budget", reason: "max_usd" })).toBe(
+      "Resumed with a budget top-up (max usd)",
+    );
+    expect(describeEvent("resumed", { kind: "budget", via: "midnight" })).toBe(
+      "Resumed at midnight UTC, when the daily limit reset",
+    );
+    expect(describeEvent("resumed", { pause: 2, via: null })).toBe("Resumed");
+  });
+
+  it("writes the amount of a budget top-up", () => {
+    expect(describeEvent("budget_added", { pause: 1, usd: 2, turns: 5, by: "alice" })).toBe(
+      "Budget added: $2.00 and 5 turns, by alice",
+    );
+    expect(describeEvent("budget_added", { pause: 1, usd: 0, turns: 1 })).toBe("Budget added: 1 turn");
+    expect(describeEvent("budget_added", { pause: 1, usd: 0, turns: 0 })).toBe("Budget added: nothing");
+  });
+
+  it("writes a compaction as the tokens it saved", () => {
+    expect(
+      describeEvent("compaction", {
+        tokens_before: 40_000,
+        tokens_after: 28_000,
+        folded_turns: 8,
+        forced: false,
+      }),
+    ).toBe("Compaction saved 12,000 tokens (40,000 to 28,000), 8 turns folded");
+    expect(
+      describeEvent("compaction", { tokens_before: 9000, tokens_after: 4000, folded_turns: 1, forced: true }),
+    ).toBe("Compaction saved 5,000 tokens (9,000 to 4,000), 1 turn folded, forced");
+  });
+
+  it("gives up, so the caller shows the key and value pairs, for a kind or a payload it does not know", () => {
+    expect(describeEvent("sandbox_recreated", { sandbox_id: "abc" })).toBeNull();
+    expect(describeEvent("verdict", { passed: "yes" })).toBeNull();
+    expect(describeEvent("step_updated", {})).toBeNull();
+    expect(describeEvent("compaction", { dropped_turns: 6 })).toBeNull();
+    expect(describeEvent("outcome", {})).toBeNull();
+  });
+});
+
+describe("toolCallStatus", () => {
+  it("is ok for a call that exited with 0 or has no exit code", () => {
+    expect(toolCallStatus({ ok: true, exit_code: 0 })).toEqual({ label: "ok", failed: false, exitCode: null });
+    expect(toolCallStatus({ ok: true, exit_code: null })).toEqual({ label: "ok", failed: false, exitCode: null });
+  });
+
+  it("is failed, with its exit code, for a command that ran and exited with a non-zero code", () => {
+    // The tool layer only sets ok to false for a timeout, so a failing test run arrives as ok.
+    expect(toolCallStatus({ ok: true, exit_code: 1 })).toEqual({ label: "failed", failed: true, exitCode: 1 });
+  });
+
+  it("is an error for a call that did not finish, and keeps its exit code when it has one", () => {
+    expect(toolCallStatus({ ok: false, exit_code: null })).toEqual({ label: "error", failed: true, exitCode: null });
+    expect(toolCallStatus({ ok: false, exit_code: 124 })).toEqual({ label: "error", failed: true, exitCode: 124 });
+  });
+});
+
+describe("groupTimeline checkpoints", () => {
+  it("puts a checkpoint under the turn that made it", () => {
+    const rows = groupTimeline([
+      turn(2),
+      call("a", 2),
+      {
+        kind: "checkpoint",
+        ts: "2026-11-01T10:00:03Z",
+        id: 7,
+        sha: "0123456789abcdef0123456789abcdef01234567",
+        checkpoint_kind: "step",
+        turn_index: 2,
+        step_id: "s1",
+      },
+    ]);
+
+    expect(rows).toHaveLength(1);
+    const only = rows[0];
+    expect(only?.kind === "turn" && only.checkpoints.map((c) => c.sha.slice(0, 7))).toEqual(["0123456"]);
+  });
+});
+
+describe("groupTimeline hand-over bundle", () => {
+  const bundle: Item = {
+    kind: "checkpoint",
+    ts: "2026-11-01T10:00:03Z",
+    id: 9,
+    sha: "89abcdef0123456789abcdef0123456789abcdef",
+    checkpoint_kind: "bundle",
+    // The hand-over records the number of turns done, which is the index of the next turn.
+    turn_index: 5,
+    step_id: null,
+  };
+
+  it("keeps a bundle in time order and makes no block for the turn that has not run", () => {
+    const rows = groupTimeline([
+      turn(4),
+      { ...bundle, id: 8, checkpoint_kind: "tool", turn_index: 4 },
+      bundle,
+      event(2, "continue_as_new"),
+    ]);
+
+    expect(rows.map((r) => r.key)).toEqual(["turn:4", "checkpoint:9", "event:2"]);
+    const first = rows[0];
+    expect(first?.kind === "turn" && first.checkpoints.map((c) => c.checkpoint_kind)).toEqual(["tool"]);
+    expect(rows.some((r) => r.kind === "turn" && r.turnIndex === 5)).toBe(false);
+  });
+
+  it("puts the next turn after the hand-over", () => {
+    const rows = groupTimeline([turn(4), bundle, event(2, "continue_as_new"), turn(5)]);
+
+    expect(rows.map((r) => r.key)).toEqual(["turn:4", "checkpoint:9", "event:2", "turn:5"]);
+    const next = rows[3];
+    expect(next?.kind === "turn" && next.checkpoints).toEqual([]);
   });
 });

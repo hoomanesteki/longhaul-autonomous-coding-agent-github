@@ -1,6 +1,6 @@
 # Three image repositories, one per image that docs/deploy-aws.md has you build:
 #   worker   docker/worker/Dockerfile. The worker, and the poller and migration tasks.
-#   api      docker/api/Dockerfile. It comes with the console stories.
+#   api      docker/api/Dockerfile, the console API and the console it serves.
 #   sandbox  docker/sandbox/Dockerfile. Each worker host pulls it when it boots, because the
 #            worker starts the sandboxes through the host's Docker daemon.
 #

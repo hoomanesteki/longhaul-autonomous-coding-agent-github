@@ -164,10 +164,38 @@ describe("tasks page", () => {
     renderPage();
 
     await screen.findByText("Fix the parser");
-    expect(within(rowOf("Speed up the build")).getByText("Paused")).toBeInTheDocument();
+    expect(within(rowOf("Speed up the build")).getByText("Send a hint or budget")).toBeInTheDocument();
     expect(within(rowOf("Add a retry")).getByText("Approve the plan")).toBeInTheDocument();
-    expect(within(rowOf("Fix the parser")).queryByText("Paused")).not.toBeInTheDocument();
-    expect(within(rowOf("Rename the flag")).queryByText("Paused")).not.toBeInTheDocument();
+    expect(within(rowOf("Fix the parser")).queryByText("Send a hint or budget")).not.toBeInTheDocument();
+    expect(within(rowOf("Rename the flag")).queryByText("Send a hint or budget")).not.toBeInTheDocument();
+  });
+
+  it("repeats the phase and what needs you under the repo, for a screen too narrow for the columns", async () => {
+    serve([CODING, PAUSED, APPROVAL]);
+    renderPage();
+
+    await screen.findByText("Fix the parser");
+    // The table scrolls sideways on a phone, and Phase and Needs you are the last columns. The
+    // line under the repo, in the first column, is what a person sees without scrolling. CSS hides it on wide screens.
+    const line = (title: string) => within(rowOf(title).querySelectorAll("td")[0] as HTMLElement);
+    expect(line("Fix the parser").getByTestId("status-line")).toHaveTextContent("Phase: coding");
+    expect(line("Fix the parser").queryByText(/Needs you/)).not.toBeInTheDocument();
+    expect(line("Speed up the build").getByTestId("status-line")).toHaveTextContent("Phase: paused");
+    expect(line("Speed up the build").getByText("Needs you: Send a hint or budget")).toBeInTheDocument();
+    expect(line("Add a retry").getByText("Needs you: Approve the plan")).toBeInTheDocument();
+    expect(line("Add a retry").getByTestId("status-line").className).toContain("lg:hidden");
+  });
+
+  it("writes the phase in words and wraps the status line between words", async () => {
+    serve([APPROVAL]);
+    renderPage();
+
+    await screen.findByText("Add a retry");
+    const line = within(rowOf("Add a retry").querySelectorAll("td")[0] as HTMLElement).getByTestId("status-line");
+    // awaiting_plan_approval has no space to wrap at and broke as "awaiting_plan_appr / oval".
+    expect(line).toHaveTextContent("Phase: awaiting plan approval");
+    expect(line.className).toContain("break-words");
+    expect(line.className).not.toContain("break-all");
   });
 
   it("leaves out the issue link for a task without an issue number", async () => {

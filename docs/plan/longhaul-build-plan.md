@@ -1187,7 +1187,7 @@ Story block format (parsed by `scripts/import_backlog.py`): a heading `#### LH-<
     - `temporal`: Temporal dev server via the official `temporalio/temporal` CLI image running `server start-dev --ip 0.0.0.0 --db-filename /data/temporal.db`, with `/data` on a named volume so a restart keeps workflow state. Ports 7233 and 8233 (UI). If the image name differs at project start, use the documented dev-server option and note it in ADR-0002.
     - `minio`: ports 9000 and 9001, plus a `minio-init` one-shot (mc) that creates bucket `longhaul`
     - `otel-collector`: config in `docker/otel/config.yaml`, exporting to `jaeger` (16686)
-    - `prometheus`: scrapes `host.docker.internal:9464` (worker) and `api:8000/metrics`
+    - `prometheus`: scrapes `host.docker.internal:9464` (worker). The API is not scraped: its copy of the worker metrics is always zero
     - `grafana`: port 3000, anonymous viewer, provisioning folder
   - `make up` runs `docker compose up -d --wait`. `make down` runs `docker compose down -v`.
   - `.env.example` lists every variable from section 3.8 with safe local defaults.
@@ -3315,13 +3315,13 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 - **Cumulative tests:** `make gate PHASE=9`. That covers every phase marker, `chaos_lite`, Playwright, and the hardening tests. The full chaos suite and the eval runs are manual and their result files are committed.
 - **Manual smoke:**
   ```bash
-  # on the eval VM
-  uv run python eval/swebench/select_subset.py --seed 42 --check   # subset unchanged
+  # on the eval VM. The run ids are the folders under eval/results/.
+  uv run python eval/swebench/select_subset.py --check   # subset unchanged (the seed is fixed at 42)
   uv run python eval/run.py --set custom --config full --run-id custom-full-$(date +%F) --concurrency 3
   uv run python eval/run.py --set swebench --config full --run-id swe-full-$(date +%F) --concurrency 4
-  ./eval/swebench/grade.sh swe-full-$(date +%F)
-  uv run python eval/chaos/chaos.py --runs 20 --seed 7
-  uv run python eval/report/build_report.py custom-full-* swe-* chaos-*
+  ./eval/swebench/grade.sh eval/results/swe-full-$(date +%F)
+  uv run python eval/chaos/chaos.py --runs 20 --seed 7   # writes eval/results/chaos-$(date +%F)
+  uv run python eval/report/build_report.py swe-full-$(date +%F) custom-full-$(date +%F) chaos-$(date +%F)
   ```
 
 ### Phase gate 9 (release)
@@ -3341,6 +3341,57 @@ The first `make gate PHASE=5` and the independent gate review found the problems
 3. **Is the naive baseline a straw man?** No. It has the same tools, model, limits and durable stack. It just drops planning, verification, memory and structured compaction in favour of a sliding window, which is what many simple agent loops do.
 4. **What if the results are bad?** We publish them anyway, with the failure list. A clear negative result with a working harness is still a strong signal; a suspicious perfect one is not.
 5. **Why EC2 workers in the AWS plan instead of Fargate?** Workers start Docker containers for sandboxes, and Fargate can't run a Docker daemon. The API and poller don't need Docker, so they stay on Fargate.
+
+### Phase 9 fix stories (from the gate)
+
+#### LH-991 · Loose ends in the worker, the API and memory
+- **Epic:** E15 · **Points:** 5 · **Branch:** `feat/lh-991-loose-ends` · **Depends on:** LH-504, LH-604, LH-606, LH-705, LH-801, LH-891
+- **Story:** As an operator, I want every planned task reviewed before its pull request, and the run report, the test command and the API errors to say what really happened, so that v1 has no known gaps from the earlier gates.
+- **Build:**
+  - A planned coder that calls `finish` goes to the verifier like the end of the last step, behind the patch marker `lh-991-finish-reviewed`. A history from before it ends as it did.
+  - The wind-up writes the stored run report again after the outcome and the lessons (`lh-991-final-report`). The pull request body keeps its cap.
+  - `run_tests` runs the repo's own test command first, then the verified command from memory, then the worker default, in direct and in Keystone mode.
+  - `compact` counts tokens with the tools of the role whose transcript it is.
+  - A hand-over to a new run keeps the phase of the task (`lh-991-keep-phase`).
+  - The API maps Temporal errors by status: unavailable and deadline to 503, a refused argument or precondition to 400 or 409, anything else to 502 with a short reason.
+  - A memory rejection names `decided_by`, and old events with `approved_by` still read.
+  - The test harness registers stand-ins for `record_task_state` and `write_run_report`, so the log of a test run stays clean.
+- **Acceptance criteria:**
+  - [ ] A planned finish is reviewed in a new run, and a history recorded before the change replays.
+  - [ ] The stored run report names the final outcome.
+  - [ ] Each source of the test command is used in its order.
+- **Tests:** `tests/integration/test_verifier.py`, `tests/integration/test_run_report.py`, `tests/integration/test_task_workflow.py`, `tests/unit/test_activities_tools.py`, `tests/unit/test_activities_context.py`, `tests/unit/test_api_errors.py`
+- **Files:** `src/longhaul/durable/workflows/task.py`, `src/longhaul/durable/activities/`, `src/longhaul/api/errors.py`, `src/longhaul/memory/promotion.py`, `src/longhaul/tools/`, tests
+
+#### LH-992 · A readable timeline and a complete security page
+- **Epic:** E13 · **Points:** 3 · **Branch:** `feat/lh-992-timeline-security` · **Depends on:** LH-804, LH-906
+- **Story:** As an operator, I want the timeline to read as sentences and the security page to name a test for every control, so that I can follow a task and trust the claims about it.
+- **Build:**
+  - Each known event kind reads as one line (step updates with the short sha, verdicts, outcome, pauses, budget top-ups, compactions), with the full payload behind a toggle. Unknown kinds keep the key and value view.
+  - The timeline endpoint returns checkpoint rows, and the console shows a marker on the turn that made each one.
+  - At 375 px the tasks table shows the phase and the Needs you text in view, and its scroll box has a visible edge.
+  - `docs/security.md` maps trace redaction and "the worker never runs repo code" to tests, and puts the compose loopback and the default hosts in the tested tables.
+- **Acceptance criteria:**
+  - [ ] Component tests cover each event kind and the fallback.
+  - [ ] The Playwright main path checks the tasks table at 375 px.
+  - [ ] Every test that `docs/security.md` names exists.
+- **Tests:** `console/src/pages/__tests__/TaskPage.test.tsx`, `console/e2e/main-path.spec.ts`, `tests/integration/test_api.py`, `tests/unit/test_security_page.py`
+- **Files:** `console/src/`, `src/longhaul/api/`, `docs/security.md`, tests
+
+#### LH-993 · Release fixes from the gate review
+- **Epic:** E15 · **Points:** 3 · **Branch:** `feat/lh-993-demo-report`, `feat/lh-993-console`, `feat/lh-993-docs` · **Depends on:** LH-907, LH-991, LH-992
+- **Story:** As a reader of the release, I want the demo, the console and the docs to do and say what the code does, so that nothing in v1.0.0 is a claim I find false the first time I try it.
+- **Build:**
+  - `make demo` stops its worker and its run on success, on failure and on an interrupt: the pids it keeps are the commands' own, not those of a subshell. A failed run keeps its logs under `TMPDIR`.
+  - The chaos table counts in its All row the runs that a kill hit (18 of 20), as the rows per kill type do.
+  - Prometheus scrapes the worker only.
+  - The timeline reads stuck events as one line with their evidence, shows a failed tool call with its exit code, keeps words whole at 375 px, and colours an outcome by how it ended. A verdict is recorded under the verifier turn that gave it.
+  - The README, runbook, architecture page, AWS page, security page, case study and demo script say what is true today: the repo is public, the docs site waits for Pages to be turned on, and the eval numbers and the video are not made yet. The CI secret scan covers every branch and tag with the version the security page names.
+- **Acceptance criteria:**
+  - [ ] No worker or run process is left after `make demo` ends, whichever way it ends.
+  - [ ] Every finding of the gate review is fixed or listed in the gate report with a reason.
+- **Tests:** `tests/unit/test_demo_script.py`, `tests/unit/test_report_tables.py`, `tests/unit/test_security_page.py`, `tests/integration/test_verifier.py`, `console/src/util/__tests__/timeline.test.ts`, `console/e2e/main-path.spec.ts`
+- **Files:** `scripts/demo.sh`, `eval/report/`, `docker/prometheus/prometheus.yml`, `console/src/`, `src/longhaul/durable/workflows/task.py`, `.github/workflows/ci.yml`, `README.md`, `docs/`
 
 ---
 

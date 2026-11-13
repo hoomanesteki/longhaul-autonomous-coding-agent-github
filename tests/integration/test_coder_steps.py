@@ -43,6 +43,7 @@ from longhaul.agent.loop import LoopConfig
 from longhaul.agent.prompts import FIRST_USER_MESSAGE, render_plan
 from longhaul.blobs.memory import MemoryBlobStore
 from longhaul.checkpoints.git_store import GitCheckpointStore
+from longhaul.context.compact import NOTES_TOOL_NAME
 from longhaul.contracts import (
     BlobRef,
     Budgets,
@@ -52,6 +53,7 @@ from longhaul.contracts import (
     OutcomeKind,
     Phase,
     Plan,
+    ProgressNotes,
     RepoSettings,
     Role,
     Sandbox,
@@ -293,12 +295,32 @@ class Boxes:
             await box.destroy()
 
 
+class SpyContext(ContextActivities):
+    """compact that keeps what the workflow asked it, and the tools it counted with."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.asked: list[acts.CompactInput] = []
+        self.counted_with: list[list[str]] = []
+
+    def _tools_of(self, role: Role, *, planned: bool) -> Any:
+        found = super()._tools_of(role, planned=planned)
+        self.counted_with.append([tool.name for tool in found])
+        return found
+
+    @activity.defn(name=acts.COMPACT.name)
+    async def compact(self, inp: acts.CompactInput) -> acts.CompactOutput:
+        self.asked.append(inp)
+        return await super().compact(inp)
+
+
 @dataclass
 class Light:
     queue: str
     provider: Probe
     recorder: MemoryRecorder
     blobs: MemoryBlobStore
+    context: SpyContext
 
 
 @pytest.fixture
@@ -346,8 +368,16 @@ async def light(
         },
         planned_tools=coder.tool_specs(registry.specs()),
     )
-    questions = ContextActivities(
-        provider, blobs, registry.specs(), lambda role: CFG, CONTEXT, templates=TEMPLATES
+    # `tools_for` is wired as build_parts wires it: the counts of a compaction are made with the
+    # tools of the role whose transcript it is.
+    questions = SpyContext(
+        provider,
+        blobs,
+        registry.specs(),
+        lambda role: CFG,
+        CONTEXT,
+        templates=TEMPLATES,
+        tools_for=llm.tools_for,
     )
     boxes = Boxes(gone=lose_sandbox)
     tools = ToolActivities(registry, boxes, blobs, recorder, checkpoints=NoCheckpoints())
@@ -371,7 +401,7 @@ async def light(
             ],
             workflow_runner=workflow_runner(),
         ):
-            yield Light(queue, provider, recorder, blobs)
+            yield Light(queue, provider, recorder, blobs, questions)
     finally:
         await boxes.destroy_all()
 
@@ -906,3 +936,87 @@ async def test_pr_commits_per_step(env: WorkflowEnvironment, tmp_path: Path) -> 
         # The review passed, so the pull request is ready and says what was verified.
         assert pull["draft"] is False
         assert "Verified: 3 passed" in pull["body"]
+
+
+# ---------- a compaction is counted for the role it belongs to (LH-991) ----------
+def notes_turn() -> dict[str, Any]:
+    notes = ProgressNotes(
+        goal="Fix add() in calc",
+        plan_status=[],
+        files_touched=[MODULE],
+        decisions=[],
+        failing_tests=[],
+        open_hypotheses=[],
+        tried_and_failed=[],
+        covers_turns_up_to=2,
+    )
+    call = tool(NOTES_TOOL_NAME, **notes.model_dump(mode="json"))
+    return {"match": {"role": "compactor"}, "respond": {"tool_calls": [call]}}
+
+
+def after_notes(index: int, *calls: dict[str, Any]) -> dict[str, Any]:
+    """A coder turn that answers only a request that carries the notes of a compaction. Put
+    before the refusal, so that the retry finds it and the first request does not."""
+    found = coder_turn(index, *calls)
+    found["match"]["request_contains"] = "turn_offset="
+    return found
+
+
+def overflow_at(index: int) -> dict[str, Any]:
+    """The provider refuses the request of this coder turn once, which forces a compaction."""
+    return {
+        "match": {"role": "coder", "turn_index": index},
+        "respond": {"raise": "context_too_long"},
+    }
+
+
+async def test_a_planned_coder_is_compacted_with_the_planned_prompt_and_tools(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    """The workflow tells the activity that the transcript is a planned coder's, and the
+    activity counts it with the step tools and not with the ones of an unplanned coder. Before
+    this the counts of every role were made with the one list of the coder (LH-501)."""
+    steps = [
+        turn("planner", 0, tool("submit_plan", **PLAN_INPUT)),
+        coder_turn(0, step("s1", "doing"), FIX),
+        coder_turn(1, step("s1", "done", "add() adds")),
+        coder_turn(2, ADD_TEST, step("s2", "done")),
+        coder_turn(3, ADD_NOTE, step("s3", "done")),
+        after_notes(4, SUBMIT),
+        overflow_at(4),
+        REVIEW,
+        notes_turn(),
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue, plan=True)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    (asked,) = world.context.asked
+    assert asked.role is Role.CODER
+    assert asked.planned is True
+    (counted,) = world.context.counted_with
+    assert set(coder.CONTROL_TOOLS) <= set(counted)
+    assert "finish" not in counted
+
+
+async def test_an_unplanned_coder_is_compacted_with_the_unplanned_tools(
+    env: WorkflowEnvironment, tmp_path: Path
+) -> None:
+    read = tool("read_file", path=MODULE)
+    steps = [
+        *(coder_turn(index, read) for index in range(4)),
+        after_notes(4, tool("finish", summary=SUMMARY)),
+        overflow_at(4),
+        notes_turn(),
+    ]
+    async with light(env, write_script(tmp_path, steps)) as world:
+        handle = await start_task(env.client, local_spec(), task_queue=world.queue)
+        outcome = await result_of(handle)
+
+    assert outcome.kind is OutcomeKind.PR_OPENED
+    (asked,) = world.context.asked
+    assert asked.planned is False
+    (counted,) = world.context.counted_with
+    assert "finish" in counted
+    assert not set(coder.CONTROL_TOOLS) & set(counted)

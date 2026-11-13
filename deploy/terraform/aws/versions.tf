@@ -8,7 +8,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "6.71.0"
+      version = "6.72.0"
     }
     # The database password. It is generated here so that it never has to be typed or pasted.
     random = {

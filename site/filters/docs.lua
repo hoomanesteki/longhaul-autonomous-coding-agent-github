@@ -27,13 +27,130 @@ local function first_h1(blocks)
   return nil
 end
 
+-- Links and images of an included doc are written relative to the doc's folder in the repo,
+-- which is not where the page is. A div that carries `base` (the doc's folder, for example
+-- base="docs") gets them pointed at the site: a link to a doc with a page goes to that page, an
+-- image goes to its copy in _generated/, and a link to any other file of the repo goes to the
+-- file on GitHub. scripts/site_pages.py writes the map from doc to page and the image copies.
+local doc_pages = nil
+
+local function load_doc_pages()
+  if doc_pages then
+    return doc_pages
+  end
+  local root = quarto.project.directory or "."
+  local handle = io.open(root .. "/_generated/doc-pages.txt", "r")
+  if not handle then
+    error("cannot read _generated/doc-pages.txt. Run scripts/site_pages.py first, or use make site.")
+  end
+  doc_pages = {}
+  for line in handle:lines() do
+    local doc, page = line:match("^(%S+) (%S+)$")
+    if doc then
+      doc_pages[doc] = page
+    end
+  end
+  handle:close()
+  return doc_pages
+end
+
+-- "docs" and "../eval/chaos/README.md" give "eval/chaos/README.md". Nil when the path climbs
+-- out of the repo.
+local function join(base, path)
+  local parts = {}
+  for part in (base .. "/" .. path):gmatch("[^/]+") do
+    if part == ".." then
+      if #parts == 0 then
+        return nil
+      end
+      table.remove(parts)
+    elseif part ~= "." then
+      table.insert(parts, part)
+    end
+  end
+  return table.concat(parts, "/")
+end
+
+-- "../" once for each folder between the project and the page, so adr/ pages reach the root.
+local function page_prefix()
+  local input, root = quarto.doc.input_file, quarto.project.directory
+  if not input or not root then
+    return ""
+  end
+  local _, depth = pandoc.path.make_relative(input, root):gsub("/", "")
+  return string.rep("../", depth)
+end
+
+-- Links to GitHub carry this prefix until Pandoc() below knows the repository from the
+-- metadata, which is read after the divs.
+local REPO = "repo:"
+
+local function site_target(base, target, image)
+  if target == "" or target:match("^#") or target:match("^/") or target:match("^%a[%w+.-]*:") then
+    return nil
+  end
+  local path, anchor = target:match("^([^#]*)(.*)$")
+  local repo_path = join(base, path)
+  if not repo_path or repo_path == "" then
+    return nil
+  end
+  if image then
+    return page_prefix() .. "_generated/" .. repo_path
+  end
+  local page = load_doc_pages()[repo_path]
+  if page then
+    return page_prefix() .. page .. anchor
+  end
+  local folder = path:sub(-1) == "/"
+  return REPO .. (folder and "tree" or "blob") .. "/main/" .. repo_path .. (folder and "/" or "") .. anchor
+end
+
+local function point_at_site(div, base)
+  return div:walk({
+    Link = function(link)
+      local target = site_target(base, link.target, false)
+      if target then
+        link.target = target
+        return link
+      end
+    end,
+    Image = function(image)
+      local target = site_target(base, image.src, true)
+      if target then
+        image.src = target
+        return image
+      end
+    end,
+  })
+end
+
+function Pandoc(doc)
+  local repo = doc.meta["source-repo"] and pandoc.utils.stringify(doc.meta["source-repo"])
+  return doc:walk({
+    Link = function(link)
+      if link.target:sub(1, #REPO) == REPO then
+        if not repo then
+          error("a link of an included doc needs source-repo in _quarto.yml")
+        end
+        link.target = repo .. "/" .. link.target:sub(#REPO + 1)
+        return link
+      end
+    end,
+  })
+end
+
 -- ::: {.drop-title} removes the included file's own H1, because the page already shows a title.
 -- ::: {.demote} moves every heading down a level, so the H1 of each included file becomes a
 -- section of a page that stacks several of them (the gate reports).
 --
--- Both hand back the blocks without the div. Pandoc leaves headings that sit inside a div out
--- of the table of contents, and the pages need them there.
+-- Both hand back the blocks without the div, and so does a div that only carries `base`.
+-- Pandoc leaves headings that sit inside a div out of the table of contents, and the pages
+-- need them there.
 function Div(div)
+  local base = div.attributes["base"]
+  if base then
+    div = point_at_site(div, base)
+  end
   if div.classes:includes("drop-title") then
     local index = first_h1(div.content)
     if index then
@@ -48,6 +165,9 @@ function Div(div)
         return header
       end,
     }).content
+  end
+  if base then
+    return div.content
   end
 end
 
@@ -124,4 +244,21 @@ function Table(tbl)
     end,
   })
   return pandoc.Div({ marked }, pandoc.Attr("", { "table-scroll" }))
+end
+
+-- A ```mermaid fence in an included file draws on GitHub, but Quarto only draws the cells it
+-- writes itself (pre.mermaid-js, from a {mermaid} cell). Without this, the diagrams of
+-- docs/architecture.md would show as code. The element and its class are the ones Quarto's
+-- own runtime looks for, and the text goes in escaped because the runtime reads textContent.
+function CodeBlock(block)
+  if not block.classes:includes("mermaid") then
+    return nil
+  end
+  local escaped = block.text:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+  -- The frame scrolls sideways, as a figure of a {mermaid} cell does (styles.css), because the
+  -- diagram keeps a readable width that can be wider than the page.
+  return pandoc.RawBlock(
+    "html",
+    '<div class="mermaid-frame"><pre class="mermaid mermaid-js">' .. escaped .. "</pre></div>"
+  )
 end

@@ -1468,19 +1468,30 @@ async def test_a_run_that_starts_with_a_sandbox_ensures_it_before_the_first_turn
     assert final.last_checkpoint == sha(7)
 
 
-async def test_a_run_that_starts_with_a_sandbox_is_preparing_while_it_is_ensured(
+async def test_a_run_that_starts_with_a_sandbox_keeps_its_phase_while_it_is_ensured(
     env: WorkflowEnvironment, spec: TaskSpec
 ) -> None:
+    """This test asserted `preparing` while the sandbox is ensured, for a new run (LH-991).
+
+    The run is a hand-over of a task that was coding, and a write of `preparing` made the console
+    show it as begun over again. The history that has the old write replays through the patch
+    marker (test_a_history_of_a_hand_over_from_before_the_phase_was_kept_replays).
+    """
     stubs = Stubs()
     stubs.hold(acts.ENSURE_SANDBOX.name)
     stubs.hold(acts.LLM_TURN.name)
     async with running(env, stubs) as queue:
         handle = await start_with(env, queue, resumed(spec))
-        assert (await wait_for_phase(handle, Phase.PREPARING)).last_checkpoint == sha(7)
+        while acts.ENSURE_SANDBOX.name not in stubs.names():
+            await asyncio.sleep(0.02)
+        held = await handle.query(TaskWorkflow.status)
+        assert (held.phase, held.last_checkpoint) == (Phase.CODING, sha(7))
         stubs.release(acts.ENSURE_SANDBOX.name)
         await wait_for_phase(handle, Phase.CODING)
         stubs.release(acts.LLM_TURN.name)
         await result_of(handle)
+
+    assert Phase.PREPARING not in [s.phase for s in stubs.states]
 
 
 async def test_ensure_sandbox_gets_the_timeout_and_retries_of_section_3_7(
@@ -2008,6 +2019,44 @@ async def test_a_new_run_asks_for_the_row_write_behind_the_patch(
         for payload in payloads.payloads
     }
     assert any(ROW_PATCH in text for text in ids)
+
+
+async def test_a_run_after_a_hand_over_keeps_the_phase_the_task_had(
+    env: WorkflowEnvironment, spec: TaskSpec
+) -> None:
+    """After a hand-over the row said `preparing` for a moment, because `_prepare` set it (LH-991).
+
+    The task was coding, and its new run only finds the sandbox again.
+    """
+    stubs = Stubs(edits_then_finishes(6))
+    async with running(env, stubs) as queue:
+        handle = await start_task(env.client, spec, task_queue=queue, tuning=EVERY_3)
+        await result_of(handle)
+
+    assert len(stubs.run_ids) == 3
+    phases = [s.phase for s in stubs.states]
+    assert phases.count(Phase.PREPARING) == 1
+    assert phases[0] is Phase.PREPARING
+    assert phases[-1] is Phase.DONE
+    assert all(p in (Phase.CODING, Phase.DONE) for p in phases[1:])
+
+
+async def test_a_history_of_a_hand_over_from_before_the_phase_was_kept_replays() -> None:
+    """Recorded with dev at v0.8.0 plus the Phase 8 report, before LH-991.
+
+    The second run of a task that handed over after three turns. It writes the row as `preparing`
+    when it starts, as the code did then, and has no marker for KEEP_PHASE_PATCH, so the new code
+    must make that write at the same place (F13).
+    """
+    path = ROOT / "tests" / "fixtures" / "histories" / "handover_before_phase_kept.json"
+    history = WorkflowHistory.from_json("replay-handover", path.read_text(encoding="utf-8"))
+    assert history.events[0].workflow_execution_started_event_attributes.continued_execution_run_id
+    replayer = Replayer(
+        workflows=[TaskWorkflow],
+        workflow_runner=workflow_runner(),
+        data_converter=guarded_data_converter,
+    )
+    await replayer.replay_workflow(history)
 
 
 async def test_the_last_write_of_a_delivered_task_names_the_pull_request(
@@ -3249,6 +3298,32 @@ async def test_a_test_command_in_the_settings_is_never_replaced(
     assert {t.spec.settings.test_command for t in stubs.payloads(acts.LLM_TURN.name)} == {
         "make check"
     }
+
+
+async def test_every_tool_call_carries_the_command_the_task_runs_its_tests_with(
+    env: WorkflowEnvironment,
+) -> None:
+    """The settings first, then the verified command from memory, then nothing (LH-991).
+
+    `run_tests` runs what the call carries, and the worker default only when it carries none.
+    """
+    verified = {**WITH_MEMORY, "test_command": "pytest -q"}
+    cases = [
+        ("the settings", "make check", verified, "make check"),
+        ("memory", None, verified, "pytest -q"),
+        ("neither", None, WITH_MEMORY, None),
+    ]
+    for number, (why, setting, prepared, expected) in enumerate(cases):
+        spec = make_spec(f"lh-acme-calc-{number}").model_copy(
+            update={"settings": RepoSettings(repo="acme/calc", test_command=setting)}
+        )
+        stubs = Stubs(edits_then_finishes(2))
+        stubs.prepared_with = prepared
+        await play(env, stubs, spec)
+
+        calls = stubs.payloads(acts.TOOL_EXEC.name)
+        assert len(calls) == 2, why
+        assert {c.test_command for c in calls} == {expected}, why
 
 
 async def test_histories_with_and_without_the_memory_call_replay(env: WorkflowEnvironment) -> None:

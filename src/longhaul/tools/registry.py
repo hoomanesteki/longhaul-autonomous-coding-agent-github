@@ -61,6 +61,23 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def with_test_command(self, command: str) -> ToolRegistry:
+        """A registry like this one whose `run_tests` runs `command` (LH-991).
+
+        The registry of a worker is built once, with one test command for every repo. A task names
+        its own, so the call is run on a copy that shares the tools, the validators and the blob
+        store and has its own `run_tests`. A registry without `run_tests` is returned as it is.
+        """
+        from longhaul.tools.exec import RunTests
+
+        tool = self._tools.get("run_tests")
+        if not isinstance(tool, RunTests) or tool.test_command == command:
+            return self
+        other = ToolRegistry(self.blobs)
+        other._tools = {**self._tools, "run_tests": RunTests(command, tool.max_timeout_s)}
+        other._validators = self._validators
+        return other
+
     def specs(self, names: list[str] | None = None) -> list[ToolSpec]:
         if names is None:
             return [t.spec for t in self._tools.values()]

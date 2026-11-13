@@ -740,6 +740,13 @@ def test_the_metrics_endpoint_defaults_to_the_port_prometheus_scrapes(
     assert settings.metrics_host == "127.0.0.1"
 
 
+def test_prometheus_scrapes_the_worker_and_not_the_api() -> None:
+    # The API answers 401 on /metrics when it listens on 0.0.0.0, as its container does, and its
+    # copy of the worker series is always zero, so scraping it would skew every average.
+    scraped = yaml.safe_load(PROMETHEUS_CONFIG.read_text(encoding="utf-8"))["scrape_configs"]
+    assert [job["job_name"] for job in scraped] == ["worker"]
+
+
 def test_the_metrics_endpoint_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LONGHAUL_METRICS_PORT", "9500")
     monkeypatch.setenv("LONGHAUL_METRICS_HOST", "0.0.0.0")

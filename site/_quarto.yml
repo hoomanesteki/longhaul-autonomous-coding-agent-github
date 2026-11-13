@@ -20,28 +20,47 @@ filters:
 
 website:
   title: Longhaul
-  description: A durable background coding agent for GitHub issues. Design, decisions and progress.
+  description: A durable background coding agent for GitHub issues. How it works, the proof, and how to run it.
   site-url: https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/
   favicon: favicon.svg
   navbar:
     search: true
+    # Grouped by what a reader is after. tests/unit/test_docs_site.py holds the same list.
     left:
       - text: Overview
         href: index.qmd
-      - text: Architecture
-        href: architecture.qmd
-      - text: Decisions
-        href: decisions.qmd
-      - text: Progress
-        href: progress.qmd
-      - text: Gate reports
-        href: gates.qmd
-      - text: Results
-        href: results.qmd
-      - text: Runbook
-        href: runbook.qmd
-      - text: Plan
-        href: plan.qmd
+      - text: How it works
+        menu:
+          - text: Architecture
+            href: architecture.qmd
+          - text: Decisions
+            href: decisions.qmd
+          - text: Console
+            href: console.qmd
+      - text: Proof
+        menu:
+          - text: Results
+            href: results.qmd
+          - text: Gate reports
+            href: gates.qmd
+          - text: Case study
+            href: case-study.qmd
+      - text: Operate
+        menu:
+          - text: Runbook
+            href: runbook.qmd
+          - text: Security
+            href: security.qmd
+          - text: Deploy to AWS
+            href: deploy-aws.qmd
+      - text: Project
+        menu:
+          - text: Plan
+            href: plan.qmd
+          - text: Progress
+            href: progress.qmd
+          - text: Demo script
+            href: demo.qmd
     tools:
       - icon: github
         href: https://github.com/hoomanesteki/longhaul-autonomous-coding-agent-github

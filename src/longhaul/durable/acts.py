@@ -513,6 +513,10 @@ class ToolExecInput(BaseModel):
     # The context window of the run (Tuning.window_tokens). A tool pages its output to the cap for
     # one result, and that cap shrinks with a small window (context.tokens.result_cap).
     window_tokens: int | None = Field(default=None, ge=1)
+    # The test command of the task: its settings, else the verified command that memory found. A
+    # `run_tests` call runs it, and the command the worker was built with is only the fallback
+    # when this is None. A history from before this field has none.
+    test_command: str | None = None
 
 
 class ToolExecResult(ToolResult):
@@ -590,6 +594,10 @@ class CompactInput(BaseModel):
     # The memory block of the task, as in LlmTurnInput. The system prompt that the token counts
     # are made from has it, as the one that the model turn sends does.
     memory_ref: BlobRef | None = None
+    # True for the coder of a task that has a plan, which has a system prompt and a tool list of
+    # its own (LH-503). The token counts are made from them. A history from before this field is
+    # a coder without a plan.
+    planned: bool = False
 
 
 class CompactOutput(BaseModel):

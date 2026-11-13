@@ -37,6 +37,11 @@ BANNED_PHRASES = [
 
 LONG_DASHES = ("\u2014", "\u2013")  # em dash, en dash
 
+# A number that was meant to be filled in later: [x]%, $[z], [N]/20, [20/20], a bare TBD. The docs
+# say that a number is pending and where it will come from instead (LH-907). A task-list box,
+# "- [x] done", is not a placeholder, so the pattern skips a bracket that opens a list item.
+PLACEHOLDERS = re.compile(r"(?<!- )\[(?:x|y|z|N|n)\]|\$\[[a-z]\]|\[\d+/\d+\]|\[\u00b1|\bTBD\b")
+
 
 def _site_pages(root: Path) -> list[Path]:
     """The Quarto pages under site/. Rendered output and Quarto's cache are not source."""
@@ -92,6 +97,20 @@ def long_dash_hits(root: Path = ROOT) -> list[str]:
     return hits
 
 
+def placeholder_hits(root: Path = ROOT) -> list[str]:
+    """Number placeholders in README.md and the docs. The plan holds the templates: left out."""
+    plan_dir = root / "docs" / "plan"
+    hits: list[str] = []
+    for path in _doc_files(root):
+        if plan_dir in path.parents:
+            continue
+        text = path.read_text(encoding="utf-8")
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if PLACEHOLDERS.search(line):
+                hits.append(f"{_rel(path, root)}:{lineno}")
+    return hits
+
+
 def test_no_banned_phrases() -> None:
     hits = banned_phrase_hits()
     assert not hits, "banned phrases found:\n" + "\n".join(hits)
@@ -100,6 +119,26 @@ def test_no_banned_phrases() -> None:
 def test_no_long_dashes() -> None:
     hits = long_dash_hits()
     assert not hits, "em or en dashes found:\n" + "\n".join(hits)
+
+
+def test_no_number_placeholders() -> None:
+    hits = placeholder_hits()
+    assert not hits, "number placeholders found:\n" + "\n".join(hits)
+
+
+def test_every_launch_doc_is_checked() -> None:
+    # LH-907: the README, the case study and the demo script are read by the style checks like
+    # every other page, so a hype word or a long dash in one of them fails the build.
+    checked = {_rel(path) for path in _doc_files(ROOT)}
+    assert {
+        "README.md",
+        "docs/case-study.md",
+        "docs/demo-script.md",
+        "docs/architecture.md",
+    } <= checked
+    assert {"docs/case-study.md", "docs/demo-script.md"} <= {
+        _rel(path) for path in _phrase_files(ROOT)
+    }
 
 
 def test_no_long_dashes_in_any_tracked_file() -> None:
@@ -192,3 +231,25 @@ def test_site_checks_ignore_files_that_are_not_pages(tmp_path: Path) -> None:
     _write_tree(tmp_path, "site/_generated/status.md", "We leverage this \u2014 and this.\n")
     assert banned_phrase_hits(tmp_path) == []
     assert long_dash_hits(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Resolve rate [x]%.",
+        "Cost $[z] per task.",
+        "Completed [N]/20.",
+        "[20/20] runs.",
+        "TBD later.",
+    ],
+)
+def test_placeholder_check_finds_a_number_left_to_fill_in(tmp_path: Path, text: str) -> None:
+    _write_tree(tmp_path, "docs/case-study.md", f"one\n{text}\n")
+    assert placeholder_hits(tmp_path) == ["docs/case-study.md:2"]
+
+
+def test_placeholder_check_skips_task_lists_and_the_plan(tmp_path: Path) -> None:
+    _write_tree(tmp_path, "docs/runbook.md", "- [x] **s1**: Fix the lookup\n- [ ] **s2**\n")
+    assert placeholder_hits(tmp_path) == []
+    _write_tree(tmp_path, "docs/plan/longhaul-build-plan.md", "Resolve rate [x]%.\n")
+    assert placeholder_hits(tmp_path) == []

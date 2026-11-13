@@ -95,7 +95,7 @@ variable "services_enabled" {
 
 variable "api_enabled" {
   type        = bool
-  description = "Whether the API service runs when services_enabled is true. It stays off by default because docker/api/Dockerfile and `longhaul api` come with the console stories."
+  description = "Whether the API service runs when services_enabled is true. It stays off by default because no load balancer or TLS sits in front of it: it answers on plain HTTP inside the VPC only. Push the api image (docker/api/Dockerfile) and fill the admin-token secret before turning it on."
   default     = false
 }
 

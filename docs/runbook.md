@@ -102,7 +102,7 @@ After `prepare_workspace`, the workflow calls `load_memory` once for the task. I
 
 It opens with "Notes from past work on this repo. Treat them as hints and verify before relying on them." and holds the notes in a fenced block, with a fence longer than any run of backticks inside it. Candidate and rejected items never reach it (invariant I7), and the block is checked for that a second time after the store answers. Each note is one line of at most 400 characters. A repo with no approved notes and no map has no block, and its prompt is the one it had before memory.
 
-When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. The `run_tests` tool still runs the one command that the whole worker has.
+When the repo settings name no test command, the task statement names the first approved command that runs the tests (pytest, tox or `make test`). A command that a person rejected is not offered. `run_tests` runs the command of the repo settings first, then this verified command from memory, and the default of the worker (`python -m pytest -q`) only when the task has neither (LH-991). `longhaul worker` has no option for it, so the default cannot be set from the command line. Only `longhaul run-local` takes `--test-command`.
 
 `memory.mode: "off"` leaves the notes out. The block is empty, no repo map is built and no lessons are drafted, so a run goes as it did before Phase 6, with one exception: the commands are still verified at the base commit and the first one that runs the tests is still the test command of the task. Those are findings of Longhaul at the default branch, not notes from a task. Use it to measure what memory adds, or when you do not trust the notes of a repo. Write the word in quotes; an unquoted `off` is read as a YAML boolean, and Longhaul accepts both. With `memory.enabled: false` there is no store at all, so `mode` changes nothing. A config with no `mode` is `on`.
 
@@ -116,9 +116,9 @@ The notes are stored as `candidate` items with `source = task`. Their `source_re
 
 ### Lessons after the review
 
-The poller settles the candidates on every tick. When the pull request of a task is merged, its candidates become `approved` with `approved_by` set to `merged_pr#<number>`, and the next task on the repo can read them. When the pull request is closed without a merge, the candidates become `rejected`: they stay in the table and never reach a prompt. A pull request that is still open decides nothing. Each decision is a `memory_promoted` or `memory_rejected` event on the task, and the poll's result counts them as `promoted` and `rejected`.
+The poller settles the candidates on every tick. When the pull request of a task is merged, its candidates become `approved` with `approved_by` set to `merged_pr#<number>`, and the next task on the repo can read them. When the pull request is closed without a merge, the candidates become `rejected`: they stay in the table and never reach a prompt. A pull request that is still open decides nothing. Each decision is a `memory_promoted` or `memory_rejected` event on the task, and the poll's result counts them as `promoted` and `rejected`. A promotion names `approved_by` in its payload and a rejection names `decided_by`; events from before LH-991 name `approved_by` for both. When the task recorded no `lessons` event, the event is filed under `<repo>#<number>`, which is not a task id, so it is found by the repo and the pull request in its payload.
 
-A task that opened no pull request, such as a stuck one, keeps its candidates until a person decides. Find them with `memory list --status candidate` and decide with `memory approve ID` or `memory reject ID`. The poller never changes an item that a person has decided, even if a pull request is merged later.
+A task that opened no pull request, such as a stuck one, keeps its candidates until a person decides. Find them with `memory list --repo OWNER/NAME --status candidate` and decide with `memory approve ID` or `memory reject ID`. The poller never changes an item that a person has decided, even if a pull request is merged later.
 
 ```bash
 uv run longhaul memory list --repo acme/inventory --status candidate
@@ -287,7 +287,7 @@ A worker with `LONGHAUL_GITHUB_TOKEN` registers the GitHub activities as well (L
 | A pause for a person (Phases 5 and 7) | `longhaul:needs-human` is added, and removed when the task resumes |
 | The task ends without a pull request | `longhaul:working` is removed. A stuck or failed task gets `longhaul:needs-human`, and a cancelled one gets neither (see "How a task ends") |
 
-The pull request branch has one commit on top of the base commit, whatever number of checkpoints the agent made. Its tree is the tree of the last checkpoint, so its diff is the diff of the scratch branch. The commit is titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`, and its author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
+The pull request branch is built on top of the base commit, whatever number of checkpoints the agent made. A task with no plan gets one commit, titled from the summary the agent gave to `finish`, as a conventional commit such as `fix(calc): add returns the sum`. A planned task gets one commit for each done step, titled from the step's description, and a last commit for the work after the last step, titled from the summary. The poller starts every task with planning on, so a pull request from an issue normally has one commit for each step (see "The coder and the steps of the plan" below). In both cases the tree is the tree of the last checkpoint, so the diff of the branch is the diff of the scratch branch. The commit author and committer come from `LONGHAUL_GIT_AUTHOR` (default `longhaul <longhaul@users.noreply.github.com>`). The branch is built on the host, from the bare repo of the task, and pushed there with the token. Nothing is ever pushed to the default branch.
 
 The body comes from `templates/pr_body.md.j2`: the summary, the changes per file, how it was tested (the counts of the last `run_tests` call, and a line `Verified: <counts>` when a verifier passed the work) and `Closes #<n>` (`Refs #<n>` for the draft of partial work, see "How a task ends"). The worker finds the folder through `LONGHAUL_TEMPLATES_DIR`, which defaults to `templates/` in the checkout and is set in the worker image. Text from the model is shown with its mentions and issue references broken up, so it cannot notify a person or close another issue.
 
@@ -310,7 +310,7 @@ A pull request carries a report of how the agent got there, inside a collapsed `
 
 The report is built from the database (`turns`, `tool_calls`, `events`, `plans`, `cost_ledger`, and `tasks` when the task has a row), never from the workflow. The cost, the tokens and the cache ratio are sums over the cost ledger, so they include the compactor and the calls that were retried. The turns are counted from `turns` by role and turn index. A task with no `tasks` row is reported from the other tables and shows as "local task". A task with no rows at all exits `longhaul report` with `no task <id> in the database`.
 
-`deliver` stores the report as a blob (`tasks/<task>/report/run-report.md`) the first time it builds it, and a retried attempt reads that copy, so the body of the pull request is the same bytes every time. The body stays under 60,000 characters: the report is cut at the end of a line, with a note, to the room that the rest of the body leaves. The activity `write_run_report` builds a fresh copy of the report and replaces the blob. Text that people or the model wrote has its mentions and issue references broken up, as in the rest of the body, and any key that matches the log redaction patterns shows as `[redacted]`.
+`deliver` stores the report as a blob (`tasks/<task>/report/run-report.md`) the first time it builds it, and a retried attempt reads that copy, so the body of the pull request is the same bytes every time. The body stays under 60,000 characters: the report is cut at the end of a line, with a note, to the room that the rest of the body leaves. The activity `write_run_report` builds a fresh copy of the report and replaces the blob. The wind-up of a task of an issue calls it once more after the outcome event and the lessons are recorded (LH-991), so the stored copy names the final outcome and the lessons. The body of the pull request is not changed by it. Text that people or the model wrote has its mentions and issue references broken up, as in the rest of the body, and any key that matches the log redaction patterns shows as `[redacted]`.
 
 ### The prompt cache
 
@@ -412,7 +412,7 @@ A coder that has a plan works it one step at a time (LH-503). It reads the plan 
 | `submit_for_review(summary)` | Ends the coding and starts the review (see "The verifier and the send-back loop"). A task of an issue goes on to open the pull request once the work passes. |
 | `ask_human(question)` | Asks a person. The task pauses as it does for a stuck signal (see "The pause and the hint" below) and goes back to coding when someone answers. |
 
-A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan still ends it, without a review and with a draft pull request, for a worker or a history from before the verifier. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
+A task without a plan keeps `finish` and is not changed. A call to `finish` in a task with a plan is reviewed like `submit_for_review` (LH-991). Only a history recorded before that change still ends on `finish` with no review and a draft pull request. A reply with no tool call gets one nudge, "Use tools or call submit_for_review.", because the coder is not offered `finish`. A second reply in a row ends the run as `no tool calls`.
 
 An update rewrites the plan block in the first message before the next model call, so the cache of the conversation after that message is written again once for each update (ADR-0013). The system prompt and the tool list do not change.
 
@@ -717,7 +717,7 @@ What the poller does and does not do:
 - A task id is `lh-<owner>-<repo>-<issue number>`, in lowercase. The task is started once. A row in `tasks` keeps a finished task from starting again while the label stays on the issue.
 - Only the allowlist counts. A labeled issue on a repo that is not in the config, or is there with `allowlisted: false`, is never read.
 - The poller reads from GitHub and writes one thing: the reply to a command from someone who may not steer a task (see the next section). It sets no label and posts no "Picked up" comment. The task does that itself (LH-306).
-- A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. Nothing pushes the branch or opens a pull request until LH-306 adds the delivery, so a finished task leaves no change on GitHub yet.
+- A task for a GitHub repo clones it in `prepare_workspace` (LH-305) and works on it. The delivery of LH-306 pushes the branch and opens the pull request when the work is done (see "Pull requests and labels").
 - To change the label or the interval, edit the config, restart the worker, and run `longhaul poller install` again for the interval.
 
 ## Steer a task from its issue
@@ -921,7 +921,7 @@ Keep the token out of shell history and logs, and put the API behind TLS before 
 |---|---|
 | `GET /api/tasks?status=&repo=&limit=50&cursor=` | The `tasks` rows, newest first, with `next_cursor` when there are more |
 | `GET /api/tasks/{id}` | The row, the answer of the workflow's `status` query, and the newest plan |
-| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls and tool calls merged by time, oldest first. A tool call carries its `post_sha` |
+| `GET /api/tasks/{id}/timeline?cursor=&limit=` | Events, model calls, tool calls and checkpoints merged by time, oldest first. A tool call carries its `post_sha`; a checkpoint row carries its `sha`, its `checkpoint_kind` (`tool`, `step`, `compaction` or `bundle`) and the turn that made it |
 | `GET /api/tasks/{id}/turns/{n}?attempt=` | The request and the reply of a model turn, redacted |
 | `GET /api/tasks/{id}/tool-calls/{call_id}/output?start=&end=` | Lines `start` to `end` of the full output of a tool call, redacted |
 | `POST /api/tasks/{id}/approve-plan`, `reject-plan`, `hint`, `budget`, `cancel` | Send the signal, with `by` set to `console` |
@@ -936,7 +936,7 @@ Things to know:
 - **Errors.** 404 is a task, turn, call or item that does not exist. A signal to a task that has ended answers 409, and so does `approve-plan` or `reject-plan` for a task whose live phase is not `awaiting_plan_approval`: the workflow would ignore it, and the issue must not show it as taken. A signal when Temporal is down answers 503. A turn or an output that the blob store cannot return answers 502. A cursor that is not one the API made answers 400, and a line range past the end of an output answers 416.
 - **Redaction.** Turns, outputs, event payloads and memory notes are redacted when they are read, with the patterns of the logs (`telemetry.logging.redact`). The stored blobs are not changed. Line numbers of an output page count the redacted text.
 - **Metrics.** `/metrics` has the metrics of the API process (`longhaul_api_requests_total{method,route,status}` and `longhaul_api_request_duration_seconds{route}`) and the worker metrics of the same process, which stay at zero unless the API runs a worker, which it does not. Point Prometheus at the worker for the worker metrics and do not scrape the API's `/metrics` for them: the copy there has the same names and is always zero, so a second series would pull down any `avg()` or per-instance panel.
-- **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out) and 502 with the status name when it answers and refuses, such as a permission or a rate limit.
+- **Errors from Temporal.** A signal answers 503 when Temporal does not answer (unavailable or timed out). When it answers and refuses, the API maps the status: 400 for `INVALID_ARGUMENT`, 409 for `FAILED_PRECONDITION`, and 502 for any other status, such as a permission or a rate limit. The detail names the status and never the server's message.
 - **Types for the console.** After a change to `src/longhaul/api`, run `make api-types` and commit `console/openapi.json` and `console/src/api/schema.ts`. A unit test fails when `openapi.json` is out of date, and the console job of CI fails when `schema.ts` is.
 
 ## The console
@@ -955,7 +955,7 @@ npm run lint && npm run typecheck && npm test && npm run build   # the checks of
 - **Token.** The client sends `Authorization: Bearer <token>` when a token is stored. The token lives in `localStorage` under `longhaul.token`, and in memory when `localStorage` is blocked. The login screen keeps it only after the API accepts it (a request to `/api/repos`), and a 401 on any later call clears it and returns to the login. The sign-out button clears it and the cached pages.
 - **One process.** When `LONGHAUL_CONSOLE_DIR` names the build folder (`console/dist`), `longhaul api` serves the pages at `/` as well, and any path that is not a file gets `index.html`. Unknown paths under `/api` stay 404. The compose `full` profile does this in a container: `docker compose --profile full up -d --build api` serves the console at `http://127.0.0.1:8000` (`LH_API_PORT` changes the port). Set `LONGHAUL_ADMIN_TOKEN` in `.env` or the shell first, or the container stops at start. The container listens on `0.0.0.0`, so `/metrics` needs the token there. The image is built from `docker/api/Dockerfile`.
 - **Tasks page.** `/tasks` lists the tasks newest first and polls every 10 seconds. The status and repo filters go to the API, and "Load more" follows `next_cursor`. The "Needs you" toggle works on the rows already loaded: a task needs you in the `paused` and `awaiting_plan_approval` phases. The filters are kept in the address (`?status=&repo=&needs_you=1`). The phase comes from the `tasks` row, which the workflow keeps current (see the console API notes above).
-- **Task page.** `/tasks/:id` shows the summary of a task (phase, cost, turns, tokens, cache ratio, pull request, plan with the status of each step) and its timeline. The summary uses the workflow's own answer when there is one and says why when there is not. The timeline loads every page of `/timeline` (500 rows each) and groups the rows by turn, with the tool calls inside. Only the rows in view are in the page (`@tanstack/react-virtual`), so a task of hundreds of turns stays light. Each turn has a Details button that fetches that turn's request and reply, and each tool call with a stored output has a Show output button that fetches 200 lines at a time. The arguments of a tool call come with its turn's reply, so they show once Details is open. Events are coloured by type: compaction, pause (paused, stuck, resumed), hint, verdict, recovery (sandbox recreated, continue as new) and error. A task that has not ended is polled every 10 seconds.
+- **Task page.** `/tasks/:id` shows the summary of a task (phase, cost, turns, tokens, cache ratio, pull request, plan with the status of each step) and its timeline. The summary uses the workflow's own answer when there is one and says why when there is not. The timeline loads every page of `/timeline` (500 rows each) and groups the rows by turn, with the tool calls inside. Only the rows in view are in the page (`@tanstack/react-virtual`), so a task of hundreds of turns stays light. Each turn has a Details button that fetches that turn's request and reply, and each tool call with a stored output has a Show output button that fetches 200 lines at a time. The arguments of a tool call come with its turn's reply, so they show once Details is open. Events are coloured by type: compaction, pause (paused, stuck, resumed), hint, verdict, recovery (sandbox recreated, continue as new) and error. Each known event reads as one line (for example "Step s1 done" with the short sha, or the verifier's verdict and round), with the full payload behind a toggle, and each checkpoint shows as a marker on the turn that made it. A task that has not ended is polled every 10 seconds.
 - **Actions.** The task page has an Actions section under the summary. Approve plan and Reject plan (with a feedback box) show only while the task is in `awaiting_plan_approval`. Send hint, Add budget (dollars, turns or both) and Cancel task show for every phase until the task ends. Cancel stays disabled until the task id is typed in full. Nothing shows for a task that has ended or whose workflow is closed or missing, and the page says so. Each action posts to its route, shows a toast, then fetches the task and its timeline again. A refused action keeps what was typed and shows the API's reason.
 - **Console actions on the issue.** For a task of an issue, the workflow repeats each signal that comes from the console as a short comment, so the issue shows every steer: "Hint from console:" with the text in a code fence, "Plan approved from console.", "Plan rejected from console:" with the feedback, and "Budget added from console: $2.50 and 10 turns." The text is cut to 1,000 characters and fenced so an @name in it notifies nobody. A cancel is not repeated, because the final comment already says "cancelled by console". Hints and commands typed on the issue are not repeated either, and a task without an issue posts nothing. The comments have the keys `<task>:console:<n>`, and the count is carried across a hand-over in the workflow memo (`console_posts`), as it is for `/longhaul status`. A comment that cannot be posted is logged and does not fail the task.
 - **Memory page.** `/memory` shows the notes of one repo in three tabs: Approved, Candidates and Rejected. Pick the repo in the selector; the repo and the tab stay in the address (`/memory?repo=acme/inventory&tab=candidates`). Each item shows its kind, content, source, uses and last used time. A source is a link when it has a known shape: a pull request number goes to the pull request on GitHub, a task id goes to `/tasks/<id>` in the console, and a commit sha goes to the commit. Any other reference is shown as text. Candidates have Approve and Reject, which call the same routes as `longhaul memory approve|reject` and record `console` as the approver. Each tab asks the API for its own status, so a busy repo cannot push new candidates out of view; a tab shows at most 1000 items and says so when it is cut. A repo map folds into a panel and renders as indented JSON in monospace text.
@@ -974,7 +974,7 @@ With `tools.backend: keystone` the path of one tool call is:
 tool_exec -> Keystone /mcp -> Keystone policy, approval, audit -> the worker's MCP server -> the sandbox
 ```
 
-The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. Those two never leave the worker, so Keystone does not audit them. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
+The worker serves the sandbox tools as an MCP server called `longhaul-sandbox` (`src/longhaul/tools/mcp_server.py`). Keystone knows it as an upstream, and `tool_exec` calls each tool through Keystone's own endpoint as an MCP client. The tools that touch the sandbox go this way, which is every tool of the registry except `finish` and `read_output`. Those two never leave the worker, so Keystone does not audit them. A `run_tests` call carries the test command of its task in the `_longhaul` argument, so the worker's server runs the same command as in direct mode and not the command the worker was started with. This is a setting of the durable worker. `longhaul run-local`, which uses no worker, runs its tools in the sandbox directly, whatever the config says. All the calls of one task share one Keystone session, so what Keystone has learned about a session (what it read, whether it was tainted) follows the task and never crosses to another.
 
 What the agent sees:
 
@@ -1066,6 +1066,121 @@ uv run pytest tests/integration/test_keystone_backend.py -v
 ```
 
 Stop the worker first, because the test serves the upstream on the same port (`KEYSTONE_UPSTREAM_PORT`, default 8765). Without `KEYSTONE_URL` the test is skipped and says why. A pass shows the deny reaching the agent. The audit log is the second half of the check. With `KEYSTONE_ADMIN_TOKEN` set, the test reads `GET /admin/api/v1/audit?tool=longhaul_sandbox__run_command` itself and checks that the allowed call and the denied one are both there, with the task id of the run in their arguments and one session id. Without the token it skips that half and says so. You can read the same rows with `keystone audit export`.
+
+## Operate a running install
+
+This section is the short form for the person who looks after a Longhaul install. The details sit in the sections it links to.
+
+### Start and stop
+
+Start, in this order. Each step needs the one before it.
+
+```bash
+make up                          # Postgres, Temporal, MinIO and the monitoring services
+make sandbox-image               # once, and again when docker/sandbox changes
+make migrate                     # the tables, at the head revision
+uv run longhaul worker           # the process that does the work; keep it in the foreground or a service
+uv run longhaul poller install   # once; GitHub tasks only
+uv run longhaul api              # optional; the console API (see "The console API")
+```
+
+Stop in the reverse order, and leave the data alone:
+
+1. `uv run longhaul poller pause`, so no new task starts. A poll that is running finishes.
+2. Stop the API with Ctrl-C or SIGTERM.
+3. Drain the worker (next section).
+4. `docker compose stop` stops the services and keeps their volumes. `make down` also deletes the volumes, which means the database, the history of every task and the blobs, so use it only to throw a stack away.
+
+Start again with `make up`, the worker, `uv run longhaul poller resume` and the API. Tasks that were running carry on from their last step, because their state is in Temporal and not in the worker.
+
+### Drain a worker
+
+A task does not belong to a worker, so there is nothing to wait for. SIGTERM or Ctrl-C starts a graceful stop (see "Stopping a worker"): the worker takes no new activity, waits up to 30 seconds for the ones that run, and cancels the rest. Temporal notices the missing answer when the heartbeat timeout passes (15 to 60 seconds) and runs the activity again on a worker that is up, from the checkpoint it started at. No task is lost and no tool call runs twice on half-applied edits.
+
+To replace a worker with no gap, start the new one first on the same task queue, check that its log says `worker running`, and then stop the old one. A task keeps its bare checkpoint repo on the worker host, in `LONGHAUL_CKPT_DIR`. Run the new worker on the same host, or with the same folder, so a task that is still running finds its repo.
+
+`longhaul_active_tasks` on the metrics port says how many tasks the worker holds. It is 0.0 when a worker is idle.
+
+### Cancel stuck tasks
+
+First find out what the task is doing:
+
+```bash
+uv run longhaul status TASK_ID     # phase, turns, spend, outcome once it ended
+uv run longhaul report TASK_ID     # the run report as markdown
+```
+
+A task that is `paused` is waiting for a person, and its comment or its console page says for what. Answer it with a hint or a budget top-up, or cancel it. A task that is `coding` and shows no new turn for a long time, with a worker up, is the case the stuck detector exists for, and it pauses the task by itself. If it does not, cancel it:
+
+| Where | How |
+|---|---|
+| CLI | `uv run longhaul cancel TASK_ID --reason "text"` |
+| Issue | a comment that starts with `/longhaul cancel` |
+| Console | Cancel task on the task page; the task id must be typed in full |
+| API | `POST /api/tasks/{id}/cancel` |
+
+The cancel is a signal. The workflow removes the sandbox and ends as `cancelled`, and a task of an issue posts a final comment. With no worker running, nothing handles the signal until one starts.
+
+If the workflow cannot take the signal, terminate it in the Temporal UI (http://localhost:8233). A terminated task records no outcome and cleans up nothing, so remove what it left:
+
+```bash
+docker ps -a --filter "label=longhaul.task_id=TASK_ID"     # then docker rm -f the container ids
+docker volume rm "lh-ws-TASK_ID"
+```
+
+Its checkpoint repo stays in `LONGHAUL_CKPT_DIR` until you delete `TASK_ID.git`.
+
+### Rotate tokens
+
+`docs/security.md` has the steps for each secret, under "Rotating tokens": the GitHub token, the GitHub App key, the console admin token, the model keys, and the database, blob store and Temporal credentials. The order is always the same. Make the new secret, put it where the process reads it, restart that process, check it works, and revoke the old one last. The GitHub token and the model keys are read by the worker at start, so the worker is the process to restart. The admin token belongs to the API.
+
+### The replay test
+
+A workflow that is running is replayed from its history every time a worker picks it up, and a change to workflow code that makes a different command from the recorded one fails the task with a non-determinism error. The replay tests are the check against that. They run the current `TaskWorkflow` over a recorded history and fail when it would make another command.
+
+- `test_recorded_histories_replay` in `tests/integration/test_task_workflow.py` makes fresh runs (signals, a cancel, a lost sandbox, a hand-over to a new run, a task of an issue), fetches their histories and replays them against the same code. It checks that the workflow is replay-safe in itself.
+- `test_histories_from_before_the_console_line_replay` and its siblings in `test_pause_flow.py`, `test_plan_gate.py` and `test_coder_steps.py` replay JSON histories that were recorded before a change, from `tests/fixtures/histories/`. These are the ones that prove an old task survives an upgrade.
+
+```bash
+uv run pytest tests/integration -k replay -q
+```
+
+They run on a local Temporal test server.
+
+To add one for a change: before you touch the workflow, run a task that reaches the code you will change, fetch its history with `handle.fetch_history()`, write it with `history.to_json()` into `tests/fixtures/histories/<name>.json`, and add the name to a replay test like the ones above. Then make the change behind a patch marker and see that the old history still replays and a new run records the marker.
+
+### Upgrade with workflow versioning
+
+Any change to what `TaskWorkflow` or `PollerWorkflow` does, such as a new activity call, a different order, a new wait or a new branch, goes behind `workflow.patched("<marker>")`. A history that began before the change has no marker, so `patched` answers false on its replay and the old path runs. A run that begins after the change records the marker and takes the new path. Name a marker `lh-<story>-<what>`, keep the constant next to the code it guards, and say in a comment which history it protects.
+
+The markers in the code today:
+
+| Marker | Story | What it guards |
+|---|---|---|
+| `lh-502-plan-gate` | LH-502 | The wait for approval of the plan. A history from before it goes straight to coding. |
+| `lh-506-pause-for-hint` | LH-506 | The pause that asks a person a question. |
+| `lh-507-final-outcome` | LH-507 | The wind-up that ends every task: final comment, labels, outcome event and clean-up. |
+| `lh-507-sweep-repos` | LH-507 | The `clean_repos` call that `PollerWorkflow` makes after each poll. |
+| `lh-604-load-memory` | LH-604 | The `load_memory` call after `prepare_workspace`. |
+| `lh-605-lessons` | LH-605 | The `extract_lessons` call at the end of a task that has a memory ref. |
+| `lh-805-console-mirror` | LH-805 | The comments that repeat a console action on the issue. |
+| `lh-891-task-row` | LH-891 | The writes of the task row that the console reads. |
+| `lh-991-finish-reviewed` | LH-991 | The verifier round after a planned coder calls `finish`. A history from before it opens the pull request without a review. |
+| `lh-991-keep-phase` | LH-991 | The phase a task keeps across a hand-over to a new run. A history from before it writes `preparing` again. |
+| `lh-991-final-report` | LH-991 | The second write of the stored run report, after the outcome and the lessons. |
+
+To upgrade a running install:
+
+1. Run the replay tests (`uv run pytest tests/integration -k replay -q`). If one fails with a non-determinism error, the change needs a marker or the marker is in the wrong place.
+2. Start the new worker on the same task queue, then drain the old one. Running tasks are replayed on the new code, and the markers keep the old ones on their old path.
+3. Check the Temporal UI for a task that was running during the switch. It should show no failed workflow task.
+
+Other rules for an upgrade:
+
+- Do not delete a marker while a workflow older than the change can still be open. A task waits up to `stuck.hint_wait_hours` (24) for a hint, and a task that was handed to a new run is a new history, so the open histories of the last few days are the ones to check. Do not remove a marker in v1.
+- A new field on a payload gets a default, so a history written before it still reads back. `tests/unit/test_acts.py` has examples of old shapes that still read.
+- Do not roll a worker back across a marker without replaying a history that the newer worker wrote against the older code. The replay test is how you know.
+- A schema change goes through Alembic. Run `make migrate` before the new worker starts, and write the migration so the old worker still runs on the new schema for the minutes the two overlap.
 
 ## Run the evaluation
 
@@ -1224,7 +1339,7 @@ Workflow: `.github/workflows/ci.yml`. It runs on pull requests into `dev` and `m
 | `integration` | Postgres with pgvector and MinIO as service containers, a Temporal dev server in Docker, then the integration tests (see "Test markers and `make gate`" below). The Grafana test starts Prometheus and Grafana from `docker-compose.yml` itself |
 | `e2e` | starts Postgres, MinIO and the Temporal dev server like `integration`, builds the sandbox image, then runs the end-to-end tests with the scripted provider on a real sandbox: `longhaul run-local` on the `calc` fixture, and `longhaul worker` with `longhaul run` on the same fixture, stopped and restarted mid-run (see "Run tasks on the durable stack"), and a labeled issue on a FakeGitHub that ends as a pull request a verifier passed (see "Steer a task from its issue") |
 | `chaos-lite` | the `chaos_lite` tests (see "Kill the worker on purpose") on the same services as `integration`. It runs on the nightly schedule (03:17 UTC, on the default branch) and by hand, not on pushes or pull requests |
-| `security` | gitleaks over the full git history, and `pip-audit` over the locked dependencies |
+| `security` | gitleaks over the full git history of the clone (`gitleaks git --log-opts="--all"`, every branch and tag), and `pip-audit` over the locked dependencies |
 | `compose` | `docker compose config -q`, so a broken compose file fails |
 | `docs` | `quarto render site`, so a broken include, page or diagram fails the pull request (see "Docs site" below) |
 | `terraform` | `terraform fmt -check`, `init -backend=false` and `validate` on `deploy/terraform/aws`, with the Terraform version pinned in `versions.tf`. It never plans or applies, because CI has no AWS credentials (see `docs/deploy-aws.md`) |
@@ -1268,7 +1383,9 @@ It requires a pull request and an up-to-date `ci` check, and blocks force pushes
 
 ## Docs site
 
-The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy nothing, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview, is short and leaves the numbers that change to tables generated from `docs/`.
+The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy no text, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview and the console page, is short and leaves the numbers that change to tables and charts generated from committed files.
+
+The navbar groups the pages by what a reader is after: Overview; How it works (architecture, decisions, console); Proof (results, gate reports, case study); Operate (runbook, security, deploy to AWS); Project (plan, progress, demo script). `tests/unit/test_docs_site.py` holds the same list, and fails when a page is missing from the navbar or from the "Find your way" table of the overview.
 
 | Command | What it does |
 |---|---|
@@ -1277,17 +1394,19 @@ The site in `site/` is a Quarto project. Its pages include the Markdown in `docs
 
 You need [Quarto](https://quarto.org/docs/download/) 1.10.18, which is the version CI pins, and `python3` on the PATH. View the pages through the preview server or any local web server. Opening an `.html` file straight from disk can break the table of contents.
 
-Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, and the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
+Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan, the chaos table (from `eval/results/chaos-2026-11-07/summary.json`) and the chaos chart. It also copies every image under `docs/` to the same path under `site/_generated/`, and writes `doc-pages.txt`, the map from each doc to its page. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
 
 Things that are easy to trip over:
 
 - `site/_quarto.yml` lists the pages to render. Without that list Quarto renders nothing when a checkout sits under a dot folder such as `.worktrees`.
 - A page cannot include a file from `site/_generated/` with the include shortcode. Quarto expands that shortcode while it scans the project, before `scripts/site_pages.py` has run, so on a clean checkout the file is missing and the render stops. `site/filters/fragments.lua` embeds those files later instead, and `tests/unit/test_site_pages.py` fails a page that includes one.
 - `site/filters/docs.lua` drops the first heading of an included file, because the page already has a title, turns status words in tables into badges, and sizes table columns by their content.
+- An included doc keeps its links and images relative to its own folder, as GitHub reads them. The div around the include names that folder (`::: {.drop-title base="docs"}`), and `docs.lua` then sends a link to a doc with a page to that page, a link to any other file to the file on GitHub, and an image to its copy in `site/_generated/`. A new page for a doc needs its line in `DOC_PAGES` of `scripts/site_pages.py`.
+- The chaos chart is `docs/media/chaos-results.svg`, which `uv run python scripts/chaos_chart.py` draws from the summary of the chaos run. `tests/unit/test_chaos_chart.py` fails when the committed file differs from a fresh drawing. The site embeds it inline, so `site/styles.css` can give it the colors of the light or dark theme.
 - `tests/unit/test_docs_style.py` applies the voice rules to the `.qmd` pages as it does to the docs.
 
 ### Publishing
 
 The `docs` job in `ci.yml` renders the site on every pull request. `.github/workflows/pages.yml` renders it again and deploys it to GitHub Pages on every push to `main`, and on a manual run.
 
-The owner turns the site on once, in two steps: set the Pages source of the repository to GitHub Actions (Settings, Pages, Build and deployment, Source, GitHub Actions), then add the repository variable `PAGES_ENABLED` with the value `true` (Settings, Secrets and variables, Actions, Variables). Until both are done the workflow renders the site and skips the deploy, so `main` stays green and the site stays offline. The site goes live after the first push to `main` that runs the workflow, which is the first phase gate merge. The address is `https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/`, and the README links to it.
+The owner turns the site on once, in two steps: set the Pages source of the repository to GitHub Actions (Settings, Pages, Build and deployment, Source, GitHub Actions), then add the repository variable `PAGES_ENABLED` with the value `true` (Settings, Secrets and variables, Actions, Variables). Until both are done the workflow renders the site and skips the deploy, so `main` stays green and the site stays offline. The site goes live with the first push to `main` after both steps are done. The address is `https://hoomanesteki.github.io/longhaul-autonomous-coding-agent-github/`, and the README links to it. The repo is public, but these two steps are not done yet, so the address answers 404 and the README says the site is not live.

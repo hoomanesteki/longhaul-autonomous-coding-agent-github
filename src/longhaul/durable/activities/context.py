@@ -65,7 +65,11 @@ from typing import Any
 from temporalio import activity
 
 from longhaul.agent.loop import LoopConfig
-from longhaul.agent.prompts import build_system_prompt, task_statement
+from longhaul.agent.prompts import (
+    build_planned_system_prompt,
+    build_system_prompt,
+    task_statement,
+)
 from longhaul.agent.turns import HINT_PREFIX, TranscriptError
 from longhaul.blobs.base import BlobStoreBase, blob_key
 from longhaul.context.compact import (
@@ -119,7 +123,10 @@ class ContextActivities:
 
     `provider`, `tools` and `config_for` are those of LlmActivities: the provider answers tasks
     without a script, the tools and the system prompt are what the token counts are made of, and
-    `config_for(Role.COMPACTOR)` gives the compactor's model and effort. `context` is the policy
+    `config_for(Role.COMPACTOR)` gives the compactor's model and effort. `tools_for` is
+    LlmActivities.tools_for: a transcript is counted with the tools of the role it belongs to (a
+    planner is offered other tools than a coder), and a worker without it counts every role with
+    `tools`, as it did before. `context` is the policy
     of the context section, of which only `keep_recent_turns` is used here. `meters` is shared
     with the model turns of the worker. `ledger` is the cost ledger, as in LlmActivities.
     `templates` is the folder of the Jinja templates (settings.templates_path), for the comment
@@ -137,6 +144,7 @@ class ContextActivities:
         ledger: Ledger | None = None,
         meters: Meters | None = None,
         templates: Path | None = None,
+        tools_for: Callable[..., Sequence[ToolSpec]] | None = None,
     ) -> None:
         if context.keep_recent_turns < 1:
             raise ValueError(
@@ -146,6 +154,7 @@ class ContextActivities:
         self._scripts = TaskProviders(blobs)
         self._blobs = blobs
         self._tools = list(tools)
+        self._tools_for = tools_for
         self._config_for = config_for
         self._context = context
         self._ledger: Ledger = NoLedger() if ledger is None else ledger
@@ -157,6 +166,11 @@ class ContextActivities:
         """What to register on a worker."""
         return [self.compact, self.summarize_for_human]
 
+    def _tools_of(self, role: Role, *, planned: bool) -> Sequence[ToolSpec]:
+        if self._tools_for is None:
+            return self._tools
+        return self._tools_for(role, planned=planned)
+
     @activity.defn(name=acts.COMPACT.name)
     async def compact(self, inp: acts.CompactInput) -> acts.CompactOutput:
         inp = small(inp)
@@ -165,11 +179,16 @@ class ContextActivities:
         cut = find_cut(view, keep)
         # The model turns send the memory block with every request, so the tokens counted here
         # include it, or a compaction would report a request smaller than the one that was sent.
-        system = build_system_prompt(
-            inp.role, inp.spec, await read_memory_block(self._blobs, inp.memory_ref)
+        memory_block = await read_memory_block(self._blobs, inp.memory_ref)
+        planned = inp.planned and inp.role is Role.CODER
+        system = (
+            build_planned_system_prompt(inp.spec, memory_block)
+            if planned
+            else build_system_prompt(inp.role, inp.spec, memory_block)
         )
+        tools = self._tools_of(inp.role, planned=planned)
         meter = self._meters.for_task(inp.task_id)
-        before = meter.projected(system, view, self._tools)
+        before = meter.projected(system, view, tools)
         if cut == 0 or not self._mode(inp.context_mode).compacts:
             return small(
                 acts.CompactOutput(
@@ -235,7 +254,7 @@ class ContextActivities:
                 notes=result.notes,
                 status=result.status,
                 tokens_before=before,
-                tokens_after=meter.projected(system, compacted, self._tools),
+                tokens_after=meter.projected(system, compacted, tools),
                 folded_turns=sum(m.role == "assistant" for m in view[:cut]),
                 cost_usd=float(sum(spent, Decimal(0))),
             )

@@ -7,12 +7,14 @@ Status values: Todo, In progress, Blocked, Done. One table per phase.
 |---|---|---|---|---|---|
 | LH-001 | Repo scaffold and tooling | 3 | Done | merge | 2026-10-25 |
 | LH-002 | Local stack with docker compose | 3 | Done | merge | 2026-10-25 |
-| LH-003 | CI pipeline and branch protection | 3 | In progress | merge | |
+| LH-003 | CI pipeline and branch protection | 3 | Done | merge | 2026-10-25 |
 | LH-004 | CONTRIBUTING.md, ADRs and contribution docs | 3 | Done | merge | 2026-10-25 |
 | LH-005 | Settings and config loading | 2 | Done | merge | 2026-10-25 |
-| LH-006 | Backlog import into GitHub issues | 3 | In progress | merge | |
+| LH-006 | Backlog import into GitHub issues | 3 | Done | merge | 2026-10-25 |
 | LH-007 | Toy repo fixtures | 2 | Done | merge | 2026-10-25 |
 | LH-008 | Database baseline and migrations | 2 | Done | merge | 2026-10-25 |
+
+LH-003 and LH-006 are built, merged and tested: the CI pipeline, `scripts/protect_branches.sh` and `scripts/import_backlog.py`. Each script is run once by the repo owner with `gh` logged in: branch protection needs admin rights, and the backlog import needs write access to issues. The steps are in the runbook.
 
 ## Phase 1: Agent core without durability (tag v0.1.0)
 | ID | Title | Pts | Status | PR | Merged |

@@ -1425,11 +1425,22 @@ It requires a pull request and an up-to-date `ci` check, and blocks force pushes
 
 `enforce_admins` is false on purpose. Admins merge the phase-gate pull requests and push `dev`, so GitHub has to let admins through. The rules bind collaborators and bots, and they do not bind admins: a direct push to `dev` is rejected for a token without admin rights and accepted for an admin. A fine-grained token that the owner mints acts with the owner's rights, so these rules do not stop it. The branch guard in the agent's own code (invariant I5) is what keeps the agent off the default branch. `tests/unit/test_ci_config.py` pins this value, so changing it means changing this paragraph too.
 
+### Backlog import
+
+To mirror the plan as GitHub issues, run this once with `gh` logged in:
+
+```bash
+uv run python scripts/import_backlog.py docs/plan/longhaul-build-plan.md --dry-run  # prints, calls nothing
+uv run python scripts/import_backlog.py docs/plan/longhaul-build-plan.md            # creates them
+```
+
+It creates one milestone per phase, the labels, and one issue per story, and writes the issue numbers back into `docs/progress.md`. A second run creates nothing new.
+
 ## Docs site
 
 The site in `site/` is a Quarto project. Its pages include the Markdown in `docs/` with the Quarto include shortcode and copy no text, so the site cannot drift from the docs. The prose that a page adds itself, such as the overview and the console page, is short and leaves the numbers that change to tables and charts generated from committed files.
 
-The navbar groups the pages by what a reader is after: Overview; How it works (architecture, decisions, console); Proof (results, gate reports, case study); Operate (runbook, security, deploy to AWS); Project (plan, progress, demo script). `tests/unit/test_docs_site.py` holds the same list, and fails when a page is missing from the navbar or from the "Find your way" table of the overview.
+The navbar groups the pages by what a reader is after: Overview; How it works (architecture, decisions, console); Proof (results, gate reports, case study); Operate (runbook, security, deploy to AWS); Project (plan, progress, demo script). `tests/unit/test_docs_site.py` holds the same list, and fails when a page is missing from the navbar or from the "Where to go" cards of the overview.
 
 | Command | What it does |
 |---|---|
@@ -1440,7 +1451,7 @@ The navbar groups the pages by what a reader is after: Overview; How it works (a
 
 You need [Quarto](https://quarto.org/docs/download/) 1.10.18, which is the version CI pins, and `python3` on the PATH. View the pages through the preview server or any local web server. Opening an `.html` file straight from disk can break the table of contents.
 
-Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase status table, the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan, the chaos table (from `eval/results/chaos-2026-11-07/summary.json`) and the chaos chart. It also copies every image under `docs/` to the same path under `site/_generated/`, and writes `doc-pages.txt`, the map from each doc to its page. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
+Before every render, Quarto runs `scripts/site_pages.py`. It reads `docs/` and writes two folders that git ignores: `site/adr/` holds one page per ADR, and `site/_generated/` holds the ADR index, the list of gate reports, the phase strip, the chaos tiles, the gate summary, the CI job diagram (from `.github/workflows/ci.yml`), the diagrams and tables that live in sections 3.1 to 3.3 and 8.1 of the plan, the chaos table (from `eval/results/chaos-2026-11-07/summary.json`) and the chaos chart. It also copies every image under `docs/` to the same path under `site/_generated/`, and writes `doc-pages.txt`, the map from each doc to its page. A new ADR in `docs/adr/` or a new report in `docs/gates/` therefore shows up on the site with no edit under `site/`. The script stops the render with a message when a doc loses a shape it relies on, such as an ADR without a `- Status:` line or a renamed plan section.
 
 Things that are easy to trip over:
 
